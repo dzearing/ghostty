@@ -125,8 +125,31 @@ function Get-ChooserScale([IntPtr]$h) {
     return $c.Width / 840.0
 }
 
-# A DIP measurement in the chooser's physical pixels.
-function Dip($scale, $v) { return [int][Math]::Round($v * $scale) }
+# A DIP measurement in the chooser's physical pixels is `Get-TestChromeDip`
+# (lib\ChromeGeometry.ps1, dot-sourced through TestDesktop.ps1 above). This
+# script used to keep a private `Dip` that rounded with PowerShell's default -
+# BANKER'S rounding - where every layout module rounds with Zig's `@round`,
+# half AWAY from zero. The two agree at 100/125/150/200% and disagree at
+# 112.5%, so the bug was latent rather than absent (T257 found it in four
+# scripts and swept them; this one measures its own dialog through its own
+# helper, so it was never in that sweep - T314).
+#
+# `text_x` below is the OTHER half of the same lesson: a metric the module
+# COMPOSES out of individually-rounded terms cannot be reproduced by rounding
+# the total, at any rounding mode. See `Get-ChooserTextX`.
+
+# The text column's left edge, composed the way `chooser_rows.rowMetrics`
+# composes it: the pill inset (4), the status column's left pad (8) and width
+# (12), the gap to the icon column (4), the icon column (28), and the gap to
+# the text (12) - each `px()`-rounded on its own, then summed. Rounding their
+# 68 DIP total instead happens to agree at 1.25 and does not at 1.125, where
+# the module gives 79 and the total gives 77.
+function Get-ChooserTextX([double]$scale) {
+    $terms = @(4.0, 8.0, 12.0, 4.0, 28.0, 12.0)
+    $sum = 0
+    foreach ($t in $terms) { $sum += (Get-TestChromeDip -Dip $t -Scale $scale) }
+    return $sum
+}
 
 # --- capture -----------------------------------------------------------------
 # PrintWindow with no flags - the chooser paints the frame itself, synchronously,
@@ -431,8 +454,8 @@ try {
         $yRow1 = $lr.Top + 1 + $rowH + [int]($rowH / 2)
         $rowTop = $lr.Top + 1
         $rowBot = $rowTop + $rowH
-        $pillX0 = $lr.Left + (Dip $scale 4)
-        $pillX1 = $lr.Left + (Dip $scale 60)
+        $pillX0 = $lr.Left + (Get-TestChromeDip -Dip 4.0 -Scale $scale)
+        $pillX1 = $lr.Left + (Get-TestChromeDip -Dip 60.0 -Scale $scale)
         $gutter = Get-ShotPixel $shot ($lr.Left + 3) $yRow0
         $pill = Get-ShotPixel $shot ($lr.Left + 14) $yRow0
         $unsel = Get-ShotPixel $shot ($lr.Left + 14) $yRow1
@@ -532,14 +555,19 @@ try {
         # band are the machine glyph (dim) and the title (bright).
         $bandTop = $lr.Top + 1
         $bandBot = $bandTop + $rowH
-        # MEASURED on this box at 1.25: the first bright column is 87 px, i.e.
-        # `text_x` (85) plus the "L" of "Local"'s left bearing. The retired
-        # geometry put `text_x` at 60 DIP -> 76 px, so the window between them
-        # is ~9 px and the bounds have to sit INSIDE it to discriminate: a floor
-        # of 62 DIP would round to 78 and pass the old build too.
-        $textAt = Get-FirstBrightColumn $shot $lr.Left $bandTop ($lr.Left + (Dip $scale 110)) $bandBot 200
-        Assert ($textAt -ge (Dip $scale 65)) "the row's text starts past the reserved 28 icon column (first bright column at $textAt, want >= $(Dip $scale 65))"
-        Assert ($textAt -ge 0 -and $textAt -le (Dip $scale 74)) "the row's text column has not run away (first bright column at $textAt, want <= $(Dip $scale 74))"
+        # The expected value is EXACT now (T314): `Get-ChooserTextX` composes it
+        # the way the module does, so the probe is anchored on `text_x` itself
+        # rather than on a band picked to survive the arithmetic. What is left
+        # over is only what the FONT adds - the "L" of "Local"'s left side
+        # bearing - so the window is [text_x, text_x + sm]. MEASURED on this box
+        # at 1.25: text_x = 85, first bright column = 87, ceiling 90. The
+        # retired geometry put `text_x` at 60 DIP -> 75 px, which now misses the
+        # floor by 10 px instead of the ~9 px of slack the band left.
+        $textX = Get-ChooserTextX $scale
+        $bearing = Get-TestChromeDip -Dip 4.0 -Scale $scale
+        $textAt = Get-FirstBrightColumn $shot $lr.Left $bandTop ($lr.Left + (Get-TestChromeDip -Dip 110.0 -Scale $scale)) $bandBot 200
+        Assert ($textAt -ge $textX) "the row's text starts at the composed text column (first bright column at $textAt, text_x = $textX)"
+        Assert ($textAt -ge 0 -and $textAt -le ($textX + $bearing)) "and no further in than one glyph bearing (first bright column at $textAt, want <= $($textX + $bearing))"
     }
 
     if ($edit -ne [IntPtr]::Zero) {
@@ -558,7 +586,7 @@ try {
     # come from the same place or a wrapped strip clips again (the T140 defect).
     # 12 + 4 still lands on 16, so this line is unchanged and is now also the
     # check that the two did not drift apart.
-    $script:hintLineH = Dip $scale 16
+    $script:hintLineH = Get-TestChromeDip -Dip 16.0 -Scale $scale
     $hint1 = ConvertTo-TestHwnd (Get-ChooserStatic -Chooser $chooser -Edge bottom)
     if ($hint1 -ne [IntPtr]::Zero) { $script:hintH1 = Get-Height $hint1 }
     Assert ($script:hintH1 -eq $script:hintLineH) "signed-in status strip is one line (line=$($script:hintLineH), got $($script:hintH1))"
@@ -574,18 +602,18 @@ try {
     # Cancel alone in the footer. Each of those is asserted here against the
     # real window, not against the layout function.
     $cr = Get-TestWindowRect -Window $chooser -Client
-    Assert ([Math]::Abs($cr.Height - (Dip $scale 540)) -le 2) "chooser client is Mac's 540 tall at this DPI (got $($cr.Height), want $(Dip $scale 540))"
+    Assert ([Math]::Abs($cr.Height - (Get-TestChromeDip -Dip 540.0 -Scale $scale)) -le 2) "chooser client is Mac's 540 tall at this DPI (got $($cr.Height), want $(Get-TestChromeDip -Dip 540.0 -Scale $scale))"
 
     $orgX = $cr.Left
     $orgY = $cr.Top
-    $masterRight = Dip $scale 260
-    $footerY = Dip $scale 480
+    $masterRight = Get-TestChromeDip -Dip 260.0 -Scale $scale
+    $footerY = Get-TestChromeDip -Dip 480.0 -Scale $scale
 
     # The column is a wash: brighter than the dialog surface beside it, at the
     # same height, below the last row.
-    $yBody = $orgY + (Dip $scale 300)
-    $washPx = Get-ShotPixel $shot ($orgX + (Dip $scale 200)) $yBody
-    $panePx = Get-ShotPixel $shot ($orgX + (Dip $scale 600)) $yBody
+    $yBody = $orgY + (Get-TestChromeDip -Dip 300.0 -Scale $scale)
+    $washPx = Get-ShotPixel $shot ($orgX + (Get-TestChromeDip -Dip 200.0 -Scale $scale)) $yBody
+    $panePx = Get-ShotPixel $shot ($orgX + (Get-TestChromeDip -Dip 600.0 -Scale $scale)) $yBody
     Assert (($washPx[0] - $panePx[0]) -ge 4) "machine column sits on a wash (col r=$($washPx[0]) vs pane r=$($panePx[0]))"
 
     # ...and a hairline rule divides them. Sample the 3 candidate columns so a
@@ -622,9 +650,9 @@ try {
     # at 100% until you put two of them on one screenshot.
     #
     # Asserted as a RELATIONSHIP between real HWNDs, not against a re-derived
-    # number: `Dip` rounds half-to-even and the layout module rounds half away
-    # from zero, so a script that rebuilt the height from 28 * scale would carry
-    # T257's latent DPI bug for a claim it can make without any arithmetic.
+    # number: a control's height is a composed metric (a line box plus padding),
+    # so rebuilding it from 28 * scale would restate at one rounding what the
+    # module builds at several - and this claim needs no arithmetic at all.
     if ($cancel) {
         $ctlH = $cancel.Bottom - $cancel.Top
         if ($primary) {
@@ -650,16 +678,16 @@ try {
             # T311 finding 6: the slot used to be a flat 150 DIP whatever the
             # caption was. "Sign in with Google…" is WIDER than that, so a
             # content-sized button is measurably not the retired slot.
-            Assert ($script:acctBtnW1 -ne (Dip $scale 150)) "the account button is sized to its caption, not the retired 150 DIP slot (width=$($script:acctBtnW1), retired=$(Dip $scale 150))"
+            Assert ($script:acctBtnW1 -ne (Get-TestChromeDip -Dip 150.0 -Scale $scale)) "the account button is sized to its caption, not the retired 150 DIP slot (width=$($script:acctBtnW1), retired=$(Get-TestChromeDip -Dip 150.0 -Scale $scale))"
         }
     }
 
     # The detail pane names the selected machine, and it FOLLOWS the selection:
     # arrowing onto the relay device must repaint it.
-    $dx0 = $orgX + (Dip $scale 300)
-    $dx1 = $orgX + (Dip $scale 620)
-    $dy0 = $orgY + (Dip $scale 60)
-    $dy1 = $orgY + (Dip $scale 110)
+    $dx0 = $orgX + (Get-TestChromeDip -Dip 300.0 -Scale $scale)
+    $dx1 = $orgX + (Get-TestChromeDip -Dip 620.0 -Scale $scale)
+    $dy0 = $orgY + (Get-TestChromeDip -Dip 60.0 -Scale $scale)
+    $dy1 = $orgY + (Get-TestChromeDip -Dip 110.0 -Scale $scale)
     $headDrawn = Measure-DrawnPixels $shot $dx0 $dy0 $dx1 $dy1 32 32 32 12
     Assert ($headDrawn -ge 40) "the detail pane renders the machine's identity ($headDrawn drawn pixels)"
     $sigLocal = Get-RegionSignature $shot $dx0 $dy0 $dx1 $dy1
@@ -779,7 +807,7 @@ try {
             # inferred from "every button above the header rule" - so where
             # they SIT is now an assertion of its own instead of a premise of
             # the lookup.
-            $bandBot3 = $org3Y + (Dip $scale3 52)
+            $bandBot3 = $org3Y + (Get-TestChromeDip -Dip 52.0 -Scale $scale3)
             $acctBtns = @(Get-ChooserAccountButton -Chooser $chooser3 -IncludeHidden)
             $liveAcct = @($acctBtns | Where-Object { $_.Visible })
             Assert ($acctBtns.Count -eq 2) "the account row carries both controls (found $($acctBtns.Count))"
@@ -797,7 +825,7 @@ try {
                 Assert ($linkW -lt $script:acctBtnW1) "the link is sized to ITS caption, not to a slot shared with sign-in (link=$linkW, button=$($script:acctBtnW1))"
                 # A link has no border and no button padding, so it is also
                 # shorter than the surface's button floor.
-                Assert ($linkW -lt (Dip $scale3 96)) "the link is not padded like a button (width=$linkW, button floor=$(Dip $scale3 96))"
+                Assert ($linkW -lt (Get-TestChromeDip -Dip 96.0 -Scale $scale3)) "the link is not padded like a button (width=$linkW, button floor=$(Get-TestChromeDip -Dip 96.0 -Scale $scale3))"
             }
 
             # The email is the identity text, right-aligned above the link.
@@ -820,10 +848,10 @@ try {
             # The disc is `avatar_d` (32) square at the band's trailing edge:
             # x in [840-16-32, 840-16], y centered in the 36 band that starts 8
             # below the client top.
-            $avR = $org3X + (Dip $scale3 824)
-            $avL = $org3X + (Dip $scale3 792)
-            $avT = $org3Y + (Dip $scale3 10)
-            $avB = $org3Y + (Dip $scale3 42)
+            $avR = $org3X + (Get-TestChromeDip -Dip 824.0 -Scale $scale3)
+            $avL = $org3X + (Get-TestChromeDip -Dip 792.0 -Scale $scale3)
+            $avT = $org3Y + (Get-TestChromeDip -Dip 10.0 -Scale $scale3)
+            $avB = $org3Y + (Get-TestChromeDip -Dip 42.0 -Scale $scale3)
             $shot3 = Get-Shot $chooser3
             Assert ((Get-TestDistinctColors -Shot $shot3) -ge 8) "the signed-in capture holds real content ($(Get-TestDistinctColors -Shot $shot3) distinct colors)"
             # Sample INSIDE the disc but off its center line, where the letter

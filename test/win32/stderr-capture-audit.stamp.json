@@ -1,8 +1,8 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-20T02:40:22-07:00",
-    "commit":  "e525bb79e",
+    "generated":  "2026-08-20T05:29:33-07:00",
+    "commit":  "e7a97ac57",
     "files":  {
                   "docs/claude/testing.md":  "a9ea00091a84cdd3b18261bbba93ac28e86073168cd462a4c8d94dfd41c07ce5",
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
@@ -105,7 +105,7 @@
                   "test/win32/ipc-fake-server.ps1":  "d8a18c722615e1ca8582e804d794886cb7734a9eb084f87add9d411b285a689b",
                   "test/win32/ipc-instance-addressability.ps1":  "6bf4ed78784e454742ae3ee84e1ce736024f398cb89593ec1a9b225cd31cef37",
                   "test/win32/ipc-list-session-id.ps1":  "07655b865933d453ecb4e76b365c3234dd839f152c3aa973414b1cbeea063530",
-                  "test/win32/ipc-machine-chooser.ps1":  "770a2806dc7e443431ccbd6e1de8267b58e11a9603d8e9f09b5f5bab5892af7d",
+                  "test/win32/ipc-machine-chooser.ps1":  "bd9e23b38989893540ca01dd493d27b54df4ae799628b368a9ea1d484f4c5112",
                   "test/win32/ipc-p1.ps1":  "925387f6e00adb7b7560045f3e1ba0650e3e47ca8bcbcde51b0e1581bf7585b6",
                   "test/win32/ipc-p2.ps1":  "8e08853912e91021876c28a69e1593654624fe548490093c5fc64372bd443e35",
                   "test/win32/ipc-p3.ps1":  "f3a6a662d7acda6e52352dd0b9ca8b968f687873072e0e1d626759100ca9aa41",

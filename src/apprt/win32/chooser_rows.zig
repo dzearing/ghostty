@@ -492,6 +492,30 @@ test "rowMetrics: the selection pill is inset (not a full-width bar)" {
     try testing.expect(m.fill_radius > 0);
 }
 
+test "rowMetrics: text_x is COMPOSED, not the 68 DIP total rounded once (T314)" {
+    // 112.5% is the scale that tells the three arithmetics apart, and it is the
+    // one no box here can be set to - so it is pinned here, where the acceptance
+    // script's `Get-ChooserTextX` mirrors it.
+    //
+    //   composed (this):        5 + 9 + 14 + 5 + 32 + 14 = 79
+    //   68 * 1.125 half-away:                          -> 77
+    //   68 * 1.125 banker's (PowerShell's default):    -> 76
+    //
+    // A script that re-derives `text_x` from the total is therefore wrong at
+    // 112.5% however it rounds, which is the half of T257's lesson that a
+    // shared rounding helper does not fix.
+    const m = rowMetrics(1.125);
+    try testing.expectEqual(@as(i32, 79), m.text_x);
+    try testing.expectEqual(@as(i32, 5), m.fill_inset_x);
+    try testing.expectEqual(@as(i32, 32), m.glyph_col_w);
+    // And the component sum IS the metric: the terms the script re-adds are
+    // exactly the ones the function above composes.
+    try testing.expectEqual(
+        px(4, 1.125) + px(8, 1.125) + px(12, 1.125) + px(4, 1.125) + px(28, 1.125) + px(12, 1.125),
+        m.text_x,
+    );
+}
+
 test "rowMetrics: scales with DPI" {
     const a = rowMetrics(1.0);
     const b = rowMetrics(2.0);
