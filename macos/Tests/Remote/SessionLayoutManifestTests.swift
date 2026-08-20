@@ -384,6 +384,49 @@ struct SessionLayoutManifestTests {
         #expect(sids == ["local-shared", "local-only", "agent-only-1", "agent-only-2"])
     }
 
+    // MARK: - Restore liveness (one LIST_SESSIONS instead of N probes)
+
+    private func roster(_ json: String) -> [BrowsedSession] {
+        (try? JSONDecoder().decode([BrowsedSession].self, from: Data(json.utf8))) ?? []
+    }
+
+    @Test func recordedSessionIDsAreDedupedInManifestOrder() {
+        let e = [entry(sid: "a"), entry(sid: "b"), entry(sid: "a"), entry(sid: "c", tree: false)]
+        #expect(AppDelegate.recordedSessionIDs(e) == ["a", "b"])
+    }
+
+    /// A session the agent still lists is `.alive` in the probe's sense — "the
+    /// agent knows this id" — INCLUDING a dead-but-relaunchable reboot-floor
+    /// tombstone. Dropping that window is the regression the drop policy exists
+    /// to prevent: after a reboot every session is a tombstone, and they are
+    /// exactly the ones restore brings back.
+    @Test func aListedSessionIsAliveEvenAsARelaunchableTombstone() {
+        let r = roster("""
+        [{"id":"live","alive":true,"pid":9},
+         {"id":"tomb","alive":false,"relaunchable":true,"pid":0}]
+        """)
+        let map = AppDelegate.liveness(forRecorded: ["live", "tomb"], roster: r)
+        #expect(map["live"] == .alive)
+        #expect(map["tomb"] == .alive)
+    }
+
+    /// An id missing from a roster the agent DID return is a positive not-found —
+    /// the only answer allowed to forget a persisted entry.
+    @Test func anIdAbsentFromAReturnedRosterIsPositivelyDead() {
+        let map = AppDelegate.liveness(
+            forRecorded: ["gone"],
+            roster: roster(#"[{"id":"other","alive":true,"pid":9}]"#))
+        #expect(map["gone"] == .dead)
+    }
+
+    /// No roster is not an answer. A transport failure must never look like
+    /// "every session is gone" — that would drop every window on one bad RPC.
+    @Test func noRosterLeavesEverySessionUnknown() {
+        let map = AppDelegate.liveness(forRecorded: ["a", "b"], roster: nil)
+        #expect(map["a"] == .unknown)
+        #expect(map["b"] == .unknown)
+    }
+
     @Test func reconcileFromEmptyLocalRecoversEveryAgentWindow() {
         // The exact crash case: the local manifest regressed to empty while the
         // agent kept every orphaned window. Reconcile must return them all.

@@ -175,6 +175,22 @@ pub const TerminalFormatter = struct {
         /// etc.
         modes: bool,
 
+        /// Include the INPUT-REPORTING modes (`modes.isInputReporting`: mouse
+        /// tracking + encoding, focus events, bracketed paste, DECCKM/DECNKM,
+        /// color-scheme and in-band size reports) in the `modes` emission.
+        ///
+        /// Only meaningful when `modes` is set. Clear it when the serialized
+        /// state will be replayed into a terminal whose CHILD PROCESS may not be
+        /// the one that asked for those reports — a persisted session snapshot
+        /// restored after the session was relaunched, say. The picture survives;
+        /// the "keep sending me mouse reports" agreement does not, and re-arming
+        /// it types SGR reports at whatever prompt is there now.
+        ///
+        /// Defaulted (unlike its siblings) so every existing construction site
+        /// keeps emitting exactly what it emitted before; only a caller that
+        /// knows its output outlives the process opts out.
+        input_modes: bool = true,
+
         /// Emit scrolling region state using DECSTBM and DECSLRM sequences.
         scrolling_region: bool,
 
@@ -199,6 +215,7 @@ pub const TerminalFormatter = struct {
         pub const none: Extra = .{
             .palette = false,
             .modes = false,
+            .input_modes = true,
             .scrolling_region = false,
             .tabstops = false,
             .pwd = false,
@@ -210,6 +227,7 @@ pub const TerminalFormatter = struct {
         pub const styles: Extra = .{
             .palette = true,
             .modes = false,
+            .input_modes = true,
             .scrolling_region = false,
             .tabstops = false,
             .pwd = false,
@@ -222,6 +240,7 @@ pub const TerminalFormatter = struct {
         pub const all: Extra = .{
             .palette = true,
             .modes = true,
+            .input_modes = true,
             .scrolling_region = true,
             .tabstops = true,
             .pwd = true,
@@ -303,10 +322,11 @@ pub const TerminalFormatter = struct {
         if (self.opts.emit == .vt and self.extra.modes) {
             inline for (@typeInfo(modespkg.Mode).@"enum".fields) |field| {
                 const mode: modespkg.Mode = @enumFromInt(field.value);
+                const is_input = comptime modespkg.isInputReporting(mode);
                 const current = self.terminal.modes.get(mode);
                 const default_val = @field(self.terminal.modes.default, field.name);
 
-                if (current != default_val) {
+                if (current != default_val and (self.extra.input_modes or !is_input)) {
                     const tag: modespkg.ModeTag = @bitCast(@intFromEnum(mode));
                     const prefix = if (tag.ansi) "" else "?";
                     const suffix = if (current) "h" else "l";
@@ -322,6 +342,7 @@ pub const TerminalFormatter = struct {
                 extra_formatter.pin_map = null;
                 extra_formatter.extra = .none;
                 extra_formatter.extra.modes = true;
+                extra_formatter.extra.input_modes = self.extra.input_modes;
                 try extra_formatter.format(&discarding.writer);
 
                 // Map all those bytes to the same pin. Use the top left to ensure
@@ -5018,6 +5039,58 @@ test "Terminal vt with modes" {
     try testing.expectEqual(t.modes.get(.bracketed_paste), t2.modes.get(.bracketed_paste));
     try testing.expectEqual(t.modes.get(.mouse_event_normal), t2.modes.get(.mouse_event_normal));
     try testing.expectEqual(t.modes.get(.wraparound), t2.modes.get(.wraparound));
+}
+
+test "Terminal vt without input modes keeps the picture, drops the reports" {
+    // A serialized screen that outlives the process it came from (Ghoztty's
+    // persisted session snapshot) must not re-arm "send reports to my process":
+    // repainted onto a pane whose child was relaunched as a plain shell, a
+    // restored `?1003h` makes the terminal type SGR mouse reports at the prompt.
+    // The picture — alt screen, wraparound, cursor visibility — is still true.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var builder: std.Io.Writer.Allocating = .init(alloc);
+    defer builder.deinit();
+
+    var t = try Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+
+    // What a full-screen TUI leaves behind: mouse tracking + SGR encoding +
+    // focus + bracketed paste (input agreements), on the alt screen with
+    // wraparound off and the cursor hidden (picture).
+    s.nextSlice("\x1b[?1049h");
+    s.nextSlice("\x1b[?1003h\x1b[?1006h\x1b[?1004h\x1b[?2004h");
+    s.nextSlice("\x1b[?7l\x1b[?25l");
+    s.nextSlice("thinking with xhigh effort");
+
+    var formatter: TerminalFormatter = .init(&t, .vt);
+    formatter.extra.modes = true;
+    formatter.extra.input_modes = false;
+    try formatter.format(&builder.writer);
+    const output = builder.writer.buffered();
+
+    var t2 = try Terminal.init(alloc, .{ .cols = 80, .rows = 24 });
+    defer t2.deinit(alloc);
+    var s2 = t2.vtStream();
+    defer s2.deinit();
+    s2.nextSlice(output);
+
+    // The reports stay at their defaults — off.
+    try testing.expect(!t2.modes.get(.mouse_event_any));
+    try testing.expect(!t2.modes.get(.mouse_format_sgr));
+    try testing.expect(!t2.modes.get(.focus_event));
+    try testing.expect(!t2.modes.get(.bracketed_paste));
+    // …while the picture round-trips exactly as before.
+    try testing.expectEqual(
+        t.modes.get(.alt_screen_save_cursor_clear_enter),
+        t2.modes.get(.alt_screen_save_cursor_clear_enter),
+    );
+    try testing.expectEqual(t.modes.get(.wraparound), t2.modes.get(.wraparound));
+    try testing.expectEqual(t.modes.get(.cursor_visible), t2.modes.get(.cursor_visible));
 }
 
 test "Terminal vt with tabstops" {

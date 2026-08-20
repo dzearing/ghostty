@@ -299,6 +299,54 @@ const entries: []const ModeEntry = &.{
     .{ .name = "in_band_size_reports", .value = 2048 },
 };
 
+/// True for the modes that are an agreement with a **process** about what the
+/// terminal will SEND it — mouse reports and their encoding, focus events,
+/// bracketed paste, arrow/keypad encoding, and the unsolicited color-scheme and
+/// size reports — as opposed to modes that describe the picture (alt screen,
+/// wraparound, cursor visibility, origin, …).
+///
+/// The distinction matters when terminal state is serialized and replayed later:
+/// the picture is still true, but "send reports to my process" is only true while
+/// that same process is running. A restore that re-arms these against a different
+/// child makes the terminal type mouse reports at a shell prompt.
+pub fn isInputReporting(mode: Mode) bool {
+    return switch (mode) {
+        .cursor_keys,
+        .keypad_keys,
+        .mouse_event_x10,
+        .mouse_event_normal,
+        .mouse_event_button,
+        .mouse_event_any,
+        .focus_event,
+        .mouse_format_utf8,
+        .mouse_format_sgr,
+        .mouse_format_urxvt,
+        .mouse_format_sgr_pixels,
+        .bracketed_paste,
+        .report_color_scheme,
+        .in_band_size_reports,
+        => true,
+        else => false,
+    };
+}
+
+test "isInputReporting separates process agreements from picture state" {
+    try testing.expect(isInputReporting(.mouse_event_any));
+    try testing.expect(isInputReporting(.mouse_format_sgr));
+    try testing.expect(isInputReporting(.bracketed_paste));
+    try testing.expect(isInputReporting(.focus_event));
+    try testing.expect(isInputReporting(.cursor_keys));
+    // Picture state: a serialized screen must still be able to say "I am on the
+    // alternate screen, wrapping, with a visible cursor".
+    try testing.expect(!isInputReporting(.alt_screen_save_cursor_clear_enter));
+    try testing.expect(!isInputReporting(.alt_screen));
+    try testing.expect(!isInputReporting(.wraparound));
+    try testing.expect(!isInputReporting(.cursor_visible));
+    try testing.expect(!isInputReporting(.origin));
+    try testing.expect(!isInputReporting(.reverse_colors));
+    try testing.expect(!isInputReporting(.synchronized_output));
+}
+
 test {
     _ = Mode;
     _ = ModePacked;

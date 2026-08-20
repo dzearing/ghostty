@@ -24,6 +24,19 @@ struct UpgradeAlertTests {
         #expect(alert.alertStyle == .warning)
     }
 
+    /// A destructive default is how a stray Return ends every live session. The
+    /// alert pops during a post-update relaunch, when the app has just come to
+    /// the front, so "Later" owns the Return key — while "Update Now" stays the
+    /// first button (and therefore `.alertFirstButtonReturn`).
+    @Test func laterIsTheDefaultButtonNotTheDestructiveOne() {
+        let alert = LocalAgentManager.makeUpgradeAlert(
+            liveSessionCount: 95, previousSeen: "1.32.0", current: "1.33.0", store: sampleStore())
+        #expect(alert.buttons[0].title == "Update Now")
+        #expect(alert.buttons[0].keyEquivalent == "")
+        #expect(alert.buttons[1].title == "Later")
+        #expect(alert.buttons[1].keyEquivalent == "\r")
+    }
+
     @Test func singularSessionText() {
         let alert = LocalAgentManager.makeUpgradeAlert(
             liveSessionCount: 1, previousSeen: "1.4.0", current: "1.5.0", store: sampleStore())
