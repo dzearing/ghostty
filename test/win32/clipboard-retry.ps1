@@ -1,5 +1,6 @@
-# T947 acceptance: a copy issued while another process holds the clipboard must
-# still land.
+# T947/T992 acceptance: a copy issued while another process holds the clipboard
+# must still land (T947), and it must claim a real owner window so the write
+# cannot be overtaken mid-flight (T992).
 #
 # THE DEFECT. `OpenClipboard` does not queue. It fails outright while any other
 # process on the desktop holds the clipboard, and something routinely does for a
@@ -16,7 +17,7 @@
 # pane can perform a real copy - no desktop, no SendInput, no selection. That is
 # the whole reason this script is headless and cheap enough to gate on.
 #
-# THE THREE ARMS, and why each is needed:
+# THE FOUR ARMS, and why each is needed:
 #
 #   A  ORACLE SENSITIVITY (the negative control). A hold far LONGER than the
 #      retry budget must produce a LOST copy - the token never reaches the
@@ -32,7 +33,14 @@
 #      clipboard call site from reintroducing the bug - `w32.OpenClipboard`
 #      appears only inside `clipboard_open.zig`. This is also what covers the
 #      PASTE site, whose behavior belongs to clipboard-paste.ps1 (it needs real
-#      ctrl+v on a desktop) but whose retry is the same one line.
+#      ctrl+v on a desktop) but whose retry is the same one line. C3 keeps the
+#      owner-window registration in `App.init` for the same reason: the arm
+#      below can only measure it while something still calls it.
+#   D  THE COPY CLAIMS A WINDOW (T992). A retried open is still not an ATOMIC
+#      write: only naming a real owner window keeps another process out between
+#      our EmptyClipboard and our SetClipboardData. Read back from
+#      `GetClipboardOwner`, with the null-owner shape reproduced first so the
+#      oracle is proven able to tell the two apart.
 #
 # THE CLIPBOARD IS NOT ISOLATABLE. It is one machine-wide resource scoped to the
 # window station, so unlike the IPC endpoint it cannot be given a private twin:
@@ -332,6 +340,73 @@ try {
     Assert "C2 no other call site opens the clipboard directly ($($outside.Count) found)" `
         ($outside.Count -eq 0)
     foreach ($o in $outside) { "      $($o.Path):$($o.LineNumber)" }
+
+    # C3: arm D measures the owner window, but only App.init puts one there. If
+    # that registration is dropped, every open silently falls back to the
+    # excludes-nobody shape - and D would only catch it on a box where the app
+    # is running, which is not where a refactor gets reviewed.
+    $appZig = Join-Path $repo 'src\apprt\win32\App.zig'
+    $regs = @(Select-String -Path $appZig -Pattern 'clipboard_open\.setDefaultOwner' -ErrorAction SilentlyContinue)
+    Assert "C3 App.zig still registers the clipboard owner window ($($regs.Count) call(s))" `
+        ($regs.Count -ge 2)
+    # ========================================================================
+    '== D: the app''s copy claims a real owner WINDOW (T992)'
+    # ========================================================================
+    # THE DEFECT THIS ARM CATCHES. The retry above makes an open reliable; it
+    # does not make the WRITE atomic. `EmptyClipboard` then `SetClipboardData`
+    # are two acts, and the only thing that keeps another process out between
+    # them is that our open named a window. `OpenClipboard(NULL)` names none,
+    # and Windows then excludes nobody - measured while writing this arm:
+    #
+    #   owner=NULL      another process opens straight through; our own
+    #                   SetClipboardData afterwards fails 1418 (CLIPBOARD_NOT_OPEN)
+    #   owner=real HWND that process is refused with 5 (ACCESS_DENIED)
+    #
+    # So the user's copy silently yields the other app's content, or nothing.
+    #
+    # THE ORACLE. `GetClipboardOwner()` is exactly the difference: a NULL-owner
+    # write leaves it 0, a real-owner write leaves it the writer's window. D0
+    # is that discrimination proven on this box in this run (the sensitivity
+    # control - without it D1/D2 could pass against an oracle that says
+    # "non-zero" for everything), and D1/D2 read it after a real OSC 52 copy.
+    Add-Type -Namespace T992Probe -Name Clip -MemberDefinition @"
+[DllImport("user32.dll", SetLastError=true)] public static extern IntPtr GetClipboardOwner();
+[DllImport("user32.dll", SetLastError=true)] public static extern int OpenClipboard(IntPtr hWnd);
+[DllImport("user32.dll", SetLastError=true)] public static extern int CloseClipboard();
+[DllImport("user32.dll", SetLastError=true)] public static extern int EmptyClipboard();
+[DllImport("user32.dll", SetLastError=true)] public static extern int GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+"@
+
+    # D0: a null-owner write from THIS process must leave the owner at 0. That
+    # is the pre-fix shape, reproduced here so the oracle is known to be able
+    # to see it.
+    $nullOwnerSeen = $null
+    if ([T992Probe.Clip]::OpenClipboard([IntPtr]::Zero) -ne 0) {
+        [void][T992Probe.Clip]::EmptyClipboard()
+        $nullOwnerSeen = [T992Probe.Clip]::GetClipboardOwner()
+        [void][T992Probe.Clip]::CloseClipboard()
+    }
+    Assert 'D0 a null-owner write leaves no clipboard owner (oracle sensitivity)' `
+        ($null -ne $nullOwnerSeen -and $nullOwnerSeen -eq [IntPtr]::Zero)
+
+    $ownToken = "t992-owner-$PID"
+    Send-Copy $pane $ownToken
+    $ownLanded = Wait-Clip $ownToken 20000
+    Assert 'D1 the copy under test landed (so D2/D3 are measuring it)' $ownLanded
+    if ($ownLanded) {
+        $owner = [T992Probe.Clip]::GetClipboardOwner()
+        Assert "D2 the clipboard has an owner window after the app's copy (got $owner)" `
+            ($owner -ne [IntPtr]::Zero)
+        if ($owner -ne [IntPtr]::Zero) {
+            $ownerPid = 0
+            [void][T992Probe.Clip]::GetWindowThreadProcessId($owner, [ref]$ownerPid)
+            # The window must be the APP's, not some other process that happened
+            # to write the clipboard in the meantime.
+            Assert "D3 the owner window belongs to the app under test (owner pid $ownerPid, app pid $($app.Id))" `
+                ($ownerPid -eq $app.Id)
+        }
+    }
+
 } finally {
     New-Item -ItemType File -Force $holderStop | Out-Null
     Stop-TestProcs

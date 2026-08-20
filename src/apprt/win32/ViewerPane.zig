@@ -7761,7 +7761,9 @@ fn clipboardReadText(alloc: Allocator) ?[]u8 {
 ///
 /// The open is retried (`clipboard_open`, T850). Without it, a link Copy issued
 /// in the few milliseconds another process holds the clipboard silently did
-/// nothing, which the user cannot tell from a broken menu item.
+/// nothing, which the user cannot tell from a broken menu item. It also claims
+/// the app's clipboard owner window (T992): passing no owner leaves the
+/// empty-then-set pair below open to another app writing between the two.
 fn clipboardWriteText(alloc: Allocator, text: []const u8) void {
     const utf16 = std.unicode.utf8ToUtf16LeAlloc(alloc, text) catch return;
     defer alloc.free(utf16);

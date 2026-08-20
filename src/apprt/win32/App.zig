@@ -44,6 +44,7 @@ const MachineConnectionPool = @import("MachineConnectionPool.zig");
 const remote_connection = @import("../../remote/connection.zig");
 const protocol = @import("../../remote/protocol.zig");
 const tab_color = @import("tab_color.zig");
+const clipboard_open = @import("clipboard_open.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const update_check = @import("update_check.zig");
@@ -633,6 +634,12 @@ pub fn init(
 
     // Store self pointer in msg_hwnd's GWLP_USERDATA for msgWndProc access
     _ = w32.SetWindowLongPtrW(self.msg_hwnd.?, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
+
+    // T992: every clipboard open in this process claims this window. It is the
+    // one HWND with the right lifetime — a surface can be freed while a copy is
+    // in flight, and an open that names no window at all excludes nobody, which
+    // makes the copy's empty-then-set pair non-atomic. See clipboard_open.zig.
+    clipboard_open.setDefaultOwner(self.msg_hwnd);
 
     // T188: from here on, a long blocking GUI-thread operation can keep serving
     // IPC by calling `gui_pump.pump()` — session restore is the one that needs
@@ -1399,6 +1406,9 @@ pub fn terminate(self: *App) void {
     }
 
     if (self.msg_hwnd) |hwnd| {
+        // T992: stop handing this window out as the clipboard owner before it
+        // is destroyed — a stale handle there would fail every later open.
+        clipboard_open.setDefaultOwner(null);
         // Clear GWLP_USERDATA before destroying so msgWndProc sees
         // userdata=0 and falls through to DefWindowProc for any
         // messages during destruction (e.g. WM_DESTROY).

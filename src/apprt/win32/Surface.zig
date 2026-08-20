@@ -1819,7 +1819,11 @@ pub fn setClipboard(
 
     _ = w32.GlobalUnlock(hglobal);
 
-    // null owner: the write is not tied to the (possibly freed) surface hwnd.
+    // No explicit owner: this write is not tied to the (possibly freed) surface
+    // hwnd, so it claims the APP's clipboard window instead of no window at all
+    // (T992) — the empty-then-set pair below is only atomic while a real window
+    // owns the open, and another app slipping between the two is how a copy
+    // silently ends up holding that app's content.
     // Retried for the same reason as the paste read above (T947): a copy that
     // loses the race is a keystroke that vanished with no message.
     if (!clipboard_open.open(null)) {
