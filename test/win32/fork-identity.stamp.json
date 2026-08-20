@@ -1,0 +1,10 @@
+{
+    "guard":  "fork-identity",
+    "script":  "test/win32/fork-identity.ps1",
+    "generated":  "2026-08-20T13:37:58-07:00",
+    "commit":  "ac4722719",
+    "files":  {
+                  "scripts/fork-identity.ps1":  "5d99572d83c88ddca5bb39daa4106c9f00a53da36aa55a658a4c2a78a5a2610a",
+                  "test/win32/fork-identity.ps1":  "19caa4f9f1fedcbb3dba03e70ca859b60ffe5570bd5c9199a34a3ab0a76196cd"
+              }
+}

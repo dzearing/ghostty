@@ -87,7 +87,10 @@ delta in that class is one of three mechanical overlays:
 
 None of those is a semantic conflict. They are a *patch overlay* that can be
 re-applied after taking upstream wholesale, which is why Stage 0 below turns
-the overlay into a script instead of 52 manual resolutions.
+the overlay into a script instead of 52 manual resolutions. Measured against
+the real fork delta once the script existed, 28 of the 52 are resolved by it
+outright and the other 24 shrink to the non-identity work they also carry -
+Stage 0 item 2 has the breakdown.
 
 ## Group summary
 
@@ -210,12 +213,50 @@ things exist, because each of them is needed by every later stage:
    wedge the loop. `check` is the gate: it exits 1 unless every sha cited in
    THIS FILE resolves and is reachable from `upstream/main`, so a re-cut stage
    is covered the day it is written here.
-2. **The branding overlay as a script.** A checked-in script that re-applies
-   the fork identity (`com.mitchellh.ghostty` -> `com.dzearing.ghoztty`,
-   `Bundle.loggerSubsystem`, the `.win32` apprt arms) across a tree, plus a
-   verifier that greps for any surviving upstream identity string. This turns
-   52 of the 131 resolutions into "take theirs, run the script, run the
-   verifier" - and makes the same 52 free in every later inventory.
+2. **The branding overlay as a script.** ✅ **Done (T956.)**
+   `scripts\fork-identity.ps1` re-applies the fork identity across a tree
+   (`apply`), reports anywhere an upstream form survives (`check`, exit 1), and
+   prints its own rule table (`rules`) so this doc and the code cannot drift.
+   A U-file merge is now "take theirs, run `apply`, run `check`".
+
+   **What it actually resolves, measured rather than claimed.** The 52 U-files
+   were checked out at the fork point, overlaid, and compared against HEAD:
+   **28 of the 52 come back byte-identical**, and across all 52 the overlay
+   removes **104 of the 210 changed lines**. The remaining 24 files are not
+   identity at all and no rule should invent them:
+
+   - **6 CI workflows** - the `github.repository == 'ghostty-org/ghostty'`
+     guards are applied SELECTIVELY (28 guards over 47 jobs in `test.yml`
+     alone), so a rule that added them everywhere would be wrong rather than
+     merely coarse.
+   - **8 macOS files** - the `Ghostty.SurfaceView` -> `PaneView` type rename
+     and real feature deltas (the window title override in the restorable
+     state, release notes on the update sheet).
+   - **10 files carrying genuine work in a small diff** - a raised comptime
+     branch quota, the `win32_input` mode, two OSC parsers, the IPC fields on
+     `Global`, `SetConsoleCP` on `src/os/windows.zig` - plus `build.zig.zon`,
+     whose `.version` is ours by policy and would go stale as a constant.
+
+   So the honest form of the earlier claim is: the overlay makes **28 of the
+   131 resolutions free and shrinks 24 more to their real content**, at every
+   stage, rather than once.
+
+   The rules are narrow and each one is derived from a measured fork delta;
+   a blanket `ghostty` -> `ghoztty` rename would be wrong and is never done.
+   `xterm-ghostty` is the TERM value, `GHOSTTY_*` is a published contract with
+   shells, `ghostty-org/ghostty` is upstream's repository, `src/apprt/gtk` and
+   `macos/Sources/Ghostty` are directory and module names, and `po/*.po`
+   headers are gettext metadata. `test\win32\fork-identity.ps1` section E is a
+   fixture of exactly those strings, asserted to come back byte-identical -
+   because a blanket rename would pass every other assertion in the harness.
+
+   The apprt arm is structural, not textual: `.none => void,` appears 29 times
+   at the fork point and only 11 of them are app-runtime switches, so the
+   script finds the brace-balanced `switch (... app_runtime)` block first and
+   widens only "not applicable" arms in blocks that do not already cover
+   `.win32`. A switch that maps members to modules (`src/apprt.zig`) or that
+   has its own `.win32` arm (`src/build/SharedDeps.zig`) is reported, never
+   rewritten.
 3. **`.gitattributes` merge drivers** ✅ **Done (T957.)** `.gitignore` is under
    git's built-in `merge=union`, measured on the real divergence: ours grew 28
    lines and upstream's grew 4 in the same two regions, which conflicts without
@@ -235,17 +276,24 @@ things exist, because each of them is needed by every later stage:
 
 Stage 0 is pure infrastructure and lands on this branch with no upstream code,
 so it is safe to do at any time - including before the decision to merge is
-final. **Item 2 is what remains** - it is tracked as T956.
+final. **All three items are now done** (T957, T956), so S1 is unblocked on
+preparation grounds; what it still waits on is the go/no-go in D80.
 
 ### Stage sequence and the gate after each
 
 Every stage lands on a scratch branch, is gated, and only then fast-forwards:
 
 ```
+powershell -NoProfile -File scripts\fork-identity.ps1 check
 powershell -NoProfile -File scripts\floor-lane.ps1 -Lane all
 powershell -NoProfile -File test\win32\ipc-p1.ps1   # then ipc-p2.ps1, ipc-p3.ps1
 powershell -NoProfile -File scripts\guard-due.ps1 check
 ```
+
+`fork-identity check` runs FIRST because it is the cheapest and because a merge
+stage is exactly when upstream identity re-enters the tree: every U-file
+resolved as "take theirs" arrives carrying it. Run `apply` on the conflicted
+paths, then `check` until it exits 0.
 
 `guard-due check` is the part that is easy to skip and should not be: a merge
 changes code under many acceptance harnesses at once, and after a merge stage

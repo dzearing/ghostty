@@ -103,6 +103,21 @@ $GuardTable = @(
             '.gitattributes'
         )
     },
+    # The other half of Stage 0 (T956): the fork-identity overlay. Same argument
+    # as above and one more - this one WRITES to a tree, so the failure mode is
+    # not "a merge stage is harder than expected" but "52 upstream files were
+    # rewritten by a rule that had quietly gone wrong". The rules are exercised
+    # by nothing else, and the plan's appendix that the harness derives its file
+    # list from is edited by the daily intake.
+    [pscustomobject]@{
+        Name   = 'fork-identity'
+        Script = 'test\win32\fork-identity.ps1'
+        Stamp  = 'test\win32\fork-identity.stamp.json'
+        Covers = @(
+            'test\win32\fork-identity.ps1',
+            'scripts\fork-identity.ps1'
+        )
+    },
     # The startup job self-escape (T675): the only harness that proves a
     # pane-launched app respawns itself OUT of a kill-on-close job and
     # survives the teardown that used to kill it mid-refresh. Interactive
