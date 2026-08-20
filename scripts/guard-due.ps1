@@ -449,6 +449,23 @@ $GuardTable = @(
             'dist\windows-installer\build-portable-zip.sh'
         )
     },
+    # Single-instance launch (T1022): the only harness that proves a second
+    # launch of one build JOINS the app already running while a second LINEAGE
+    # still starts its own. Both arms need two real GUI launches racing for one
+    # endpoint, which no unit lane can stage, and the whole behavior lives in
+    # `App.init`'s bind -> AlreadyRunning -> forward path. It is not in the
+    # P1-P3 floor, so without this row an edit to the endpoint derivation or to
+    # the handoff could silently turn every launch into a second app again.
+    [pscustomobject]@{
+        Name   = 'single-instance-join'
+        Script = 'test\win32\single-instance-join.ps1'
+        Stamp  = 'test\win32\single-instance-join.stamp.json'
+        Covers = @(
+            'test\win32\single-instance-join.ps1',
+            'src\os\ipc_handoff.zig',
+            'src\apprt\win32\IpcServer.zig'
+        )
+    },
     # Release version-drift detection (T579): the checker and its CI wiring
     # only ever matter around a release, which is exactly when nobody on this
     # box is watching -- the same argument as release-artifacts above. Its

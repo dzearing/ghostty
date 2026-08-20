@@ -63,6 +63,7 @@ const agent_upgrade = @import("agent_upgrade.zig");
 const job_escape = @import("job_escape.zig");
 const relaunch_guard = @import("relaunch_guard.zig");
 const url_scheme = @import("url_scheme.zig");
+const provenance = @import("provenance.zig");
 const host_defaults = @import("host_defaults.zig");
 const gui_pump = @import("gui_pump.zig");
 const surface_reap = @import("surface_reap.zig");
@@ -674,10 +675,20 @@ pub fn init(
                 self.config.@"initial-command",
                 self.config.@"working-directory",
             ) catch null;
-            const ok = internal_os.ipc_client.sendAction(
+            // T1022: and say WHICH build asked. Two copies of one lineage
+            // (the installed release and the Desktop portable) share this
+            // endpoint by design, so the window the user gets belongs to
+            // whichever was started first — D79 chose that, and named the
+            // shortcut-looks-wrong case as its one con. The running instance
+            // compares this identity with its own and is loud when they
+            // differ; when they match it stays silent, because two copies of
+            // the same build are indistinguishable and the join is invisible
+            // on purpose.
+            const ok = internal_os.ipc_client.sendActionWithHandoff(
                 alloc,
                 "new-window",
                 fwd_args,
+                launchIdentity(alloc),
             ) catch false;
             std.process.exit(if (ok) 0 else 1);
         },
@@ -971,6 +982,22 @@ pub fn pumpIpc(self: *App) void {
 /// null when there is nothing to say, preserving the bare-verb wire shape.
 /// Allocations are owned by the caller; the forward path exits the process
 /// immediately after sending, so it never frees them.
+/// This process's build identity, for the launch handoff (T1022).
+///
+/// The exe path is the only part that has to be looked up at runtime, and a
+/// failure to resolve it is not a reason to skip the handoff: the version and
+/// commit alone still answer "is this the build you started?", and the notice
+/// degrades to naming the build without a path. Allocated from `alloc`, which
+/// is the app allocator — the process exits a few statements later, so nothing
+/// frees it.
+fn launchIdentity(alloc: Allocator) internal_os.ipc_handoff.Identity {
+    return .{
+        .version = provenance.version,
+        .commit = provenance.commit,
+        .exe = std.fs.selfExePathAlloc(alloc) catch "",
+    };
+}
+
 fn forwardedNewWindowArgs(
     alloc: Allocator,
     initial_command: ?configpkg.Config.Command,
@@ -7638,6 +7665,17 @@ fn showDesktopNotification(
         .surface => |core_surface| core_surface.id,
     };
     self.showDesktopNotificationText(value.title, value.body);
+}
+
+/// Tell the user that the window they just got belongs to a DIFFERENT build
+/// than the one they started (T1022). A balloon rather than a dialog: the
+/// window is already open and usable, so this is information, not a decision —
+/// and a modal here would block the launch the user is watching for.
+///
+/// Text is bounded by `ipc_handoff.mismatchNotice`, which sizes the body for
+/// `szInfo`; the copies below are the same ones every other notification makes.
+pub fn showLaunchHandoffNotice(self: *App, title: []const u8, body: []const u8) void {
+    self.showDesktopNotificationText(title, body);
 }
 
 /// Show a desktop toast with the given title/body via the tray icon. The

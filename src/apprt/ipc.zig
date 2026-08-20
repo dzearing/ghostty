@@ -150,6 +150,13 @@ pub const read_tail = @import("ipc/read_tail.zig");
 /// in-app paths that short-circuit one, so a link cannot mean two things.
 pub const url_scheme = @import("ipc/url_scheme.zig");
 
+/// The build identity a launch carries when it hands its window to the
+/// instance already running, and the notice shown when the two builds differ
+/// (T1022 / D79). Lives beside the transport in `os/` — the wire field is the
+/// client's to write — and is aliased here so an apprt reads it off the same
+/// namespace as every other IPC shape.
+pub const handoff = internal_os.ipc_handoff;
+
 test {
     _ = args;
     _ = segments;

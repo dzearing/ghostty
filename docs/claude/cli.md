@@ -506,6 +506,41 @@ the release binary (before this, it silently drove the release app).
   forward its startup `new-window` to) that release instance's endpoint.
   Acceptance: `test/win32/ipc-instance-addressability.ps1`.
 
+### Starting Ghoztty when Ghoztty is already running
+
+**A second launch does not become a second app.** It loses the race for the IPC
+endpoint (`FILE_FLAG_FIRST_PIPE_INSTANCE`; `IpcServer.init` answers
+`AlreadyRunning`), forwards a `new-window` to the winner and exits — one app,
+one tray icon, one session list, a new window. That is the Mac app-bundle
+behavior and Windows Terminal's, and the user chose it in D79 over two copies
+quietly sharing one agent and one saved layout.
+
+- **The launch's own arguments ride along** (T487): the working directory and
+  `-e`/`--command` are re-emitted as `+new-window` flags
+  (`App.forwardedNewWindowArgs`), so `ghoztty -e pwsh` typed in a project
+  directory opens *that* command in *that* directory rather than a bare shell
+  wherever the running app happens to sit. The handoff happens in `App.init`
+  before any window, tray icon or agent connection exists, so nothing of the
+  second app is ever half-created.
+- **The instance identity is the endpoint, which is keyed on the build
+  LINEAGE** — the `-debug` suffix, or an explicit `GHOZTTY_PIPE_SUFFIX`. A
+  debug `zig-out` build and the installed release therefore never join each
+  other, which is what keeps side-by-side development (and every acceptance
+  script) working.
+- **Two copies of ONE lineage do join**, because they already share that
+  endpoint, the agent and the saved layout. The installed release and the
+  Desktop portable copy are exactly that pair — so a shortcut pointing at one
+  can hand you a window belonging to the other, which D79 named as its one con.
+- **A build mismatch is therefore not silent** (T1022). The launch carries its
+  own `{version, commit, exe}` across the handoff as an additive `handoff`
+  object on the request (`ipc_client.buildRequestWithHandoff`); when it differs
+  from the running instance's, the reply carries a `note` (the CLI prints it to
+  stderr) and the app shows a desktop balloon naming the copy that actually
+  owns the window. Same build ⇒ nothing is said: the two copies are the same
+  bits and the join is invisible on purpose. Text and comparison:
+  `src/os/ipc_handoff.zig`. Acceptance:
+  `test/win32/single-instance-join.ps1`.
+
 ### Every verb answers or explains — it never just waits
 
 **No CLI verb blocks indefinitely on the app** (T755). The bound is 30s per

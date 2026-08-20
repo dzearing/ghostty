@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-20T07:52:25-07:00",
-    "commit":  "f37ecc909",
+    "generated":  "2026-08-20T09:57:52-07:00",
+    "commit":  "87b99c4b6",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
                   "test/win32/activity-monitor-dialed.ps1":  "383cc42ce06e2b0201ccc7aedb3951eef309584a36beebef0f4e0faaf8d52c07",
@@ -182,6 +182,7 @@
                   "test/win32/sessions-agent-build.ps1":  "a54adedd012376c5ec12ae1d7c1ecf1f9ffeda89817df8aeabc4e75fd11ac10f",
                   "test/win32/session-snapshot-reattach.ps1":  "4ce7452f0dda95fa496f63d30cd918106aaa875009546ce1abb964df7b8cdea3",
                   "test/win32/share-machine.ps1":  "6a0634ad85c63070a76b84c814eba32de44e69083f3527bd7d2663f874bdabc7",
+                  "test/win32/single-instance-join.ps1":  "e782a18881100c372296625f8cebd4b44d8a41ea9f51c779b13a1dbba43cfcfe",
                   "test/win32/skip-visibility.ps1":  "c757621d0e3bb387d615cc74968e708190720f712eb6484d8438180c8ee870e2",
                   "test/win32/soak.ps1":  "0896bf5a4a307162215d32072c67b2fa71a949975bab859f2c2c814566901b69",
                   "test/win32/split-dim.ps1":  "fd8a5b8ec1f19be08d297fb84c92c3b0fed60d7cb1845a6256b3fb1a35fc1b19",

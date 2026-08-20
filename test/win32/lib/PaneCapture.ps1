@@ -53,11 +53,18 @@ Send one framed IPC request and return the parsed response object
 Reads are overlapped with a bounded wait: a synchronous read on a pipe whose
 server is wedged has no timeout at all, and a helper that can hang forever turns
 one product bug into a suite that never finishes.
+
+-Extra adds TOP-LEVEL fields beside `action`/`arguments`. Exactly one request
+shape needs it today - the launch handoff's `handoff` object (T1022), which no
+CLI verb can produce because only a losing LAUNCH sends one. A harness that
+wants to see the server's answer to a build it is not running has to write that
+field itself.
 #>
 function Invoke-GhozttyIpc {
     param(
         [Parameter(Mandatory = $true)][string]$Action,
         [string[]]$Arguments,
+        [hashtable]$Extra,
         [string]$PipeName,
         [int]$TimeoutMs = 20000
     )
@@ -65,6 +72,7 @@ function Invoke-GhozttyIpc {
 
     $body = @{ action = $Action }
     if ($Arguments) { $body['arguments'] = @($Arguments) }
+    if ($Extra) { foreach ($k in $Extra.Keys) { $body[$k] = $Extra[$k] } }
     $json = $body | ConvertTo-Json -Compress -Depth 5
     $payload = [System.Text.Encoding]::UTF8.GetBytes($json)
 

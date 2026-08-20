@@ -25,6 +25,7 @@ pub const cli_launch = @import("cli_launch.zig");
 pub const hostname = @import("hostname.zig");
 pub const i18n = @import("i18n.zig");
 pub const ipc_client = @import("ipc_client.zig");
+pub const ipc_handoff = @import("ipc_handoff.zig");
 pub const ipc_timeout = @import("ipc_timeout.zig");
 pub const listening_pid = @import("listening_pid.zig");
 pub const log_stamp = @import("log_stamp.zig");
@@ -81,6 +82,7 @@ test {
     _ = file;
     _ = i18n;
     _ = ipc_client;
+    _ = ipc_handoff;
     _ = ipc_timeout;
     _ = listening_pid;
     _ = log_stamp;

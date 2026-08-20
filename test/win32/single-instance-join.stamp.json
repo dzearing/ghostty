@@ -1,0 +1,11 @@
+{
+    "guard":  "single-instance-join",
+    "script":  "test/win32/single-instance-join.ps1",
+    "generated":  "2026-08-20T09:39:47-07:00",
+    "commit":  "87b99c4b6",
+    "files":  {
+                  "src/apprt/win32/IpcServer.zig":  "2d07c784b46762ef1205a8113f0fbc68d10ada6b06b907dd90b524204fcc0d56",
+                  "src/os/ipc_handoff.zig":  "a6c5f6929a63730418a98e144309aced58509601031753ba1839f2937dbde84e",
+                  "test/win32/single-instance-join.ps1":  "e782a18881100c372296625f8cebd4b44d8a41ea9f51c779b13a1dbba43cfcfe"
+              }
+}

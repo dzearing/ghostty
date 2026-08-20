@@ -16,6 +16,10 @@ const build_config = @import("../build_config.zig");
 
 pub const timeout = @import("ipc_timeout.zig");
 
+/// The build identity a LAUNCH carries when it hands its window to the
+/// instance already running, and the notice shown when the two differ (T1022).
+pub const handoff = @import("ipc_handoff.zig");
+
 const is_windows = builtin.os.tag == .windows;
 
 pub const Error = error{
@@ -488,6 +492,22 @@ pub fn buildRequest(
     action: []const u8,
     arguments: ?[]const [:0]const u8,
 ) Allocator.Error![]u8 {
+    return buildRequestWithHandoff(alloc, action, arguments, null);
+}
+
+/// `buildRequest` plus the optional `handoff` object a LAUNCH attaches when it
+/// hands its window to the instance that already owns the endpoint (T1022).
+///
+/// Additive by construction and in both directions: an older server parses
+/// with `ignore_unknown_fields` and behaves exactly as it did, and a server
+/// that understands the field treats its absence as "an older launcher, say
+/// nothing". Nothing else on the wire moves.
+pub fn buildRequestWithHandoff(
+    alloc: Allocator,
+    action: []const u8,
+    arguments: ?[]const [:0]const u8,
+    handoff_id: ?handoff.Identity,
+) Allocator.Error![]u8 {
     var json_buf: std.Io.Writer.Allocating = .init(alloc);
     errdefer json_buf.deinit();
     var jws: std.json.Stringify = .{ .writer = &json_buf.writer };
@@ -502,6 +522,17 @@ pub fn buildRequest(
             jws.beginArray() catch break :write;
             for (args) |arg| jws.write(arg) catch break :write;
             jws.endArray() catch break :write;
+        }
+        if (handoff_id) |id| {
+            jws.objectField("handoff") catch break :write;
+            jws.beginObject() catch break :write;
+            jws.objectField("version") catch break :write;
+            jws.write(id.version) catch break :write;
+            jws.objectField("commit") catch break :write;
+            jws.write(id.commit) catch break :write;
+            jws.objectField("exe") catch break :write;
+            jws.write(id.exe) catch break :write;
+            jws.endObject() catch break :write;
         }
         jws.endObject() catch break :write;
         return json_buf.toOwnedSlice();
@@ -651,6 +682,20 @@ pub fn sendAction(
     action_name: []const u8,
     arguments: ?[]const [:0]const u8,
 ) Error!bool {
+    return sendActionWithHandoff(alloc, action_name, arguments, null);
+}
+
+/// `sendAction` for the LAUNCH HANDOFF (T1022): the same exchange, plus this
+/// process's build identity so the instance that already owns the endpoint can
+/// tell whether the window it is about to open belongs to the build the user
+/// actually started. Only `App.init`'s `AlreadyRunning` branch passes one — a
+/// CLI verb is not a launch and has nothing to hand over.
+pub fn sendActionWithHandoff(
+    alloc: Allocator,
+    action_name: []const u8,
+    arguments: ?[]const [:0]const u8,
+    handoff_id: ?handoff.Identity,
+) Error!bool {
     var buf: [256]u8 = undefined;
     // Streaming (not positional) writer: the CLI command that called us
     // has its own buffered stderr writer, and mixing a positional writer
@@ -661,7 +706,7 @@ pub fn sendAction(
     const conn = try connectWithReset(alloc, stderr);
     defer conn.close();
 
-    const json_bytes = try buildRequest(alloc, action_name, arguments);
+    const json_bytes = try buildRequestWithHandoff(alloc, action_name, arguments, handoff_id);
     defer alloc.free(json_bytes);
 
     var action_buf: [64]u8 = undefined;
@@ -704,6 +749,46 @@ pub fn sendAction(
     }
 
     return true;
+}
+
+test "buildRequest: no handoff object unless a launch supplies one (T1022)" {
+    const testing = std.testing;
+    const json = try buildRequest(testing.allocator, "new-window", null);
+    defer testing.allocator.free(json);
+    try testing.expectEqualStrings("{\"action\":\"new-window\"}", json);
+    try testing.expect(std.mem.indexOf(u8, json, "handoff") == null);
+}
+
+test "buildRequestWithHandoff: the launch's build rides beside the arguments (T1022)" {
+    const testing = std.testing;
+    const args = [_][:0]const u8{"--working-directory=D:\\proj"};
+    const json = try buildRequestWithHandoff(
+        testing.allocator,
+        "new-window",
+        &args,
+        .{ .version = "1.4.0", .commit = "abc1234", .exe = "D:\\a\\ghoztty.exe" },
+    );
+    defer testing.allocator.free(json);
+
+    // The pre-existing shape is untouched — an older server parsing this with
+    // `ignore_unknown_fields` sees exactly the request it saw before.
+    try testing.expect(std.mem.indexOf(u8, json, "\"action\":\"new-window\"") != null);
+    // JSON-escaped: one source backslash arrives on the wire as two.
+    try testing.expect(std.mem.indexOf(u8, json, "--working-directory=D:\\\\proj") != null);
+    // ...and the new object is a sibling of it, not nested in the arguments.
+    try testing.expect(std.mem.indexOf(u8, json, "\"handoff\"") != null);
+    try testing.expect(std.mem.indexOf(u8, json, "\"commit\":\"abc1234\"") != null);
+
+    // It round-trips through a parser that ignores what it does not know.
+    const parsed = try std.json.parseFromSlice(
+        struct { action: []const u8, handoff: handoff.Identity = .{} },
+        testing.allocator,
+        json,
+        .{ .ignore_unknown_fields = true },
+    );
+    defer parsed.deinit();
+    try testing.expectEqualStrings("1.4.0", parsed.value.handoff.version);
+    try testing.expectEqualStrings("D:\\a\\ghoztty.exe", parsed.value.handoff.exe);
 }
 
 test "clientEndpointPath: the pane's baked endpoint beats the derivation" {

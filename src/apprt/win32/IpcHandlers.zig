@@ -18,6 +18,7 @@ const Surface = @import("Surface.zig");
 const ipc_capture = @import("ipc_capture.zig");
 const ipc_hover = @import("ipc_hover.zig");
 const ipc_agent_integration = @import("ipc_agent_integration.zig");
+const ipc_handoff = @import("../../os/ipc_handoff.zig");
 const CoreSurface = @import("../../Surface.zig");
 const PaneView = @import("PaneView.zig");
 const ViewerPane = @import("ViewerPane.zig");
@@ -43,6 +44,11 @@ pub const Context = struct {
 const Request = struct {
     action: []const u8,
     arguments: ?[]const []const u8 = null,
+    /// Set only by a LAUNCH that lost the race for the IPC endpoint and handed
+    /// its window to us (T1022). Absent for every CLI verb, and absent from a
+    /// launch built before this existed — both of which mean "say nothing",
+    /// which is what the app did before.
+    handoff: ?ipc_handoff.Identity = null,
 };
 
 /// Dispatch one request on the GUI thread. Returns the response JSON
@@ -462,7 +468,34 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         }
     }
 
-    return try successResponse(ctx.alloc, "created", null);
+    return try successResponse(ctx.alloc, "created", try handoffNote(ctx, arena, request));
+}
+
+/// The caveat a LAUNCH HANDOFF earns when the build that asked for the window
+/// is not the build that opened it (T1022, D79's remaining con).
+///
+/// Returned as the reply's `note` — the CLI prints it to stderr, so a `ghoztty`
+/// run from a shell says it in the shell — AND shown as a desktop notification,
+/// because the case that matters is a GUI launch from a shortcut, which has no
+/// stderr to read. Same build, no handoff, or a launch too old to send one: no
+/// note, no balloon. The join is meant to be invisible when the two copies are
+/// the same bits.
+fn handoffNote(ctx: Context, arena: Allocator, request: Request) Allocator.Error!?[]const u8 {
+    const launcher = request.handoff orelse return null;
+
+    const running: ipc_handoff.Identity = .{
+        .version = provenance.version,
+        .commit = provenance.commit,
+        .exe = (provenance.collect(arena) catch return null).exe,
+    };
+
+    const notice = (try ipc_handoff.mismatchNotice(arena, launcher, running)) orelse return null;
+    log.warn(
+        "launch handoff from a different build: launcher={s} running={s}",
+        .{ launcher.version, running.version },
+    );
+    ctx.app.showLaunchHandoffNotice(notice.title, notice.body);
+    return notice.note;
 }
 
 /// Open a remote-machine window, dialing the agent at `--host=<h> --port=<p>`
