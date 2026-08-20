@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-19T16:37:41-07:00",
-    "commit":  "310d82923",
+    "generated":  "2026-08-19T17:30:40-07:00",
+    "commit":  "16765630f",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
                   "test/win32/activity-monitor-probe-fail.ps1":  "03192baabe1b96dd282dbab66507b452e252abbe605e4c58d198bc706ab4a9eb",
@@ -161,6 +161,7 @@
                   "test/win32/remote-reconnect-fresh.ps1":  "93d02a61b21346b30f1b03108c3102dcf23ba12e371e4a651e78b0a30b8eefc2",
                   "test/win32/reset-context.ps1":  "ae80a036e865733e3bad6c8637170bf31389525fd3cccd09bb875b1bd456fc63",
                   "test/win32/reset-window-size.ps1":  "07ce44b26418263c899d37ddc3ea38f59a44c9c7919914c1974bae32085c96c0",
+                  "test/win32/restore-late-agent.ps1":  "567598e0350cf7864afe28c042bd9ece7b6a14dfbd00083cd17b4d6e523e20ff",
                   "test/win32/scrollback-narrow.ps1":  "7fa238efc1595a1f499d434bd9155eb0ee36c70dcd38ad99766a3186a5e62127",
                   "test/win32/send-keys-bracketed.ps1":  "eb9889c0fa009347578e559d42dc0a14de44eb85eb382c2b4a1652576b951d9e",
                   "test/win32/send-keys-soak.ps1":  "10a2b28393f90c3daedff675b2fd0530f5731f598621ffd70f52ae88d0447349",

@@ -56,6 +56,7 @@ const layout_blobs = @import("layout_blobs.zig");
 const restore_frame = @import("restore_frame.zig");
 const window_placement = @import("window_placement.zig");
 const agent_recovery = @import("agent_recovery.zig");
+const restore_retry = @import("restore_retry.zig");
 const RemoteReconnect = @import("RemoteReconnect.zig");
 const agent_upgrade = @import("agent_upgrade.zig");
 const job_escape = @import("job_escape.zig");
@@ -201,6 +202,13 @@ const LAYOUT_REFRESH_MAX_MS: i64 = 30_000;
 /// tick. (Timer 8 is the orphan balloon's icon-cleanup timer, defined beside
 /// the other NOTIF_* timer ids below.)
 const ORPHAN_CHECK_TIMER_ID: usize = 9;
+
+/// Timer ID (on `msg_hwnd`) for the DEFERRED launch restore (T976). Armed only
+/// when the launch restore ran before the local agent was dialable and had to
+/// carry windows forward; one-shot per attempt, and it disarms itself the
+/// moment the carried set is empty or the schedule in `restore_retry.zig` runs
+/// out. (Timer 10 is the layout refresh, defined above.)
+const RESTORE_RETRY_TIMER_ID: usize = 11;
 
 /// Window class for the top-level container (GDI painting, no CS_OWNDC).
 pub const WINDOW_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyWindow");
@@ -404,6 +412,15 @@ agent_retry_attempts: usize = 0,
 /// pending" flag: while it is set, a fresh settle watch would only race the
 /// retry to the same re-dial.
 agent_retry_armed: bool = false,
+
+/// How many DEFERRED launch-restore retries have already run (T976), indexing
+/// `restore_retry.retry_delays_ms`. Only ever counts up: the deferred pass runs
+/// once per launch, so a spent schedule is a launch that gave up, not a state
+/// to recover from.
+restore_retry_attempts: usize = 0,
+
+/// True while `RESTORE_RETRY_TIMER_ID` is armed (T976).
+restore_retry_armed: bool = false,
 
 /// Non-zero while a destructive agent refresh is tearing the app's terminals
 /// down and rebuilding them (T229). The app deliberately has zero — or
@@ -1340,6 +1357,9 @@ pub fn terminate(self: *App) void {
     }
     // T145: no in-place recovery during teardown — the windows are about to go.
     self.endAgentSettleWatch();
+    // T976: nor a deferred restore — a window built mid-teardown would be one
+    // the quit path has already walked past.
+    self.cancelRestoreRetry();
     self.syncSessionLayout();
 
     if (self.update_latest_ver) |v| {
@@ -2672,8 +2692,25 @@ const RestoreTransport = struct {
 /// and the window are preserved), which is friendlier than a permanently-exited
 /// pane and keeps every restored pane persistable.
 pub fn restoreSessionLayout(self: *App) bool {
+    return self.restorePass(null);
+}
+
+/// One restore pass. `only` is null for the LAUNCH pass (every window the two
+/// sources offer) and a set of window keys for the DEFERRED pass (T976) — the
+/// windows an earlier pass carried forward because the local agent was not
+/// dialable yet, and nothing else.
+///
+/// The filter is what keeps the deferred pass from being a second launch: by
+/// the time it runs, this process has its own windows in the manifest (the
+/// blank startup window, anything the user opened since), and rebuilding those
+/// would duplicate what is already on screen. Every other rule below — the
+/// never-all-dead drop, the attach-flag settle, the positive-adjudication
+/// gate — is re-applied verbatim, so a window that became held, or whose
+/// sessions died while we waited, is adjudicated on what is true NOW.
+fn restorePass(self: *App, only: ?[]const []const u8) bool {
     if (!self.config.@"session-persistence") return false;
     const gpa = self.core_app.alloc;
+    const deferred = only != null;
 
     // A TEST SEAM (T620), earning its place the way T657's probe override does.
     // The state this forces — a launch where NEITHER restore source yields a
@@ -2826,6 +2863,17 @@ pub fn restoreSessionLayout(self: *App) bool {
     // keeping N manifest entries for next launch").
     const positively_adjudicated = conn != null and probe.roster != null;
 
+    // T976: the deferred pass re-decides the carried set from scratch, so it
+    // hands the map back empty and the loop below re-fills it with whatever it
+    // still cannot build. This happens HERE — past every early return — on
+    // purpose: a pass that bails before the loop (no manifest, a failed
+    // reconcile, persistence turned off underneath us) has learned nothing
+    // about those windows, and clearing them any earlier would let the next
+    // manifest rewrite erase entries the launch deliberately preserved. The
+    // filter slice is the CALLER's copy of the keys, so emptying the map does
+    // not disturb it.
+    if (deferred) self.clearCarriedLayouts();
+
     var restored: usize = 0;
     for (union_set.windows) |win| {
         // T188: a window boundary is the natural yield point — nothing of this
@@ -2833,6 +2881,13 @@ pub fn restoreSessionLayout(self: *App) bool {
         // that lands mid-restore sees the windows built so far, which is a
         // truthful partial answer; before this it saw no answer at all.
         gui_pump.pump();
+        // T976: the deferred pass rebuilds ONLY what an earlier pass carried.
+        // A skip here is not a drop — the window is either already on screen or
+        // was never this pass's to consider — so it must not be carried either,
+        // or the retry would keep re-adjudicating windows it will never build.
+        if (only) |keys| {
+            if (!containsKey(keys, session_layout.windowKey(win))) continue;
+        }
         if (!restoreWindowHasAttachableLeaf(win, attach_ptr)) {
             // T851: two drops that look identical here and mean opposite
             // things. "Every session is gone" is an adjudication and the
@@ -2861,10 +2916,41 @@ pub fn restoreSessionLayout(self: *App) bool {
         collectAttachedLeaves(win, attach_ptr, &attached_ids, &attached_panes);
     }
     if (self.carried_layout_windows.count() > 0) {
-        log.info(
-            "session-restore: keeping {d} unrestored manifest window(s) for the next launch",
-            .{self.carried_layout_windows.count()},
-        );
+        // T976: "for the next launch" is the LAST resort, not the first. When
+        // the reason those windows are still here is an agent that had not come
+        // up within `spawn_deadline_ms` — not an adjudication that their
+        // sessions are gone — the restore is unfinished rather than decided, so
+        // arm the deferred pass and finish it when the agent arrives.
+        if (!deferred and restore_retry.shouldArm(
+            self.carried_layout_windows.count(),
+            positively_adjudicated,
+        )) {
+            log.info(
+                "session-restore: {d} window(s) still need the local agent; " ++
+                    "retrying for up to {d}s before deferring them to the next launch",
+                .{ self.carried_layout_windows.count(), restore_retry.budgetMs() / 1000 },
+            );
+            // Hold their `window-N` names against the blank startup window this
+            // launch is about to open (T121's counter, from the other side).
+            // The counter restarts at zero every run and only ever moves
+            // FORWARD, so a startup window that mints `window-1` first makes the
+            // carried `window-1` unreachable when the deferred pass finally
+            // rebuilds it: the incumbent wins the registration, and every
+            // `--target=window-1` a script was written against lands on a blank
+            // terminal instead. Reserving now costs nothing and keeps each name
+            // for its owner.
+            for (union_set.windows) |w| {
+                const name = w.ipc_name orelse continue;
+                if (self.carried_layout_windows.contains(session_layout.windowKey(w)))
+                    self.ipcReserveWindowName(name);
+            }
+            self.armRestoreRetry();
+        } else if (!deferred) {
+            log.info(
+                "session-restore: keeping {d} unrestored manifest window(s) for the next launch",
+                .{self.carried_layout_windows.count()},
+            );
+        }
     }
     if (restored == 0) return false;
     log.info("session-restore: restored {d} window(s)", .{restored});
@@ -2909,6 +2995,146 @@ pub fn restoreSessionLayout(self: *App) bool {
     // IS the adopt; the message loop `run` is about to enter fires it.
     if (union_set.adopted > 0) self.markLayoutDirty();
     return true;
+}
+
+/// Whether `key` is one of `keys`. Linear on purpose: the deferred restore's
+/// filter is the handful of windows one launch could not rebuild, and a hash
+/// map for four strings costs more than it saves.
+fn containsKey(keys: []const []const u8, key: []const u8) bool {
+    for (keys) |k| {
+        if (std.mem.eql(u8, k, key)) return true;
+    }
+    return false;
+}
+
+/// Arm the next deferred-restore retry, or give up and say so (T976). GUI
+/// thread.
+fn armRestoreRetry(self: *App) void {
+    const hwnd = self.msg_hwnd orelse return;
+    const delay = restore_retry.retryDelayMs(self.restore_retry_attempts) orelse {
+        self.reportRestoreDeferred();
+        self.cancelRestoreRetry();
+        return;
+    };
+    self.restore_retry_armed = true;
+    _ = w32.SetTimer(hwnd, RESTORE_RETRY_TIMER_ID, delay, null);
+}
+
+/// Disarm the deferred restore. GUI thread. Does NOT touch
+/// `carried_layout_windows`: whatever is still in it is carried to the next
+/// launch, which is the pre-T976 behaviour and the correct floor.
+fn cancelRestoreRetry(self: *App) void {
+    self.restore_retry_armed = false;
+    if (self.msg_hwnd) |hwnd| _ = w32.KillTimer(hwnd, RESTORE_RETRY_TIMER_ID);
+}
+
+/// The give-up line. Says the same thing the launch used to say immediately,
+/// now with the wait behind it so a reader can tell "the agent never came up"
+/// from "we never waited".
+fn reportRestoreDeferred(self: *App) void {
+    const n = self.carried_layout_windows.count();
+    if (n == 0) return;
+    log.warn(
+        "session-restore: no local agent after {d}s; keeping {d} unrestored " ++
+            "manifest window(s) for the next launch",
+        .{ restore_retry.budgetMs() / 1000, n },
+    );
+}
+
+/// One deferred-restore tick (T976): has the local agent come up? If it has,
+/// finish the launch restore for the windows that were waiting on it; if not,
+/// wait again until the schedule runs out. GUI thread.
+///
+/// The timer is one-shot per attempt (killed here before anything else), so a
+/// slow dial can never queue a second tick behind itself.
+fn tickRestoreRetry(self: *App) void {
+    self.restore_retry_armed = false;
+    if (self.msg_hwnd) |hwnd| _ = w32.KillTimer(hwnd, RESTORE_RETRY_TIMER_ID);
+
+    // FIND-only: the launch already issued the spawn, so this asks whether the
+    // agent has finished binding its pipe. It costs nothing while none has.
+    const agent_up = self.local_agent.adoptIfUp() != null;
+
+    switch (restore_retry.evaluate(
+        self.carried_layout_windows.count(),
+        agent_up,
+        self.restore_retry_attempts,
+    )) {
+        .stand_down => {
+            self.cancelRestoreRetry();
+            return;
+        },
+        .exhausted => {
+            self.reportRestoreDeferred();
+            self.cancelRestoreRetry();
+            return;
+        },
+        .retry => {
+            self.restore_retry_attempts += 1;
+            self.armRestoreRetry();
+            return;
+        },
+        .restore => {},
+    }
+    self.restore_retry_attempts += 1;
+
+    const gpa = self.core_app.alloc;
+    log.info(
+        "session-restore: the local agent came up after the launch; completing " ++
+            "the restore of {d} window(s)",
+        .{self.carried_layout_windows.count()},
+    );
+
+    // Snapshot the carried keys, because the pass below empties the map and
+    // re-fills it with whatever it still cannot build — and because iterating
+    // the very map it mutates would be a use-after-free waiting to happen. The
+    // pass owns the clear, not this function: it does it only once it is past
+    // the early returns that would otherwise drop the keys having learned
+    // nothing.
+    var keys: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (keys.items) |k| gpa.free(k);
+        keys.deinit(gpa);
+    }
+    var it = self.carried_layout_windows.iterator();
+    while (it.next()) |entry| {
+        const dup = gpa.dupe(u8, entry.key_ptr.*) catch continue;
+        keys.append(gpa, dup) catch {
+            gpa.free(dup);
+            continue;
+        };
+    }
+    if (keys.items.len == 0) {
+        self.cancelRestoreRetry();
+        return;
+    }
+
+    const restored = self.restorePass(keys.items);
+
+    // The manifest must learn what just happened either way: a rebuilt window
+    // has to be captured (it is live now, and the carried entry that stood in
+    // for it is gone), and a window this pass positively dropped has to stop
+    // being carried.
+    self.markLayoutDirty();
+
+    if (!restored) log.info(
+        "session-restore: the deferred pass rebuilt no window; the agent knows " ++
+            "none of their sessions",
+        .{},
+    );
+
+    // The deferred pass runs ONCE. Its job was to finish the restore when the
+    // agent arrived, and it has; anything it left behind was adjudicated by an
+    // agent that ANSWERED — held by another running instance, or a window that
+    // failed to build — and re-running the whole pass against the same healthy
+    // agent would reach the same verdict fifteen more times. Those entries go
+    // to the next launch, exactly as they did before T976.
+    if (self.carried_layout_windows.count() > 0) log.info(
+        "session-restore: {d} window(s) the agent could not give back; keeping " ++
+            "them for the next launch",
+        .{self.carried_layout_windows.count()},
+    );
+    self.cancelRestoreRetry();
 }
 
 /// Load the app-local session-layout manifest, or null when there isn't a usable
@@ -8502,6 +8728,14 @@ fn msgWndProc(
     // recovery aborted with no reachable agent; one-shot per attempt.
     if (msg == w32.WM_TIMER and wparam == AGENT_RETRY_TIMER_ID) {
         app.tickAgentRecoveryRetry();
+        return 0;
+    }
+
+    // Timer ID 11: the deferred launch restore (T976). Armed only when the
+    // launch restore had to carry windows forward for want of an agent;
+    // one-shot per attempt.
+    if (msg == w32.WM_TIMER and wparam == RESTORE_RETRY_TIMER_ID) {
+        app.tickRestoreRetry();
         return 0;
     }
 

@@ -998,6 +998,23 @@ $GuardTable = @(
             'test\win32\session-layout-preserve.ps1'
         )
     },
+    # The deferred launch restore (T976): the retry only ever runs on a launch
+    # that found NO agent within its spawn deadline, which no P1-P3 floor run
+    # produces - the floor always reaches a healthy agent first. The row covers
+    # the policy module and the agent-side entry point the tick dials through;
+    # App.zig is deliberately NOT here (it moves for a hundred unrelated reasons
+    # and would leave this multi-minute GUI run due every turn), so the residual
+    # gap is App.zig's WIRING of the timer, which only a run of this catches.
+    [pscustomobject]@{
+        Name   = 'restore-late-agent'
+        Script = 'test\win32\restore-late-agent.ps1'
+        Stamp  = 'test\win32\restore-late-agent.stamp.json'
+        Covers = @(
+            'src\apprt\win32\restore_retry.zig',
+            'src\apprt\win32\LocalAgent.zig',
+            'test\win32\restore-late-agent.ps1'
+        )
+    },
     # The chooser's session-list sort (T602): the headers are owner-drawn and
     # the order is asserted through log oracles only this harness reads - the
     # P1-P3 floor opens no chooser, so a sort/cursor regression is invisible to

@@ -500,6 +500,64 @@ pub fn sharedConnectionIfWarm(self: *LocalAgent) ?*connection.Connection {
     return null;
 }
 
+/// Adopt an agent that came up AFTER a failed resolve (T976): dial the pipe it
+/// has since recorded, and install the result as the shared connection.
+///
+/// Two deliberate differences from `sharedConnection`, both of which exist
+/// because the caller is a bounded RETRY on a timer rather than a window being
+/// created:
+///
+///   * **It never spawns.** The launch resolve already issued the spawn; the
+///     agent is coming up, not missing. Spawning again on every tick would
+///     start a process that the single-instance guard immediately kills, and
+///     the poll loop that follows a spawn is exactly the 2s GUI-thread block
+///     the retry exists to stop paying.
+///   * **It ignores the failure cooldown.** The cooldown (15s) protects window
+///     creation from re-blocking on an unspawnable agent — a real concern for
+///     a call that spawns and polls, and none at all for a find-only dial that
+///     fails the instant no pipe exists. Honouring it here would mean the
+///     first ~15s of the retry schedule, which is where the late agent almost
+///     always lands, could not see it.
+///
+/// Returns the shared connection when one is now available (including the
+/// already-warm case), or null while no healthy agent answers.
+pub fn adoptIfUp(self: *LocalAgent) ?*connection.Connection {
+    if (comptime builtin.os.tag != .windows) return null;
+
+    // Warm and healthy: nothing to adopt, and the caller's question ("can I
+    // talk to an agent?") is already answered yes.
+    if (self.shared) |d| {
+        if (d.conn.state() != .dead) return d.conn;
+        // Same rule as `sharedConnection`: retire, never free — surfaces still
+        // hold the raw pointer.
+        self.retire(d);
+        self.shared = null;
+        self.shared_pid = 0;
+    }
+
+    // Same re-entrancy rule as `sharedConnection` (T188): the dial below pumps
+    // IPC, and a request served from inside it must not start a second resolve.
+    if (self.resolving) return null;
+    self.resolving = true;
+    defer self.resolving = false;
+
+    gui_pump.pump();
+    const dialed = self.dialExisting() orelse return null;
+    gui_pump.pump();
+
+    self.shared = dialed;
+    self.shared_pid = if (self.readInfoFile()) |i| i.pid else 0;
+    self.last_failure_ms = null;
+    self.applyStateObserver();
+    log.info("adopted the local agent that came up late (agent pid {d})", .{self.shared_pid});
+
+    // Persistence just engaged, exactly as in `sharedConnection`: make sure the
+    // agent also comes back after a reboot.
+    self.ensureAutostart();
+
+    return self.shared.?.conn;
+}
+
 /// Dial the agent that is ALREADY running — never spawning one, and touching
 /// none of a manager's shared state. Returns a PROBE connection the caller owns
 /// and must `deinit`; null when no healthy agent answered.
