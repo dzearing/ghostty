@@ -1740,22 +1740,18 @@ pub const DWMWA_TEXT_COLOR: u32 = 36;
 /// Border color (Windows 11+). COLORREF 0x00BBGGRR.
 pub const DWMWA_BORDER_COLOR: u32 = 34;
 
-pub const MARGINS = extern struct {
-    left: i32,
-    right: i32,
-    top: i32,
-    bottom: i32,
-};
+// `MARGINS` + `DwmExtendFrameIntoClientArea` used to be declared here and were
+// never called. They are the entry point to a DWM system backdrop (Mica /
+// Acrylic) behind the chrome, and T306 evaluated that and decided AGAINST it —
+// measured: our GDI-painted band writes no alpha, so opening glass into the
+// client area washes the band out (#7e6734 -> #a69368) and drops the title to
+// 3.0:1, under the 4.5:1 floor. See "Window material" in
+// `docs/design/win32-design-system.md` before reaching for them again.
 
 pub extern "uxtheme" fn SetWindowTheme(
     hwnd: HWND,
     pszSubAppName: ?[*:0]const u16,
     pszSubIdList: ?[*:0]const u16,
-) callconv(.winapi) i32;
-
-pub extern "dwmapi" fn DwmExtendFrameIntoClientArea(
-    hWnd: HWND,
-    pMarInset: *const MARGINS,
 ) callconv(.winapi) i32;
 
 pub extern "dwmapi" fn DwmSetWindowAttribute(

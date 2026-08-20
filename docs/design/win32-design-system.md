@@ -367,6 +367,71 @@ center, which is off the card, so **no pixel is ever lit at the first stop's
 alpha**. Anything reading `banner_card.RIM_TOP` as "the brightness of a top
 edge" is wrong by about 35%.
 
+### 3.4 Window material: the caption + tab band is NOT Mica (T306)
+
+§3.3 rules a system backdrop out for a card floating *inside* a pane. This
+rules it out one level up as well: **the window itself sets no
+`DWMWA_SYSTEMBACKDROP_TYPE`** — no Mica, no Mica Alt, no Acrylic behind the
+merged caption + tab band — and the band stays what `chrome_theme` computes
+from the terminal background. Evaluated deliberately rather than skipped,
+because Mica is the single most recognizable Windows 11 window cue and it is
+what makes Terminal's strip read as part of the frame.
+
+**Measured on the box (2026-08-20, Windows 11 26200), applying the backdrop to
+a live window from outside the app:**
+
+| Setting | `DwmSetWindowAttribute` | Band pixel |
+|---|---|---|
+| baseline | — | `#7e6734` |
+| `BACKDROP=1` (auto) | `S_OK`, reads back 1 | `#7e6734` |
+| `BACKDROP=2` (Mica) | `S_OK`, reads back 2 | `#7e6734` |
+| `BACKDROP=3` (Acrylic) | `S_OK`, reads back 3 | `#7e6734` |
+| `BACKDROP=4` (Tabbed) | `S_OK`, reads back 4 | `#7e6734` |
+| legacy `DWMWA_MICA_EFFECT` (1029) | `E_INVALIDARG` | `#7e6734` |
+| Mica + `DwmExtendFrameIntoClientArea(-1)` | `S_OK` | **`#a69368`** |
+
+Three findings, in the order they decide the question:
+
+- **The attribute alone is a no-op here.** DWM accepts it and composites the
+  material *behind* the window; our client area is opaque GDI all the way to
+  the top edge (T254 took the caption into the client area), so nothing of it
+  is ever seen. Adoption is not a flag flip.
+- **Opening glass into the client area does not deliver Mica — it destroys the
+  band.** GDI writes no alpha, so every chrome pixel becomes a blend the
+  painter never computed: the band lifted 40 units to `#a69368` and the title
+  measured **3.0:1** against it, under §2.3's non-negotiable 4.5:1 floor. And
+  the washed color is **wallpaper-independent** (identical under a solid black
+  and a solid white wallpaper), which is the tell that it is not the material
+  at all. Real Mica means re-drawing the caption, the tab shapes, the glyphs
+  and the text through an alpha-correct path (premultiplied 32bpp DIB,
+  alpha-aware text) — a rewrite of the chrome painter, not a feature.
+- **After that rewrite, the band's color would be a function of the user's
+  wallpaper**, and three things this app has already committed to depend on it
+  not being: §2.3's contrast floors are computed from the band color, so a
+  provable floor becomes an unprovable one; T202's selected chiclet MERGES into
+  the pane, which requires the band and the pane to agree on a color a
+  desktop-sampling material cannot see; and `window-theme = auto` tints the
+  caption to the *terminal background* (`applyChromeTheme`), which is the Mac
+  behavior this seat is matching — Mica erases exactly that signal.
+
+There is a fourth, practical one: the acceptance harness cannot see a DWM
+material. It captures with `PrintWindow` on a background desktop, and DWM
+composes the input desktop only (`test/win32/lib/TestDesktop.ps1`'s CAPTURE
+LIMIT), so every chrome color and contrast assertion would score the *painted*
+band while the user looked at a composited one.
+
+So the Windows-native answer to "what material is the band" is the same as
+§3.3's: hand-composited, tinted off our own surface. `chrome_theme`'s
+`wash(bg)` band already reads as the Fluent tone-on-tone strip Mica is going
+for, and it reads that way at every wallpaper. Recorded the way T124 recorded
+Liquid Glass as a deliberate non-port; `DwmExtendFrameIntoClientArea` and
+`MARGINS` were removed from `win32.zig` with this decision (declared, never
+called), so reaching for glass is a deliberate act that starts here.
+
+What this does NOT rule out: `background-opacity < 1`, where the user has
+asked for a translucent window and the terminal surface renders its own alpha.
+That path is `background-blur` today and is unaffected.
+
 ---
 
 ## 4. Glyphs
