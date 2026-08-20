@@ -1201,6 +1201,26 @@ $GuardTable = @(
             'src\apprt\win32\ActivityMonitor.zig',
             'test\win32\activity-selection.ps1'
         )
+    },
+    # The Activity Monitor's DIALED path (T297) - the third row on
+    # ActivityMonitor.zig, for the same reason there is a second: it is the only
+    # harness that runs a dial at all. 'activity-monitor' drives a LOCAL panel
+    # and 'activity-monitor-remote' a BORROWED one, so the code that owns a
+    # transport - startDial, onDialed, adoptDial, and close's shutdown-then-join
+    # - is reachable from neither. `relay_dial.zig` is covered because the dial
+    # IS that call, and `lib\FakeRelay.ps1` because the whole success case
+    # exists only through its bridge: a change to either can make this harness
+    # pass over a path it never took.
+    [pscustomobject]@{
+        Name   = 'activity-monitor-dialed'
+        Script = 'test\win32\activity-monitor-dialed.ps1'
+        Stamp  = 'test\win32\activity-monitor-dialed.stamp.json'
+        Covers = @(
+            'src\apprt\win32\ActivityMonitor.zig',
+            'src\remote\relay_dial.zig',
+            'test\win32\lib\FakeRelay.ps1',
+            'test\win32\activity-monitor-dialed.ps1'
+        )
     }
 )
 
