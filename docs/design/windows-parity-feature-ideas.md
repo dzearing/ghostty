@@ -133,3 +133,14 @@ as the digest that showed them.
 - Follow the system's text size, not just its colors (Windows text scaling)
 - A "why is this slow" readout you can actually send (frame time / backlog / RTT panel)
 - A first run that finds your shells for you (guided shell-flavor setup)
+
+## 2026-08-21
+
+- Finish my command before I type it (inline autosuggestion from history)
+- Press a key, every link on screen gets a label (hint-mode link/path jumping)
+- My terminal looks the same on every machine I sign into (settings sync over the relay account)
+- Let someone watch this pane (read-only live share link)
+- A cheat sheet for the keys you have (searchable keybinding overlay)
+- Zoom just this pane, and remember it (per-pane font size, persisted)
+- Stay responsive when a pane floods (decoupled render rate under output floods)
+- Tell me when a saved session's program has died (dead-session marker in the chooser)

@@ -1,5 +1,5 @@
 {
-  "lastEvaluated": "38c4c4ca4",
-  "date": "2026-08-20",
-  "note": "2026-08-20 intake: origin/main unmoved since 2026-08-14's watermark (38c4c4ca4) - 0 commits evaluated, 0 tasks filed. parity-sweep.ps1: SWEEP CLEAN, 0 commits, exit 0. Lag: zero commits, twelfth day running. This watermark tracks the ghoztty fork's own main only; the upstream Ghostty gap (~764 commits) is D80's staged plan - answered 2026-08-19 with 'start now', so Stage 0 (T957/T956) is queued as P1. Previous (2026-08-19): 0 commits, 0 tasks."
+  "lastEvaluated": "22c9c6d8a",
+  "date": "2026-08-21",
+  "note": "2026-08-21 intake: origin/main moved 38c4c4ca4 -> 22c9c6d8a, the first movement in thirteen days. 3 commits (1 merge), 2 non-merge commits evaluated, 2 tasks filed - T1055 (b723409c4: a restored snapshot hands a dead TUI's mouse-tracking agreement to a plain shell, shared core, partially covered here by T824) and T1056 (9a04b745c: an app update restarts the agent for a build-stamp gap alone, and liveness is read from the window count). Both P1, both promoted into M1: session persistence is the feature the user lives in. parity-sweep.ps1 38c4c4ca4..origin/main: 2 evaluated, 2 mapped, 0 unmapped, SWEEP CLEAN, exit 0. Lag: zero commits. This watermark tracks the ghoztty fork's own main only; the upstream Ghostty gap (~764 commits) is D80's staged plan, whose Stage 0 (T957/T956) closed 2026-08-20. Previous (2026-08-20): 0 commits, 0 tasks."
 }
