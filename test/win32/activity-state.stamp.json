@@ -1,11 +1,11 @@
 {
     "guard":  "activity-state",
     "script":  "test/win32/activity-state.ps1",
-    "generated":  "2026-08-15T23:34:42-07:00",
-    "commit":  "b12cab800",
+    "generated":  "2026-08-21T00:33:08-07:00",
+    "commit":  "a905a5363",
     "files":  {
                   "src/apprt/win32/assets/ghoztty/hooks/ghoztty-activity-state.sh":  "8a37b7305be4d2b14e9c12455bee30b155ea46ea93a88f431667257e124a05b5",
-                  "test/win32/activity-state.ps1":  "9cf643a93354cfadd2061c0a46a0018a22ada8a3b2833bab7ce3b47293569a70",
+                  "test/win32/activity-state.ps1":  "209ae3df48c44fb7543ce13583d55b3204698531ed4a398075ca097164428c74",
                   "test/win32/lib/upstream/test-activity-state.sh":  "fbe1f5959f77c3be67b6b15c280c6affe699ae449c732b424a7dc07fa68a0463"
               }
 }

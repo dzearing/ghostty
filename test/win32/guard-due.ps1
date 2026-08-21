@@ -367,6 +367,28 @@ try {
         ($relSrc -match '(?s)if \(\$script:failures -eq 0\) \{(?:(?!skipped).)*?-Guard release-artifacts -Repo') ''
     Check 'G11 the packaging stamp is behind a zero-skip condition' `
         ($relSrc -match '(?s)if \(\$script:skipped -eq 0\) \{(?:(?!-Guard).)*?-Guard release-artifacts-packaging') ''
+
+    # H: every row must be CLEARABLE. A row whose harness never calls
+    # `guard-due update` goes due the moment anything it covers moves and stays
+    # due through every green run of the thing it watches - a permanent red that
+    # trains the next turn to pass -NoGuardDue, which is the one outcome T783
+    # exists to prevent. agent-adopt shipped in exactly that state and was found
+    # by hand while working T1042; this is the check that finds the next one.
+    "== H: every guard row's harness can actually clear it"
+    $rowScripts = @()
+    foreach ($line in (Invoke-Due list -AtRepo $Repo).Text -split "`r?`n") {
+        if ($line -match '(test\\win32\\[A-Za-z0-9._-]+\.ps1)') { $rowScripts += $matches[1] }
+    }
+    Check 'H1 the table lists harnesses at all (the parse found rows)' ($rowScripts.Count -ge 40) `
+        "found $($rowScripts.Count)"
+    $noStamp = @()
+    foreach ($rel in ($rowScripts | Sort-Object -Unique)) {
+        $abs = Join-Path $Repo $rel
+        if (-not (Test-Path $abs)) { $noStamp += "$rel (missing)"; continue }
+        if (-not (Select-String -Path $abs -Pattern 'guard-due' -Quiet)) { $noStamp += $rel }
+    }
+    Check 'H2 every row names a harness that exists and stamps itself' ($noStamp.Count -eq 0) `
+        ($noStamp -join ', ')
     Complete-TestBody  # T1039: the run reached the end of its body
 }
 finally {

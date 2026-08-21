@@ -1,8 +1,8 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-20T23:53:25-07:00",
-    "commit":  "62c40738d",
+    "generated":  "2026-08-21T00:49:45-07:00",
+    "commit":  "a905a5363",
     "files":  {
                   "docs/claude/testing.md":  "f939385433e03ecf218cb22140f2cf8aea0821f43d934f0d15101935c778a330",
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
@@ -11,7 +11,7 @@
                   "test/win32/activity-monitor-remote.ps1":  "a2b417f13d978482eab39ba73aa4731aa1f840454a151bef9f0b6c240826ba45",
                   "test/win32/activity-selection.ps1":  "1a1ecf21fdbc1996f85f66a0ad2942b55398d675c8fcbf547fa0e2fa0593d5eb",
                   "test/win32/activity-state.ps1":  "209ae3df48c44fb7543ce13583d55b3204698531ed4a398075ca097164428c74",
-                  "test/win32/agent-adopt.ps1":  "508266a8bfa077c0d6f5d9981663b5a6c47fa225cfa1564aad0d32e4b2b88e49",
+                  "test/win32/agent-adopt.ps1":  "c9aa305113306d2f5d1e58deac085a6d6ae2ff287c8eb8fc239de86aec8ba043",
                   "test/win32/agent-attach-refused.ps1":  "afda0675b08258f43f32969ce906f665d6ffe532b50e10cf02633b3c8992c36e",
                   "test/win32/agent-autostart.ps1":  "e0d6e8fa0e26c8aca73ad44003e06a062adf926e4ce834b6d23ae8b580686ae7",
                   "test/win32/agent-handoff.ps1":  "72150958a22f83d00794885db48b4f519ff0270d460ad7228703f4b7467cc0af",
@@ -89,7 +89,7 @@
                   "test/win32/fork-identity.ps1":  "19caa4f9f1fedcbb3dba03e70ca859b60ffe5570bd5c9199a34a3ab0a76196cd",
                   "test/win32/go-loop-guard.ps1":  "e280a9caecc315d984cc39cd962f21117c08f0f067e5864bcb820edbeb06b0e3",
                   "test/win32/go-loop-uptime.ps1":  "a97005d970a564088741646542ffaca3cb9ffe03d2eb30c55b96841607948b82",
-                  "test/win32/guard-due.ps1":  "f5b0c6bdd978542080252e58f629119e43f035d589571d195a1566fd6c486137",
+                  "test/win32/guard-due.ps1":  "da65905d0262d7117e0116e81aec88c7e76ed3b65b0faf04b68a763e98ad77a1",
                   "test/win32/gui-launch-command.ps1":  "90c55316959e28ebec3bf7e04b7ff91ad98f78a1b6905c99ed989811e9be4a54",
                   "test/win32/harness-exitcode-audit.ps1":  "1fdbe9c4d70fd1e9fe80ac17257de1d346a3b5c07c7c69628578eba5ac45f033",
                   "test/win32/harness-process-leak.ps1":  "68d9dd61e6dc556835e337a6a762b690013eedf55ce843d4b4427723d3de84cc",

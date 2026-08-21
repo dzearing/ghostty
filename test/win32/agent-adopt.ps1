@@ -197,6 +197,18 @@ try {
     }
 }
 
+# --- stamp (T783) -----------------------------------------------------------
+# This harness had a guard row from the start and no way to satisfy it: the row
+# went DUE the moment anything it covers moved, and nothing here ever wrote a
+# stamp, so it stayed DUE through every green run. A row that can only ever be
+# due is worse than no row - it is the constant red that teaches the next turn
+# to pass -NoGuardDue (found while working T1042).
+if ($script:failures -eq 0) {
+    $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard agent-adopt -Repo $repo 2>&1 | ForEach-Object { "  $_" }
+}
+
 # MinPass = the full-run assertion count: an abort mid-run must never score a
 # truncated run as ALL PASS.
 Write-TestVerdict -Label 'T549 AGENT ADOPT' -Pass $script:passes -Fail $script:failures -MinPass 26
