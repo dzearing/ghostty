@@ -707,6 +707,7 @@ function Wait-Instance([int]$timeoutSec, $appProc = $null) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     $polls = 0
     $lastWhy = ''
+    $handoffNoted = $false
     while ((Get-Date) -lt $deadline) {
         $r = Get-ListJson
         if ($r.Json) {
@@ -720,9 +721,24 @@ function Wait-Instance([int]$timeoutSec, $appProc = $null) {
             Log "instance probe $polls not ready: $($r.Why)"
             $lastWhy = $r.Why
         }
+        # T675 changed what our own pid MEANS. At startup the app notices it is
+        # inside the agent's kill-on-close job and respawns its command line
+        # outside it, then exits 0 - so the process we started is a launcher
+        # that hands off, and its exit is the expected shape of a healthy start
+        # rather than a dead app. Only a NONZERO exit is evidence of failure;
+        # exit 0 keeps polling for the escaped twin until the deadline. Before
+        # this, a twin that took longer than one poll to answer read as a dead
+        # app and the reuse path logged RESUME-REUSE FAIL over an app that was
+        # coming up fine (measured in test\win32\upgrade-no-fork.ps1 section B).
         if ($appProc -and $appProc.HasExited) {
-            Log "instance probe: the process we started (pid=$($appProc.Id)) EXITED with $($appProc.ExitCode)"
-            return ''
+            if ($appProc.ExitCode -ne 0) {
+                Log "instance probe: the process we started (pid=$($appProc.Id)) EXITED with $($appProc.ExitCode)"
+                return ''
+            }
+            if (-not $handoffNoted) {
+                Log "instance probe: the process we started (pid=$($appProc.Id)) exited 0 - a T675 job-escape handoff; waiting for the escaped twin to answer"
+                $handoffNoted = $true
+            }
         }
         Start-Sleep -Milliseconds 750
     }
@@ -761,6 +777,8 @@ if ($action -eq 'restart-only') {
     # as the reuse path, 2026-07-30).
     $state = if ($appProc -and -not $appProc.HasExited) {
         "pid=$($appProc.Id) is ALIVE but never answered +list (IPC unreachable, not a dead app)"
+    } elseif ($appProc.ExitCode -eq 0) {
+        "pid=$($appProc.Id) handed off (exit 0, T675 job escape) and no escaped twin ever answered +list"
     } else {
         "pid=$($appProc.Id) EXITED with $($appProc.ExitCode)"
     }
@@ -852,6 +870,8 @@ if ($action -eq 'reuse') {
         # message asserted the first while the truth was the second (2026-07-30).
         $state = if ($appProc -and -not $appProc.HasExited) {
             "pid=$($appProc.Id) is ALIVE but never answered +list (IPC unreachable, not a dead app)"
+        } elseif ($appProc -and $appProc.ExitCode -eq 0) {
+            "pid=$($appProc.Id) handed off (exit 0, T675 job escape) and no escaped twin ever answered +list"
         } elseif ($appProc) {
             "pid=$($appProc.Id) EXITED with $($appProc.ExitCode)"
         } else {
