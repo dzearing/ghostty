@@ -414,6 +414,50 @@ pub fn windowKey(win: Window) []const u8 {
     return win.uuid orelse win.id;
 }
 
+/// Pair a LIVE window walk against a CAPTURED one by identity (T343).
+///
+/// `live_keys` holds one key per live window in walk order (`Window.layoutUuid`
+/// on the win32 side); the result holds one entry per live window: the index of
+/// the captured window that window owns, or `null` when the capture has none —
+/// a window born after the capture, or one the capture's own filter skipped (a
+/// quick terminal, a cross-machine window, a window with no tabs). `null` is
+/// always the safe answer: the caller leaves that window alone.
+///
+/// Every captured entry is handed out AT MOST ONCE, so even a duplicated key
+/// cannot make two live windows rebuild from the same topology — the second is
+/// skipped, which is the conservative half of that failure rather than the
+/// destructive one.
+///
+/// This replaces the positional join in-place recovery used to do, which was
+/// correct only while a hand-copy of `captureSessionLayout`'s skip rule stayed
+/// in step with the original AND no window closed in between (the capture is
+/// followed by a re-dial that can block for seconds). Either drift silently
+/// paired a window with ANOTHER window's captured tree, and nothing asserted.
+pub fn pairWindows(
+    alloc: Allocator,
+    captured: []const Window,
+    live_keys: []const []const u8,
+) ![]const ?usize {
+    const out = try alloc.alloc(?usize, live_keys.len);
+    errdefer alloc.free(out);
+
+    const used = try alloc.alloc(bool, captured.len);
+    defer alloc.free(used);
+    @memset(used, false);
+
+    for (live_keys, 0..) |key, li| {
+        out[li] = null;
+        for (captured, 0..) |cap, ci| {
+            if (used[ci]) continue;
+            if (!std.mem.eql(u8, windowKey(cap), key)) continue;
+            used[ci] = true;
+            out[li] = ci;
+            break;
+        }
+    }
+    return out;
+}
+
 /// The result of `reconcile`: the restore set, plus how many of its entries came
 /// from the AGENT alone. `adopted > 0` is the signal that the local manifest has
 /// fallen behind and needs re-writing once the windows are live.
@@ -1241,4 +1285,95 @@ test "T590: a duplicated manifest key is appended once" {
     const out = try mergeCarried(arena, alloc, &.{}, &manifest, &carried);
     try testing.expectEqual(@as(usize, 1), out.len);
     try testing.expectEqualStrings("old", out[0].id);
+}
+
+// -- pairWindows (T343) -------------------------------------------------------
+
+test "T343: pairing follows the uuid when the live walk is reordered" {
+    const alloc = testing.allocator;
+    var an: [1]Node = undefined;
+    var at: [1]Tab = undefined;
+    var bn: [1]Node = undefined;
+    var bt: [1]Tab = undefined;
+    var cn: [1]Node = undefined;
+    var ct: [1]Tab = undefined;
+    // The capture, in the order the capture walk saw them.
+    const captured = [_]Window{
+        reconcileWindow("win-0", "uuid-a", "sess-a", &an, &at),
+        reconcileWindow("win-1", "uuid-b", "sess-b", &bn, &bt),
+        reconcileWindow("win-2", "uuid-c", "sess-c", &cn, &ct),
+    };
+
+    // …and the live list as the rebuild walk finds it: the middle window closed
+    // while the re-dial blocked and the survivors shifted up. A positional join
+    // would hand window C's tree to B; the key does not move.
+    const live = [_][]const u8{ "uuid-a", "uuid-c" };
+    const pairing = try pairWindows(alloc, &captured, &live);
+    defer alloc.free(pairing);
+
+    try testing.expectEqual(@as(usize, 2), pairing.len);
+    try testing.expectEqual(@as(?usize, 0), pairing[0]);
+    try testing.expectEqual(@as(?usize, 2), pairing[1]);
+}
+
+test "T343: a live window the capture never saw is skipped, not mispaired" {
+    const alloc = testing.allocator;
+    var an: [1]Node = undefined;
+    var at: [1]Tab = undefined;
+    const captured = [_]Window{reconcileWindow("win-0", "uuid-a", "sess-a", &an, &at)};
+
+    // `uuid-new` was created after the capture (or is a quick terminal, or a
+    // cross-machine window — everything the capture filters out looks the same
+    // from here, which is the point of dropping the hand-copied skip rule).
+    const live = [_][]const u8{ "uuid-new", "uuid-a" };
+    const pairing = try pairWindows(alloc, &captured, &live);
+    defer alloc.free(pairing);
+
+    try testing.expect(pairing[0] == null);
+    try testing.expectEqual(@as(?usize, 0), pairing[1]);
+}
+
+test "T343: a captured window is handed out at most once" {
+    const alloc = testing.allocator;
+    var an: [1]Node = undefined;
+    var at: [1]Tab = undefined;
+    const captured = [_]Window{reconcileWindow("win-0", "uuid-dup", "sess-a", &an, &at)};
+
+    const live = [_][]const u8{ "uuid-dup", "uuid-dup" };
+    const pairing = try pairWindows(alloc, &captured, &live);
+    defer alloc.free(pairing);
+
+    try testing.expectEqual(@as(?usize, 0), pairing[0]);
+    // The second claimant is skipped rather than rebuilt from a tree that is
+    // already someone else's.
+    try testing.expect(pairing[1] == null);
+}
+
+test "T343: an empty capture pairs nothing and an empty live walk is empty" {
+    const alloc = testing.allocator;
+    var an: [1]Node = undefined;
+    var at: [1]Tab = undefined;
+    const captured = [_]Window{reconcileWindow("win-0", "uuid-a", "sess-a", &an, &at)};
+
+    const live = [_][]const u8{"uuid-a"};
+    const none = try pairWindows(alloc, &.{}, &live);
+    defer alloc.free(none);
+    try testing.expectEqual(@as(usize, 1), none.len);
+    try testing.expect(none[0] == null);
+
+    const empty = try pairWindows(alloc, &captured, &.{});
+    defer alloc.free(empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
+}
+
+test "T343: a pre-T338 capture with no uuid still pairs on its id" {
+    const alloc = testing.allocator;
+    var an: [1]Node = undefined;
+    var at: [1]Tab = undefined;
+    const captured = [_]Window{reconcileWindow("window-1", null, "sess-a", &an, &at)};
+
+    const live = [_][]const u8{"window-1"};
+    const pairing = try pairWindows(alloc, &captured, &live);
+    defer alloc.free(pairing);
+    try testing.expectEqual(@as(?usize, 0), pairing[0]);
 }

@@ -4512,21 +4512,30 @@ fn recoverLocalAgentInPlace(self: *App) ?usize {
     defer if (attach_set) |*m| m.deinit();
     const attach_ptr: ?*const std.StringHashMap(void) = if (attach_set) |*m| m else null;
 
-    // Match captured windows to live ones by POSITION in `self.windows`:
-    // `captureSessionLayout` walks that same list in order, skipping quick
-    // terminals and cross-machine remote windows, so we replay the skip rule
-    // here rather than trying to key on a synthesized `win-N` id.
-    var ci: usize = 0;
+    // Match captured windows to live ones BY IDENTITY (T343). This used to be a
+    // positional join that replayed `captureSessionLayout`'s skip rule by hand,
+    // because at the time there was no id worth keying on; T338's `layout_uuid`
+    // is one, so the two walks no longer have to agree step for step. A window
+    // whose uuid is absent from the capture is simply left alone — which is both
+    // what the old skip rule meant and the right answer for a window that was
+    // born, or that closed, while `reconnectForRecovery` blocked above.
+    const live_keys = arena.alloc([]const u8, self.windows.items.len) catch |err| {
+        log.warn("in-place recovery: pairing allocation failed err={}", .{err});
+        return null;
+    };
+    for (self.windows.items, 0..) |win, i| live_keys[i] = win.layoutUuid();
+    const pairing = session_layout.pairWindows(arena, captured.windows, live_keys) catch |err| {
+        log.warn("in-place recovery: pairing failed err={}", .{err});
+        return null;
+    };
+
     var rebuilt: usize = 0;
-    for (self.windows.items) |win| {
-        if (win.is_quick_terminal) continue;
-        if (win.remote_dialed != null) continue;
-        if (win.tab_count == 0) continue;
-        defer ci += 1;
-        if (ci >= captured.windows.len) break;
+    for (self.windows.items, pairing) |win, matched| {
+        const ci = matched orelse continue;
         // A window that was never agent-backed (persistence unresolved at its
         // creation, so its panes are plain exec children) has nothing to
-        // re-attach and must not have its shells replaced.
+        // re-attach and must not have its shells replaced. The capture does not
+        // filter these out, so this one is ours to check.
         if (win.local_agent_conn == null) continue;
 
         _ = self.rebuildWindowInPlace(arena, win, captured.windows[ci], .local(conn), attach_ptr) catch |err| {
