@@ -48,12 +48,21 @@ $script:HarnessLeakRepo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Pa
 # Every image a harness can leave behind. `.com` is in the list because it is
 # the CLI entry point from PowerShell (T245) and a GUI launch through it
 # respawns `ghoztty.exe` detached - so a leak can wear either name.
-$script:HarnessLeakImages = @('ghoztty.exe', 'ghoztty.com', 'ghoztty-agent.exe')
+# `ghoztty-agent.exe.bak` is in the list because that is the image name a real
+# delivery leaves the RUNNING agent with (a running exe cannot be overwritten on
+# Windows, so the upgrade renames it and copies the new build into the original
+# path), and a harness that drives the T907 self-handoff has to reproduce it -
+# Win32_Process.Name is the image name recorded at creation, so without this
+# entry that agent is invisible to the leak sweep and outlives the run.
+$script:HarnessLeakImages = @('ghoztty.exe', 'ghoztty.com', 'ghoztty-agent.exe', 'ghoztty-agent.exe.bak')
 
 # The same set as Get-Process names them: no extension, so one entry covers both
 # `ghoztty.exe` and `ghoztty.com`. Used by the exit-time teardown, which cannot
 # reach Get-CimInstance (see Get-HarnessTeardownBlock).
-$script:HarnessLeakProcessNames = @('ghoztty', 'ghoztty-agent')
+# `ghoztty-agent.exe` is here as a NAME because Get-Process strips only the last
+# extension: an agent running from `ghoztty-agent.exe.bak` (see above) is named
+# `ghoztty-agent.exe`, which the `ghoztty-agent` entry does not match.
+$script:HarnessLeakProcessNames = @('ghoztty', 'ghoztty-agent', 'ghoztty-agent.exe')
 
 function ConvertTo-HarnessLeakDir {
     <#

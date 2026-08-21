@@ -1,8 +1,8 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-20T20:50:17-07:00",
-    "commit":  "4361b6592",
+    "generated":  "2026-08-20T21:18:19-07:00",
+    "commit":  "9b0d87463",
     "files":  {
                   "docs/claude/testing.md":  "3fd38fe48d7f0b33ff94533eff73c54e39e30a907fbb6a5ec6a271c6ba7339b3",
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
@@ -25,7 +25,7 @@
                   "test/win32/agent-session-cap.ps1":  "2a7212c7e9bb1b7b78189670d01bedb77784a4b621c7200cc409e3cb9ed00643",
                   "test/win32/agent-sharing-uplink.ps1":  "183edf2ea64d35211987947d44f85961c30ef0f1da1d5ced9e3423d0ff107900",
                   "test/win32/agent-shell-integration.ps1":  "390a036f6a5467ede7f5b173276ae946ffa3aa5b13f5628fcdcdecd2763e1478",
-                  "test/win32/agent-upgrade.ps1":  "459c351e3e60279ba9482c86799ea0dac76278567d11dceda41af8eef0c164c9",
+                  "test/win32/agent-upgrade.ps1":  "8b60516b5a74cc64f322857e0568b0319f29b61aefa702e5a4744b698d5babac",
                   "test/win32/agent-user-env.ps1":  "4c2f211e5b8034790bedc55d72be7918fc83c50fd08d4e06ac3c3c82cbc6c65f",
                   "test/win32/asserted-nothing.ps1":  "b893fdbd48adca2e6ea237a07de3828a3da9a6ecdee98dcdd0f71c6a6951e04c",
                   "test/win32/auto-launch-cwd.ps1":  "d070e40efd46942016daf6759c05c84f45ff1d6d20a52f08ab9ff15e67343638",
@@ -141,7 +141,7 @@
                   "test/win32/lib/FakeAgentRelay.ps1":  "75beb6bffdb603e237860dc7bcbda4cfc41ace110f7f12b13777395244c232c7",
                   "test/win32/lib/FakeRelay.ps1":  "e30d00b4c6d6d58bbdc23d82fa76b586a84143111b8d00bcd5a7777736088075",
                   "test/win32/lib/ForegroundAudit.ps1":  "7b5deda440053a6ce0b0e8fa4047a3febd432bdbabd4b65a09e5425f81dc9e3c",
-                  "test/win32/lib/HarnessLeak.ps1":  "cffcda1f77dc3c966327c93cf4fd8b6f374c08e99c7d9775b030bacc58f89a3c",
+                  "test/win32/lib/HarnessLeak.ps1":  "e868e0f48de89135f1ae0a56bdc3efc4da043f3257ed1ea2a57361b0d56efa35",
                   "test/win32/lib/HoverCapture.ps1":  "ce62c60da9068be953b9c4bece7b10afda478af42ebc0942ab90e7a634b285a0",
                   "test/win32/lib/Isolation.ps1":  "f347b74d0c160f2fae983bf56f07c74b33ce86c910f923ab60083cdcecb6ee49",
                   "test/win32/lib/paint-blocks.ps1":  "c3b9ec5522cf016fe072c425c05969a0d4fab11cd3fdecb9d67b8b25c7b4702d",

@@ -32,6 +32,30 @@
 #   K: T125 negative control - a skew where the AGENT is the newer side is never
 #      acted on. The app is the out-of-date one; downgrading it would eat
 #      sessions a newer app could still have attached to.
+#   L: T907 - handoff-capable, but a session the agent owns DIRECTLY is still
+#      live => the confirmation still appears, now saying the update installs
+#      itself once that session closes. Also the POSITIVE CONTROL for arm M's
+#      no-dialog claim: same build, same wait, same timeout, a dialog found.
+#   M: T907 - handoff-capable and every live session holder-backed => the app
+#      STANDS DOWN. No dialog, the decision logged as such, no destructive
+#      restart attempted, and the agent's own replacement carries the session
+#      across.
+#
+# T1037 - WHICH stale agent still raises that confirmation, because the answer
+# changed under this harness and nothing was obliged to notice. T907 gave the
+# agent the ability to replace ITSELF without losing a session, and the app's
+# policy changed with it: a running agent that advertises
+# `capability.agent_handoff` and owns nothing but holder-backed sessions is
+# stood down from, not restarted, so there is no dialog and nothing for the user
+# to answer. Arm M is where that contract is asserted, and anyone re-reading
+# "the confirmation never appears" as a regression should start there.
+#
+# The confirmation is therefore the LEGACY-generation path, and arms C/D/E/H/I
+# produce one deliberately with `GHOSTTY_AGENT_SUPPRESS_CAPS=agent_handoff` (the
+# T469 test seam): the agent this tree builds then advertises what a pre-T907
+# agent advertised, so it cannot replace itself and the restart is the only way
+# to update it. Each of those arms asserts `handoff-capable=false` in the
+# decision line, so an arm cannot silently stop exercising the case it names.
 #
 # The staleness INPUT is faked with GHOZTTY_AGENT_BUNDLED_VERSION (a debug-only
 # hook): every stamp in a real build comes from the same binary the agent runs,
@@ -97,8 +121,13 @@ $script:TestProcRoot = Join-Path $env:TEMP 'ghoztty-agent-upgrade-'
 . (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
 Register-HarnessGhozttyRoot -Root $root | Out-Null
 function Stop-TestProcs {
-    foreach ($n in @('ghoztty.exe', 'ghoztty-agent.exe')) {
-        Get-CimInstance Win32_Process -Filter "Name='$n'" |
+    # `ghoztty-agent%`, not `ghoztty-agent.exe`: arm M runs its agent from
+    # `ghoztty-agent.exe.bak` (the image name a real delivery leaves the RUNNING
+    # agent with), and Win32_Process.Name is the image name recorded at
+    # creation - so an exact-name filter would walk straight past the one
+    # process that arm is about and leak it into the next run.
+    foreach ($n in @('ghoztty.exe', 'ghoztty-agent%')) {
+        Get-CimInstance Win32_Process -Filter "Name LIKE '$n'" |
             Where-Object {
                 $_.CommandLine -like '*zig-out*' -or
                 $_.ExecutablePath -like "$script:TestProcRoot*"
@@ -111,8 +140,16 @@ function Stop-TestProcs {
 # The agents belonging to THIS run (their command line names this run's state
 # dir). Never the user's release agent, never another test's.
 function Get-RunAgents($tmp) {
-    return , @(Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
-        Where-Object { $_.CommandLine -like "*$tmp*" })
+    # `--pty-host` children are the same binary (T904): one per holder-backed
+    # session, spawned by the agent under test. They are NOT the session manager,
+    # and every `Agent-Pid` comparison in this script means the manager - so a
+    # holder answering "the agent pid" would make "same pid" and "new pid" both
+    # arbitrary. Holders became the default in T909, which is when this filter
+    # started earning its place.
+    # `LIKE 'ghoztty-agent%'` for arm M, whose agent runs from
+    # `ghoztty-agent.exe.bak` - see Stop-TestProcs.
+    return , @(Get-CimInstance Win32_Process -Filter "Name LIKE 'ghoztty-agent%'" |
+        Where-Object { $_.CommandLine -like "*$tmp*" -and $_.CommandLine -notmatch '--pty-host' })
 }
 function Agent-Pid($tmp) {
     $a = Get-RunAgents $tmp
@@ -295,12 +332,26 @@ $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 $savedOverride = $env:GHOZTTY_AGENT_BUNDLED_VERSION
 $savedProto = $env:GHOZTTY_AGENT_PROTO_VERSION
 $savedPipe = $env:GHOZTTY_PIPE_SUFFIX
+# T1037: the three knobs that decide WHICH arm of the policy a stale agent lands
+# on - whether it can replace itself at all, whether its sessions can be carried
+# across when it does, and how long it waits before doing it.
+$savedSuppress = $env:GHOSTTY_AGENT_SUPPRESS_CAPS
+$savedHolder = $env:GHOZTTY_AGENT_PTY_HOLDER
+$savedForce = $env:GHOZTTY_AGENT_HANDOFF_FORCE
+$savedInterval = $env:GHOZTTY_AGENT_HANDOFF_INTERVAL_MS
 
 $tmp = Join-Path $root 'run'
 New-Item -ItemType Directory -Force (Join-Path $tmp 'ghoztty\local-agent-debug') | Out-Null
 $env:LOCALAPPDATA = $tmp
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 $env:GHOZTTY_AGENT_BUNDLED_VERSION = $null
+# Holders ON is the shipping default (T909) and every arm below depends on
+# knowing which it got, so it is stated rather than inherited: arm L turns them
+# off to build its legacy session, and arms B-K are unaffected either way.
+$env:GHOZTTY_AGENT_PTY_HOLDER = '1'
+$env:GHOSTTY_AGENT_SUPPRESS_CAPS = $null
+$env:GHOZTTY_AGENT_HANDOFF_FORCE = $null
+$env:GHOZTTY_AGENT_HANDOFF_INTERVAL_MS = $null
 # Isolate the IPC endpoint unconditionally: every `+list` / `+read` /
 # `+send-keys` below is an oracle, and an instance answering the shared pipe
 # would answer them about somebody else's windows.
@@ -364,8 +415,17 @@ Assert "B7 the no-op decision is logged with its reason" `
 Stop-TestProcs
 
 # ============================================================================
-Say "== C: stale + a live session => mandatory confirmation, nothing killed yet"
+Say "== C: stale LEGACY agent + a live session => mandatory confirmation, nothing killed yet"
 # ============================================================================
+# T1037: a stale agent only raises this dialog when it cannot replace itself -
+# since T907 a handoff-capable one is stood down from instead (arm M). So the
+# agent for arms C-I is made a pre-T907 one at the source: suppressing the
+# capability in its HELLO is the whole difference between the two generations,
+# and it is what a box that has not yet taken the agent-side update actually
+# advertises. Set here and left set through arm K; the new arms at the end clear
+# it. The agent reads it once at startup, so it must be in place BEFORE the app
+# spawns one - which is why Stop-TestProcs at the end of B matters.
+$env:GHOSTTY_AGENT_SUPPRESS_CAPS = 'agent_handoff'
 $env:GHOZTTY_AGENT_BUNDLED_VERSION = $FAKE_NEW
 $appPidC = Start-App $tmp 't147-stale-decline'
 $logC = $script:AppLog
@@ -404,6 +464,11 @@ if ($NegativeControl) {
 # second monitor for ~20 minutes and the log gave no evidence it existed.)
 Assert "C9 the decision is logged while the dialog is STILL UP" `
     (Wait-LogMatch $logC 'agent upgrade check: stale with live sessions, confirmation required' 20)
+# T1037: and that it is THIS arm's decision. Without this, the day the seam
+# stops working the whole C-I block silently becomes a test of some other
+# policy arm that happens to end in the same dialog.
+Assert "C9b the agent under test really is the legacy generation" `
+    (Wait-LogMatch $logC 'agent upgrade check: stale with live sessions.*handoff-capable=false' 20)
 Assert "C10 the pending modal announces itself before it blocks" `
     (Wait-LogMatch $logC 'showing mandatory restart confirmation.*waiting for the user' 20)
 Assert "C11 the dialog is still up after those asserts (they did not race it)" `
@@ -636,7 +701,7 @@ Say "== I: negative control - a refresh that CANNOT re-dial says so"
 # running .exe cannot be deleted on Windows, but it CAN be renamed.
 # Keep the copy's FILE NAME - Win32_Process.Name is the image name recorded at
 # creation, and every agent-pid helper in this script filters on
-# 'ghoztty-agent.exe'. A copy called anything else is invisible to them.
+# 'ghoztty-agent*'. A copy called anything else is invisible to them.
 $agentCopyDir = Join-Path $tmp 'agentcopy'
 New-Item -ItemType Directory -Force $agentCopyDir | Out-Null
 $agentCopy = Join-Path $agentCopyDir 'ghoztty-agent.exe'
@@ -748,6 +813,154 @@ Assert "K6 the app is still running (degraded, not broken)" `
 $env:GHOZTTY_AGENT_PROTO_VERSION = $null
 Stop-TestProcs
 
+# ============================================================================
+Say "== L: T907 - handoff-capable, but a session it owns DIRECTLY holds it back"
+# ============================================================================
+# The mixed-generation box, and the arm that keeps the confirmation honest: the
+# agent CAN replace itself, but a ConPTY it owns in-process cannot be carried
+# across a process boundary at any price, so the update drains instead - each
+# such session that closes brings it nearer. The confirmation is still offered,
+# because forcing it early is the only thing left for a user to decide, and the
+# dialog says the waiting is happening so "Later" is a promise rather than a
+# deferral into silence.
+#
+# Built by keeping the capability and taking the HOLDERS away: with
+# GHOZTTY_AGENT_PTY_HOLDER=0 every session this agent spawns is one it owns
+# directly, which is exactly the state a box in the middle of the T909 rollout
+# is in.
+#
+# It is also the POSITIVE CONTROL for arm M below. "No dialog appeared" is only
+# evidence when the same wait, against the same build, on the same desktop, is
+# known to find one - otherwise M would pass just as well against a harness that
+# had lost the ability to see dialogs at all.
+$env:GHOSTTY_AGENT_SUPPRESS_CAPS = $null
+$env:GHOZTTY_AGENT_PTY_HOLDER = '0'
+$env:GHOZTTY_AGENT_BUNDLED_VERSION = $FAKE_NEW
+$appPidL = Start-App $tmp 't907-draining'
+$logL = $script:AppLog
+Assert "L1 the GUI came up" ($appPidL -ne 0)
+$agentL = Wait-AgentPid $tmp 25
+Assert "L2 an agent is running for this run" ($agentL -ne 0)
+$dlgL = Wait-Dialog $appPidL 40
+Assert "L3 the confirmation still appears while a legacy session is live" `
+    ($dlgL -ne [IntPtr]::Zero)
+if ($dlgL -ne [IntPtr]::Zero) {
+    Assert "L4 it is the SAME dialog the staleness path uses" `
+        ((Get-TestWindowText -Window $dlgL) -like '*background terminal process*')
+    # Asked of the dialog's OWN owner rather than the window this arm launched
+    # with: the app owns the modal to `windows.items[0]`, and by this point it
+    # has restored the windows the previous arms left in the manifest, so the
+    # hwnd Start-App happened to find first is not reliably the one that was
+    # disabled. C4b can cache it because arm C opens with a single window.
+    $ownerL = Get-TestWindowOwner -Window $dlgL
+    Assert "L4b the owner window is DISABLED while it is up (mandatory, not advisory)" `
+        (($ownerL -ne [IntPtr]::Zero) -and (-not (Test-TestWindowEnabled -Window $ownerL)))
+}
+# The decision, not just the dialog: this arm and arm C end in the same window,
+# and only the log says which policy arm produced it.
+Assert "L5 the decision names the DRAINING reason, not the legacy one" `
+    (Wait-LogMatch $logL 'agent upgrade check: stale and self-replacing, but sessions the agent owns directly must close first' 25)
+# At least one legacy session, and the capability still advertised - the two
+# facts that separate this arm from arm C's. The count itself is deliberately
+# not pinned: by this point in the run the app restores whatever the earlier
+# arms left in the manifest, so "how many" is history, not policy.
+Assert "L6 ... and reports the agent as handoff-capable with a legacy session" `
+    (Wait-LogMatch $logL 'agent upgrade check: stale and self-replacing.*, [1-9]\d* of them legacy, handoff-capable=true' 25)
+# Same contract as C5: consent comes BEFORE the destruction.
+Assert "L7 nothing was killed while the dialog was up" ((Agent-Pid $tmp) -eq $agentL)
+if ($dlgL -ne [IntPtr]::Zero) { Send-TestControlKey -Control $dlgL -Key Escape | Out-Null }
+Assert "L8 the dialog closed on 'Later'" (Wait-NoDialog $appPidL 15)
+Start-Sleep -Seconds 3
+Assert "L9 declining left the agent running (same pid)" ((Agent-Pid $tmp) -eq $agentL)
+$treeL = Wait-Panes $tmp 'l0' 1
+$leafL = (All-Leaves $treeL)[0]
+Assert "L10 the legacy session survived the decline" (Test-PaneResponsive $tmp $leafL.id 'l')
+Stop-TestProcs
+
+# ============================================================================
+Say "== M: T907 - handoff-capable + every session holder-backed => the app stands down"
+# ============================================================================
+# THE contract T1037 exists to write down. The running agent is stale, a session
+# is live, and the app asks nobody and restarts nothing: the agent replaces
+# itself, hands the per-session holders to its successor and exits, and the live
+# session never notices. A dialog here would be the defect - it would be asking
+# the user to consent to losing sessions that are not going to be lost.
+#
+# Two seams are needed to make the agent actually do it, and both are about the
+# same limitation: one tree bakes one stamp into one binary, so there is no way
+# to put a genuinely newer agent on disk here.
+#
+#   * GHOZTTY_AGENT_HANDOFF_FORCE (debug-only) skips the "is the file on disk
+#     newer?" comparison. It is consumed by the agent that reads it (removed
+#     from its own environment block), so the successor does not hand off again
+#     forever.
+#   * The running agent has to be started from `ghoztty-agent.exe.bak`, because
+#     force does NOT skip the structural refusal: the candidate is our own image
+#     path with the delivery's backup suffix stripped, and an agent running from
+#     the canonical name resolves to ITSELF and is refused outright. That is the
+#     shape a real delivery leaves behind - a running exe cannot be overwritten
+#     on Windows, so the upgrade renames it and copies the new build into the
+#     original path - which is why the copy beside it is what gets spawned.
+$handoffDir = Join-Path $tmp 'handoff'
+New-Item -ItemType Directory -Force $handoffDir | Out-Null
+$runningAgentM = Join-Path $handoffDir 'ghoztty-agent.exe.bak'
+Copy-Item $AgentExe $runningAgentM -Force
+Copy-Item $AgentExe (Join-Path $handoffDir 'ghoztty-agent.exe') -Force
+$env:GHOSTTY_LOCAL_AGENT_BIN = $runningAgentM
+$env:GHOZTTY_AGENT_PTY_HOLDER = '1'
+$env:GHOZTTY_AGENT_HANDOFF_FORCE = '1'
+$env:GHOZTTY_AGENT_HANDOFF_INTERVAL_MS = '2000'
+$env:GHOZTTY_AGENT_BUNDLED_VERSION = $FAKE_NEW
+$appPidM = Start-App $tmp 't907-standdown'
+$logM = $script:AppLog
+Assert "M1 the GUI came up" ($appPidM -ne 0)
+$agentM = Wait-AgentPid $tmp 25
+Assert "M2 an agent is running for this run" ($agentM -ne 0)
+$treeM = Wait-Panes $tmp 'm0' 1
+Assert "M3 it has a live session to lose" ((Leaf-Count $treeM) -ge 1)
+$leafM = (All-Leaves $treeM)[0]
+Assert "M4 the app STOOD DOWN and said so" `
+    (Wait-LogMatch $logM 'agent upgrade check: stale, but the agent is replacing itself without losing any session' 30)
+Assert "M5 ... reporting the agent as handoff-capable with nothing legacy" `
+    (Wait-LogMatch $logM 'agent upgrade check: stale, but the agent.*, 0 of them legacy, handoff-capable=true' 30)
+if ($NegativeControl) {
+    Say 'NEGATIVE CONTROL: asserting a confirmation appeared for a fully holder-backed agent - this run MUST fail'
+    Assert "M6 a confirmation was raised for a handoff-capable agent (inverted)" `
+        ((Wait-Dialog $appPidM 20) -ne [IntPtr]::Zero)
+} else {
+    # Arm L just proved this same wait finds a dialog when there is one.
+    Assert "M6 NO confirmation was raised (nothing for the user to consent to)" `
+        ((Wait-Dialog $appPidM 20) -eq [IntPtr]::Zero)
+}
+# Standing down means standing down: not a quieter restart, no restart at all.
+# `agent restart: begin` is the first line of the destructive path (H11), so its
+# absence is the checkable form of "the app touched nothing".
+Assert "M7 the app attempted no destructive restart of its own" `
+    ((Read-AppLog $logM) -notmatch 'agent restart: begin')
+# ... and the stand-down was a stand-down from something REAL: the agent did
+# replace itself. Without this, an agent whose supervisor never ran would pass
+# every assert above.
+$agentM2 = Wait-AgentPid $tmp 60 $agentM
+Assert "M8 the agent replaced ITSELF (new pid, nobody asked)" `
+    ($agentM2 -ne 0 -and $agentM2 -ne $agentM)
+Assert "M9 the old agent is gone" `
+    (@(Get-Process -Id $agentM -ErrorAction SilentlyContinue).Count -eq 0)
+# THE user-visible half: the session was carried across the replacement. Retried
+# because the app's link to the agent drops mid-handoff and the keystrokes of a
+# single attempt can land in that gap - the pane is what has to survive, not one
+# particular write to it.
+$liveM = $false
+for ($i = 1; $i -le 4; $i++) {
+    if (Test-PaneResponsive $tmp $leafM.id "m$i" 20) { $liveM = $true; break }
+}
+Assert "M10 the live session came across to the successor" $liveM
+Assert "M11 the app survived the replacement it stood down for" `
+    (@(Get-Process -Id $appPidM -ErrorAction SilentlyContinue).Count -eq 1)
+$env:GHOZTTY_AGENT_HANDOFF_FORCE = $null
+$env:GHOZTTY_AGENT_HANDOFF_INTERVAL_MS = $null
+$env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
+Stop-TestProcs
+
 } finally {
     Remove-TestDesktop
     Stop-TestProcs
@@ -756,6 +969,10 @@ Stop-TestProcs
     $env:GHOZTTY_AGENT_BUNDLED_VERSION = $savedOverride
     $env:GHOZTTY_AGENT_PROTO_VERSION = $savedProto
     $env:GHOZTTY_PIPE_SUFFIX = $savedPipe
+    $env:GHOSTTY_AGENT_SUPPRESS_CAPS = $savedSuppress
+    $env:GHOZTTY_AGENT_PTY_HOLDER = $savedHolder
+    $env:GHOZTTY_AGENT_HANDOFF_FORCE = $savedForce
+    $env:GHOZTTY_AGENT_HANDOFF_INTERVAL_MS = $savedInterval
     Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
 }
 
@@ -768,6 +985,17 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
     Assert "G1 the foreground watcher actually sampled (negative control)" ($fgSeen.Count -gt 0)
     $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
     Assert "G2 no test-desktop app ever became foreground on the interactive desktop" ($leaked.Count -eq 0)
+}
+
+# --- stamp (T783/T1037) ------------------------------------------------------
+# This harness went 12 days red at HEAD because nothing tied an edit of the
+# upgrade DECISION to a run of the only thing that measures it end to end.
+# A clean green run stamps the code it covers; a red one leaves the stamp alone,
+# so red stays due.
+if ($script:failures -eq 0 -and -not $NegativeControl) {
+    $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard agent-upgrade -Repo $repo 2>&1 | ForEach-Object { "  $_" }
 }
 
 Say ""

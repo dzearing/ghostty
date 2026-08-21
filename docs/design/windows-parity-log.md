@@ -9,6 +9,59 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-20 - **T1037 (filed T1038) - the terminal is RIGHT not to ask before
+  the background session helper updates itself, and the harness now says so.**
+  `test\win32\agent-upgrade.ps1` ran 27 FAILURE(S) / 79 passed at HEAD and every
+  failure was one expectation: `FAIL C3/D3/E3/H6 the confirmation appeared`. The
+  product is not broken - T907 taught the agent to replace ITSELF, and
+  `agent_upgrade.evaluate` returns `.handoff_now` (stand down, no dialog,
+  nothing restarted) when the running agent advertises
+  `capability.agent_handoff` and every live session is holder-backed. That IS
+  the contract now; the four arms predated it and were waiting 40s each for a
+  window the app is correct never to show. **So the confirmation arms had to
+  become what they always meant: the LEGACY-generation path.** C/D/E/H/I now
+  build a pre-T907 agent deliberately with `GHOSTTY_AGENT_SUPPRESS_CAPS=
+  agent_handoff` (the T469 seam - one tree builds both peers, so this is the
+  only way to produce an agent that cannot replace itself), and a new C9b
+  asserts the decision line really reports `handoff-capable=false`, so the day
+  the seam stops biting the whole block cannot quietly become a test of some
+  other policy arm that ends in the same dialog. Two arms are new. **L** keeps
+  the capability and takes the HOLDERS away (`GHOZTTY_AGENT_PTY_HOLDER=0`): an
+  agent that would replace itself but owns a ConPTY that cannot cross a process
+  boundary, which drains lazily and still offers the confirmation as the only
+  way to force it early - and it is the standing POSITIVE CONTROL for M, since
+  "no dialog appeared" is evidence only when the same wait, same build, same
+  desktop is known to find one. **M** is the contract itself: no dialog, the
+  decision logged as standing down, **no `agent restart: begin`** (the checkable
+  form of "the app touched nothing"), the agent replaced by its own successor,
+  and the same pane still answering afterwards - the session came across.
+  Getting M to run needed the shape a real delivery leaves behind: `force`
+  skips the staleness comparison but NOT the structural refusal, so an agent
+  running from the canonical name resolves its own image as the candidate and
+  hands off to nobody; the arm therefore runs it from `ghoztty-agent.exe.bak`
+  with the new build beside it, exactly as `upgrade-ghoztty-windows.ps1` leaves
+  a box. Two harness-infra defects surfaced on the way, both latent since
+  holders became the default: `Get-RunAgents` did not exclude `--pty-host`
+  children, which are the same image name and could answer "the agent pid" for
+  every same-pid/new-pid assert in the file; and `lib\HarnessLeak.ps1` knew
+  nothing of the `.bak` image name, so such an agent could outlive the run and
+  own the agent pipe the NEXT run needs (the 33-failure shape recorded in this
+  script's own header). **The why-nobody-noticed half** is T884's missing row,
+  now filled: `guard-due` row `agent-upgrade` covers the harness,
+  `agent_upgrade.zig` and `LocalAgent.zig`, with a green-run stamp block in the
+  tail, so the next edit to the decision code makes this due; App.zig stays out
+  by the house rule, leaving its wiring of the check as the known residual.
+  Green: `AGENT-UPGRADE: ALL PASS (136)`, `-NegativeControl` red on exactly the
+  two inverted asserts (C5, M6) with no stamp written, floor lanes
+  lib/none/win32/agent ALL PASS, ipc-p1 25 / p2 20 / p3 16 ALL PASS, the four
+  suite-wide audits the edits made due (isolation-meta 7, launch-preflight 17,
+  verdict-exit, stderr-capture 25) re-run and re-stamped, `guard-due.ps1 check`
+  exit 0. Filed T1038: `GHOZTTY_AGENT_NO_HANDOFF` stops the supervisor but does
+  not stop the HELLO advertising `agent_handoff`, so the documented kill switch
+  leaves the app standing down forever for a handoff that will never come - the
+  agent then updates only on a reboot, which is the exact defect T147 exists to
+  close.
+
 - 2026-08-20 - **T1031 - panes stop blanking themselves when you resize
   them.** The user's report was that dragging a split divider, dragging the
   window edge, or opening the sticky banner made the panes strobe: "it seems

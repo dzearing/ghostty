@@ -299,6 +299,27 @@ $GuardTable = @(
             'src\remote\agent_build.zig'
         )
     },
+    # The agent-upgrade DECISION as the user meets it (T147/T125/T907), and the
+    # row T1037 exists because of: the policy grew a whole new arm when the agent
+    # learned to replace itself, four of this harness's assertions became wrong
+    # in the same commit, and nothing obliged anyone to re-run it - so it sat 27-
+    # red at HEAD for 12 days. It is the only harness that drives the real dialog
+    # (mandatory modality, decline, accept, the deferral to the next idle moment)
+    # and the only one that measures the STAND-DOWN: no dialog, no restart, the
+    # session carried across by the agent itself. App.zig is deliberately not
+    # covered - it moves for a hundred unrelated reasons and would leave this
+    # multi-minute GUI run due every turn - so the residual gap is App.zig's
+    # WIRING of the check, which only a run of this catches.
+    [pscustomobject]@{
+        Name   = 'agent-upgrade'
+        Script = 'test\win32\agent-upgrade.ps1'
+        Stamp  = 'test\win32\agent-upgrade.stamp.json'
+        Covers = @(
+            'test\win32\agent-upgrade.ps1',
+            'src\apprt\win32\agent_upgrade.zig',
+            'src\apprt\win32\LocalAgent.zig'
+        )
+    },
     # Cross-lineage layout blobs (T337/T623): the only harness that proves the
     # REAL binary translates a Mac-shaped blob on the launch-restore path and,
     # since T623, that the restored window lands the right way up (the
