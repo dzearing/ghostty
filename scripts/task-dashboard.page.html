@@ -304,6 +304,10 @@ td.fin, td.when { white-space: nowrap; color: var(--muted); font-variant-numeric
 .pri.P1 { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, transparent);
   background: color-mix(in srgb, var(--warning) 12%, transparent); }
 .pri.P2 { color: var(--ink-2); }
+/* P3 is "reviewed and deliberately last" (T345). It reads quieter than P2 but
+   is still a written band, so it can never be mistaken for the blank chip an
+   untriaged task gets. */
+.pri.P3 { color: var(--muted); border-style: dashed; }
 
 /* Category tag chip: a dot plus the word. The color is never the only
    signal — the label is always written — so tags survive greyscale. */
@@ -729,8 +733,9 @@ function drawDaily(host, data) {
 /* Replaced "by phase" (2026-08-04): phases carried no information anybody used.
    How much OPEN work sits in each severity band is the question the queue
    actually raises. */
-var PRI_COLOR = { P0: '--critical', P1: '--warning', P2: '--open', untriaged: '--muted' };
-var PRI_LABEL = { P0: 'P0 severe', P1: 'P1 feature + polish', P2: 'P2 infra', untriaged: 'Untriaged' };
+var PRI_COLOR = { P0: '--critical', P1: '--warning', P2: '--open', P3: '--ink-2', untriaged: '--muted' };
+var PRI_LABEL = { P0: 'P0 severe', P1: 'P1 feature + polish', P2: 'P2 infra',
+  P3: 'P3 parked on purpose', untriaged: 'Untriaged' };
 function drawPriorities(host, data) {
   var rows = (data.priorities || []).filter(function (r) { return r.open > 0; });
   host.innerHTML = '';
@@ -1617,7 +1622,8 @@ function tasksView(d) {
     statusMulti,
     sel('priority', 'Any priority', [
       ['P0', 'P0 - severe'], ['P1', 'P1 - feature + polish'],
-      ['P2', 'P2 - infra'], ['untriaged', 'Untriaged']
+      ['P2', 'P2 - infra'], ['P3', 'P3 - parked on purpose'],
+      ['untriaged', 'Untriaged']
     ]),
     sel('seat', 'Any seat', d.seats.map(function (x) { return [x.seat, 'Seat: ' + x.seat]; })),
     // Tag filter: the closed vocabulary first, then anything else the files
@@ -1681,8 +1687,9 @@ function idRank(id) {
   return m ? Number(m[1]) * 1000 + (m[2] ? m[2].charCodeAt(0) - 96 : 0) : 0;
 }
 
-/** P0 first, untriaged last. */
-function priRank(p) { return p === 'P0' ? 0 : p === 'P1' ? 1 : p === 'P2' ? 2 : 9; }
+/** P0 first, then P1/P2/P3, untriaged last of all: "somebody looked and put
+    this last" outranks "nobody has looked yet" (T345). */
+function priRank(p) { return p === 'P0' ? 0 : p === 'P1' ? 1 : p === 'P2' ? 2 : p === 'P3' ? 3 : 9; }
 
 /** A date cell: short label, full date + time on hover, em dash when unknown. */
 function dateCell(ts, cls) {

@@ -9,7 +9,9 @@
     - the served page carries the T505 event-L2 wiring (openEvent dialog,
       whole-card hover, the /api/commit fetch) and its inline script parses;
     - /api/data answers with an activity feed whose work items carry the sha
-      the page hands to /api/commit;
+      the page hands to /api/commit, and carries every priority band the CLI
+      knows, in queue order (T345 - the payload keeps its own copy of that
+      closed set, so a band it has not learned is invisible on the charts);
     - /api/commit returns the FULL commit message for a real sha (oracle:
       git show -s on the same sha), and refuses a malformed or unknown sha
       with 400/404 rather than resolving whatever it was handed;
@@ -133,6 +135,16 @@ try {
     Assert 'B3 the feed has at least one work event' ($work.Count -ge 1) "got $($work.Count)"
     Assert 'B4 work events carry the sha the L2 fetch needs' `
         ($work.Count -ge 1 -and $work[0].sha -match '^[0-9a-f]{7,40}$') "got '$(if ($work.Count) { $work[0].sha })'"
+
+    # The priority bands are the queue's own vocabulary, and the dashboard keeps
+    # a SECOND copy of the closed set (here, and again in the page's PRI_LABEL /
+    # priRank). A band the CLI knows and this payload does not is invisible on
+    # the charts: that is exactly how `P3` hid in two real task files until T345
+    # went looking. Assert the set, and assert its order, since "reviewed and
+    # deliberately last" must still rank ahead of "nobody has looked yet".
+    $bands = @($data.priorities | ForEach-Object { $_.priority })
+    Assert 'B5 the payload carries every priority band, untriaged last' `
+        (($bands -join ',') -eq 'P0,P1,P2,P3,untriaged') "got '$($bands -join ',')'"
 
     # --- section C: /api/commit, both directions ----------------------------
     # C4 proves the endpoint serves the WHOLE message, not just the subject, so

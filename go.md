@@ -253,10 +253,25 @@ Concretely, in order, with no stops in between:
    glance. When you claim an untagged task, add tags to its frontmatter as
    part of making it readable.
 
-   `next` picks by **`priority:`** (P0 → P1 → P2 → untriaged), then `order:`
-   within that band, then id (D55; user, 2026-08-12). Priority is what the work
-   is WORTH and it decides; `order:` only sequences tasks that are worth the
-   same. Anything in **Current priorities** below still outranks both.
+   `next` picks by **`priority:`** (P0 → P1 → P2 → P3 → untriaged), then
+   `order:` within that band, then id (D55; user, 2026-08-12). Priority is what
+   the work is WORTH and it decides; `order:` only sequences tasks that are
+   worth the same.
+
+   **`next` IS the ordering authority, as of 2026-08-21 (T345).** There is no
+   hand-curated list above it any more: every task named in **Current
+   priorities** in `windows-parity-tasks.md` is closed, and that section is now
+   frozen history like the state table beside it. What replaces it is
+   re-triage — `set-priority` moves a task to the head of the queue on its own
+   and journals why — so the queue is a pure function of the task files and no
+   turn negotiates with itself about what to work on.
+
+   **P3 means "reviewed, and deliberately behind everything else"** (T345).
+   Leaving `priority:` blank does NOT say that: blank means *nobody has looked*,
+   which is why untriaged sorts behind even P3. `order:` cannot say it either —
+   an unplaced task ranks last within its band, so any number you write pulls
+   the task *ahead* of every unordered one. A value outside the set is a
+   `validate` failure, not a silent demotion to untriaged.
 
    It used to be the other way round, and the inversion was invisible: an
    unplaced task ranks last, so a P0 with no `order:` sorted behind every
@@ -274,8 +289,9 @@ Concretely, in order, with no stops in between:
    own, and journals the transition (old → new, plus the reason) into the
    task's `## Progress log` — since D55 a re-prioritisation *is* a queue edit,
    so it is no longer a silent one. `-NoNote` is for a bulk normalisation pass
-   and nothing else. Acceptance: sections K and K2 of
-   `test\win32\parity-tasks-seat.ps1`.
+   and nothing else. Acceptance: sections K, K2 and K3 of
+   `test\win32\parity-tasks-seat.ps1` — K3 is the loop's own shape, a low old
+   id against a high follow-up id, plus the P3 band and the validate failure.
 
    `next` answers for **this box's seat** (T344): tasks marked `seat: mac` — a
    Swift fix, a macOS regression run — are the Mac seat's and are listed as
@@ -649,10 +665,12 @@ the fix is the message.
    ```
 
    `docs/design/windows-parity-tasks.md` is still worth reading for its
-   narrative sections — the resume protocol, **Current priorities** (which
-   still outranks `next`), and the key code landmarks — but its **state
-   table is frozen**: a historical snapshot, no longer ground truth. Never
-   add a row to it. Likewise `windows-parity-details.md` is frozen; its
+   narrative sections — the resume protocol and the key code landmarks — but
+   its **state table is frozen**: a historical snapshot, no longer ground
+   truth. Never add a row to it. **Current priorities** is frozen too as of
+   2026-08-21 (T345): every task it names is closed, and `next` is the
+   ordering authority now. Do not add to it; re-triage with `set-priority`
+   instead, which moves the queue and leaves a receipt. Likewise `windows-parity-details.md` is frozen; its
    per-task sections were copied into the task files, and the task file
    wins. The session log (`windows-parity-log.md`), the audit appendix
    (`windows-parity-audit.md`), and the spec (`windows-parity-spec.md`) are

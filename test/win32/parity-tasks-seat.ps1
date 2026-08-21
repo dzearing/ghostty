@@ -30,6 +30,13 @@
 #      renumbering. `set-priority` journals the transition (naming the old
 #      priority and the reason), writes `triage-reason:`, stays silent on a
 #      no-op, and honours `-NoNote` for a bulk pass.
+#   K3. The loop's own follow-ups (T345). Every turn files what it turned up, so
+#      a follow-up always carries a HIGHER id than the task that produced it.
+#      Inside one band the older id still goes first (equal worth is FIFO), and
+#      a re-triage alone lifts a 1011-id-younger follow-up to the head with no
+#      renumbering. Plus the P3 band: "reviewed and deliberately last" outranks
+#      "nobody has looked yet", and a band outside the set is a validate
+#      FAILURE rather than the silent blanking that hid `P3` in two real files.
 #   L. `next -Claim` marks the picked task in-progress in the same breath;
 #      plain `next` stays a read-only question.
 #   M. Stale in-progress resume (2026-08-05): one agent runs the queue, so a
@@ -400,6 +407,69 @@ $r = Task-Run @('set-priority', 'T2', '-Priority', 'P1', '-NoNote')
 $txt = [System.IO.File]::ReadAllText((Join-Path $fixture 'T2.md'))
 Assert '-NoNote suppresses the journal entry' ($txt -notmatch 'priority: P0 -> P1')
 Assert 'but the field itself still changed' ($txt -match '(?m)^priority: "P1"$')
+
+# --- K3. a low old id vs a high follow-up id (T345) ---------------------------
+""
+"K3. the loop's own follow-ups are ranked by worth, not by when they were filed"
+Reset-Fixture
+# The shape T345 was filed about: every turn ends by filing what it turned up,
+# so a follow-up always carries a HIGHER id than the backlog task that produced
+# it. Under the id-first sort those follow-ups sorted permanently last, behind
+# every survivor of the original backlog - roughly the opposite of the order a
+# person would pick. This section pins the answer so it is a test rather than a
+# habit, with the ids deliberately far apart.
+New-FixtureTask -Id 'T37'   -PriorityLine 'priority: "P2"'   # original backlog
+New-FixtureTask -Id 'T1048' -PriorityLine 'priority: "P2"'   # filed by a turn today
+
+# Inside one band, the older id still goes first: equal worth is worked FIFO,
+# which is the only tiebreak that needs no judgement.
+$r = Task-Run @('next')
+Assert 'same band: the older id is worked first' ($r.Out -match 'NEXT: T37\b')
+
+# ...and the moment triage says the follow-up is worth more, it takes the head
+# on that alone - no renumbering, no hand-placement, which is the property that
+# makes a filed-with-a-priority task reachable the day it is filed.
+$r = Task-Run @('set-priority', 'T1048', '-Priority', 'P1', '-Summary', 'the shipped feature it follows is broken')
+Assert 'set-priority exits 0' ($r.Code -eq 0)
+$r = Task-Run @('next')
+Assert 'a re-triaged follow-up outranks a 1011-id-older backlog task' ($r.Out -match 'NEXT: T1048\b')
+$txt = [System.IO.File]::ReadAllText((Join-Path $fixture 'T1048.md'))
+Assert 'and nothing was renumbered to do it' ($txt -notmatch '(?m)^order:')
+
+# P3 is "reviewed, and deliberately behind everything else" (T345). It cannot
+# be spelled with `order:` - an unplaced task ranks MaxValue, so ANY number
+# written pulls a task AHEAD of every unordered one in its band - and it must
+# not be spelled by leaving the field blank either, because blank means nobody
+# looked. Both parked tasks here therefore sit behind the P2, and the written
+# band sits ahead of the blank one.
+Reset-Fixture
+New-FixtureTask -Id 'T10'                                    # untriaged
+New-FixtureTask -Id 'T20' -PriorityLine 'priority: "P3"'     # parked on purpose
+New-FixtureTask -Id 'T30' -PriorityLine 'priority: "P2"'
+$r = Task-Run @('list')
+Assert 'queue order is P2, then P3, then untriaged' ($r.Out -match '(?s)T30.*T20.*T10')
+$r = Task-Run @('next')
+Assert 'next takes the P2 over both' ($r.Out -match 'NEXT: T30\b')
+$r = Task-Run @('set-status', 'T30', '-Status', 'done')
+$r = Task-Run @('next')
+Assert 'a deliberate P3 outranks a task nobody has ranked' ($r.Out -match 'NEXT: T20\b')
+Assert 'and next names the band it picked on' ($r.Out -match 'priority=P3\b')
+$r = Task-Run @('list', '-Priority', 'P3')
+Assert 'list -Priority P3 filters to the parked band' ($r.Out -match '1 task\(s\)')
+$r = Task-Run @('validate')
+Assert 'a fixture using P3 validates' ($r.Code -eq 0)
+
+# A band outside the set is the failure this section exists to make loud. It
+# reads as untriaged for sorting - a garbled value must never seize a position
+# - but `validate` now NAMES it, because T499 and T551 carried `P3` for weeks
+# while it was silently blanked and nothing ever said so.
+New-FixtureTask -Id 'T40' -PriorityLine 'priority: "P4"'
+$r = Task-Run @('validate')
+Assert 'validate FAILS on a priority outside the set' ($r.Code -ne 0)
+Assert 'and names the task and the bogus value' ($r.Out -match "ODD PRIORITY: T40 = 'P4'")
+Assert 'and says what it is being read as' ($r.Out -match 'read as untriaged')
+$r = Task-Run @('next')
+Assert 'the bogus band still sorts last rather than seizing the head' ($r.Out -match 'NEXT: T20\b')
 
 # --- L. next -Claim marks the task -------------------------------------------
 ""

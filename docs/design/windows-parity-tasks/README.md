@@ -70,6 +70,9 @@ Spec, design notes, on-box evidence. Grows as the task is worked.
 | `status` | `todo` / `in-progress` / `done` / `blocked(<what>)` / `skipped(<why>)` |
 | `commits` | Commit hashes that delivered it. |
 | `seat` | Which box can do the work: `win` (default when absent) / `mac` / `any`. |
+| `priority` | What the work is WORTH, and the queue's primary sort key: `P0` severe (crash, hang, data loss, a broken feature) / `P1` feature work and UX polish (the `new` default) / `P2` infra and nice-to-have / `P3` reviewed and deliberately behind everything else. Absent means *untriaged*, which sorts behind even `P3` — "nobody has looked" is a weaker claim than "somebody looked and parked it". A value outside the set fails `validate` (T345): it would otherwise read as untriaged and silently lose its ranking. |
+| `order` | The sequence *within* one priority band. Fractional on purpose, so `set-order T500 -Order 2.5` injects between two neighbours without renumbering. Absent means unordered, which sorts LAST in the band — so `order:` cannot express "put this behind everything", and `P3` is the spelling for that. |
+| `triage-reason` | One line saying why the task carries the priority it does. Written by `set-priority -Summary`, shown by `next`. |
 | `tags` | Categories, from a closed set: `feature` / `fix` / `polish` / `perf` / `test` / `infra` / `docs` / `security`. Optional (pre-tag files have none); an unknown tag fails `validate`. The dashboard shows them on activity cards and in the task detail view, so a reader can tell user-facing work (`feature`/`fix`/`polish`) from internal work at a glance. |
 
 ## Progress log + stale in-progress resume (2026-08-05)
@@ -213,10 +216,12 @@ Nothing was dropped, including three things the first pass would have lost:
 
 **The old docs are frozen, not deleted:**
 
-- `../windows-parity-tasks.md` — the narrative sections (resume protocol,
-  **Current priorities**, key code landmarks) are still live and still worth
-  reading; its **state table** is a historical snapshot. Do not add rows to
-  it. `Current priorities` remains the ordering authority over `next`.
+- `../windows-parity-tasks.md` — the resume protocol and the key code
+  landmarks are still live and still worth reading; its **state table** is a
+  historical snapshot. Do not add rows to it. **Current priorities** was
+  frozen on 2026-08-21 (T345) once every task it named had closed: `next` is
+  the ordering authority, and the way to change what comes next is to
+  re-triage the task (`set-priority`), not to hand-maintain a list.
 - `../windows-parity-details.md` — its per-task sections were copied into the
   task files. Do not edit it; edit the task file.
 - `../windows-parity-log.md` — unchanged, still the dated session log.

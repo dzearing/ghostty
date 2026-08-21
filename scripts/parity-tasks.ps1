@@ -73,10 +73,11 @@ param(
     [string]$Session,
 
     # P0 severe (crash, hang, data loss, a broken feature) | P1 feature work and
-    # UX polish | P2 infra and nice-to-have. `next` picks P0 before P1 before
-    # P2, which is the whole point of the field: without it the loop worked in
-    # id order and shipped whatever had been logged most recently.
-    [ValidateSet('P0', 'P1', 'P2')]
+    # UX polish | P2 infra and nice-to-have | P3 reviewed and deliberately last.
+    # `next` picks P0 before P1 before P2 before P3, which is the whole point of
+    # the field: without it the loop worked in id order and shipped whatever had
+    # been logged most recently.
+    [ValidateSet('P0', 'P1', 'P2', 'P3')]
     [string]$Priority,
     # The work queue's sort key: lowest goes first. Fractional on purpose, so a
     # task can be injected between two others without renumbering the tracker.
@@ -154,8 +155,17 @@ $ValidSeats = @('win', 'mac', 'any')
 # The priority a `new` task gets when none is given. P1 is "feature work and
 # polish", which is what most parity tasks are; something severe or something
 # merely nice gets said out loud with -Priority.
+#
+# P3 is "reviewed, real, and deliberately behind everything else" (T345). It
+# exists because that sentence had no spelling: an absent priority sorts last
+# too, but it MEANS "nobody has looked at this", which is the opposite claim,
+# and `order:` cannot say it either - an unplaced task ranks MaxValue, so any
+# number you write pulls the task AHEAD of every unordered one in its band.
+# Two authors independently wrote `priority: "P3"` anyway (T499, T551) and it
+# was silently blanked to untriaged, which is why an out-of-set value is now a
+# validate failure rather than a quiet normalisation.
 $DefaultPriority = 'P1'
-$ValidPriorities = @('P0', 'P1', 'P2')
+$ValidPriorities = @('P0', 'P1', 'P2', 'P3')
 
 # The closed tag vocabulary. feature/fix/polish are the user-facing bands;
 # perf/test/infra/docs/security are the internal ones. Closed on purpose:
@@ -204,10 +214,16 @@ function ConvertFrom-Frontmatter {
     $seat = & $unquote (& $get 'seat')
     if (-not $seat) { $seat = $DefaultSeat }
 
-    # Absent priority means untriaged. It sorts AFTER P2 rather than defaulting
-    # to the middle: a task nobody has ranked should not outrank one somebody
-    # deliberately called P2.
-    $priority = & $unquote (& $get 'priority')
+    # Absent priority means untriaged. It sorts AFTER every band rather than
+    # defaulting to the middle: a task nobody has ranked should not outrank one
+    # somebody deliberately called P2.
+    #
+    # An out-of-set value still reads as untriaged for sorting - a garbled band
+    # must not seize a queue position - but the RAW text is kept so `validate`
+    # can name it. Before T345 the blanking was the whole story, so `P3` looked
+    # exactly like a task nobody had triaged and nothing ever said otherwise.
+    $priorityRaw = & $unquote (& $get 'priority')
+    $priority = $priorityRaw
     if ($priority -notin $ValidPriorities) { $priority = '' }
 
     [PSCustomObject]@{
@@ -219,6 +235,7 @@ function ConvertFrom-Frontmatter {
         Commits      = & $parseList (& $get 'commits')
         Seat         = $seat
         Priority     = $priority
+        PriorityRaw  = $priorityRaw
         TriageReason = & $unquote (& $get 'triage-reason')
         Tags         = & $parseList (& $get 'tags')
         # What has to be TRUE before this task comes back into the queue, in the
@@ -300,13 +317,16 @@ function Get-OrderRank {
     return [double]$O
 }
 
-# Sort key for a priority: P0 first, untriaged last.
+# Sort key for a priority: P0 first, then P1, P2, the deliberately-parked P3,
+# and untriaged last of all. Untriaged stays BEHIND P3 on purpose - "somebody
+# looked and put this last" is a stronger claim than "nobody looked yet".
 function Get-PriorityRank {
     param([string]$P)
     switch ($P) {
         'P0' { return 0 }
         'P1' { return 1 }
         'P2' { return 2 }
+        'P3' { return 3 }
         default { return 9 }
     }
 }
@@ -697,7 +717,7 @@ switch ($Command) {
 
     'set-priority' {
         $tid = Get-TaskId $Id
-        if (-not $Priority) { throw 'set-priority requires -Priority (P0|P1|P2).' }
+        if (-not $Priority) { throw 'set-priority requires -Priority (P0|P1|P2|P3).' }
         $path = Get-TaskPath $tid
         $text = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
         # Read the OLD priority before overwriting it, so the journal below can
@@ -908,6 +928,14 @@ switch ($Command) {
             # is exactly the silent stall this field exists to end.
             if ($ValidSeats -notcontains $t.Seat) {
                 Write-Host ("ODD SEAT: {0} = '{1}' (want one of: {2})" -f $t.Id, $t.Seat, ($ValidSeats -join ', ')); $problems++
+            }
+            # Priority is optional (untriaged is a real state), but a value
+            # outside the set is not: it reads as untriaged, so a deliberate
+            # ranking silently becomes "nobody looked at this" and the task
+            # sorts behind every band. Two files carried `P3` for weeks that
+            # way before T345 went looking (T499, T551).
+            if ($t.PriorityRaw -and $ValidPriorities -notcontains $t.PriorityRaw) {
+                Write-Host ("ODD PRIORITY: {0} = '{1}' (want one of: {2}) - it is being read as untriaged" -f $t.Id, $t.PriorityRaw, ($ValidPriorities -join ', ')); $problems++
             }
             # Tags are optional (the pre-tag tracker has none), but a tag
             # outside the vocabulary is a typo that no filter will ever match.

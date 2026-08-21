@@ -13,8 +13,11 @@ doc.) See `go.md`.
 
 1. Read `go.md` and this doc ONLY. Do NOT read the details/log/audit/spec
    docs wholesale — they are split out precisely to keep resume cheap.
-2. Pick the first task in **Current priorities** below; if that list is
-   empty, the first `todo` row in the state table whose deps are `done`.
+2. Pick the task `scripts\parity-tasks.ps1 next -Claim` hands you. That is
+   the whole selection rule as of 2026-08-21 (T345): priority, then `order:`
+   within the band, then id. **Current priorities** below is frozen history —
+   every task it names is closed — and the state table stopped being ground
+   truth on 2026-07-29. Neither is consulted any more.
 3. Read ONLY your task's section in `windows-parity-details.md`
    (Grep `^## T<id> ` for its line, then Read that slice). Before any IPC
    task, also read the "Architecture decisions (pinned)" section of
@@ -94,7 +97,18 @@ The user is stepping away: do NOT stop to ask clarifying questions; audit
 your own trail; use adversarial investigation for hard problems and
 recommended approaches where they exist.
 
-## Current priorities (user directive 2026-07-15, overrides table order)
+## Current priorities — FROZEN 2026-08-21 (T345), kept as history
+
+> **This section is no longer consulted.** It was the ordering authority from
+> 2026-07-15, and every task it names below is now `done`, `skipped(...)` or
+> `blocked(...)` — checked one by one on 2026-08-21. `scripts\parity-tasks.ps1
+> next` is the authority: priority, then `order:` within the band, then id.
+> Do not add an entry here. To change what the loop works on next, re-triage
+> the task itself (`set-priority <id> -Priority P0 -Summary "<why>"`), which
+> moves the queue head on its own and journals the transition into the task's
+> progress log — a hand-maintained list in a 1300-line doc could do neither.
+>
+> Read on only for the history of what the user asked for and when.
 
 Work these first, in order, before falling back to first-todo-in-table
 (and note that `parity-tasks.ps1 next` now orders by `priority:` before id,
@@ -1440,9 +1454,10 @@ July-5 exe (no code regression; pixel-verified on HEAD).
 > ```
 >
 > Format and full command set: `windows-parity-tasks/README.md`. Everything in
-> this table was migrated (185 files, `validate` passes). The rest of THIS file
-> — the resume protocol above and **Current priorities**, which still outranks
-> `next` — remains live and correct.
+> this table was migrated (185 files, `validate` passes). Of the rest of THIS
+> file, only the resume protocol above is still live: **Current priorities**
+> was frozen on 2026-08-21 (T345) once every task it named had closed, and
+> `next` is the ordering authority.
 
 One line per row. Full spec + validation + evidence per task:
 `windows-parity-details.md` (`## T<id>` sections).

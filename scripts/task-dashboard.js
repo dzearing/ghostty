@@ -202,10 +202,12 @@ function loadTasks() {
       // task instead of advancing it. When present this is the primary action.
       unblockDo: F['unblock-do'] == null ? null : String(F['unblock-do']),
       blockedOn: bucketOf(status) === 'blocked' ? blockedOnOf(F, status, F.unblock) : null,
-      // Triage rank (P0 severe / P1 feature+polish / P2 infra) and the one-line
-      // reason for it. Absent means untriaged, which sorts AFTER P2 — a task
-      // nobody ranked should not outrank one somebody deliberately called P2.
-      priority: /^P[012]$/.test(String(F.priority || '')) ? String(F.priority) : null,
+      // Triage rank (P0 severe / P1 feature+polish / P2 infra / P3 reviewed and
+      // deliberately last) and the one-line reason for it. Absent means
+      // untriaged, which sorts AFTER every band — a task nobody ranked should
+      // not outrank one somebody deliberately called P2, nor one somebody
+      // deliberately parked at P3 (T345).
+      priority: /^P[0123]$/.test(String(F.priority || '')) ? String(F.priority) : null,
       triageReason: F['triage-reason'] == null ? null : String(F['triage-reason']),
       // Milestone membership (the convergence cutline, 2026-08-06): the
       // completion number the user watches is measured against a milestone's
@@ -1044,7 +1046,7 @@ function buildPayload() {
   return {
     digests,
     digest: digests.length ? readDigest(digests[0]) : null,
-    priorities: ['P0', 'P1', 'P2', 'untriaged'].map((p) => ({ priority: p, open: priorities.get(p) || 0 })),
+    priorities: ['P0', 'P1', 'P2', 'P3', 'untriaged'].map((p) => ({ priority: p, open: priorities.get(p) || 0 })),
     generatedAt: now,
     pageVersion: pageVersion(),
     branch: branchName(),
