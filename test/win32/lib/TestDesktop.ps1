@@ -2120,6 +2120,28 @@ function Find-TestMessageWindow {
     return $td.FindMessageWindow((ConvertTo-TestFilter $Class), [uint32]$ProcessId)
 }
 
+<#
+A window's rectangle in SCREEN coordinates - BOTH forms (T327).
+
+    $wr = Get-TestWindowRect -Window $h            # the whole window
+    $cr = Get-TestWindowRect -Window $h -Client    # its client area
+
+-Client does NOT mean "client coordinates". It selects which RECTANGLE you
+get - the client area rather than the frame - and returns it in the same
+screen space as the other form, so `$cr.Left`/`$cr.Top` are the client
+origin's position ON SCREEN and are exactly what an offset inside the client
+is added to. A client rect that started at 0,0 would be useless here, since
+everything downstream of this function is screen-space too.
+
+That is deliberate, because it is what makes the two units line up: what
+this returns is what Send-TestMouse, Get-TestMouseRoute and the pixel probes
+all take. `$cr.Left + 40` is a screen point 40px inside the client, and it
+can be passed to any of them unconverted.
+
+The naming trap is real and has cost a red run: a local called `$cx`/`$cy`
+built from `($r.Left + $r.Right) / 2` is a screen coordinate no matter what
+it is called. Read the derivation, not the name.
+#>
 function Get-TestWindowRect {
     param([Parameter(Mandatory = $true)][IntPtr]$Window, [switch]$Client, $Desktop)
     $td = Resolve-TestDesktop $Desktop
@@ -2791,6 +2813,11 @@ run loop, and a synchronous send would block the harness's one worker thread.
 
 Not for input. Keys and clicks go through Send-TestKeys / Send-TestMouse, which
 carry the modifier state and lParam encoding those messages need.
+
+-WParam/-LParam are passed through VERBATIM: nothing here packs a point or
+converts a coordinate space (T327), so a message that carries one is the
+caller's to encode, in whatever space that message defines. The WM_APP
+protocol this exists for carries no coordinates at all.
 #>
 function Send-TestRawMessage {
     param(
@@ -2806,9 +2833,25 @@ function Send-TestRawMessage {
 <#
 Post a mouse event at a SCREEN coordinate.
 
-    Send-TestMouse -Window $top -Target $pane -X $cx -Y $cy -Button right
+    Send-TestMouse -Window $top -Target $pane -X $sx -Y $sy -Button right
     Send-TestMouse -Window $top -Target $tabstrip -X $x -Y $y -Action down
     Send-TestMouse -Window $top -Target $top -X $x -Y $y -Action move
+
+-X/-Y ARE SCREEN COORDINATES, and this function does the conversion (T327):
+it SetCursorPos'es the point and then ScreenToClient's it per target to build
+the lparam. Hand it client coordinates and they are converted a SECOND time,
+landing the click one client origin up and to the left of where you aimed -
+usually outside the control entirely. That is a silent miss, not an error:
+the post succeeds, this returns $true, and the assertion after it fails
+against a feature that works, which sends you looking in the app. It cost
+T318 exactly that (a Kill button that opened nothing because the click never
+reached it).
+
+Get the point from Get-TestWindowRect, whose BOTH forms are screen-space -
+`-Client` picks the client RECTANGLE, still positioned on screen - so an
+offset inside a control is `$r.Left + 40`, never a bare `40`. Get-TestPixel
+and the Find-/Test-ExactPixel probes are screen-space too, so a point read
+off a capture can be clicked as-is.
 
 -Target is the hwnd the message is POSTED to: posted messages skip hit
 testing, so name the window that would really have received the click (the
@@ -2911,9 +2954,14 @@ Hammer unpaced left down/up pairs round-robin across several targets.
 This is a LOAD SHAPE, not a gesture. Send-TestMouse settles ~100ms per click
 so the app can act on it; a deadlock repro needs focus changes arriving faster
 than the GUI thread drains them, which the same 1500 clicks through
-Send-TestMouse would stretch to about four minutes. -X/-Y are CLIENT
-coordinates (every target is a different window) and default to a point that
-is inside any surface.
+Send-TestMouse would stretch to about four minutes.
+
+THIS FUNCTION's -X/-Y are CLIENT coordinates, and it is the exception (T327):
+one point is posted to every target as-is, and the targets are different
+windows, so there is no single screen point that is inside all of them. The
+default is a point inside any surface. Send-TestMouse next door takes SCREEN
+coordinates and converts them itself - the two do not share a convention, so
+do not carry a point from one to the other unconverted.
 
 Returns the number of messages ACCEPTED, which is 2 * Rounds * Targets.Count
 when every post landed. ASSERT IT (T107): a storm that posted nothing - dead

@@ -12,6 +12,13 @@
 #   desktop     the window exists on the test desktop and is NOT enumerable on
 #               the interactive one, and nothing we launch ever takes
 #               foreground there (the user's actual complaint).
+#   coords      both Get-TestWindowRect forms are SCREEN space - including
+#               -Client, which picks the client RECTANGLE and still returns it
+#               positioned on screen - and it is the same space the input
+#               takes. T327 (2026-08-20): that was the unwritten assumption
+#               under every click in the suite, stated only inside the C#
+#               body. Parked off the screen origin with a negative control,
+#               so a 0,0-based rect would turn it red.
 #   focus       Focus-TestWindow, which replaces the T86 GrabForeground that
 #               cannot work off the input desktop.
 #   text        Send-TestText into a terminal -> the characters appear in
@@ -156,6 +163,42 @@ try {
 
     $r = Get-TestWindowRect -Window $top
     Assert ($r.Width -gt 100 -and $r.Height -gt 100) "Get-TestWindowRect returns a real rect ($($r.Width)x$($r.Height))"
+
+    # --- coords: BOTH rect forms are SCREEN space, and it is the same space
+    #     the input takes (T327). Every click in this suite is a screen point
+    #     built from one of these rects, so "-Client returns a screen-positioned
+    #     client rect" is the assumption under all 147 of them - and it was only
+    #     ever written down inside the C# body, where no caller reads it. A
+    #     client rect that came back 0,0-based would send every one of those
+    #     clicks one client origin up and to the left, which is a silent MISS:
+    #     the post succeeds and the assertion after it fails against a working
+    #     feature (T318 paid for that once).
+    #
+    #     Parked off the screen origin first, so the two spaces are far apart
+    #     and the check can actually fail. The negative control below is what
+    #     proves that: the same offsets read as client-relative land nowhere.
+    $homeRect = Get-TestWindowRect -Window $top
+    [void](Set-TestWindowPos -Window $top -X 220 -Y 160)
+    Start-Sleep -Milliseconds 400
+    $wr = Get-TestWindowRect -Window $top
+    $cr = Get-TestWindowRect -Window $top -Client
+    Assert ($wr.Left -ge 200 -and $wr.Top -ge 140) `
+        "coords setup: the window parked off the screen origin ($($wr.Left),$($wr.Top))"
+    Assert ($cr.Left -ge $wr.Left -and $cr.Top -ge $wr.Top -and
+            $cr.Right -le $wr.Right -and $cr.Bottom -le $wr.Bottom) `
+        "-Client returns the client rect INSIDE the window rect, i.e. in the same space ($($cr.Left),$($cr.Top))"
+    Assert ($cr.Left -ge 200) `
+        "-Client is screen-positioned, not 0,0-based (Left=$($cr.Left))"
+    # And it is the space the INPUT takes: Get-TestMouseRoute asks the window
+    # the same question Send-TestMouse asks before every post.
+    $inClient = Get-TestMouseRoute -Window $top -X ($cr.Left + 8) -Y ($cr.Top + 8)
+    Assert ($inClient.Code -ne 0) `
+        "a point built off the client rect hit-tests ON the window (code $($inClient.Code))"
+    $asIfClient = Get-TestMouseRoute -Window $top -X 8 -Y 8
+    Assert ($asIfClient.Code -eq 0) `
+        'negative control: the same offset read as CLIENT-relative hit-tests nowhere (HTNOWHERE)'
+    [void](Set-TestWindowPos -Window $top -X $homeRect.Left -Y $homeRect.Top)
+    Start-Sleep -Milliseconds 400
 
     # --- focus: what replaces GrabForeground off the input desktop.
     Assert (Focus-TestWindow -Window $top -Child $pane) 'Focus-TestWindow reports focus taken'
