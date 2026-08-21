@@ -371,6 +371,10 @@ class IPCServer {
         // A path or http(s) URL to open as a viewer pane instead of a terminal
         // (mutually exclusive with command/-e).
         var view: String?
+        // The pane the command was invoked FROM: `$GHOZTTY_PANE_ID`, forwarded
+        // by the CLI as `--caller-pane=`. A DEFAULT anchor only — see
+        // `callerAnchorPane`.
+        var callerPane: String?
         // When true, `+new-window` mirrors the keyboard/menu "New Window" action:
         // it resolves the focused/preferred window as the parent and inherits its
         // REMOTE host + command + cwd (§WP4). Lets the inheriting path be driven
@@ -660,6 +664,14 @@ class IPCServer {
                 )
             }
             return .ok
+        }
+
+        // No explicit anchor: split off the pane this command was invoked FROM
+        // rather than whatever window is focused by the time we get here.
+        // Assigning `parsed.pane` routes it down the ordinary `--pane` path, so
+        // a caller-anchored split is the same split an explicit one would be.
+        if let callerPane = callerAnchorPane(parsed) {
+            parsed.pane = callerPane
         }
 
         // Resolve --pane targeting: find the named pane (terminal surface or
@@ -1584,6 +1596,13 @@ class IPCServer {
                         result = IPCResponse(success: false, error: "target window '\(target)' not found")
                         return
                     }
+                } else if let callerController = self.callerAnchorController(parsed) {
+                    // "Rearrange this window" means the caller's window, not
+                    // whichever one the user has clicked into since. Same race
+                    // as `+split`, same fix; the layout names panes that live in
+                    // a particular window, so the focused-window guess made the
+                    // command fail outright as often as it moved the wrong one.
+                    controller = callerController
                 } else {
                     controller = TerminalController.preferredParent
                     if controller == nil {
@@ -2082,6 +2101,55 @@ class IPCServer {
         Ghostty.SurfaceView.adjustPaletteForContrast(surface: surface, background: resolved)
     }
 
+    /// The pane a command with no explicit target should anchor at: the one it
+    /// was invoked FROM (`$GHOZTTY_PANE_ID`, which the CLI forwards as
+    /// `--caller-pane=`), or nil to keep the `preferredParent` focused-window
+    /// fallback.
+    ///
+    /// This is the ONE place the app consumes the caller's pane, as
+    /// `apprt.ipc.seedCallerPane` is the ONE place the CLI produces it. It
+    /// exists because `preferredParent` is read on the main queue at HANDLE
+    /// time: the user can switch windows between the CLI invocation and the
+    /// app's turn, and an agent's command is asynchronous with respect to
+    /// focus even when nobody touches anything.
+    ///
+    /// Three ways to get nil, all of them ordinary:
+    ///
+    ///   * The caller named an anchor of its own. `--target`, `--pane`, and
+    ///     `--from-focused` all say where the command should land, and each
+    ///     wins over the environment's default.
+    ///   * Nothing was forwarded — a plain non-Ghoztty shell, or a pane baked
+    ///     by an app/agent that predates the flag.
+    ///   * The pane id no longer resolves. A script outliving its own pane is
+    ///     normal, so this falls back rather than failing the command — which
+    ///     is exactly why the CLI sends `--caller-pane=` and not `--pane=`,
+    ///     where a name that resolves to nothing is a typo and a hard error.
+    static func callerAnchorPane(
+        _ parsed: ParsedArguments,
+        isAlive: (String) -> Bool
+    ) -> String? {
+        guard parsed.target == nil,
+              parsed.pane == nil,
+              !parsed.fromFocused,
+              let caller = parsed.callerPane,
+              !caller.isEmpty,
+              isAlive(caller)
+        else { return nil }
+        return caller
+    }
+
+    /// `callerAnchorPane` against the live registry.
+    private func callerAnchorPane(_ parsed: ParsedArguments) -> String? {
+        Self.callerAnchorPane(parsed, isAlive: { self.resolveTarget($0)?.isAlive == true })
+    }
+
+    /// The window owning the pane the command was invoked from, for the
+    /// commands that act on a WINDOW rather than anchoring beside a pane.
+    private func callerAnchorController(_ parsed: ParsedArguments) -> TerminalController? {
+        guard let pane = callerAnchorPane(parsed) else { return nil }
+        return resolveTarget(pane)?.controller
+    }
+
     private static func parseSplitDirection(_ value: String) -> SplitTree<PaneView>.NewDirection? {
         switch value.lowercased() {
         case "right": return .right
@@ -2170,6 +2238,11 @@ class IPCServer {
 
             if let value = arg.dropPrefix("--pane=") {
                 result.pane = String(value)
+                continue
+            }
+
+            if let value = arg.dropPrefix("--caller-pane=") {
+                result.callerPane = String(value)
                 continue
             }
 

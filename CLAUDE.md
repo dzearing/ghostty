@@ -27,7 +27,9 @@ ghoztty +split --direction=right|down|left|up --target=<name> --name=<name> --co
 ```
 
 - `--direction`: Split direction. Default: `right`.
-- `--target`: Named window to split in (default: most recently focused).
+- `--target`: Named window to split in. Default: **the pane the command was
+  invoked from** (see Caller anchoring), falling back to the most recently
+  focused window.
 - `--name`: Register the new pane with a name for later targeting.
 - `--view`: Open a **viewer** pane (see Viewer Panes below) instead of a terminal — a file (markdown, HTML rendered as a live page, or code), a website, or a **git diff** (`git-status:` / `git-diff:<revspec>`, see Git diff panes). Mutually exclusive with `--command`/`-e`. Works with `--pane` targeting, including splitting off an existing viewer pane.
 
@@ -313,6 +315,36 @@ Every pane has a **stable, ghoztty-owned pane id** (a UUID):
 Prefer the pane id over pid/tty matching for self-identification: pids and ttys
 belong to the machine the process runs on and are meaningless for remote panes.
 (`+list --tty=<tty>` still works for local panes as a fallback.)
+
+### Caller anchoring
+
+A command that needs a pane or window and was given none anchors at **the pane
+it was invoked from**, not at whatever window happens to be focused. The CLI
+forwards `$GHOZTTY_PANE_ID` as `--caller-pane=<id>`; the app prefers it over
+`TerminalController.preferredParent`.
+
+This is the same shape as Instance addressability below (the CLI reads a baked
+env var; one resolution site each side) and exists for the same reason: the
+default used to be read on the app's **main queue at handle time**, so the
+answer was whichever window was key by then. An agent in pane A asking for a
+viewer side pane, plus a user clicking window B in the meantime, put the pane in
+B. The race does not need a user, either — an agent's command is asynchronous
+with respect to focus.
+
+- **Applies to `+split` and `+rearrange`.** Both took the focused-window
+  fallback. `+new-window` creates a window and needs no anchor, and
+  `--from-focused` (on `+split` and `+new-window`) is the caller asking for the
+  focused window BY NAME, so neither changed.
+- **Anything explicit wins**: `--target`, `--pane`, `--from-focused`.
+- **Absent or empty ⇒ today's behavior**, so a CLI run from a plain non-Ghoztty
+  shell, or from a pane baked by an older app/agent, is unchanged.
+- **A pane id that no longer resolves falls back rather than failing** — a
+  script outliving its own pane is ordinary. That is why the wire flag is
+  `--caller-pane=` and not `--pane=`: an explicit `--pane=` naming nothing is a
+  typo and stays a hard error.
+- One resolution site each side: `apprt.ipc.seedCallerPane()`
+  (`src/apprt/ipc.zig`) for the CLI, `IPCServer.callerAnchorPane` (Swift) for
+  the server.
 
 ### Instance addressability
 

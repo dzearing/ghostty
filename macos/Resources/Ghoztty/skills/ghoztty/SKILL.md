@@ -33,6 +33,12 @@ call `+list` to figure it out.
 | `$GHOZTTY_WINDOW_NAME` | The name of the window this pane is in, when it has one. |
 | `$GHOZTTY_IPC_SOCKET` | The IPC socket of the app instance that owns this pane. The CLI reads it automatically — you never pass it, but it is why commands reach *this* app (e.g. a debug build) rather than whichever build is on `$PATH`. |
 
+The CLI reads `$GHOZTTY_PANE_ID` automatically too: a `+split` or `+rearrange`
+that names no target anchors at **your** pane, not at whatever window the user
+has clicked into. You still write it out in the examples below — it says out
+loud where the pane is going, and it is what makes a command work on an older
+Ghoztty — but forgetting it no longer sends the split to another window.
+
 **So "open a side pane here" is one command:**
 
 ```bash
@@ -41,10 +47,11 @@ ghoztty +split --pane="$GHOZTTY_PANE_ID" --direction=right
 
 Rules that follow from this:
 
-- **Target your own pane explicitly.** A bare `+split` goes to the *most recently
-  focused* window — if the user clicks another window between their request and
-  your command, the split lands in the wrong place. `--pane="$GHOZTTY_PANE_ID"`
-  is immune to focus changes.
+- **Say which pane you mean.** `--pane="$GHOZTTY_PANE_ID"` is what a bare
+  `+split` now does anyway, so the two land in the same place — but writing it
+  keeps the intent readable, and it still works against an older Ghoztty, where
+  a bare `+split` went to whichever window was focused when the app got the
+  message. Pass `--target=<window>` when you mean a *different* window.
 - **Do not pass `--working-directory` for a plain split.** A new split inherits
   the parent pane's cwd. Passing your own cwd overrides it, and the two diverge
   as soon as the shell `cd`s somewhere.
@@ -93,8 +100,8 @@ ghoztty +split [flags]
 | Flag | Description |
 |------|-------------|
 | `--direction=right\|down\|left\|up` | Split direction. Default: `right`. |
-| `--target=<name>` | Window or pane to split in — a name from `--target`/`--name`, or any pane id (e.g. `$GHOZTTY_PANE_ID`, no registration needed). Default: most recently focused window. |
-| `--pane=<name-or-id>` | Split adjacent to this specific pane instead of the focused one. Use `--pane="$GHOZTTY_PANE_ID"` to split off your own pane regardless of what the user has focused. |
+| `--target=<name>` | Window or pane to split in — a name from `--target`/`--name`, or any pane id (e.g. `$GHOZTTY_PANE_ID`, no registration needed). Default: **your own pane** (`$GHOZTTY_PANE_ID`), falling back to the most recently focused window when there is none. |
+| `--pane=<name-or-id>` | Split adjacent to **this exact pane** — where `--target` anchors at whichever pane its window has focused. Your own pane is now the default, so reach for this to name a *different* pane, or to state the anchor out loud (`--pane="$GHOZTTY_PANE_ID"`). Unlike the implicit default, a `--pane` that names nothing is an error, not a fallback. |
 | `--name=<name>` | Register the new pane with a name. If it already exists, focuses it instead. |
 | `--command=<cmd>` | Command to run in the new pane. Auto-wrapped in the user's login shell with profile loaded. |
 | `--view=<path-or-url>` | Open the new pane as a **viewer** (rendered markdown / live HTML page / highlighted code / website) instead of a terminal. Relative paths resolve against `--working-directory` (else caller cwd). Mutually exclusive with `--command`/`-e`. This is the way to "open a file/README/doc in a side pane". |
@@ -192,8 +199,8 @@ ghoztty +split --pane="$GHOZTTY_PANE_ID" --direction=right --name=status \
   --working-directory=/path/to/project --view=git-status:
 
 # one commit, and an arbitrary range
-ghoztty +split --name=commit  --view=git-diff:a1b2c3d
-ghoztty +split --name=release --view=git-diff:v1.2.0..v1.3.0
+ghoztty +split --pane="$GHOZTTY_PANE_ID" --name=commit  --view=git-diff:a1b2c3d
+ghoztty +split --pane="$GHOZTTY_PANE_ID" --name=release --view=git-diff:v1.2.0..v1.3.0
 
 ghoztty +reload --target=diff        # re-run after new commits land
 ```
@@ -223,7 +230,8 @@ you set this up once and every edit re-renders automatically (no `+reload`).
 
 ```bash
 # From your working pane: doc preview fills the right 2/3
-ghoztty +split --direction=right --split-percent=66 --name=preview --view=docs/design/spec.md
+ghoztty +split --pane="$GHOZTTY_PANE_ID" --direction=right --split-percent=66 \
+  --name=preview --view=docs/design/spec.md
 # ...keep editing docs/design/spec.md — the preview re-renders on each save.
 ```
 
@@ -235,8 +243,8 @@ server, no `+reload`.
 
 ```bash
 # Preview the mock in the right 2/3 — that's the whole setup
-ghoztty +split --direction=right --split-percent=66 --name=preview \
-  --view=/path/to/app/index.html
+ghoztty +split --pane="$GHOZTTY_PANE_ID" --direction=right --split-percent=66 \
+  --name=preview --view=/path/to/app/index.html
 # ...keep editing index.html — the page re-renders on each save.
 ```
 
@@ -258,12 +266,12 @@ after edits.
 
 ```bash
 # 1. Run the dev server from a work pane stacked below your session (left third)
-ghoztty +split --direction=down --name=server \
+ghoztty +split --pane="$GHOZTTY_PANE_ID" --direction=down --name=server \
   --working-directory=/path/to/app --command="npm run dev"
 
 # 2. Preview the running app in the right 2/3
-ghoztty +split --direction=right --split-percent=66 --name=preview \
-  --view=http://localhost:3000
+ghoztty +split --pane="$GHOZTTY_PANE_ID" --direction=right --split-percent=66 \
+  --name=preview --view=http://localhost:3000
 
 # 3. After each edit, refresh the preview (URL viewers don't live-reload)
 ghoztty +reload --target=preview
@@ -271,10 +279,11 @@ ghoztty +reload --target=preview
 
 **Locking the exact 1/3-stacked ⁄ 2/3-preview layout.** When you have several
 work panes and want them tiled deterministically in the left third with the
-preview pinned to the right 2/3, name every pane and `+rearrange`:
+preview pinned to the right 2/3, name every pane and `+rearrange`. With no
+`--target` it rearranges the window you are running in:
 
 ```bash
-ghoztty +rearrange --target=<window> --layout='{
+ghoztty +rearrange --layout='{
   "direction": "horizontal",
   "ratio": 33,
   "left": {
@@ -414,7 +423,7 @@ ghoztty +rearrange [flags]
 
 | Flag | Description |
 |------|-------------|
-| `--target=<name>` | Window to rearrange. Default: most recently focused window. |
+| `--target=<name>` | Window to rearrange. Default: **your own window** (the one holding `$GHOZTTY_PANE_ID`), falling back to the most recently focused window when there is none. |
 | `--layout=<json>` | JSON layout descriptor (required). See format below. |
 
 **Layout JSON format:**

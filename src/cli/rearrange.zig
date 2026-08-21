@@ -50,7 +50,9 @@ pub const Options = struct {
 /// Flags:
 ///
 ///   * `--target=<name>`: The target window name to rearrange. If not
-///     specified, the most recently focused window is used.
+///     specified, the window containing the calling pane
+///     (`$GHOZTTY_PANE_ID`) is used, falling back to the most recently
+///     focused window when there is no such pane.
 ///
 ///   * `--layout=<json>`: A JSON layout descriptor. The layout is a tree
 ///     of split nodes and leaf panes:
@@ -94,6 +96,8 @@ fn runArgs(
     var arena = ArenaAllocator.init(alloc_gpa);
     defer arena.deinit();
     const alloc = arena.allocator();
+
+    try ipc.seedCallerPane(alloc, &opts._arguments);
 
     sendRearrange(alloc, opts._arguments.items, stderr) catch |err| switch (err) {
         error.NoRunningInstance => {
