@@ -57,6 +57,35 @@ zig build -Dapp-runtime=win32 -Doptimize=Debug      # -> zig-out\bin\ghoztty.exe
   roots at `src/main.zig` and reaches no build logic at all); "cannot tell" is
   always answered as "no mismatch", so a POSIX seat, a UNC checkout, or a
   same-drive CI box is untouched.
+- **A bare `error: Unexpected` from zig means the drive is full, not that the
+  code is red** (T1054). Zig never evicts its build cache: every distinct build
+  hash keeps its whole output under `.zig-cache\o\<hash>\`, and a debug
+  `ghoztty.exe` is 48 MB with a 100 MB `.pdb` beside it, so this repo produces
+  roughly 40 GB a day that nothing removes. On 2026-08-21 that reached exactly 0
+  bytes free on `D:` — 31,359 entries, 1,235 GB — and every floor lane then died
+  in five seconds with that one line, naming no file, no line and no disk.
+
+  Two mechanisms now stand in front of it, and both live outside `build.zig`
+  because a build that cannot start cannot diagnose itself:
+
+  - `scripts\go-loop-exec.ps1 claim` runs `scripts\build-cache.ps1 sweep` once a
+    turn. It asks the cheap questions only — free space on the cache drives
+    (O(1)) and one non-recursive count of `.zig-cache\o` — and when either is
+    over its limit it deletes the caches **whole** and prints what it reclaimed.
+    Whole, not by age: pruning `o\` alone leaves the manifests in `h\` naming
+    outputs that no longer exist, and the next build fails with `failed to spawn
+    build runner ... FileNotFound`, which is a worse message than the one being
+    fixed. `build-cache.ps1 check` reports without deleting; `clear -Force` is
+    the manual hatch.
+  - `scripts\floor-lane.ps1` refuses to launch a lane below 10 GB free and says
+    `FLOOR PREFLIGHT FAIL: less than N GB free - the build cache needs pruning`,
+    with the command to run. Same class of fix as `GlobalCacheOnDifferentDrive`
+    above: when the ENVIRONMENT is at fault, say so rather than relaying a
+    message about something else.
+
+  Acceptance: `test\win32\build-cache.ps1`. Stale `zig-out-*` staging copies and
+  `.dumps` are **reported and never deleted** — they sit outside a cache, so
+  "entirely regenerable" is an assumption rather than a fact.
 - **`-Doptimize=Debug` is not optional**, and the reason is not speed — it is
   **endpoint isolation** (T350). The IPC pipe, the local agent's pipe and the
   state directory are all derived from the build mode: `is_debug` (Debug or

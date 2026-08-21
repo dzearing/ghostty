@@ -230,6 +230,23 @@ switch ($Action) {
         # never enforced: a claim that could exit nonzero over a stale stamp
         # would wedge the loop, which is the disease and not the cure. The teeth
         # are in `parity-tasks.ps1 validate`, at the pre-commit gate.
+        # T1054: zig never evicts its build cache and this repo builds all day,
+        # so the drive fills on roughly a monthly clock - and a full drive does
+        # not announce itself. Every floor lane dies in five seconds with a bare
+        # `error: Unexpected` from zig, which reads as red code, so a turn can
+        # spend its whole context on a compiler error that is really a disk.
+        # Reported (and cleared) HERE because this is the one command every turn
+        # runs before it needs the disk, and because clearing is only safe when
+        # no lane is mid-build - which at claim time is guaranteed. Never fatal
+        # and never nonzero: a claim that can fail over housekeeping wedges the
+        # loop. The check itself is O(1) on free space plus one non-recursive
+        # directory enumeration, so a healthy box pays nothing for it.
+        $cacheScript = Join-Path $PSScriptRoot 'build-cache.ps1'
+        if (Test-Path -LiteralPath $cacheScript) {
+            $cacheOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $cacheScript sweep -Repo $Repo 2>&1 | Out-String
+            foreach ($line in ($cacheOut -split "`r?`n")) { if ($line.Trim()) { "  $($line.Trim())" } }
+        }
+
         $dueScript = Join-Path $PSScriptRoot 'guard-due.ps1'
         if (Test-Path -LiteralPath $dueScript) {
             $dueOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $dueScript check -Repo $Repo 2>&1 | Out-String

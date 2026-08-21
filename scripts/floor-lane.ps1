@@ -117,6 +117,12 @@ param(
     # do that with a fixture of its own rather than by leaking a real agent
     # test binary, which is the thing under investigation.
     [string[]]$ExtraTestExeNames = @(),
+    # Refuse to launch a zig lane when the repo or global cache drive has less
+    # than this free (T1054). 10 GB, not 1: zig needs room for a whole cache
+    # entry plus link output, and a lane that starts and dies at 500 MB free
+    # produces the same unreadable `error: Unexpected` as one that starts at
+    # zero. -MinFreeGB 0 disables the gate.
+    [double]$MinFreeGB = 10,
     [switch]$SelfTest
 )
 
@@ -140,6 +146,10 @@ $ErrorActionPreference = 'Stop'
 # Counts, explains and reaps test binaries that are still running after their
 # lane reported a verdict (T837) -- a leak the webview sweep below cannot see.
 . "$PSScriptRoot\lib\LaneLeak.ps1"
+# Free-space accounting for the build caches (T1054), so a lane that cannot
+# possibly build says "the drive is full" instead of relaying zig's
+# `error: Unexpected`.
+. "$PSScriptRoot\lib\BuildCache.ps1"
 
 # Exit codes, named so a caller does not have to guess.
 $EXIT_PASS = 0
@@ -172,12 +182,11 @@ foreach ($n in @($ExtraTestExeNames)) { if ($n) { $TEST_EXE_NAMES += $n } }
 
 function Resolve-CacheDir {
     param([string]$RepoPath, [string]$Explicit)
-    if ($Explicit) { return $Explicit }
-    if ($env:ZIG_GLOBAL_CACHE_DIR) { return $env:ZIG_GLOBAL_CACHE_DIR }
-    # CLAUDE.md: the global cache MUST sit on the repo's drive, or zig 0.15.2's
-    # build runner panics in convertPathArg before any test runs.
-    $drive = (Split-Path -Qualifier $RepoPath)
-    return (Join-Path $drive '\zig-global-cache')
+    # One copy of the rule, in lib\BuildCache.ps1 (T1054). It used to live here
+    # too, and the cache sweeper needs the same answer: two spellings of "where
+    # is the global cache" are two things free to disagree about which pile to
+    # measure and which to clear.
+    return (Resolve-ZigGlobalCacheDir -RepoPath $RepoPath -Explicit $Explicit)
 }
 
 function Get-ProcessTree {
@@ -638,6 +647,41 @@ if ($Command) {
         'TIMEOUT' { exit $EXIT_TIMEOUT }
     }
     exit $EXIT_FAIL
+}
+
+# DISK PREFLIGHT (T1054). When the drive is full zig fails in about five
+# seconds with a bare `error: Unexpected` and no file, no line and no mention of
+# a disk -- which reads as red code and has cost a turn its whole context. This
+# is the same class of fix as T243's `GlobalCacheOnDifferentDrive`: when the
+# ENVIRONMENT is the fault, say so in the error instead of relaying a message
+# about something else. Checked before the first lane launches, so nothing zig
+# prints can be mistaken for the reason.
+if ($MinFreeGB -gt 0) {
+    $short = @()
+    $seenDrives = @{}
+    foreach ($d in @($Repo, $cacheDir)) {
+        if (-not $d) { continue }
+        $qual = Split-Path -Qualifier ([System.IO.Path]::GetFullPath($d))
+        # Both paths are normally on the same drive (T243 requires it), and one
+        # drive is one number: reporting it twice reads like two problems.
+        if ($seenDrives.ContainsKey($qual)) { continue }
+        $seenDrives[$qual] = $true
+        $free = Get-DriveFreeGB -Path $d
+        if ($null -ne $free -and $free -lt $MinFreeGB) {
+            $short += "$qual has $free GB free (checked via $d)"
+        }
+    }
+    if ($short.Count -gt 0) {
+        Write-Host ''
+        foreach ($s in $short) { Write-Host "DISK: $s" }
+        Write-Host "FLOOR PREFLIGHT FAIL: less than $MinFreeGB GB free - the build cache needs pruning."
+        Write-Host "  powershell -NoProfile -File scripts\build-cache.ps1 clear -Force"
+        Write-Host "  (no lane was launched; zig would have failed with a bare 'error: Unexpected')"
+        Write-Host ''
+        Write-Host "FLOOR SUMMARY: preflight=FAIL"
+        Write-Host 'FLOOR NOT GREEN'
+        exit $EXIT_FAIL
+    }
 }
 
 # `lib` runs first: it is the cheapest lane by far and it is a pure compile, so

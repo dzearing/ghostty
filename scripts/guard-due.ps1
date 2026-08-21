@@ -1419,6 +1419,24 @@ $GuardTable = @(
             'test\win32\build-fresh-guard.ps1'
         )
     },
+    # The build-cache sweeper and the floor lane's disk pre-flight (T1054). The
+    # thing being protected is a diagnosis, not a feature: when the drive is
+    # full zig fails in five seconds with a bare `error: Unexpected` and names
+    # nothing, so a regression here does not look like a regression - it looks
+    # like the code being red, which is what cost a turn its whole context on
+    # 2026-08-21. Neither floor lane nor P1-P3 exercises the sweeper, and the
+    # `sweep` path in particular DELETES, so it must not be able to drift
+    # unwatched. Non-interactive, launches nothing, a few seconds.
+    [pscustomobject]@{
+        Name   = 'build-cache'
+        Script = 'test\win32\build-cache.ps1'
+        Stamp  = 'test\win32\build-cache.stamp.json'
+        Covers = @(
+            'scripts\lib\BuildCache.ps1',
+            'scripts\build-cache.ps1',
+            'test\win32\build-cache.ps1'
+        )
+    },
     # The resize paint path (T1031). `resize_paint.zig` is the rule that says a
     # pane which already holds pixels must NOT blank itself ahead of the GL
     # frame, and the acceptance script asks a live pane that same question
