@@ -403,6 +403,16 @@ ring/snapshot/gap-fill replay, HELLO handshake):
     confirmation before resetting**: *"Upgrading will reset all windows.
     Continue?"* Never silently reset live sessions, and never silently replay
     across a version the handshake flagged as incompatible.
+  - **A newer bundled BUILD is not such a case, and must never raise that
+    confirmation** (T1056). `proto_version` is negotiated in HELLO and a mismatch
+    is fatal there, so an agent the app can talk to has already agreed the wire
+    contract, and every capability since rides an additive list that degrades on
+    its own. A stale-but-compatible agent is therefore left strictly alone while
+    anything is live and adopted at the next quiet moment — the last window
+    closing, a handoff draining, or the next cold start. Mac's 1.33.0 update
+    ended 95 live sessions on this path before the rule was written down. The
+    confirmation exists for the skew the handshake actually flags, where the app
+    cannot reach the sessions to save them and there is no other way back.
 
   The mandatory-update process is the safety net that makes breaking changes
   survivable; the HELLO handshake is what lets us detect when we need it. Build
@@ -534,9 +544,11 @@ closed. Five things here are contract:
 - **`capability.agent_handoff` is advertised by BOTH sides and negotiated as the
   intersection.** The agent advertises it only where the mechanism exists
   (comptime Windows-only today; the Mac half is increment 5). An app that does not
-  advertise it keeps the pre-T907 policy — refresh at idle, confirm while live —
-  because standing down on a promise it cannot hear about would leave the agent
-  stale forever. The app-side policy arm is `agent_upgrade.Action.handoff_now`.
+  advertise it keeps the pre-T907 policy — refresh at idle, and since T1056
+  leave it alone while live — because standing down on a promise it cannot hear
+  about would leave the agent stale forever. The app-side policy arm is
+  `agent_upgrade.Action.handoff_now`; the leave-alone arms are
+  `Reason.stale_live_deferred` and `Reason.stale_handoff_draining`, both `.none`.
 - **The test seam is `GHOZTTY_AGENT_HANDOFF_FORCE=1`, debug builds only.** One
   tree cannot produce two build stamps, so without it no acceptance script could
   reach the handoff arm at all. It skips ONLY the staleness comparison — never

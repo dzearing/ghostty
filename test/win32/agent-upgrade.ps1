@@ -15,47 +15,64 @@
 #      below rests on it, so it is asserted rather than assumed.
 #   B: negative control - a CURRENT agent is never touched. No dialog, same
 #      agent pid, pane still responsive after a full check cycle.
-#   C: stale + a live session => the MANDATORY confirmation, and NOTHING is
-#      killed before the user answers. Declining ("Later") leaves the agent pid
-#      and the live pane exactly as they were - the contract assert.
-#   D: stale + accept => the agent is actually replaced (new pid) and the panes
-#      come back IN PLACE (same app pid, same window/pane count, pane responsive
-#      again on the RELAUNCHed shell).
-#   E: the deferral promise - after declining, closing the last pane makes the
-#      agent idle, and the refresh then happens SILENTLY (new agent pid, no
-#      second dialog). "Ghoztty updates automatically the next time no sessions
-#      are open" is a promise the code has to keep.
+#   C: stale + a live session => NOTHING HAPPENS. No dialog, the same agent pid,
+#      the live pane untouched, and the decision logged as a deliberate
+#      leave-alone. This is T1056's contract assert (see below).
+#   E: the adoption promise - closing the last pane makes the agent idle, and the
+#      refresh then happens SILENTLY (new agent pid, no dialog anywhere in the
+#      arm). "Ghoztty updates automatically the next time no sessions are open"
+#      is a promise the code has to keep, and it is the whole reason leaving a
+#      live agent alone costs the user nothing.
 #   F: negative control - session-persistence=off never runs the check at all.
+#   H: T229/T1056 - the user's shape: RESTORED windows, several BUSY sessions, a
+#      stale agent. The app leaves every one of them alone. This is the arm that
+#      stands for the 95 sessions the Mac 1.33.0 update tombstoned.
+#   I: negative control - a refresh that CANNOT re-dial says so, and the app
+#      stays up. Driven through the skew path, the only one that still restarts
+#      an agent whose sessions are live.
 #   J: T125 - a PROTOCOL SKEW (the handshake itself fails, so there is no
-#      connection to judge) takes the same mandatory-update path, and answering
-#      it actually replaces the agent.
+#      connection to judge) takes the mandatory-update path, and answering it
+#      actually replaces the agent, leaves the full step trail, and brings the
+#      panes back in place.
 #   K: T125 negative control - a skew where the AGENT is the newer side is never
 #      acted on. The app is the out-of-date one; downgrading it would eat
 #      sessions a newer app could still have attached to.
-#   L: T907 - handoff-capable, but a session the agent owns DIRECTLY is still
-#      live => the confirmation still appears, now saying the update installs
-#      itself once that session closes. Also the POSITIVE CONTROL for arm M's
-#      no-dialog claim: same build, same wait, same timeout, a dialog found.
+#   L: T907/T1056 - handoff-capable, but a session the agent owns DIRECTLY is
+#      still live => the update drains and nobody is asked to hurry it along.
 #   M: T907 - handoff-capable and every live session holder-backed => the app
 #      STANDS DOWN. No dialog, the decision logged as such, no destructive
 #      restart attempted, and the agent's own replacement carries the session
 #      across.
 #
-# T1037 - WHICH stale agent still raises that confirmation, because the answer
-# changed under this harness and nothing was obliged to notice. T907 gave the
-# agent the ability to replace ITSELF without losing a session, and the app's
-# policy changed with it: a running agent that advertises
-# `capability.agent_handoff` and owns nothing but holder-backed sessions is
-# stood down from, not restarted, so there is no dialog and nothing for the user
-# to answer. Arm M is where that contract is asserted, and anyone re-reading
-# "the confirmation never appears" as a regression should start there.
+# T1056 - what a STALE BUILD may cost the user, which is now nothing. An app
+# update replaces ghoztty-agent.exe while the running agent keeps every PTY
+# attached, and the staleness check used to read that build-stamp gap as grounds
+# for a restart. It is not one: proto_version is negotiated in HELLO and a
+# mismatch is fatal there, so an agent we can talk to has already agreed the wire
+# contract, and everything since rides additive capabilities that degrade on
+# their own. Mac's 1.33.0 update took that path and tombstoned 95 live sessions
+# for a binary refresh nothing required.
 #
-# The confirmation is therefore the LEGACY-generation path, and arms C/D/E/H/I
-# produce one deliberately with `GHOSTTY_AGENT_SUPPRESS_CAPS=agent_handoff` (the
-# T469 test seam): the agent this tree builds then advertises what a pre-T907
-# agent advertised, so it cannot replace itself and the restart is the only way
-# to update it. Each of those arms asserts `handoff-capable=false` in the
-# decision line, so an arm cannot silently stop exercising the case it names.
+# So the mandatory confirmation is now reserved for a skew the handshake actually
+# flags as incompatible - arms J and I - and arms C/E/H/L assert that a stale
+# BUILD produces no dialog and no restart while anything is live. Anyone reading
+# "the confirmation never appears for a stale agent" as a regression should start
+# here: it is the fix.
+#
+# T1037 - WHICH stale agent lands on WHICH policy arm, because the answer has
+# changed twice under this harness and nothing was obliged to notice. T907 gave
+# the agent the ability to replace ITSELF without losing a session (arm M);
+# T1056 then made every OTHER live-session arm a leave-alone too. The three are
+# told apart only by the decision line, so arms C/E/H/L each assert the reason
+# they are named for rather than just "no dialog".
+#
+# Arms C/E/H/I run as the LEGACY generation via
+# `GHOSTTY_AGENT_SUPPRESS_CAPS=agent_handoff` (the T469 test seam): the agent
+# this tree builds then advertises what a pre-T907 agent advertised, so it cannot
+# replace itself. That is the generation with the most to lose from a restart -
+# it has no handoff to fall back on - and each of those arms asserts
+# `handoff-capable=false` in the decision line, so an arm cannot silently stop
+# exercising the case it names.
 #
 # The staleness INPUT is faked with GHOZTTY_AGENT_BUNDLED_VERSION (a debug-only
 # hook): every stamp in a real build comes from the same binary the agent runs,
@@ -415,16 +432,25 @@ Assert "B7 the no-op decision is logged with its reason" `
 Stop-TestProcs
 
 # ============================================================================
-Say "== C: stale LEGACY agent + a live session => mandatory confirmation, nothing killed yet"
+Say "== C: stale LEGACY agent + a live session => the app leaves it strictly alone"
 # ============================================================================
-# T1037: a stale agent only raises this dialog when it cannot replace itself -
-# since T907 a handoff-capable one is stood down from instead (arm M). So the
-# agent for arms C-I is made a pre-T907 one at the source: suppressing the
-# capability in its HELLO is the whole difference between the two generations,
-# and it is what a box that has not yet taken the agent-side update actually
-# advertises. Set here and left set through arm K; the new arms at the end clear
-# it. The agent reads it once at startup, so it must be in place BEFORE the app
-# spawns one - which is why Stop-TestProcs at the end of B matters.
+# THE T1056 contract assert. The agent is stale, it cannot replace itself (a
+# pre-T907 generation), and it owns a live session - the exact state that used to
+# put a modal on screen offering to end that session for a binary refresh. The
+# app must now do nothing at all: the running agent is protocol-compatible by the
+# fact that we are talking to it, so the newer build costs the user nothing until
+# the next quiet moment (arm E) and everything to adopt right now.
+#
+# Measured as three separate facts, because each of them failed differently in
+# the field: no dialog (the user is not asked), the same agent pid (nothing was
+# restarted behind the ask), and a responsive pane (the session survived).
+#
+# T1037: the agent for arms C-I is made a pre-T907 one at the source. Suppressing
+# the capability in its HELLO is the whole difference between the two
+# generations, and it is what a box that has not yet taken the agent-side update
+# actually advertises. Set here and left set through arm K; the new arms at the
+# end clear it. The agent reads it once at startup, so it must be in place BEFORE
+# the app spawns one - which is why Stop-TestProcs at the end of B matters.
 $env:GHOSTTY_AGENT_SUPPRESS_CAPS = 'agent_handoff'
 $env:GHOZTTY_AGENT_BUNDLED_VERSION = $FAKE_NEW
 $appPidC = Start-App $tmp 't147-stale-decline'
@@ -434,96 +460,58 @@ Assert "C1 the GUI came up" ($appPidC -ne 0)
 $agentC = Wait-AgentPid $tmp 25
 Assert "C2 an agent is running for this run" ($agentC -ne 0)
 
-$dlgC = Wait-Dialog $appPidC 40
-Assert "C3 the mandatory confirmation appeared" ($dlgC -ne [IntPtr]::Zero)
-if ($dlgC -ne [IntPtr]::Zero) {
-    $title = Get-TestWindowText -Window $dlgC
-    Say "    dialog title: '$title'"
-    Assert "C4 it names the background process restart" ($title -like '*background terminal process*')
-    # "Mandatory" is a modality claim, and IsWindowEnabled on the owner is the
-    # only cross-process-safe way to check it: ConfirmDialog.show disables its
-    # owner for exactly as long as it is up. Nothing asserted this before the
-    # T217 migration - the old script could only see that a window existed.
-    Assert "C4b the owner window is DISABLED while the confirmation is up" `
-        (($topC -ne [IntPtr]::Zero) -and (-not (Test-TestWindowEnabled -Window $topC)))
-}
-# THE contract assert: consent comes BEFORE the destruction, not after.
+# The decision has to be logged even though nothing happens - in fact
+# ESPECIALLY because nothing happens. This arm's whole outcome is an absence, and
+# an absence is indistinguishable from a check that never ran unless the check
+# says what it decided (T201). The clause also has to be THIS arm's: a
+# leave-alone that silently became "current" or "bundled unknown" would pass
+# every other assert here while measuring nothing.
+Assert "C3 the decision is logged as a deliberate leave-alone" `
+    (Wait-LogMatch $logC 'agent upgrade check: stale with live sessions, but protocol-compatible; leaving it alone' 25)
+# T1037: and that the agent under test really is the generation with the most to
+# lose - a pre-T907 one, which cannot replace itself. Without this, the day the
+# seam stops working this arm silently becomes a re-test of arm M.
+Assert "C4 the agent under test really is the legacy generation" `
+    (Wait-LogMatch $logC 'agent upgrade check: stale with live sessions.*handoff-capable=false' 25)
+
+# THE contract assert, in three parts. Give the app the same wall-clock it used
+# to need to raise the dialog before concluding there is none.
+$dlgC = Wait-Dialog $appPidC 25
 if ($NegativeControl) {
-    Say 'NEGATIVE CONTROL: asserting the agent was killed BEFORE the user answered - this run MUST fail'
-    Assert "C5 the agent was destroyed while the dialog was still up (inverted)" ((Agent-Pid $tmp) -ne $agentC)
+    Say 'NEGATIVE CONTROL: asserting the stale agent DID raise a confirmation - this run MUST fail'
+    Assert "C5 a confirmation was raised for a stale-but-compatible agent (inverted)" ($dlgC -ne [IntPtr]::Zero)
 } else {
-    Assert "C5 the agent is still alive and unchanged while the dialog is up" ((Agent-Pid $tmp) -eq $agentC)
+    Assert "C5 NO confirmation was raised (a build gap is not the user's problem)" `
+        ($dlgC -eq [IntPtr]::Zero)
 }
-
-# THE T201 assert, and it must run HERE -- before the dialog is answered.
-# `ConfirmDialog.show` pumps its own loop and does not return until the user
-# acts, which can be never; every message the old code emitted was contingent on
-# that answer. So a live, correctly-working confirmation left the log ending at
-# "bundled agent build is ..." and nothing more, indistinguishable from a check
-# that decided nothing or never ran. (Field case, 2026-07-30: a dialog sat on a
-# second monitor for ~20 minutes and the log gave no evidence it existed.)
-Assert "C9 the decision is logged while the dialog is STILL UP" `
-    (Wait-LogMatch $logC 'agent upgrade check: stale with live sessions, confirmation required' 20)
-# T1037: and that it is THIS arm's decision. Without this, the day the seam
-# stops working the whole C-I block silently becomes a test of some other
-# policy arm that happens to end in the same dialog.
-Assert "C9b the agent under test really is the legacy generation" `
-    (Wait-LogMatch $logC 'agent upgrade check: stale with live sessions.*handoff-capable=false' 20)
-Assert "C10 the pending modal announces itself before it blocks" `
-    (Wait-LogMatch $logC 'showing mandatory restart confirmation.*waiting for the user' 20)
-Assert "C11 the dialog is still up after those asserts (they did not race it)" `
-    ((Find-Dialog $appPidC) -ne [IntPtr]::Zero)
-
-if ($dlgC -ne [IntPtr]::Zero) {
-    # ConfirmDialog reads WM_KEYDOWN off its own nested pump, so a posted
-    # Escape reaches it without any foreground grab.
-    $r = Send-TestControlKey -Control $dlgC -Key Escape
-    Say "    Escape => $r"
-}
-Assert "C6 the dialog closed on 'Later'" (Wait-NoDialog $appPidC 15)
-Assert "C6b the owner window is enabled again once the modal is gone" `
+Assert "C6 the owner window was never disabled by a modal" `
     (($topC -ne [IntPtr]::Zero) -and (Test-TestWindowEnabled -Window $topC))
-Start-Sleep -Seconds 3
-Assert "C7 declining left the agent running (same pid)" ((Agent-Pid $tmp) -eq $agentC)
+Assert "C7 the agent is still running, untouched (same pid)" ((Agent-Pid $tmp) -eq $agentC)
+# "Left alone" means left alone: `agent restart: begin` is the first line of the
+# destructive path (H/J), so its absence is the checkable form of "the app
+# touched nothing".
+Assert "C8 the app attempted no destructive restart of its own" `
+    ((Read-AppLog $logC) -notmatch 'agent restart: begin')
 $treeC = Wait-Panes $tmp 'c0' 1
 $leafC = (All-Leaves $treeC)[0]
-Assert "C8 the live pane survived the decline" (Test-PaneResponsive $tmp $leafC.id 'c')
+Assert "C9 the live pane is still responsive" (Test-PaneResponsive $tmp $leafC.id 'c')
 Stop-TestProcs
 
 # ============================================================================
-Say "== D: stale + 'Update Now' => the agent is replaced and panes come back"
+Say "== E: the adoption promise - the agent refreshes SILENTLY once it goes idle"
 # ============================================================================
-$appPidD = Start-App $tmp 't147-stale-accept'
-Assert "D1 the GUI came up" ($appPidD -ne 0)
-$agentD = Wait-AgentPid $tmp 25
-Assert "D2 an agent is running for this run" ($agentD -ne 0)
-$dlgD = Wait-Dialog $appPidD 40
-Assert "D3 the confirmation appeared" ($dlgD -ne [IntPtr]::Zero)
-if ($dlgD -ne [IntPtr]::Zero) { Say "    Update Now => $(Confirm-Update $dlgD)" }
-Assert "D4 the dialog closed on 'Update Now'" (Wait-NoDialog $appPidD 15)
-$agentD2 = Wait-AgentPid $tmp 30 $agentD
-Assert "D5 the agent was REPLACED (new pid)" ($agentD2 -ne 0 -and $agentD2 -ne $agentD)
-Assert "D6 the old agent is gone" (@(Get-Process -Id $agentD -ErrorAction SilentlyContinue).Count -eq 0)
-# In place: the app never relaunched.
-Assert "D7 the app is the SAME process (in-place, not a relaunch)" (@(Get-Process -Id $appPidD -ErrorAction SilentlyContinue).Count -eq 1)
-$treeD = Wait-Panes $tmp 'd0' 1 40
-Assert "D8 the window still has its pane" ((Leaf-Count $treeD) -ge 1)
-$leafD = (All-Leaves $treeD)[0]
-Assert "D9 the rebuilt pane is responsive on the new agent" (Test-PaneResponsive $tmp $leafD.id 'd')
-Stop-TestProcs
-
-# ============================================================================
-Say "== E: the deferral promise - idle after a decline refreshes SILENTLY"
-# ============================================================================
+# This is the other half of arm C, and the reason C costs the user nothing:
+# leaving a stale agent alone is only acceptable if it is genuinely adopted at
+# the next quiet moment. Here that moment is made to arrive - the last window
+# closes, the agent goes idle, and the refresh happens with no UI at all.
 $appPidE = Start-App $tmp 't147-idle'
 $logE = $script:AppLog
 Assert "E1 the GUI came up" ($appPidE -ne 0)
 $agentE = Wait-AgentPid $tmp 25
 Assert "E2 an agent is running for this run" ($agentE -ne 0)
-$dlgE = Wait-Dialog $appPidE 40
-Assert "E3 the confirmation appeared (a session is live)" ($dlgE -ne [IntPtr]::Zero)
-if ($dlgE -ne [IntPtr]::Zero) { Send-TestControlKey -Control $dlgE -Key Escape | Out-Null }
-Assert "E4 the dialog closed on 'Later'" (Wait-NoDialog $appPidE 15)
+Assert "E3 the stale agent was left alone while its session was live" `
+    (Wait-LogMatch $logE 'agent upgrade check: stale with live sessions, but protocol-compatible' 25)
+Assert "E4 the live agent was not restarted (same pid)" ((Agent-Pid $tmp) -eq $agentE)
 $treeE = Wait-Panes $tmp 'e0' 1
 $winE = (Windows-Of $treeE)[0]
 # Close the only window: its session ENDS (user close intent), so the agent goes
@@ -539,8 +527,8 @@ while ((Get-Date) -lt $deadline) {
 }
 Assert "E5 the window actually closed (the agent is now idle)" $closed
 $agentE2 = Wait-AgentPid $tmp 40 $agentE
-Assert "E6 the idle agent was refreshed without asking again (new pid)" ($agentE2 -ne 0 -and $agentE2 -ne $agentE)
-Assert "E7 no second dialog was shown" ((Find-Dialog $appPidE) -eq [IntPtr]::Zero)
+Assert "E6 the idle agent was refreshed without ever asking (new pid)" ($agentE2 -ne 0 -and $agentE2 -ne $agentE)
+Assert "E7 no dialog was shown anywhere in this arm" ((Find-Dialog $appPidE) -eq [IntPtr]::Zero)
 # The silent arm is the one most in need of a log line: it restarts the agent
 # with no UI at all, so the log is the ONLY record that it happened.
 Assert "E8 the silent idle refresh is logged with its reason" `
@@ -564,23 +552,23 @@ Assert "F4 no decision line at all with persistence off" `
 Stop-TestProcs
 
 # ============================================================================
-Say "== H: T229 - the user's shape: RESTORED windows, several BUSY sessions"
+Say "== H: T1056 - the user's shape: RESTORED windows, several BUSY sessions, a stale agent"
 # ============================================================================
-# Arm D above passes with ONE freshly-created window holding ONE idle pane, and
-# it passed right through the field failure. What the user actually hits is
+# Arm C passes with ONE freshly-created window holding ONE idle pane. What the
+# user actually hits - and what cost 95 sessions on Mac's 1.33.0 update - is
 # different in three ways, all of which this arm reproduces:
 #
 #   * the app RESTORED its windows from the manifest, so every pane is an
 #     ATTACH to a session the agent already owned rather than a fresh spawn;
 #   * there is more than one window and more than one session; and
-#   * the sessions are STREAMING. An idle cmd.exe leaves the agent
-#     connection's reader/writer threads parked, which is the one state in
-#     which the blocking `Connection.shutdown` join on the GUI thread cannot
-#     wedge - i.e. the state arm D measures.
+#   * the sessions are STREAMING - real work in flight, the thing the user
+#     would actually mourn.
 #
-# The oracle is the same as D's (the app survives, the panes come back), plus
-# the T229 step trail: a hang inside the destructive restart used to leave the
-# log ending at the confirm, with no way to tell WHICH step it stopped in.
+# The oracle is that ALL of it survives the app noticing a stale agent: no
+# dialog, no restart, three panes still answering. Before T1056 this arm asked
+# the user to end all three for a binary refresh, and the accepted path is what
+# T229 was filed for - so the destructive machinery those asserts covered now
+# lives in arm J, which still reaches it through the skew.
 $env:GHOZTTY_AGENT_BUNDLED_VERSION = $null
 $appPidH1 = Start-App $tmp 't229-build'
 Assert "H1 the layout GUI came up" ($appPidH1 -ne 0)
@@ -609,74 +597,35 @@ $env:GHOZTTY_AGENT_BUNDLED_VERSION = $FAKE_NEW
 $appPidH2 = Start-App $tmp 't229-restore'
 $logH = $script:AppLog
 Assert "H5 the restoring GUI came up" ($appPidH2 -ne 0)
-$dlgH = Wait-Dialog $appPidH2 40
-Assert "H6 launch-restore found the stale agent and asked" ($dlgH -ne [IntPtr]::Zero)
-if ($dlgH -ne [IntPtr]::Zero) { Confirm-Update $dlgH }
-Assert "H7 the dialog closed on 'Update Now'" (Wait-NoDialog $appPidH2 15)
-$agentH2 = Wait-AgentPid $tmp 40 $agentH
-Assert "H8 the agent was REPLACED (new pid)" ($agentH2 -ne 0 -and $agentH2 -ne $agentH)
-# THE assert this arm exists for. The field report is "the dialog disappears
-# and Ghoztty never comes back"; a survivor that logged nothing is what made it
-# undiagnosable.
-Assert "H9 the app SURVIVED the refresh it promised to survive" `
+Assert "H6 the restored layout came back" ((Leaf-Count (Wait-Panes $tmp 'h3' 3 60)) -ge 3)
+Assert "H7 the restoring app found the stale agent and said so" `
+    (Wait-LogMatch $logH 'agent upgrade check: stale with live sessions, but protocol-compatible' 40)
+Assert "H8 ... reporting the generation that cannot replace itself" `
+    (Wait-LogMatch $logH 'agent upgrade check: stale with live sessions.*handoff-capable=false' 40)
+# THE assert this arm exists for, in the shape the user reported it. Same wait
+# the dialog needed when this arm still raised one.
+$dlgH = Wait-Dialog $appPidH2 25
+if ($NegativeControl) {
+    Say 'NEGATIVE CONTROL: asserting the restored busy layout WAS offered up for a restart - this run MUST fail'
+    Assert "H9 a confirmation was raised over the restored busy sessions (inverted)" ($dlgH -ne [IntPtr]::Zero)
+} else {
+    Assert "H9 NO confirmation was raised over the restored busy sessions" ($dlgH -eq [IntPtr]::Zero)
+}
+Assert "H10 the agent that owns all three sessions was never restarted" ((Agent-Pid $tmp) -eq $agentH)
+Assert "H11 the app attempted no destructive restart of its own" `
+    ((Read-AppLog $logH) -notmatch 'agent restart: begin')
+Assert "H12 the app is still running" `
     (@(Get-Process -Id $appPidH2 -ErrorAction SilentlyContinue).Count -eq 1)
-$treeH2 = Wait-Panes $tmp 'h3' 3 60
-Assert "H10 all three panes came back" ((Leaf-Count $treeH2) -ge 3)
-Assert "H11 the destructive restart leaves a step trail (begin)" `
-    (Wait-LogMatch $logH 'agent restart: begin' 20)
-Assert "H12 ... and names the step that can wedge (retiring the connection)" `
-    (Wait-LogMatch $logH 'agent restart: retiring the shared connection' 20)
-Assert "H13 ... and the step after it (terminate)" `
-    (Wait-LogMatch $logH 'agent restart: terminating agent pid' 20)
-Assert "H14 the refresh reports its OUTCOME, not just its intent" `
-    (Wait-LogMatch $logH 'destructive agent refresh finished: \d+ window\(s\) rebuilt' 30)
-Assert "H15 the in-place rebuild logged how many windows it rebuilt" `
-    (Wait-LogMatch $logH 'in-place recovery: rebuilt \d+ window\(s\)' 30)
-# T421. H9 asserts the app survived; these assert that it would have been
-# BROUGHT BACK if it had not. The guard is armed inside the confirmed path
-# itself, so this is the only place the arming half is exercised end to end -
-# `test\win32\relaunch-guard.ps1` drives the watching half directly.
-Assert "H16 T421: the destructive window is SUPERVISED (guard armed)" `
-    (Wait-LogMatch $logH 'relaunch guard: ARMED \(guard pid \d+ watching app pid \d+' 30)
-Assert "H17 T421: ... and disarmed once the rebuild finished" `
-    (Wait-LogMatch $logH 'relaunch guard: disarmed' 30)
-# The marker is what a guard keys on; a leaked one would make the NEXT app exit
-# look like a death inside a refresh.
-$markerH = Join-Path $tmp 'ghoztty\agent-refresh-debug.marker'
-Assert "H18 T421: the guard marker is gone afterwards" (-not (Test-Path $markerH))
-# The identity gate (T421): the pid out of port.json is verified to be the agent
-# before it is killed, so a stale/recycled pid can never make this a self-kill.
-Assert "H19 T421: the kill target was VERIFIED as the agent binary first" `
-    (Wait-LogMatch $logH "agent restart: pid \d+ verified as '.*ghoztty-agent\.exe'" 30)
-Assert "H20 T421: ... and the terminate step reports that it returned" `
-    (Wait-LogMatch $logH 'agent restart: pid \d+ terminate returned' 30)
-# T426. Four times the app ended cleanly INSIDE that terminate call, and the
-# only mechanism consistent with all four is a shared kill-on-close job dying
-# with the process being killed. The refresh now measures that BEFORE the kill,
-# because by the time it matters the app is gone and nobody can ask.
-Assert "H21 T426: the refresh records the job facts before the kill" `
-    (Wait-LogMatch $logH 'agent restart: job facts before the kill' 30)
-# ... and records the ANSWER, not just the question. `?` for every field would
-# satisfy the line above while measuring nothing.
-Assert "H22 T426: ... including whether the agent shares OUR job" `
-    (Wait-LogMatch $logH 'SHARED_JOB=(yes|no)' 30)
-# The structural half: the agent this build spawns is not in the app's job in
-# the first place, so there is no shared job left to tear down. Direct
-# membership probe: test\win32\agent-job-escape.ps1.
-Assert "H23 T426: the agent spawn NAMES which job escape it got" `
-    (Wait-LogMatch $logH 'spawned local agent pid \d+ \(job escape=[^)]+\)' 30)
-# Escaping is environment-dependent - tier 1 needs a job chain that permits
-# breakaway (this box's does not: ACCESS_DENIED, measured) and tier 2 needs a
-# shell window, which THIS harness's background test desktop does not have. So
-# the invariant asserted here is the one that holds everywhere: a degraded
-# spawn is LOUD. The outcome itself - the agent is not a member of the app's
-# job, and survives its teardown - is measured directly by
-# test\win32\agent-job-escape.ps1, which runs on a desktop that has a shell.
-$logTextH = Read-AppLog $logH
-$escapedH = $logTextH -match 'spawned local agent pid \d+ \(job escape=(breakaway|shell-parent)\)'
-$loudH = $logTextH -match 'local agent pid \d+ is INSIDE this app''s job object'
-Assert "H24 T426: it either escaped, or said out loud that it did not" `
-    ($escapedH -or $loudH)
+# The user-visible half: the busy sessions are still THERE, on the agent nobody
+# touched. Retried per pane because these are streaming and a single write can
+# land in a repaint - what has to survive is the pane, not one keystroke.
+$aliveH = 0
+foreach ($lf in (All-Leaves (Get-List $tmp 'h4' 15))) {
+    for ($i = 1; $i -le 3; $i++) {
+        if (Test-PaneResponsive $tmp $lf.id "h$($lf.id)-$i" 20) { $aliveH++; break }
+    }
+}
+Assert "H13 all three busy sessions survived (they were never at risk)" ($aliveH -ge 3)
 Stop-TestProcs
 
 # ============================================================================
@@ -689,9 +638,10 @@ Say "== I: negative control - a refresh that CANNOT re-dial says so"
 # agent binary is gone, so find-or-spawn cannot succeed) and the requirement is
 # that the app SAYS so and STAYS UP, rather than vanishing.
 #
-# The staleness input still comes from the debug stamp hook, which returns
-# before it ever touches the binary - so a missing binary breaks the SPAWN
-# without also disabling the check.
+# Driven through the SKEW, because since T1056 that is the only trigger left
+# that restarts an agent on purpose - a stale build is left alone (arms C/H).
+# The skew input is the agent-side proto hook, which the agent reads at startup
+# and which is independent of whether its binary is still on disk afterwards.
 #
 # The break has to be arranged BEFORE the app starts: a process gets a SNAPSHOT
 # of the environment at CreateProcess time, so changing GHOSTTY_LOCAL_AGENT_BIN
@@ -707,14 +657,15 @@ New-Item -ItemType Directory -Force $agentCopyDir | Out-Null
 $agentCopy = Join-Path $agentCopyDir 'ghoztty-agent.exe'
 Copy-Item $AgentExe $agentCopy -Force
 $env:GHOSTTY_LOCAL_AGENT_BIN = $agentCopy
-$env:GHOZTTY_AGENT_BUNDLED_VERSION = $FAKE_NEW
+$env:GHOZTTY_AGENT_BUNDLED_VERSION = $null
+$env:GHOZTTY_AGENT_PROTO_VERSION = '0'
 $appPidI = Start-App $tmp 't229-nodial'
 $logI = $script:AppLog
 Assert "I1 the GUI came up" ($appPidI -ne 0)
 $agentI = Wait-AgentPid $tmp 25
 Assert "I2 an agent is running for this run" ($agentI -ne 0)
-$dlgI = Wait-Dialog $appPidI 40
-Assert "I3 the confirmation appeared" ($dlgI -ne [IntPtr]::Zero)
+$dlgI = Wait-Dialog $appPidI 60
+Assert "I3 the skew confirmation appeared" ($dlgI -ne [IntPtr]::Zero)
 # Break the spawn between the ask and the answer. Rename, not delete: the copy
 # is the running agent's own image.
 Rename-Item $agentCopy (Join-Path $agentCopyDir 'ghoztty-agent.bak') -Force -ErrorAction SilentlyContinue
@@ -724,7 +675,7 @@ if ($dlgI -ne [IntPtr]::Zero) { Confirm-Update $dlgI }
 # Not Wait-NoDialog: the FAILURE dialog (I7) is itself a GhozttyConfirmDialog,
 # so "no dialog" is never true here and would score a working fix as broken.
 Assert "I4 the confirmation was answered with 'Update Now'" `
-    (Wait-LogMatch $logI 'user confirmed destructive agent refresh' 25)
+    (Wait-LogMatch $logI 'user confirmed destructive agent restart to clear a protocol skew' 25)
 Assert "I5 the app is STILL RUNNING after a failed refresh" `
     (@(Get-Process -Id $appPidI -ErrorAction SilentlyContinue).Count -eq 1)
 Assert "I6 the failed re-dial is logged as an ABORT, not silence" `
@@ -732,6 +683,7 @@ Assert "I6 the failed re-dial is logged as an ABORT, not silence" `
 Assert "I7 the user is TOLD, in the same modal channel that asked for consent" `
     ((Wait-LogMatch $logI 'agent refresh failed; telling the user' 30) -and `
      ((Wait-TestWindow -ProcessId $appPidI -Class 'GhozttyConfirmDialog' -TimeoutMs 20000) -ne [IntPtr]::Zero))
+$env:GHOZTTY_AGENT_PROTO_VERSION = $null
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 Stop-TestProcs
 
@@ -785,6 +737,86 @@ $agentJ2 = Wait-AgentPid $tmp 40 $agentJ
 Assert "J10 the skewed agent was REPLACED (new pid)" ($agentJ2 -ne 0 -and $agentJ2 -ne $agentJ)
 Assert "J11 the app survived the restart it promised to survive" `
     (@(Get-Process -Id $appPidJ -ErrorAction SilentlyContinue).Count -eq 1)
+# --- the destructive-restart machinery (T229/T421/T426) ----------------------
+# These asserts used to hang off the staleness path (arms D and H), which since
+# T1056 no longer restarts anything while a session is live. The machinery is
+# unchanged and shared - `restartForUpgrade` + `recoverLocalAgentInPlace`, one
+# restart story rather than two - so it is measured here instead, on the only
+# trigger that still reaches it. Losing them with arm D would have left the
+# whole T229 step trail untested at HEAD.
+#
+# What this arm can and cannot reach, measured rather than assumed: the KILL half
+# runs in full (every line below fires), but the RE-DIAL that follows it cannot
+# succeed here. The app got GHOZTTY_AGENT_PROTO_VERSION in its environment
+# SNAPSHOT at CreateProcess time, so every agent it spawns afterwards - the
+# replacement included - is skewed too, and clearing the variable in this harness
+# afterwards is invisible to it. The run therefore ends in `in-place recovery
+# ABORTED`, which is a real production shape (arm I is where the user being told
+# about it is asserted) but not the successful-rebuild one. That half is measured
+# by OUTCOME rather than by a log line, in `test/win32/agent-recovery.ps1` arm H
+# (surfaces replaced, sessions alive, pane responsive, topology intact) and in
+# `test/win32/holder-adopt.ps1`.
+$treeJ = Wait-Panes $tmp 'j0' 1 60
+Assert "J12 the window still has its pane after the restart" ((Leaf-Count $treeJ) -ge 1)
+$leafJ = (All-Leaves $treeJ)[0]
+# Deliberately not "responsive ON THE NEW AGENT": with the re-dial aborted this
+# pane is not agent-backed, and claiming otherwise would be a pass that means
+# something it does not.
+Assert "J13 the app's pane still works after the restart" (Test-PaneResponsive $tmp $leafJ.id 'j')
+# T229: a hang inside the destructive restart used to leave the log ending at
+# the confirm, with no way to tell WHICH step it stopped in.
+Assert "J14 the destructive restart leaves a step trail (begin)" `
+    (Wait-LogMatch $logJ 'agent restart: begin' 25)
+Assert "J15 ... and names the step that can wedge (retiring the connection)" `
+    (Wait-LogMatch $logJ 'agent restart: retiring the shared connection' 25)
+Assert "J16 ... and the step after it (terminate)" `
+    (Wait-LogMatch $logJ 'agent restart: terminating agent pid' 25)
+Assert "J17 the restart reports its OUTCOME, not just its intent" `
+    (Wait-LogMatch $logJ 'protocol-skew agent restart finished: \d+ window\(s\) rebuilt' 40)
+# T421. J11 asserts the app survived; this asserts that it would have been
+# BROUGHT BACK if it had not. The guard is armed inside the confirmed path
+# itself, so this is the only place the arming half is exercised end to end -
+# `test/win32/relaunch-guard.ps1` drives the watching half directly. Its DISARM
+# is deliberately NOT asserted here: after the aborted re-dial the app raises the
+# modal failure notice, which blocks the very function whose `defer` would
+# disarm, so the guard stays armed and its marker stays on disk for as long as
+# that notice is up. Filed as its own defect (T1069) rather than measured as
+# correct here.
+Assert "J18 T421: the destructive window is SUPERVISED (guard armed)" `
+    (Wait-LogMatch $logJ 'relaunch guard: ARMED \(guard pid \d+ watching app pid \d+' 30)
+# The identity gate (T421): the pid out of port.json is verified to be the agent
+# before it is killed, so a stale/recycled pid can never make this a self-kill.
+Assert "J19 T421: the kill target was VERIFIED as the agent binary first" `
+    (Wait-LogMatch $logJ "agent restart: pid \d+ verified as '.*ghoztty-agent\.exe'" 30)
+Assert "J20 T421: ... and the terminate step reports that it returned" `
+    (Wait-LogMatch $logJ 'agent restart: pid \d+ terminate returned' 30)
+# T426. Four times the app ended cleanly INSIDE that terminate call, and the
+# only mechanism consistent with all four is a shared kill-on-close job dying
+# with the process being killed. The restart now measures that BEFORE the kill,
+# because by the time it matters the app is gone and nobody can ask.
+Assert "J21 T426: the restart records the job facts before the kill" `
+    (Wait-LogMatch $logJ 'agent restart: job facts before the kill' 30)
+# ... and records the ANSWER, not just the question. `?` for every field would
+# satisfy the line above while measuring nothing.
+Assert "J22 T426: ... including whether the agent shares OUR job" `
+    (Wait-LogMatch $logJ 'SHARED_JOB=(yes|no)' 30)
+# The structural half: the agent this build spawns is not in the app's job in
+# the first place, so there is no shared job left to tear down. Direct
+# membership probe: test\win32\agent-job-escape.ps1.
+Assert "J23 T426: the agent spawn NAMES which job escape it got" `
+    (Wait-LogMatch $logJ 'spawned local agent pid \d+ \(job escape=[^)]+\)' 30)
+# Escaping is environment-dependent - tier 1 needs a job chain that permits
+# breakaway (this box's does not: ACCESS_DENIED, measured) and tier 2 needs a
+# shell window, which THIS harness's background test desktop does not have. So
+# the invariant asserted here is the one that holds everywhere: a degraded
+# spawn is LOUD. The outcome itself - the agent is not a member of the app's
+# job, and survives its teardown - is measured directly by
+# test\win32\agent-job-escape.ps1, which runs on a desktop that has a shell.
+$logTextJ = Read-AppLog $logJ
+$escapedJ = $logTextJ -match 'spawned local agent pid \d+ \(job escape=(breakaway|shell-parent)\)'
+$loudJ = $logTextJ -match 'local agent pid \d+ is INSIDE this app''s job object'
+Assert "J24 T426: it either escaped, or said out loud that it did not" `
+    ($escapedJ -or $loudJ)
 Stop-TestProcs
 
 # ============================================================================
@@ -814,25 +846,23 @@ $env:GHOZTTY_AGENT_PROTO_VERSION = $null
 Stop-TestProcs
 
 # ============================================================================
-Say "== L: T907 - handoff-capable, but a session it owns DIRECTLY holds it back"
+Say "== L: T907/T1056 - handoff-capable, but a session it owns DIRECTLY holds it back"
 # ============================================================================
-# The mixed-generation box, and the arm that keeps the confirmation honest: the
-# agent CAN replace itself, but a ConPTY it owns in-process cannot be carried
-# across a process boundary at any price, so the update drains instead - each
-# such session that closes brings it nearer. The confirmation is still offered,
-# because forcing it early is the only thing left for a user to decide, and the
-# dialog says the waiting is happening so "Later" is a promise rather than a
-# deferral into silence.
+# The mixed-generation box: the agent CAN replace itself, but a ConPTY it owns
+# in-process cannot be carried across a process boundary at any price, so the
+# update drains instead - each such session that closes brings it nearer.
+#
+# Until T1056 the confirmation was still offered here, on the argument that
+# forcing it early was the only thing left for a user to decide. Forcing it early
+# meant ending those sessions, which is the act the fix removes: waiting costs
+# the user nothing (the agent is compatible) and forcing costs them their work.
+# So this arm now measures the same absence arms C and H do, and is told apart
+# from them only by its reason clause.
 #
 # Built by keeping the capability and taking the HOLDERS away: with
 # GHOZTTY_AGENT_PTY_HOLDER=0 every session this agent spawns is one it owns
 # directly, which is exactly the state a box in the middle of the T909 rollout
 # is in.
-#
-# It is also the POSITIVE CONTROL for arm M below. "No dialog appeared" is only
-# evidence when the same wait, against the same build, on the same desktop, is
-# known to find one - otherwise M would pass just as well against a harness that
-# had lost the ability to see dialogs at all.
 $env:GHOSTTY_AGENT_SUPPRESS_CAPS = $null
 $env:GHOZTTY_AGENT_PTY_HOLDER = '0'
 $env:GHOZTTY_AGENT_BUNDLED_VERSION = $FAKE_NEW
@@ -842,22 +872,16 @@ Assert "L1 the GUI came up" ($appPidL -ne 0)
 $agentL = Wait-AgentPid $tmp 25
 Assert "L2 an agent is running for this run" ($agentL -ne 0)
 $dlgL = Wait-Dialog $appPidL 40
-Assert "L3 the confirmation still appears while a legacy session is live" `
-    ($dlgL -ne [IntPtr]::Zero)
-if ($dlgL -ne [IntPtr]::Zero) {
-    Assert "L4 it is the SAME dialog the staleness path uses" `
-        ((Get-TestWindowText -Window $dlgL) -like '*background terminal process*')
-    # Asked of the dialog's OWN owner rather than the window this arm launched
-    # with: the app owns the modal to `windows.items[0]`, and by this point it
-    # has restored the windows the previous arms left in the manifest, so the
-    # hwnd Start-App happened to find first is not reliably the one that was
-    # disabled. C4b can cache it because arm C opens with a single window.
-    $ownerL = Get-TestWindowOwner -Window $dlgL
-    Assert "L4b the owner window is DISABLED while it is up (mandatory, not advisory)" `
-        (($ownerL -ne [IntPtr]::Zero) -and (-not (Test-TestWindowEnabled -Window $ownerL)))
+if ($NegativeControl) {
+    Say 'NEGATIVE CONTROL: asserting the draining agent DID raise a confirmation - this run MUST fail'
+    Assert "L3 a confirmation was raised while the update drains (inverted)" ($dlgL -ne [IntPtr]::Zero)
+} else {
+    Assert "L3 NO confirmation appears while the update drains" ($dlgL -eq [IntPtr]::Zero)
 }
-# The decision, not just the dialog: this arm and arm C end in the same window,
-# and only the log says which policy arm produced it.
+Assert "L4 the app attempted no destructive restart of its own" `
+    ((Read-AppLog $logL) -notmatch 'agent restart: begin')
+# The decision, not just the absence: this arm, arm C and arm M all end in "no
+# dialog", and only the log says which policy arm produced it.
 Assert "L5 the decision names the DRAINING reason, not the legacy one" `
     (Wait-LogMatch $logL 'agent upgrade check: stale and self-replacing, but sessions the agent owns directly must close first' 25)
 # At least one legacy session, and the capability still advertised - the two
@@ -866,15 +890,10 @@ Assert "L5 the decision names the DRAINING reason, not the legacy one" `
 # arms left in the manifest, so "how many" is history, not policy.
 Assert "L6 ... and reports the agent as handoff-capable with a legacy session" `
     (Wait-LogMatch $logL 'agent upgrade check: stale and self-replacing.*, [1-9]\d* of them legacy, handoff-capable=true' 25)
-# Same contract as C5: consent comes BEFORE the destruction.
-Assert "L7 nothing was killed while the dialog was up" ((Agent-Pid $tmp) -eq $agentL)
-if ($dlgL -ne [IntPtr]::Zero) { Send-TestControlKey -Control $dlgL -Key Escape | Out-Null }
-Assert "L8 the dialog closed on 'Later'" (Wait-NoDialog $appPidL 15)
-Start-Sleep -Seconds 3
-Assert "L9 declining left the agent running (same pid)" ((Agent-Pid $tmp) -eq $agentL)
+Assert "L7 the agent was not restarted (same pid)" ((Agent-Pid $tmp) -eq $agentL)
 $treeL = Wait-Panes $tmp 'l0' 1
 $leafL = (All-Leaves $treeL)[0]
-Assert "L10 the legacy session survived the decline" (Test-PaneResponsive $tmp $leafL.id 'l')
+Assert "L8 the legacy session is still responsive" (Test-PaneResponsive $tmp $leafL.id 'l')
 Stop-TestProcs
 
 # ============================================================================
@@ -928,7 +947,11 @@ if ($NegativeControl) {
     Assert "M6 a confirmation was raised for a handoff-capable agent (inverted)" `
         ((Wait-Dialog $appPidM 20) -ne [IntPtr]::Zero)
 } else {
-    # Arm L just proved this same wait finds a dialog when there is one.
+    # "No dialog appeared" is only evidence when the same wait, against the same
+    # build, on the same desktop, is known to find one. Arm L used to be that
+    # positive control; since T1056 it is a no-dialog arm too, so the control is
+    # arms J and I - the skew confirmation, found by this same Wait-Dialog
+    # earlier in this run.
     Assert "M6 NO confirmation was raised (nothing for the user to consent to)" `
         ((Wait-Dialog $appPidM 20) -eq [IntPtr]::Zero)
 }
@@ -973,7 +996,16 @@ Stop-TestProcs
     $env:GHOZTTY_AGENT_PTY_HOLDER = $savedHolder
     $env:GHOZTTY_AGENT_HANDOFF_FORCE = $savedForce
     $env:GHOZTTY_AGENT_HANDOFF_INTERVAL_MS = $savedInterval
-    Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+    # The per-run root holds every arm's APP LOG, and a failing Wait-LogMatch
+    # assert is answerable only from it - so a failure that needs the log costs a
+    # whole second run today, with the evidence deleted again at the end of it.
+    # Set GHOZTTY_TEST_KEEP_ROOT=1 to keep it (and print where it is); unset,
+    # which is every CI and sweep run, this is byte-identical to before.
+    if ($env:GHOZTTY_TEST_KEEP_ROOT -eq '1') {
+        Say "KEEPING test root for inspection: $root"
+    } else {
+        Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+    }
 }
 
 $fgSeen = @(Stop-TestForegroundWatch)

@@ -1,8 +1,8 @@
 {
     "guard":  "printclient-audit",
     "script":  "test/win32/printclient-audit.ps1",
-    "generated":  "2026-08-21T02:34:00-07:00",
-    "commit":  "442d36b12",
+    "generated":  "2026-08-21T10:37:05-07:00",
+    "commit":  "ea429c401",
     "files":  {
                   "src/apprt/win32/activity_actions.zig":  "9f5cfa4c1238fd023d5c8a1d80790ae21751be5f7389662e2fe1b790fef8ad63",
                   "src/apprt/win32/activity_borrow.zig":  "8be5e4ba3e61feeaf28f2d7027fbadb5607c7e5541562795e984c9dc4a2e43a7",
@@ -22,10 +22,10 @@
                   "src/apprt/win32/agent_integration_service.zig":  "96462ad4254afc51d65f9c2b3e7f076096b0e9b7a930a9c0ae317cf09ffe2b08",
                   "src/apprt/win32/agent_integrations_vm.zig":  "42b753ce83ad0b8994a1ed4f30a27604fbb16dd21c874af1228b546402eef089",
                   "src/apprt/win32/agent_recovery.zig":  "634ab36ba22df2fcb9996545d1404e9c1e10f02a73c57019b9b1a78820357a2a",
-                  "src/apprt/win32/agent_upgrade.zig":  "69cb9263387c632381fbb006d75dd7142054b46cb334db6715e4ed0bfb88d032",
+                  "src/apprt/win32/agent_upgrade.zig":  "20c614d5a708c29dfed3a4c7ad01699cf2e13af4ca57946b492bf5e56cc4f424",
                   "src/apprt/win32/AgentIntegration.zig":  "a903d72d7e0f4242ebf0327acf25fc414508fed54c41ecbbbdfdeb6222d801ac",
                   "src/apprt/win32/AgentIntegrationsDialog.zig":  "331ad4d876637f86611df7a2c70bb6def4b511fa3dfebf6ea8b781501956a3ce",
-                  "src/apprt/win32/App.zig":  "ec030cd4f057760abc0b1f0b7ac225a70fe3fb9a8f879ff3a39fde9cb2e77b97",
+                  "src/apprt/win32/App.zig":  "53e1af50f58e60c8595fec172e1ea983b7e897b3549ab00c1d6977bc5cdd8654",
                   "src/apprt/win32/banner_card.zig":  "87659068b86b4875b1890d1ce2d4ff1a671bb3ddc817d05d8983a13d5a9a95c8",
                   "src/apprt/win32/banner_layout.zig":  "4d495e2873a219a53a1122b7e0d8ab074502348adedd08d8801dae2827a917ce",
                   "src/apprt/win32/banner_link.zig":  "77bd381ab5cca8cf4a4d12d9e15971303d5d4e83ea600fe4576c9e5bf4a34c95",

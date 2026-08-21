@@ -433,11 +433,11 @@ restore_retry_armed: bool = false,
 /// cannot clear the outer one's guard.
 agent_refresh_depth: usize = 0,
 
-/// True once the user has declined a destructive agent refresh in this app run
-/// (T147). It suppresses further PROMPTS only — the silent idle refresh still
-/// happens the next time no sessions are live, which is exactly what the
-/// dialog promises. Per-run by design: the next launch asks again, because by
-/// then the sessions in question are new ones.
+/// True once the user has declined a destructive agent restart in this app run
+/// (T147; since T1056 that means the PROTOCOL-SKEW confirmation, the only one
+/// left). It suppresses further PROMPTS only — the silent idle refresh still
+/// happens the next time no sessions are live. Per-run by design: the next
+/// launch asks again, because by then the sessions in question are new ones.
 agent_upgrade_declined: bool = false,
 
 /// How many agent restarts this run has already spent trying to adopt the
@@ -3680,10 +3680,15 @@ fn agentSessionMix(self: *App) ?AgentSessionMix {
 /// Is an unattended client refresh in progress (T525)?
 ///
 /// The morning delivery restarts the app with nobody in front of it, and the
-/// fresh app's first act is the agent-upgrade check below — which, on a box that
-/// has taken a few deliveries, lands on `confirm_first` and puts a modal on an
-/// empty desk. The delivery leaves a marker holding a UTC unix-seconds deadline;
-/// while it is in the future, a confirmation is deferred rather than shown.
+/// fresh app's first act is the agent-upgrade check below — which used to land
+/// on `confirm_first` for a stale build and put a modal on an empty desk. The
+/// delivery leaves a marker holding a UTC unix-seconds deadline; while it is in
+/// the future, a confirmation is deferred rather than shown.
+///
+/// Since T1056 a stale build raises no modal at all, so the case this was
+/// written for cannot happen any more. It still guards the PROTOCOL-SKEW
+/// confirmation, which an unattended relaunch can absolutely walk into and
+/// which nobody is there to answer.
 ///
 /// Every failure here answers `false`. A marker we could not read, a
 /// `%LOCALAPPDATA%` we could not resolve, a deadline we could not parse — none
@@ -3719,10 +3724,18 @@ fn unattendedRefreshActive(self: *App) bool {
 /// Called at the two moments where a restart can be safe: launch restore
 /// finished, and the last persistent window closed.
 ///
-/// The DECISION is `agent_upgrade.decide` (pure, unit-tested); this function is
-/// only its mechanism. Idle ⇒ restart silently (logged, never invisible). Live
-/// sessions ⇒ the mandatory confirmation docs/claude/sessions.md requires, never a silent
-/// reset; a decline defers to the next idle moment and is not re-asked this run.
+/// The DECISION is `agent_upgrade.evaluate` (pure, unit-tested); this function
+/// is only its mechanism. Idle ⇒ restart silently (logged, never invisible).
+/// Live sessions ⇒ NOTHING (T1056): the agent is protocol-compatible by the fact
+/// that we are talking to it, so the newer build is adopted at the next quiet
+/// moment — the last persistent window closing, or the next cold start — and no
+/// session is ever ended to install it a few hours sooner.
+///
+/// The liveness question is put to the AGENT (`agentSessionMix` →
+/// `LIST_SESSIONS`), never to this app's window list: a window count reads 0 in
+/// all the wrong situations — a partial or slow restore, the user closing their
+/// last window while pinned sessions keep running, a second app instance — and
+/// a 0 that is not true is a silent bootout.
 pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
     if (!self.config.@"session-persistence") return;
     if (self.agent_recovering) return;
@@ -3777,18 +3790,15 @@ pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
     // `.none` reported nothing ever. That made a correctly-working mandatory
     // confirmation indistinguishable in the log from a check that decided
     // nothing, and from one that never ran.
-    // T525: fold the unattended deferral in BEFORE the log line, so the one line
-    // an operator greps reports the decision that was actually acted on. Only
-    // consulted when a confirmation is on the table — the marker read is a file
-    // open, and the common case is `.none`.
-    const raw = agent_upgrade.evaluate(running, bundled, live, .{
+    // T525 used to fold an unattended-refresh deferral in here, because a stale
+    // build put a modal on an empty desk during the morning delivery. Since
+    // T1056 it cannot: staleness raises no modal at all, so there is nothing to
+    // defer and the marker is not even read on this path. `applyDeferral` still
+    // guards the SKEW confirmation, which is the one that remains.
+    const decision = agent_upgrade.evaluate(running, bundled, live, .{
         .capable = mix.handoff_capable,
         .legacy_live = mix.legacy,
     });
-    const decision = agent_upgrade.applyDeferral(
-        raw,
-        raw.action == .confirm_first and self.unattendedRefreshActive(),
-    );
     log.info(
         "agent upgrade check: {s} (running {s}, bundled {s}, {d} live session(s), {d} of them legacy, handoff-capable={}) [{s}]",
         .{
@@ -3831,129 +3841,25 @@ pub fn refreshLocalAgentIfStale(self: *App, reason: []const u8) void {
             self.endAgentRefresh();
             log.info("local agent refreshed to bundled build {s} (idle, no live sessions affected)", .{bundled orelse "?"});
         },
+        // Unreachable since T1056: a build-stamp gap never asks for consent to
+        // end a session, because ending one buys nothing (the agent we are
+        // talking to has already agreed the wire contract in HELLO). Handled
+        // rather than `unreachable` for the same reason the skew handler handles
+        // its impossible arms: this is the destructive path, and in a release
+        // build `unreachable` would turn a future policy edit into undefined
+        // behavior instead of a log line.
         .confirm_first => {
-            if (self.agent_upgrade_declined) {
-                log.info(
-                    "local agent still stale with {d} live session(s), but the user deferred this run [{s}]",
-                    .{ live, reason },
-                );
-                return;
-            }
-            self.promptAndRefreshLocalAgent(
-                live,
-                running,
-                bundled orelse "?",
-                if (decision.reason == .stale_handoff_draining) mix.legacy else null,
+            log.err(
+                "agent upgrade check: a stale BUILD asked to end {d} live session(s) ({s}); refusing",
+                .{ live, @tagName(decision.reason) },
             );
+            return;
         },
     }
 }
 
-/// The mandatory confirmation before a destructive agent restart while sessions
-/// are live, and the restart itself when the user takes it.
-///
-/// On confirm the local windows are rebuilt in place on the fresh agent: the
-/// terminated agent's children are gone, but its `sessions.json` survives, so
-/// the respawned agent materializes them as relaunchable tombstones and the
-/// re-ATTACH finds each one dead.
-///
-/// What happens next is `session-relaunch` (T230), and the DEFAULT is `restore`:
-/// each pane comes back on a FRESH shell in its recorded working directory,
-/// above a notice naming the command that had been running. It is deliberately
-/// NOT re-run — "We should not ever re-execute the commands which were
-/// previously ran". (`rerun` restores the old RELAUNCH-with-divider behavior for
-/// anyone who opts in.) That is the honest outcome the dialog promises: the
-/// panes come back, their processes do not, and nothing starts itself.
-/// `draining_legacy` is the T907 arm: non-null when the agent WOULD replace
-/// itself and is only waiting for that many sessions it owns directly to close.
-/// The dialog then says so, because there "Later" is a promise the agent keeps
-/// rather than the indefinite wait the original wording implies.
-fn promptAndRefreshLocalAgent(
-    self: *App,
-    live: usize,
-    running: ?[]const u8,
-    bundled: []const u8,
-    draining_legacy: ?usize,
-) void {
-    const alloc = self.core_app.alloc;
-
-    var text_buf: [1024]u8 = undefined;
-    const text = if (draining_legacy) |legacy|
-        agent_upgrade.formatDrainConfirmText(&text_buf, live, legacy) catch return
-    else
-        agent_upgrade.formatConfirmText(&text_buf, live) catch return;
-    const text_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, text) catch return;
-    defer alloc.free(text_w);
-    const title_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, agent_upgrade.confirm_title) catch return;
-    defer alloc.free(title_w);
-
-    const owner: ?*Window = if (self.windows.items.len > 0) self.windows.items[0] else null;
-
-    // Announce the modal BEFORE it blocks (T201). `ConfirmDialog.show` pumps its
-    // own loop and does not return until the user answers, which can be never —
-    // so without this line a dialog sitting on a second monitor leaves no trace
-    // at all, and the log simply stops. Every message after this one is
-    // contingent on an answer; this one is the evidence that we asked.
-    log.info(
-        "agent upgrade: showing mandatory restart confirmation ({d} live session(s), running {s} → bundled {s}); waiting for the user",
-        .{ live, agent_upgrade.stampForLog(running), bundled },
-    );
-
-    const result = ConfirmDialog.show(
-        self,
-        if (owner) |win| win.hwnd else null,
-        if (owner) |win| win.scale else 1.0,
-        if (owner) |win| (if (win.getActiveSurface()) |s| s.hwnd else null) else null,
-        .{
-            .title = title_w.ptr,
-            .text = text_w,
-            .icon = .warning,
-            .ok_label = std.unicode.utf8ToUtf16LeStringLiteral("Update Now"),
-            .cancel_label = std.unicode.utf8ToUtf16LeStringLiteral("Later"),
-        },
-    );
-    if (result != .ok) {
-        self.agent_upgrade_declined = true;
-        log.info("user deferred destructive agent refresh ({d} live session(s))", .{live});
-        return;
-    }
-
-    log.warn(
-        "user confirmed destructive agent refresh (running {s} → bundled {s}, {d} live session(s))",
-        .{ running orelse "<pre-versioned>", bundled, live },
-    );
-    self.agent_upgrade_attempts += 1;
-
-    // The dialog PROMISED the panes come back, so nothing between here and the
-    // rebuild may end the app behind the user's back — a momentarily empty
-    // window list must not trip `quit-after-last-window-closed`, and neither
-    // must a WM_QUIT already sitting in the queue. Cleared unconditionally on
-    // the way out (see `endAgentRefresh`).
-    self.beginAgentRefresh();
-    defer self.endAgentRefresh();
-
-    // …and if it ends anyway, something outside this process has to notice
-    // (T421). Twice the app has simply stopped between here and the rebuild —
-    // no crash record, no further log line, no windows — and the user was left
-    // relaunching Ghoztty by hand. The guard is a detached watcher that starts
-    // the app again if this process ends before the marker below is cleared.
-    var guard = relaunch_guard.arm(alloc);
-    defer if (guard) |*g| g.disarm();
-
-    _ = self.local_agent.restartForUpgrade();
-    const rebuilt = self.recoverLocalAgentInPlace();
-    log.warn("destructive agent refresh finished: {d} window(s) rebuilt", .{rebuilt orelse 0});
-
-    // The honest fallback. `recoverLocalAgentInPlace` returning null means the
-    // fresh agent could not be reached at all: every pane is now pointing at a
-    // retired connection and there is nothing behind them. Saying so is the
-    // whole point — the failure the user reported was INVISIBLE, and an empty
-    // desktop with no explanation is the worst outcome a confirmation can have.
-    if (rebuilt == null) self.showAgentRefreshFailed();
-}
-
-/// The second trigger for the mandatory-update path: the running agent speaks a
-/// protocol this build cannot negotiate (T125).
+/// The mandatory-update path, and since T1056 its ONLY trigger: the running
+/// agent speaks a protocol this build cannot negotiate (T125).
 ///
 /// T147 answers "is the running agent an older BUILD?" and needs a working
 /// connection to ask. This is the case where there is no connection *because*
@@ -3963,16 +3869,23 @@ fn promptAndRefreshLocalAgent(
 /// that an incompatible skew take the mandatory-update path.
 ///
 /// The DECISION is `agent_upgrade.evaluateSkew` (pure, unit-tested); everything
-/// here is its mechanism, and it is deliberately the same mechanism the stale
-/// path uses — same dialog, same refresh-guard, same relaunch guard, same honest
-/// failure notice — so there is one restart story rather than two.
+/// here is its mechanism — the same refresh-guard, relaunch guard and honest
+/// failure notice the silent idle refresh uses, so there is one restart story
+/// rather than two.
+///
+/// Why the sessions may be ended HERE and nowhere else: the app cannot reach
+/// them. The handshake failed, so there is no connection over which to save,
+/// migrate or even count them, and leaving the agent alone leaves the user with
+/// session persistence silently off for the rest of the run. That is the whole
+/// distinction T1056 draws — a stale BUILD still works, an unnegotiable
+/// PROTOCOL does not.
 fn handleAgentProtocolSkew(self: *App, skew: LocalAgent.Skew, reason: []const u8) void {
     const alloc = self.core_app.alloc;
     const raw = agent_upgrade.evaluateSkew(skew.peer_proto_version, protocol.proto_version);
-    // T525: the same deferral the staleness path takes. This is the same modal
-    // with the same outcome, so an unattended refresh must not raise it here
-    // either — and a skew is if anything the worse one to leave on an empty
-    // desk, since until it is answered session persistence is off.
+    // T525: an unattended refresh must not raise this modal on an empty desk.
+    // Since T1056 this is the only place the deferral still has anything to
+    // suppress — and a skew is the worse one to leave sitting there, since until
+    // it is answered session persistence is off.
     const decision = agent_upgrade.applyDeferral(
         raw,
         raw.action == .confirm_first and self.unattendedRefreshActive(),

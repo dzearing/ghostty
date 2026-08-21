@@ -22,11 +22,22 @@
 //!     bundled one is left alone: a debug/dev agent, or an app rolled back
 //!     under a newer agent, must not have its sessions killed to install an
 //!     older binary.
-//!  3. **Live sessions are never reset silently.** Zero live panes ⇒ refresh
-//!     immediately (nothing to lose). One or more ⇒ a mandatory confirmation
-//!     first, and a decline means the agent refreshes at the next quiet moment
-//!     instead — which is why the check is re-run when the last persistent
-//!     window closes, not just at launch.
+//!  3. **Live sessions are never ended for a build-stamp gap at all** (T1056).
+//!     Zero live sessions ⇒ refresh immediately (nothing to lose). One or more
+//!     ⇒ the agent is left strictly alone and adopted at the next quiet moment
+//!     — which is why the check is re-run when the last persistent window
+//!     closes, not just at launch.
+//!
+//!     A newer bundled build is NOT an incompatibility. `proto_version` is
+//!     negotiated in HELLO and a mismatch is fatal there, so an agent we can
+//!     talk to has already agreed the wire contract, and every capability since
+//!     rides an additive, intersection-negotiated list that degrades on its own.
+//!     Ending live sessions to pick up a fresher binary therefore buys nothing
+//!     and costs the user every running process — which is exactly what Mac's
+//!     1.33.0 update did (95 sessions tombstoned by a restart nothing required).
+//!     The mandatory-update confirmation still exists, reserved for the case it
+//!     was written for: a skew the handshake actually flags as INCOMPATIBLE
+//!     (`evaluateSkew`), which by construction cannot be this one.
 
 const std = @import("std");
 const agent_build = @import("../../remote/agent_build.zig");
@@ -48,6 +59,11 @@ pub const Action = enum {
     /// never a modal — there is nothing for the user to decide.
     refresh_now,
     /// Restart only after a mandatory confirmation: live sessions WILL close.
+    ///
+    /// Since T1056 this comes from `evaluateSkew` ALONE — a protocol skew, where
+    /// the app cannot reach the agent's sessions to save them and there is no
+    /// other way back to a working terminal. A merely older BUILD never reaches
+    /// here: see rule 3 above.
     confirm_first,
     /// Stand down: the agent replaces ITSELF (T907). Not "nothing is wrong" —
     /// the running agent IS stale — but nothing for the app to do about it, and
@@ -80,8 +96,12 @@ pub const Reason = enum {
     running_newer,
     /// Stale with nothing to lose: restart silently.
     stale_idle,
-    /// Stale with live sessions: restarting would end them, so consent first.
-    stale_live,
+    /// Stale with live sessions, and protocol-compatible (T1056): the app does
+    /// nothing at all. The bundled build is adopted at the next quiet moment —
+    /// the last persistent window closing, or the next cold start — because the
+    /// agent's argv is stable and the newer binary sits at the path it respawns
+    /// from. Never a dialog, and never a restart: see rule 3.
+    stale_live_deferred,
 
     /// Stale, and the agent replaces itself without losing anything (T907):
     /// every live session is holder-backed and both peers negotiated
@@ -90,8 +110,9 @@ pub const Reason = enum {
     stale_handoff,
     /// Stale and handoff-capable, but sessions the agent owns DIRECTLY are still
     /// live and cannot be carried across a process boundary. The handoff drains
-    /// lazily — each one that closes brings it closer — and the confirmation
-    /// stays available as the only way to force it early.
+    /// lazily — each one that closes brings it closer — and nobody is asked to
+    /// hurry it along: since T1056 forcing it early would mean ending live
+    /// sessions for a build-stamp gap, which is the act rule 3 forbids.
     stale_handoff_draining,
 
     /// Protocol skew, and the AGENT is the older side: the mandatory-update path
@@ -118,9 +139,9 @@ pub const Reason = enum {
             .current => "no action, running agent is the bundled build",
             .running_newer => "no action, running agent is NEWER than bundled (never downgrade)",
             .stale_idle => "stale and idle, refreshing now",
-            .stale_live => "stale with live sessions, confirmation required",
+            .stale_live_deferred => "stale with live sessions, but protocol-compatible; leaving it alone and adopting at the next quiet moment",
             .stale_handoff => "stale, but the agent is replacing itself without losing any session (standing down)",
-            .stale_handoff_draining => "stale and self-replacing, but sessions the agent owns directly must close first; confirmation required to force it",
+            .stale_handoff_draining => "stale and self-replacing, but sessions the agent owns directly must close first; waiting for them",
             .skew_agent_older => "protocol skew, running agent speaks an OLDER protocol, confirmation required",
             .skew_app_older => "no action, running agent speaks a NEWER protocol — this app is the out-of-date side (never downgrade)",
             .skew_unknown => "no action, protocol skew of unknown direction (no peer version captured)",
@@ -184,20 +205,22 @@ pub fn evaluate(
     // about how long it takes.
     if (live_sessions == 0) return .{ .action = .refresh_now, .reason = .stale_idle };
 
-    if (handoff.capable) {
-        // Every live session is holder-backed ⇒ the agent carries them all
-        // across on its own. Standing down IS the action.
-        if (handoff.legacy_live == 0) {
-            return .{ .action = .handoff_now, .reason = .stale_handoff };
-        }
-        // Mixed generations drain lazily. The confirmation is still offered,
-        // because it remains the only way to force the upgrade early — but the
-        // dialog says the waiting is happening, so "Later" is a real option
-        // rather than a deferral into silence.
-        return .{ .action = .confirm_first, .reason = .stale_handoff_draining };
+    // Every live session is holder-backed ⇒ the agent carries them all across on
+    // its own. Standing down IS the action.
+    if (handoff.capable and handoff.legacy_live == 0) {
+        return .{ .action = .handoff_now, .reason = .stale_handoff };
     }
 
-    return .{ .action = .confirm_first, .reason = .stale_live };
+    // Everything left is "stale, compatible, and something is live". Since T1056
+    // that is not an action at all — see rule 3. The two reasons differ only in
+    // WHEN the newer build gets adopted, which is what an operator reading the
+    // log needs to know: a handoff-capable agent installs it as its own legacy
+    // sessions close, whereas a pre-T907 one waits for the next cold start.
+    // Neither is worth ending a session over, so neither asks.
+    return .{
+        .action = .none,
+        .reason = if (handoff.capable) .stale_handoff_draining else .stale_live_deferred,
+    };
 }
 
 /// The action alone, for callers that don't log (and every existing test).
@@ -312,11 +335,12 @@ pub fn evaluateSkew(peer: ?u16, local: u16) Decision {
     return .{ .action = .confirm_first, .reason = .skew_agent_older };
 }
 
-/// The mandatory-confirmation body for a protocol skew. Distinct from
-/// `formatConfirmText` because the situation is: there, the agent still works
-/// and the restart is an upgrade; here the agent is already unreachable, so the
-/// honest promise is not "you keep working" but "this is how you get working
-/// again".
+/// The mandatory-confirmation body for a protocol skew — since T1056 the ONLY
+/// confirmation this policy raises, because it is the only state in which a
+/// restart is the difference between working and not working. The agent is
+/// already unreachable, so the honest promise is not "you keep working" but
+/// "this is how you get working again"; a merely older BUILD keeps working and
+/// is therefore never offered up for one.
 ///
 /// It states the cost without inventing a number — the session count lives
 /// inside the agent we cannot talk to, and a dialog that guessed at it would be
@@ -350,53 +374,15 @@ pub const skew_confirm_title = confirm_title;
 /// too old to advertise one; `bundled == null` is an unreadable binary.
 pub const stampForLog = agent_build.stampForLog;
 
-/// The mandatory-confirmation body, Mac's wording (`makeUpgradeAlert`) with the
-/// session count pluralized. Written into `buf`; the caller widens it to UTF-16
-/// for the dialog.
-pub fn formatConfirmText(buf: []u8, live_sessions: usize) ![]const u8 {
-    return std.fmt.bufPrint(
-        buf,
-        "Ghoztty keeps your terminal sessions running in the background. " ++
-            "Finishing this update restarts that background process, which will " ++
-            "close your {d} open terminal session{s} — they can't be carried " ++
-            "across the update.\n\n" ++
-            "You can keep working instead: Ghoztty updates automatically the " ++
-            "next time no sessions are open.",
-        .{ live_sessions, if (live_sessions == 1) "" else "s" },
-    );
-}
-
-/// The confirmation body for a handoff-capable agent that is still DRAINING
-/// (T907): a newer build is waiting, the agent will adopt it by itself as soon
-/// as the sessions it owns directly have closed, and the dialog exists only so
-/// the user can force it early.
+/// Title for the mandatory-update dialog.
 ///
-/// It differs from `formatConfirmText` in exactly the thing the user is being
-/// asked to weigh. There, "Later" means "at the next quiet moment", which on a
-/// box with an always-open pane is never. Here it means "when these N close",
-/// which is a promise the agent can actually keep — so the honest dialog names
-/// the number and says so, instead of implying the update is stuck.
-pub fn formatDrainConfirmText(buf: []u8, live_sessions: usize, legacy: usize) ![]const u8 {
-    return std.fmt.bufPrint(
-        buf,
-        "Ghoztty keeps your terminal sessions running in the background, and an " ++
-            "update for that background process is ready.\n\n" ++
-            "It will install itself with nothing lost as soon as {d} older " ++
-            "session{s} ha{s} closed. Installing it right now instead restarts the " ++
-            "background process, which will close all {d} of your open terminal " ++
-            "session{s}.\n\n" ++
-            "You can keep working: nothing is lost by waiting.",
-        .{
-            legacy,
-            if (legacy == 1) "" else "s",
-            if (legacy == 1) "s" else "ve",
-            live_sessions,
-            if (live_sessions == 1) "" else "s",
-        },
-    );
-}
-
-/// Title for the same dialog.
+/// There used to be two bodies to go with it — `formatConfirmText` and
+/// `formatDrainConfirmText` — for the two ways a merely STALE agent could be
+/// offered up for a restart. T1056 removed both along with the policy that
+/// reached them: a build-stamp gap is not a reason to end a session, so there is
+/// nothing there to ask the user, and a dialog offering to do it anyway is a
+/// hazard rather than a courtesy. `formatSkewConfirmText` is the one body left,
+/// for the one case that genuinely cannot be recovered any other way.
 pub const confirm_title = "Restart the Ghoztty background terminal process?";
 
 /// The image name a pid must carry before the destructive refresh is allowed to
@@ -469,7 +455,7 @@ test "the shared stamp primitives are the ones this policy is written against" {
     try testing.expectEqualStrings("<pre-versioned>", stampForLog(null));
 }
 
-test "decide: unknown never restarts, idle refreshes, live always confirms" {
+test "decide: unknown never restarts, idle refreshes, live is left alone" {
     const bundled = "20260730-e69d41755";
     const old = "20260719-574fe0805";
 
@@ -486,14 +472,36 @@ test "decide: unknown never restarts, idle refreshes, live always confirms" {
     // Rule 2: newer running agent is left alone even when idle.
     try testing.expectEqual(Action.none, decide("20260801-zzz", bundled, 0));
 
-    // Rule 3: the two stale arms.
+    // Rule 3: idle refreshes, and ANY live session means hands off (T1056).
+    // A single live session is the whole difference between a free upgrade and
+    // destroying the user's work, and it is never worth a build-stamp gap.
     try testing.expectEqual(Action.refresh_now, decide(old, bundled, 0));
-    try testing.expectEqual(Action.confirm_first, decide(old, bundled, 1));
-    try testing.expectEqual(Action.confirm_first, decide(old, bundled, 12));
+    try testing.expectEqual(Action.none, decide(old, bundled, 1));
+    try testing.expectEqual(Action.none, decide(old, bundled, 12));
 
     // A pre-versioned agent takes the same two arms.
     try testing.expectEqual(Action.refresh_now, decide(null, bundled, 0));
-    try testing.expectEqual(Action.confirm_first, decide(null, bundled, 2));
+    try testing.expectEqual(Action.none, decide(null, bundled, 2));
+}
+
+test "no build-stamp gap can ever produce a destructive restart of a live agent" {
+    // THE T1056 invariant, enumerated rather than argued: whatever the stamps,
+    // whatever the roster, whatever the generation — if the agent still owns a
+    // live session, `evaluate` never asks for anything that ends it. The only
+    // action it may reach there is `handoff_now`, which is the agent replacing
+    // ITSELF with nothing lost.
+    //
+    // Mac reached this state through `agentIsStale` and tombstoned 95 sessions
+    // on the 1.33.0 update. A test that pins the two arms individually would not
+    // have caught a third arm being added; this one does.
+    const stamps = [_]?[]const u8{ null, "", "dev", "20260719-aaa", "20260730-e69d41755", "20260801-zzz" };
+    const bundles = [_]?[]const u8{ null, "", "dev", "20260730-e69d41755" };
+    for (stamps) |r| for (bundles) |b| for ([_]usize{ 1, 2, 95 }) |live| {
+        for ([_]bool{ false, true }) |capable| for ([_]usize{ 0, 1, live }) |legacy| {
+            const d = evaluate(r, b, live, .{ .capable = capable, .legacy_live = legacy });
+            try testing.expect(d.action == .none or d.action == .handoff_now);
+        };
+    };
 }
 
 test "evaluate: every .none carries the reason that produced it" {
@@ -512,12 +520,17 @@ test "evaluate: every .none carries the reason that produced it" {
     try testing.expectEqual(Reason.running_newer, evaluate("20260801-zzz", bundled, 0, none).reason);
     try testing.expectEqual(Reason.running_newer, evaluate("20260801-zzz", bundled, 4, none).reason);
 
-    // The two stale arms, including the pre-versioned peer.
+    // The two stale arms, including the pre-versioned peer. `stale_live_deferred`
+    // is a `.none` like the three above it and must still be told apart from
+    // them: "we are deliberately not touching a stale agent" and "there was
+    // nothing wrong" are the two states an operator has to distinguish after
+    // T1056, because only one of them means an update is still pending.
     try testing.expectEqual(Reason.stale_idle, evaluate(old, bundled, 0, none).reason);
-    try testing.expectEqual(Reason.stale_live, evaluate(old, bundled, 1, none).reason);
+    try testing.expectEqual(Reason.stale_live_deferred, evaluate(old, bundled, 1, none).reason);
+    try testing.expectEqual(Action.none, evaluate(old, bundled, 1, none).action);
     try testing.expectEqual(Reason.stale_idle, evaluate(null, bundled, 0, none).reason);
-    try testing.expectEqual(Reason.stale_live, evaluate(null, bundled, 9, none).reason);
-    try testing.expectEqual(Reason.stale_live, evaluate("", bundled, 2, none).reason);
+    try testing.expectEqual(Reason.stale_live_deferred, evaluate(null, bundled, 9, none).reason);
+    try testing.expectEqual(Reason.stale_live_deferred, evaluate("", bundled, 2, none).reason);
 }
 
 test "evaluate: a handoff-capable agent is never restarted out from under its sessions" {
@@ -536,19 +549,19 @@ test "evaluate: a handoff-capable agent is never restarted out from under its se
     // policy must not depend on that: the capability is what decides.
     try testing.expectEqual(Action.handoff_now, evaluate(null, bundled, 1, ready).action);
 
-    // Mixed generations: the handoff waits, and the confirmation stays as the
-    // only way to force it early. This is TODAY's behavior on a box where the
-    // holder path is off — every session is legacy — so the new arm cannot
-    // change what an existing box does.
+    // Mixed generations: the handoff waits for the sessions the agent owns
+    // directly, and nobody is asked to hurry it along (T1056 — the only way to
+    // force it early was to end those sessions).
     const draining: Handoff = .{ .capable = true, .legacy_live = 2 };
-    try testing.expectEqual(Action.confirm_first, evaluate(old, bundled, 5, draining).action);
+    try testing.expectEqual(Action.none, evaluate(old, bundled, 5, draining).action);
     try testing.expectEqual(Reason.stale_handoff_draining, evaluate(old, bundled, 5, draining).reason);
 
-    // Not capable ⇒ the pre-T907 policy, whatever the roster says. Standing down
-    // on an agent that will never hand itself off means never upgrading it.
+    // Not capable ⇒ nothing happens either, and for the same reason: the agent
+    // is compatible, so the gap costs nothing until the next cold start, and
+    // closing it early would cost every live session.
     const incapable: Handoff = .{ .capable = false, .legacy_live = 0 };
-    try testing.expectEqual(Action.confirm_first, evaluate(old, bundled, 3, incapable).action);
-    try testing.expectEqual(Reason.stale_live, evaluate(old, bundled, 3, incapable).reason);
+    try testing.expectEqual(Action.none, evaluate(old, bundled, 3, incapable).action);
+    try testing.expectEqual(Reason.stale_live_deferred, evaluate(old, bundled, 3, incapable).reason);
 
     // Idle still wins: nothing to lose, and a restart completes now rather than
     // at the agent's next poll.
@@ -570,7 +583,7 @@ test "decide is the pre-T907 policy, exactly" {
     for ([_]usize{ 0, 1, 9 }) |live| {
         try testing.expectEqual(evaluate(old, bundled, live, .{}).action, decide(old, bundled, live));
     }
-    try testing.expectEqual(Action.confirm_first, decide(old, bundled, 3));
+    try testing.expectEqual(Action.none, decide(old, bundled, 3));
 }
 
 test "evaluate and decide can never disagree" {
@@ -591,7 +604,7 @@ test "evaluate and decide can never disagree" {
         const expected: Action = switch (d.reason) {
             .bundled_unknown, .current, .running_newer => .none,
             .stale_idle => .refresh_now,
-            .stale_live, .stale_handoff_draining => .confirm_first,
+            .stale_live_deferred, .stale_handoff_draining => .none,
             .stale_handoff => .handoff_now,
             // `evaluate` is the STALENESS policy; a skew reason coming out of it
             // would mean the two policies had been crossed. `confirm_deferred`
@@ -600,9 +613,18 @@ test "evaluate and decide can never disagree" {
             .skew_agent_older, .skew_app_older, .skew_unknown, .confirm_deferred => unreachable,
         };
         try testing.expectEqual(expected, d.action);
-        // A `.none` must never be reported as stale, and vice versa.
+        // Staleness now decides the REASON, not the action: since T1056 three of
+        // the stale reasons are themselves `.none`, so the old
+        // "stale ⟺ something happens" equivalence would read the fix as a bug.
+        // The equivalence that still has to hold is the one an operator relies
+        // on — a stale agent is always REPORTED as stale, and a current one
+        // never is.
         if (b) |bb| if (bb.len > 0) {
-            try testing.expectEqual(isStale(r, bb), d.action != .none);
+            const reported_stale = switch (d.reason) {
+                .stale_idle, .stale_live_deferred, .stale_handoff, .stale_handoff_draining => true,
+                else => false,
+            };
+            try testing.expectEqual(isStale(r, bb), reported_stale);
         };
     };
 }
@@ -619,13 +641,19 @@ test "Reason.description is a distinct non-empty clause for every reason" {
             try testing.expect(!std.mem.eql(u8, a.description(), b.description()));
         }
     }
-    // The two arms an operator greps for must say what they mean.
-    try testing.expect(std.mem.indexOf(u8, Reason.stale_live.description(), "confirmation") != null);
+    // The two arms an operator greps for must say what they mean. T1056 changed
+    // what the live-session arm means, so the clause has to change with it: it
+    // is the "we are leaving it alone" line now, not a "confirmation required"
+    // one, and a description still promising a dialog would send whoever greps
+    // it looking for a modal that is never shown.
+    try testing.expect(std.mem.indexOf(u8, Reason.stale_live_deferred.description(), "leaving it alone") != null);
+    try testing.expect(std.mem.indexOf(u8, Reason.stale_live_deferred.description(), "confirmation") == null);
     try testing.expect(std.mem.indexOf(u8, Reason.running_newer.description(), "NEWER") != null);
     // A stale agent that the app is deliberately NOT touching must be
     // distinguishable in the log from one it found nothing wrong with (T907).
     try testing.expect(std.mem.indexOf(u8, Reason.stale_handoff.description(), "replacing itself") != null);
     try testing.expect(std.mem.indexOf(u8, Reason.stale_handoff_draining.description(), "close first") != null);
+    try testing.expect(std.mem.indexOf(u8, Reason.stale_handoff_draining.description(), "confirmation") == null);
 }
 
 test "applyDeferral never suppresses a handoff" {
@@ -638,41 +666,33 @@ test "applyDeferral never suppresses a handoff" {
     try testing.expectEqual(Action.handoff_now, applyDeferral(d, true).action);
     try testing.expectEqual(Reason.stale_handoff, applyDeferral(d, true).reason);
 
-    // The draining arm IS a modal, so it defers like every other modal.
-    const draining = Decision{ .action = .confirm_first, .reason = .stale_handoff_draining };
+    // The draining arm is no longer a modal either (T1056), so there is nothing
+    // left for the unattended deferral to suppress. Pinned so a re-introduced
+    // dialog has to come through this test rather than appearing on an empty
+    // desk during the morning refresh.
+    const draining = Decision{ .action = .none, .reason = .stale_handoff_draining };
     try testing.expectEqual(Action.none, applyDeferral(draining, true).action);
-    try testing.expectEqual(Reason.confirm_deferred, applyDeferral(draining, true).reason);
+    try testing.expectEqual(Reason.stale_handoff_draining, applyDeferral(draining, true).reason);
 }
 
-test "formatDrainConfirmText names the wait and promises nothing is lost by it" {
-    var buf: [1024]u8 = undefined;
-    const many = try formatDrainConfirmText(&buf, 5, 2);
-    try testing.expect(std.mem.indexOf(u8, many, "2 older sessions have closed") != null);
-    try testing.expect(std.mem.indexOf(u8, many, "all 5 of your open terminal sessions") != null);
-    // The half that makes declining a real choice rather than a shrug: waiting
-    // costs nothing, which is only true because of the handoff.
-    try testing.expect(std.mem.indexOf(u8, many, "nothing is lost by waiting") != null);
-
-    var buf2: [1024]u8 = undefined;
-    const one = try formatDrainConfirmText(&buf2, 1, 1);
-    try testing.expect(std.mem.indexOf(u8, one, "1 older session has closed") != null);
-    try testing.expect(std.mem.indexOf(u8, one, "all 1 of your open terminal session.") != null);
-    try testing.expect(std.mem.indexOf(u8, one, "sessions have") == null);
-}
-
-test "formatConfirmText pluralizes and names the count" {
-    var buf: [512]u8 = undefined;
-    const one = try formatConfirmText(&buf, 1);
-    try testing.expect(std.mem.indexOf(u8, one, "your 1 open terminal session —") != null);
-    try testing.expect(std.mem.indexOf(u8, one, "sessions —") == null);
-
-    var buf2: [512]u8 = undefined;
-    const many = try formatConfirmText(&buf2, 4);
-    try testing.expect(std.mem.indexOf(u8, many, "your 4 open terminal sessions —") != null);
-
-    // The "you can defer" half is what makes the dialog honest about the
-    // decline path; it must never be dropped.
-    try testing.expect(std.mem.indexOf(u8, many, "next time no sessions are open") != null);
+test "no staleness decision is left for the unattended deferral to suppress" {
+    // T525 deferred the modal that a stale agent raised on a box nobody was
+    // sitting at. T1056 removed the modal itself, so the deferral is now the
+    // SKEW path's alone — and every decision `evaluate` can produce passes
+    // through `applyDeferral` untouched, deferred or not. That is the property
+    // worth pinning: it is what makes the morning refresh silent by
+    // construction rather than by a marker file being present.
+    const stamps = [_]?[]const u8{ null, "20260719-aaa", "20260801-zzz", "20260730-e69d41755" };
+    const handoffs = [_]Handoff{
+        .{},
+        .{ .capable = true, .legacy_live = 0 },
+        .{ .capable = true, .legacy_live = 3 },
+    };
+    for (stamps) |r| for ([_]usize{ 0, 1, 5 }) |live| for (handoffs) |h| {
+        const d = evaluate(r, "20260730-e69d41755", live, h);
+        try testing.expectEqual(d.action, applyDeferral(d, true).action);
+        try testing.expectEqual(d.reason, applyDeferral(d, true).reason);
+    };
 }
 
 test "evaluateSkew: the agent is only restarted when IT is the older side" {
@@ -733,9 +753,11 @@ test "formatSkewConfirmText names both versions, and drops the pair when unknown
     }
 }
 
-test "the skew dialog shares the staleness dialog's title" {
-    // One outcome (the background process restarts) reached two ways is one
-    // dialog. Pinned so a later copy edit to one does not quietly fork them.
+test "the skew dialog keeps the mandatory-update title" {
+    // The staleness path that shared it is gone (T1056), so this is now the only
+    // caller — but the title stays put rather than being folded into the skew
+    // module, because it is the string the acceptance harness identifies the
+    // mandatory-update dialog by on screen.
     try testing.expectEqualStrings(confirm_title, skew_confirm_title);
 }
 
@@ -782,25 +804,28 @@ test "deferralActive: absent, malformed and expired markers never suppress" {
 }
 
 test "applyDeferral suppresses only the modal, never the free upgrade" {
-    const stale_live = Decision{ .action = .confirm_first, .reason = .stale_live };
+    const deferred_stale = Decision{ .action = .none, .reason = .stale_live_deferred };
     const skew_older = Decision{ .action = .confirm_first, .reason = .skew_agent_older };
     const idle = Decision{ .action = .refresh_now, .reason = .stale_idle };
     const nothing = Decision{ .action = .none, .reason = .current };
 
     // Not deferred ⇒ the decision is returned untouched, whatever it is.
-    for ([_]Decision{ stale_live, skew_older, idle, nothing }) |d| {
+    for ([_]Decision{ deferred_stale, skew_older, idle, nothing }) |d| {
         const out = applyDeferral(d, false);
         try testing.expectEqual(d.action, out.action);
         try testing.expectEqual(d.reason, out.reason);
     }
 
-    // Deferred ⇒ both routes to the SAME modal are suppressed, with a reason
-    // that says so rather than pretending nothing was wrong.
-    for ([_]Decision{ stale_live, skew_older }) |d| {
-        const out = applyDeferral(d, true);
+    // Deferred ⇒ the one remaining modal is suppressed, with a reason that says
+    // so rather than pretending nothing was wrong. (Before T1056 a stale build
+    // was a second route to the same dialog; it no longer raises one, so its
+    // decision passes through untouched.)
+    {
+        const out = applyDeferral(skew_older, true);
         try testing.expectEqual(Action.none, out.action);
         try testing.expectEqual(Reason.confirm_deferred, out.reason);
     }
+    try testing.expectEqual(Reason.stale_live_deferred, applyDeferral(deferred_stale, true).reason);
 
     // `refresh_now` asks nobody and loses nothing, so deferring it would trade a
     // free upgrade for no benefit at all. `none` has nothing to suppress.
@@ -813,7 +838,7 @@ test "applyDeferral suppresses only the modal, never the free upgrade" {
 test "applyDeferral is idempotent" {
     // The app composes it once, but a re-check on the same live marker must not
     // walk the decision somewhere else.
-    const d = applyDeferral(.{ .action = .confirm_first, .reason = .stale_live }, true);
+    const d = applyDeferral(.{ .action = .confirm_first, .reason = .skew_agent_older }, true);
     const again = applyDeferral(d, true);
     try testing.expectEqual(d.action, again.action);
     try testing.expectEqual(d.reason, again.reason);
