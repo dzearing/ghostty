@@ -36,6 +36,10 @@ $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if ($ExePath) { $exe = $ExePath }
 if (-not (Test-Path $exe)) { Write-Host "SETUP FAIL: $exe missing (zig build first)"; exit 1 }
+# T1033: a private pipe suffix moves the APP endpoint only - the agent pipe and
+# the state files stay build-mode derived - so the exe about to be launched is
+# checked for the -debug lineage before the first launch, not assumed.
+Assert-GhozttyIsolatedBuild -Exe $exe | Out-Null
 
 $script:pass = 0
 $script:fail = 0

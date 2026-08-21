@@ -46,6 +46,10 @@ $script:passes = 0
 $root = Join-Path $env:TEMP "ghoztty-session-cap-$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+# T1033: this script launches the app itself (Start-Process, not the test
+# desktop's helper), so it asks the pre-flight question the helper asks: are
+# these bytes ours to drive, or the ones the user's installed Ghoztty owns?
+Assert-GhozttyIsolatedBuild -Exe $Exe | Out-Null
 
 function Assert($name, $cond) {
     if ($cond) { Write-Host "  PASS $name"; $script:passes++ }

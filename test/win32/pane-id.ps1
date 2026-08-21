@@ -248,6 +248,10 @@ Assert "agent binary exists in zig-out" (Test-Path $AgentExe)
 # makes the pre-flight mean what its comment says.
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
 [void](Set-GhozttyTestIsolation -Tag 'paneid')
+# T1033: a private pipe suffix moves the APP endpoint only - the agent pipe and
+# the state files stay build-mode derived - so the exe about to be launched is
+# checked for the -debug lineage before the first launch, not assumed.
+Assert-GhozttyIsolatedBuild -Exe $Exe | Out-Null
 
 # T116 pre-flight: anything already answering means this exe's endpoints are
 # shared with a live instance (a release-build exe collides with the user's).

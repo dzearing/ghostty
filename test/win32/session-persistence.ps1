@@ -376,11 +376,15 @@ Assert "ghoztty exe exists in zig-out" (Test-Path $Exe)
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
 [void](Set-GhozttyTestIsolation -Tag 'sesspersist')
-if (-not (Test-GhozttyIsolatedBuildMode -Mode (Get-GhozttyBuildMode -Exe $Exe))) {
+# T1033: the shared gate, not a local copy of it. This used to hand-roll the
+# same predicate, which meant it also missed the freshness half the shared one
+# grew in T1028. The catch keeps this script's own exit contract (restore
+# LOCALAPPDATA, exit 2) over the assert's throw.
+try {
+    Assert-GhozttyIsolatedBuild -Exe $Exe | Out-Null
+} catch {
     Write-Host ""
-    Write-Host "ABORT: '$Exe' is not a Debug/ReleaseSafe build, so it speaks the" -ForegroundColor Red
-    Write-Host "  user's endpoints (app pipe, agent pipe and state files alike)." -ForegroundColor Red
-    Write-Host "  Use zig-out\bin\ghoztty.exe; a release exe cannot be isolated here." -ForegroundColor Red
+    Write-Host "ABORT: $($_.Exception.Message)" -ForegroundColor Red
     $env:LOCALAPPDATA = $savedLocalAppData
     exit 2
 }

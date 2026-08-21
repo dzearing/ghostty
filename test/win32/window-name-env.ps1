@@ -166,6 +166,10 @@ Assert "agent binary exists in zig-out" (Test-Path $AgentExe)
 # Private IPC endpoint FIRST (T441), then the T116 pre-flight.
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
 [void](Set-GhozttyTestIsolation -Tag 'winname')
+# T1033: a private pipe suffix moves the APP endpoint only - the agent pipe and
+# the state files stay build-mode derived - so the exe about to be launched is
+# checked for the -debug lineage before the first launch, not assumed.
+Assert-GhozttyIsolatedBuild -Exe $Exe | Out-Null
 
 $preflight = Run-Cli '+list --json' "$root\preflight.json" 10
 if ($preflight -eq 0) {

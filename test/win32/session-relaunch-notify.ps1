@@ -89,6 +89,10 @@ $root = Join-Path $env:TEMP "ghoztty-relaunch-notify-$PID"
 # T652: the "attached is not alive" oracle. Read its header before adding an
 # assertion about a restored pane.
 . (Join-Path $PSScriptRoot 'lib\PaneLiveness.ps1')
+# T1033: this script launches the app itself (Start-Process, not the test
+# desktop's helper), so it asks the pre-flight question the helper asks: are
+# these bytes ours to drive, or the ones the user's installed Ghoztty owns?
+Assert-GhozttyIsolatedBuild -Exe $Exe | Out-Null
 
 # Write-Host, never the pipeline: a helper that asserts AND returns a value would
 # hand its caller @('  PASS ...', $realValue) and the caller would silently read

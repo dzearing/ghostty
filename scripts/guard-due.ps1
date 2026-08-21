@@ -1173,6 +1173,22 @@ $GuardTable = @(
             'test\win32\*.ps1'
         )
     },
+    # The launch pre-flight meta-check (T1033): the only thing that fails when
+    # a test\win32 script LAUNCHES the app without asking whether the exe is a
+    # debug build - i.e. whether it is about to open windows in the user's own
+    # terminal and grade a binary nobody here built. Covers lib\ as well as the
+    # top level, because the seam it exercises (Start-OnTestDesktop's own
+    # pre-flight, which ~80 GUI scripts inherit) lives in lib\TestDesktop.ps1.
+    # Static text plus a handful of stub calls, about a second.
+    [pscustomobject]@{
+        Name   = 'launch-preflight'
+        Script = 'test\win32\launch-preflight-audit.ps1'
+        Stamp  = 'test\win32\launch-preflight-audit.stamp.json'
+        Covers = @(
+            'test\win32\*.ps1',
+            'test\win32\lib\*.ps1'
+        )
+    },
     # The verdict/exit meta-check (T221, given a guard by T963): a script that
     # PRINTS failure and EXITS 0 reports a red run to the loop as green. Its two
     # siblings above were guarded and this one was not, so it sat red at HEAD

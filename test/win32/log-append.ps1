@@ -68,7 +68,18 @@ $env:LOCALAPPDATA = $root
 # leaked instance from an earlier run can never be the thing that answers.
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
 [void](Set-GhozttyTestIsolation -Tag 'logappend')
+# T1033: the build-mode pre-flight, answered explicitly rather than skipped.
+# This script's SUBJECT is a release build - the file sink is compiled out of
+# Debug - and what makes that safe is above: its own LOCALAPPDATA (so the log
+# it counts is not the user's), its own pipe suffix, and a workload of nothing
+# but `+list`, which opens no window and starts no agent.
+Assert-GhozttyIsolatedBuild -Exe $Exe -Allow | Out-Null
 $logPath = Join-Path $root 'ghoztty\ghoztty.log'
+# ...and the pre-flight is itself a writer: it asks the exe for `+version`, and
+# a release build logs its startup banner on the way through. Those lines would
+# be counted into the per-process baseline below and then multiplied by 24,
+# which reads as "23 x banner lines lost". Start the measurement from empty.
+Remove-Item $logPath -Force -ErrorAction SilentlyContinue
 
 try {
 

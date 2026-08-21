@@ -74,7 +74,6 @@ $script:passes = 0
 $root = Join-Path $env:TEMP "ghoztty-agent-upgrade-$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
-
 # Write-Host, never the pipeline: a helper that asserts AND returns a value
 # would otherwise hand its caller an array of @('  PASS ...', $realValue), and
 # the caller's `.Pid` / `-eq` silently reads the wrong element. Start-App below
@@ -306,6 +305,13 @@ $env:GHOZTTY_AGENT_BUNDLED_VERSION = $null
 # `+send-keys` below is an oracle, and an instance answering the shared pipe
 # would answer them about somebody else's windows.
 $env:GHOZTTY_PIPE_SUFFIX = '-agentupg'
+
+# T1033: this script launches the app itself (Start-Process, not the test
+# desktop's helper), so it asks the pre-flight question the helper asks: are
+# these bytes ours to drive, or the ones the user's installed Ghoztty owns?
+# Here rather than at the top of the file so the `+version` it runs is itself
+# inside the hermetic env above.
+Assert-GhozttyIsolatedBuild -Exe $Exe | Out-Null
 
 Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive

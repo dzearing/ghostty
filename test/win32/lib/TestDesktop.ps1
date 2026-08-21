@@ -1974,6 +1974,16 @@ Launching ghoztty.exe also clears the debug window-placement memory
 order. -KeepWindowPlacement opts out, and is for the two scripts whose SUBJECT
 is that memory (window-size-memory.ps1, reset-window-size.ps1): deleting the
 file between their launches would delete the thing under test.
+
+Launching ghoztty.exe ALSO runs the build-mode pre-flight (T1033): a non-debug
+zig-out derives the endpoints the user's installed Ghoztty owns, and a test
+desktop does not change that - the launched app dials the user's agent and
+writes the user's state files, off-screen where nobody sees it happen. 80 GUI
+scripts reach the app through this one helper and none of them asked, so the
+gate rides the launch rather than 80 copies of one line. -AllowReleaseBuild is
+the same explicit opt-in Reset-GhozttyTestState takes, for a script whose
+SUBJECT is a release build. It runs before the desktop is resolved so the
+refusal costs nothing and speaks first.
 #>
 function Start-OnTestDesktop {
     param(
@@ -1982,8 +1992,12 @@ function Start-OnTestDesktop {
         [string]$WorkingDirectory,
         [string]$StdErr,
         [switch]$KeepWindowPlacement,
+        [switch]$AllowReleaseBuild,
         $Desktop
     )
+    if ((Split-Path -Leaf $Exe) -ieq 'ghoztty.exe') {
+        Assert-GhozttyIsolatedBuild -Exe $Exe -Allow:$AllowReleaseBuild | Out-Null
+    }
     $td = Resolve-TestDesktop $Desktop
     if (-not $KeepWindowPlacement -and (Split-Path -Leaf $Exe) -ieq 'ghoztty.exe') {
         Clear-TestWindowPlacement | Out-Null

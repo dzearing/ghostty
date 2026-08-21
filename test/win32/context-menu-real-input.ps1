@@ -52,6 +52,10 @@ if ($ExePath) { $exe = $ExePath }
 # reads the instance launched here, never the pane the caller is sitting in.
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
 [void](Set-GhozttyTestIsolation -Tag 'ctxreal')
+# T1033: a private pipe suffix moves the APP endpoint only - the agent pipe and
+# the state files stay build-mode derived - so the exe about to be launched is
+# checked for the -debug lineage before the first launch, not assumed.
+Assert-GhozttyIsolatedBuild -Exe $exe | Out-Null
 
 $script:pass = 0
 $script:fail = 0
