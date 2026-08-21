@@ -176,7 +176,11 @@ $ErrorActionPreference = 'SilentlyContinue'
 docker info *> $null
 $dockerUp = ($LASTEXITCODE -eq 0)
 if ($dockerUp) {
-    docker image inspect msitools-local *> $null
+    # `:latest` explicitly: docker 29.x stopped defaulting the tag for
+    # `image inspect` (it still does for `run`), so the bare name reports the
+    # image missing on a box that has it - which under -RequireDocker scores a
+    # RED B1 instead of running the check. Measured 2026-08-21 on docker 29.7.2.
+    docker image inspect msitools-local:latest *> $null
     $imageUp = ($LASTEXITCODE -eq 0)
 } else { $imageUp = $false }
 $ErrorActionPreference = $prev

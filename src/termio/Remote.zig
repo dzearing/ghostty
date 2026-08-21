@@ -475,6 +475,27 @@ pub const RelaunchPolicy = enum {
 /// residual gap; it is rarer than "every relaunched pane" and the cure is worse
 /// there.
 pub const replay_mode_reset =
+    input_mode_reset ++
+    "\x1b[?7h" ++ // DECAWM: autowrap back on (its default)
+    "\x1b[?25h" ++ // DECTCEM: cursor visible again
+    "\x1b[0m"; // SGR: default text attributes
+
+/// The INPUT-REPORTING modes — the subset of `replay_mode_reset` that is an
+/// agreement between the terminal and a **process**, not a description of the
+/// picture: "send me mouse reports, in this encoding; tell me about focus; frame
+/// my pastes; encode my arrow keys this way; tell me when the theme changes".
+///
+/// Kept as its own list because two different restores must be able to say
+/// "whatever process asked for these is gone": the raw ring replay
+/// (`replay_mode_reset`, which adds the display bits above), and the app's own
+/// persisted screen snapshot (`Surface.sessionSnapshot`) — a picture of a
+/// PREVIOUS app run's grid, which may describe a child that has since been
+/// relaunched (see `threadEnter`). A second, drifting copy of this list is
+/// exactly how a mode gets missed, which is why there is one.
+///
+/// Same discipline as its parent: mode state only, nothing that moves the cursor
+/// or erases (see the doc above and the structural test).
+pub const input_mode_reset =
     "\x1b[?9l" ++ // X10 mouse reporting
     "\x1b[?1000l" ++ // normal button-press mouse tracking
     "\x1b[?1002l" ++ // button-event (drag) tracking
@@ -485,11 +506,10 @@ pub const replay_mode_reset =
     "\x1b[?1015l" ++ // urxvt mouse encoding
     "\x1b[?1016l" ++ // SGR-pixel mouse encoding
     "\x1b[?2004l" ++ // bracketed paste
+    "\x1b[?2031l" ++ // color-scheme change reports (DSR on light/dark switch)
+    "\x1b[?2048l" ++ // in-band size reports (DSR on every resize)
     "\x1b[?1l" ++ // DECCKM: normal (not application) cursor keys
-    "\x1b>" ++ // DECKPNM: normal (not application) keypad
-    "\x1b[?7h" ++ // DECAWM: autowrap back on (its default)
-    "\x1b[?25h" ++ // DECTCEM: cursor visible again
-    "\x1b[0m"; // SGR: default text attributes
+    "\x1b>"; // DECKPNM: normal (not application) keypad
 
 /// A single `OPEN.env` key/value pair. Re-exported so surface-construction code
 /// (`Surface.zig`) can build the forwarded env list without importing the wire
@@ -1358,6 +1378,31 @@ pub fn threadEnter(
         if (self.restore_snapshot) |snap| {
             if (snap.len > 0) {
                 @call(.always_inline, termio.Termio.processOutput, .{ io, snap });
+
+                // …then drop the INPUT-reporting modes it may carry. The
+                // snapshot is a picture of the PREVIOUS app run's grid, so its
+                // `?1003h` & co. describe whatever program owned the pane back
+                // then — and a pane can be ALIVE here while running a completely
+                // different child, because an agent restart between the two app
+                // runs relaunches every session as a plain login shell. Restoring
+                // a dead TUI's mouse tracking onto that shell is the reported
+                // spam: `35;106;15M35;103;14M…` typed at the prompt on every
+                // pointer move. (This is the belt for snapshots ALREADY on disk;
+                // new ones no longer capture these modes at all — see
+                // `Surface.sessionSnapshot`, which clears `extra.input_modes`.)
+                //
+                // Gated on the same capability the park below is, and for the
+                // same reason: `grid_snapshot` is what makes this a fix instead
+                // of a trade. The agent appends a repaint of the CURRENT screen
+                // — modes included — derived continuously from the child's own
+                // byte stream, and it lands in the drain just below. So a live
+                // TUI gets its real mouse tracking back from the one source that
+                // actually knows, and only an agent too old to send one keeps
+                // today's behavior (its own dead-mode hazard included) rather
+                // than losing a live TUI's mouse.
+                if (rd.conn.peerRepaintsOnAttach()) {
+                    @call(.always_inline, termio.Termio.processOutput, .{ io, input_mode_reset });
+                }
 
                 // T666: the paint we just made sits on the VISIBLE SCREEN, and
                 // the next thing the agent sends is a repaint of the session's
@@ -2365,6 +2410,68 @@ test "T824 replay_mode_reset disarms every mode a dead TUI could leave armed" {
     // It fits the wire cap the agent enforces, or the tail would be truncated
     // off and the last modes in the list would silently never be reset.
     try testing.expect(replay_mode_reset.len <= protocol.Relaunch.max_notice_bytes);
+}
+
+test "T1055 input_mode_reset: every process-facing report mode comes back off" {
+    const testing = std.testing;
+    // The persisted screen snapshot (`Surface.sessionSnapshot`) is a picture of a
+    // PREVIOUS app run's grid, and a snapshot already on disk still re-emits the
+    // modes that grid had — `?1003h`/`?1006h` included. Repainted onto a pane
+    // whose child was relaunched as a plain shell in between, that arms mouse
+    // tracking against a shell, which then reads every pointer move as typed
+    // input (`35;106;15M35;103;14M…`). Whatever asked for these is gone; they all
+    // reset — and the two "send me a report" agreements T824 missed are here too.
+    for ([_][]const u8{
+        "\x1b[?9l", // X10
+        "\x1b[?1000l", // button press
+        "\x1b[?1002l", // drag
+        "\x1b[?1003l", // any-event / hover — the reported spam
+        "\x1b[?1004l", // focus reporting
+        "\x1b[?1005l", // UTF-8 encoding
+        "\x1b[?1006l", // SGR encoding
+        "\x1b[?1015l", // urxvt encoding
+        "\x1b[?1016l", // SGR-pixel encoding
+        "\x1b[?2004l", // bracketed paste
+        "\x1b[?2031l", // color-scheme change reports
+        "\x1b[?2048l", // in-band size reports
+        "\x1b[?1l", // DECCKM
+        "\x1b>", // DECKPNM
+    }) |seq| {
+        try testing.expect(std.mem.indexOf(u8, input_mode_reset, seq) != null);
+    }
+
+    // It is INPUT state only: the display bits belong to `replay_mode_reset`, so
+    // a snapshot repaint (which sets its own cursor visibility, SGR and wrap from
+    // the grid it is restoring) is not disturbed by this list landing after it.
+    for ([_][]const u8{
+        "\x1b[?7h", // DECAWM
+        "\x1b[?25h", // DECTCEM
+        "\x1b[0m", // SGR reset
+    }) |display| {
+        try testing.expect(std.mem.indexOf(u8, input_mode_reset, display) == null);
+    }
+
+    // Same discipline as its parent: nothing that homes the cursor or erases, or
+    // it would eat the restored rows it is emitted on top of.
+    for ([_][]const u8{
+        "\x1b[?1049", // alt screen (save/restore cursor)
+        "\x1b[?1047", // alt screen (erase on exit)
+        "\x1b[?6l", // origin mode (homes)
+        "\x1bc", // RIS
+    }) |banned| {
+        try testing.expect(std.mem.indexOf(u8, input_mode_reset, banned) == null);
+    }
+    try testing.expect(std.mem.indexOf(u8, input_mode_reset, "\x1b[r") == null);
+}
+
+test "T1055 input_mode_reset is a prefix of replay_mode_reset (one list, not two)" {
+    const testing = std.testing;
+    // The two resets must never drift: a mode added to one and missed by the
+    // other is precisely how `?1003h` survived a restore in the first place.
+    // `replay_mode_reset` is literally built from this one plus the display bits,
+    // and this is the assertion that keeps it that way.
+    try testing.expect(std.mem.startsWith(u8, replay_mode_reset, input_mode_reset));
+    try testing.expect(replay_mode_reset.len > input_mode_reset.len);
 }
 
 test "T824 only the replaying policies ask the agent to splice a mode reset" {

@@ -1,11 +1,9 @@
 {
     "guard":  "release-artifacts-packaging",
     "script":  "test/win32/release-artifacts.ps1",
-    "generated":  "2026-08-16T10:37:04-07:00",
-    "commit":  "5f3f8f45b",
-    "seeded_from":  "test/win32/release-artifacts.stamp.json (T898 row split; these two hashes were recorded by that zero-skip Docker run, unchanged since)",
+    "generated":  "2026-08-21T09:24:41-07:00",
+    "commit":  "2a7b7783f",
     "files":  {
-                  "dist/windows-installer/build-msi.sh":  "e3dc180e865afafef6035f9bd6bee34ddb27f23c300bf1f3fcfe983339284d4a",
-                  "dist/windows-installer/build-portable-zip.sh":  "0adc05d0eb7ef0d29d4308dd2ab914722fdb9e81c6031eaaa77301ab62474917"
+                  "dist/windows-installer/build-msi.sh":  "54a40f24d052dbcc8fc8630bca1634fa6bc18972deed602f85c0dadec1b6a5c5"
               }
 }

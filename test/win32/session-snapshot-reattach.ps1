@@ -23,6 +23,9 @@
 #      both N and M > 0, N equal to the offset the manifest recorded) rather
 #      than the full-ring path (`offset=0 snapshot=0`) - and that the pane's
 #      pre-quit content survived.
+#   M. INPUT-MODE half (T1055) - a pane arms the mouse-tracking family the way
+#      a TUI does; the snapshot the app records for it carries none of those
+#      "keep sending me reports" modes, while still describing the picture.
 #
 # The log line is the oracle because the two paths are indistinguishable from
 # outside: both end with a pane full of the right text. `-NegativeControl`
@@ -417,6 +420,84 @@ $mC = Wait-Manifest $tmp {
 $leafC = First-Snapshot-Leaf $mC
 Assert "C7 the restored pane records a fresh snapshot at an offset >= the first" (
     $null -ne $leafC -and [uint64]$leafC.screen_snapshot_offset -ge $offsetA)
+
+# ============================================================================
+Say "== M: a snapshot never carries a dead TUI's input-reporting modes (T1055)"
+# ============================================================================
+# The snapshot is a PICTURE of a grid, persisted at quit and repainted at the
+# next launch - but "keep sending me mouse reports" is an agreement with the
+# PROCESS that asked for it, and between the two app runs an agent restart can
+# relaunch a session as a plain login shell. A snapshot that carries `?1003h`
+# re-arms mouse tracking against that shell, which then reads every pointer move
+# as typed input (`35;106;15M35;103;14M...` at the prompt). So: a pane arms the
+# full input-reporting set the way a TUI does, and the snapshot the app records
+# for it must contain none of them - while still describing the picture.
+#
+# Byte-level assertions on the recorded blob rather than a synthetic pointer
+# move: the acceptance run is on a BACKGROUND desktop where SendInput is dead
+# (lib\TestDesktop.ps1), and the blob is what a restore actually replays. The
+# unit half (`src/terminal/formatter.zig`, "keeps the picture, drops the
+# reports") pins the same rule at the serializer.
+#
+# MEASURED, not assumed (2026-08-21): built with `input_modes` left ON, this
+# exact arm scores `M3 ... found: [?1004h [?2004h`, so the oracle has teeth.
+# ConPTY does eat `?1003h`/`?1006h` on the way out of the child - a Windows-only
+# narrowing of the upstream repro, and the reason M3 checks the whole family
+# rather than mouse tracking alone.
+$armMarker = "MOUSEARM$($PID)XYZ"
+$armBin = Join-Path $tmp 'arm.bin'
+$armCmd = Join-Path $tmp 'arm.cmd'
+$esc = [char]27
+$armPayload = "$esc[?1003h$esc[?1006h$esc[?1004h$esc[?2004h$armMarker`r`n"
+[System.IO.File]::WriteAllText($armBin, $armPayload, [System.Text.Encoding]::ASCII)
+[System.IO.File]::WriteAllText(
+    $armCmd,
+    "@echo off`r`ntype `"$armBin`"`r`n",
+    [System.Text.Encoding]::ASCII)
+
+# One space-free token, the same way A plants its marker: `type` dumps the raw
+# bytes so the CHILD emits them, which is the only way the pane's terminal ends
+# up with the modes actually set.
+Run-Cli "+send-keys --target=$paneC $armCmd Enter" "$tmp\arm-send.txt" 12 | Out-Null
+$armOk = $false
+$deadline = (Get-Date).AddSeconds(30)
+while ((Get-Date) -lt $deadline) {
+    Run-Cli "+read --name=$paneC --lines=200" "$tmp\read-arm.txt" 10 | Out-Null
+    if (((Out-Text "$tmp\read-arm.txt") -replace '\s', '') -match $armMarker) { $armOk = $true; break }
+    Start-Sleep -Milliseconds 600
+}
+Assert "M1 the pane's child emitted the arming sequence (marker on screen)" $armOk
+
+# Provoke the debounced capture and wait for the one that POST-DATES the arming.
+Run-Cli "+rename --target=$paneC --title=t1055-mouse" "$tmp\ren3.txt" 12 | Out-Null
+$armPat = $armMarker
+$mM = Wait-Manifest $tmp {
+    param($m)
+    $l = First-Snapshot-Leaf $m
+    $null -ne $l -and (Snapshot-Text (Decode-Snapshot $l.screen_snapshot)) -match $armPat
+} 35
+$leafM = First-Snapshot-Leaf $mM
+$decodedM = if ($null -ne $leafM) { Decode-Snapshot $leafM.screen_snapshot } else { $null }
+Assert "M2 a snapshot captured AFTER the arming holds the marker" (
+    $null -ne $decodedM -and (Snapshot-Text $decodedM) -match $armMarker)
+
+# The whole point. Each of these is a "send reports to my process" agreement,
+# and each one re-armed over a relaunched shell is user-visible garbage.
+$armedFound = @()
+foreach ($seq in @('[?1003h', '[?1002h', '[?1000h', '[?9h', '[?1006h', '[?1004h', '[?2004h', '[?1015h', '[?1016h', '[?1005h')) {
+    if ($null -ne $decodedM -and $decodedM.Contains("$esc$seq")) { $armedFound += $seq }
+}
+Assert "M3 the snapshot arms no input-reporting mode (found: $($armedFound -join ' '))" (
+    $null -ne $decodedM -and $armedFound.Count -eq 0)
+
+# POSITIVE CONTROL, and it is load-bearing: M3 would also be scored by a build
+# that stopped serializing modes into the snapshot altogether. `?9001h`
+# (win32-input-mode) is the one non-default mode a ConPTY-backed pane reliably
+# carries, and it is deliberately NOT in `modes.isInputReporting` - the ConPTY
+# that asks for it is still there after a relaunch, so restoring it is correct
+# rather than a dead program's leftover. So it must SURVIVE.
+Assert "M4 the snapshot still serializes non-input modes (?9001h survives)" (
+    $null -ne $decodedM -and $decodedM.Contains("$esc[?9001h"))
 
 if ($script:failures -gt 0) {
     Say "== DIAG: sid=$sid pane=$pane offsetA=$offsetA offsetFinal=$offsetFinal"

@@ -1,8 +1,8 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-21T08:01:29-07:00",
-    "commit":  "de8ab7545",
+    "generated":  "2026-08-21T09:25:47-07:00",
+    "commit":  "2a7b7783f",
     "files":  {
                   "docs/claude/testing.md":  "f939385433e03ecf218cb22140f2cf8aea0821f43d934f0d15101935c778a330",
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
@@ -189,7 +189,7 @@
                   "test/win32/rearrange-session-drop.ps1":  "581a3ec58c4ebf777faf556318f9b628220b0be4e88af1adc481e23c46a151eb",
                   "test/win32/relaunch-guard.ps1":  "c9eba909ca4f70a63bad193281df40f31b001c8da9cf6253809e1b9247f23bdb",
                   "test/win32/relay-account.ps1":  "996aa87fe7e3d21cacfcbbe180529dab25dd80916e751ce8226cf22280bed50f",
-                  "test/win32/release-artifacts.ps1":  "b2ed7f7da6a3f1195124a36d47f75436e5a76f1ed1618758f14e2929719fa927",
+                  "test/win32/release-artifacts.ps1":  "d2f61e55484ebe94aa6235b615bb52f9c6bf39515c7a0574ba06b95be8cab835",
                   "test/win32/release-parity.ps1":  "58774aa921db12266c09e382a9d3908036bb01f4c5b09c7b2dda00bba7f42715",
                   "test/win32/remote-inherit.ps1":  "9e02e4869ce88671af453e4c6997588df9061e29bb210cb41c869cd6c97c4361",
                   "test/win32/remote-pill.ps1":  "41325c92a54cdfc27a577c400f10865fcf82c48556a8425bff7abd9cd68557f9",
@@ -214,7 +214,7 @@
                   "test/win32/session-restore-maximized.ps1":  "f1d51789dea2a462468e8f27da0f912594ad3deece41d6fd7a18bd3c2b8bd3ff",
                   "test/win32/session-resume-offset.ps1":  "8386aad5e6f2a402ad9e23034fa4ef771be1a08cffead37b1224b3cee73b2258",
                   "test/win32/sessions-agent-build.ps1":  "a54adedd012376c5ec12ae1d7c1ecf1f9ffeda89817df8aeabc4e75fd11ac10f",
-                  "test/win32/session-snapshot-reattach.ps1":  "4ce7452f0dda95fa496f63d30cd918106aaa875009546ce1abb964df7b8cdea3",
+                  "test/win32/session-snapshot-reattach.ps1":  "60af4d23ff7fd68b35e4d061e5ec85654308cc0fcdf75762311db46fb922b3ca",
                   "test/win32/share-machine.ps1":  "e73db9d168f63d50d002de3881193d129aacbd47df8015caec17799ff1b79b5b",
                   "test/win32/single-instance-join.ps1":  "eb389e12af433cbd41efe59858b51e6f5f5c00a8f550d3a04f8c8af042ed4cd1",
                   "test/win32/skip-visibility.ps1":  "c757621d0e3bb387d615cc74968e708190720f712eb6484d8438180c8ee870e2",
