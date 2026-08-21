@@ -402,5 +402,43 @@
 </description>
             <enclosure url="https://github.com/dzearing/ghoztty/releases/download/v1.33.0/Ghoztty-1.33.0-arm64.dmg" type="application/octet-stream" sparkle:edSignature="7ik5ylGpI+yjuaSen7wNZeQzKIBqZDL4v9Si0ly56BbXtfNpOXWWR8SeMO26c0xsEdYRDL9GWL4CQNiyC9rpBw==" length="25795967" />
         </item>
+        <item>
+            <title>Version 1.34.0</title>
+            <sparkle:version>1.34.0</sparkle:version>
+            <sparkle:shortVersionString>1.34.0</sparkle:shortVersionString>
+            <pubDate>Fri, 21 Aug 2026 14:08:57 +0000</pubDate>
+            <description>{
+  "version": "1.34.0",
+  "sections": [
+    {
+      "title": "Split panes",
+      "items": [
+        { "title": "Dragging a divider moves only that edge", "text": "With three or more panes in a row, dragging the left divider dragged the right one along with it, because each split stored a fraction and setting one rescaled the whole subtree. A divider drag is now measured in points against a snapshot of the layout taken at mouse-down, so only the two panes flanking that divider change and every other edge stays exactly where you put it. Push a pane to its minimum and the one behind it starts giving instead — and dragging past the minimum and back restores the squashed panes precisely. Keyboard resize follows the same math." }
+      ]
+    },
+    {
+      "title": "Viewer panes",
+      "items": [
+        { "title": "A website or HTML mock keeps its address bar on screen", "text": "A live page is something you navigate, so its address field and back/forward controls now stay visible instead of peeking in on hover. Markdown and code viewers are reading surfaces and keep the hover peek. The bar follows the pane's current content, so browsing a document out to the web pins it and going Back hands it away again." },
+        { "title": "A squeezed viewer stays inside its pane", "text": "Narrowing a viewer past the width of its navigation buttons spilled the whole viewer out both sides — over the pane next door and off the window edge. A viewer is a leaf in the split tree like a terminal now: the tree decides the width and the content compresses to fit." }
+      ]
+    },
+    {
+      "title": "Command line",
+      "items": [
+        { "title": "A target-less `+split` lands in the pane that asked for it", "text": "`ghoztty +split` with no `--target` used whichever window was focused at the moment the app got around to handling it — so an agent in one pane asking for a side pane, plus a click somewhere else in the meantime, put the pane in the wrong window. It now anchors at the pane the command was actually run from. `--target`, `--pane`, and `--from-focused` still win, and a command run outside Ghoztty behaves as before." }
+      ]
+    },
+    {
+      "title": "Build",
+      "items": [
+        { "title": "`ghostty-vt` compiles again", "text": "The C formatter binding had fallen out of sync with its Zig counterpart, which stopped the library building. The missing option is mirrored across." }
+      ]
+    }
+  ]
+}
+</description>
+            <enclosure url="https://github.com/dzearing/ghoztty/releases/download/v1.34.0/Ghoztty-1.34.0-arm64.dmg" type="application/octet-stream" sparkle:edSignature="LZhJJKGdt3B3h212bYy3ccDo1pEbx839DMPCEvgveOUcyupwMZHga3RCjAAOglgtGmTK17FZDAlCa58fvz/IAg==" length="25806432" />
+        </item>
     </channel>
 </rss>
