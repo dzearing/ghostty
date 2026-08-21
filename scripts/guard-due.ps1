@@ -1319,12 +1319,20 @@ $GuardTable = @(
     # IS that call, and `lib\FakeRelay.ps1` because the whole success case
     # exists only through its bridge: a change to either can make this harness
     # pass over a path it never took.
+    #
+    # `activity_dial.zig` joined the list in T329, and its absence until then is
+    # the failure mode this table exists to prevent: T299 MOVED startDial /
+    # onDialed / adoptDial / teardownSource out of `ActivityMonitor.zig` into a
+    # file of their own, and the row that named those four functions in its own
+    # comment kept pointing at the file they had left. An edit to the connection
+    # plane made nothing due.
     [pscustomobject]@{
         Name   = 'activity-monitor-dialed'
         Script = 'test\win32\activity-monitor-dialed.ps1'
         Stamp  = 'test\win32\activity-monitor-dialed.stamp.json'
         Covers = @(
             'src\apprt\win32\ActivityMonitor.zig',
+            'src\apprt\win32\activity_dial.zig',
             'src\remote\relay_dial.zig',
             'test\win32\lib\FakeRelay.ps1',
             'test\win32\activity-monitor-dialed.ps1'

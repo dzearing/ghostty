@@ -65,9 +65,16 @@
 # `-NegativeControl` inverts B - it asserts the root pid is the APP's, i.e.
 # that the panel sampled locally - and that run MUST fail.
 #
-# NOT COVERED HERE: the DIALED entry (the chooser's Activity button) needs a
-# relay device, which needs a signed-in account; `chooser-menu.ps1` covers the
-# button and this covers the data plane it lands on.
+# NOT COVERED HERE: the DIALED entry (the chooser's Activity button), which is
+# the other half of the ownership question this script is about - it OWNS what
+# it opens, where every panel here BORROWS. That used to be uncoverable on box
+# (a relay device needs a signed-in account and a real relay), and it is not
+# any more: `lib\FakeRelay.ps1` bridges a loopback relay to a real agent, so
+# `activity-monitor-dialed.ps1` drives dial -> sample -> free end to end,
+# including a panel closed with its dial still in flight and - the mirror image
+# of D below - a panel that must free its OWN connection while a window on the
+# same machine keeps its session (T297, T329). `chooser-menu.ps1` still owns the
+# button itself and its honest failure against a directory that is no agent.
 #
 # T211/T217: runs on a BACKGROUND Win32 desktop and asserts at the end that it
 # never took the user's foreground.

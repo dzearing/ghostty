@@ -35,6 +35,21 @@
 #   C  a panel closed WHILE its dial is in flight neither crashes nor leaks -
 #      the late dial lands on the app's message window, is torn down instead of
 #      adopted, and the relay sees that bridge close too
+#   D  (T329) and it frees NOTHING ELSE: with a live remote WINDOW on the same
+#      machine, the panel still dials its own link beside the window's, and
+#      closing it leaves that window's session round-tripping
+#
+# WHY D IS A SEPARATE SECTION. A-C measure the dial with nothing else on the
+# machine, which states only half the ownership rule. "The panel frees what it
+# owns" is the half a leak breaks; "and nothing that it does not" is the half a
+# CRASH breaks, and it cannot be wrong about anything until something else holds
+# a connection to the same machine. `activity-monitor-remote.ps1` asserts that
+# second half for the BORROWED panel (closing it must not take the window's
+# shell down); D is the same claim on the OWNED path, where it can fail the
+# other way round - a panel that frees the WINDOW's transport instead of its
+# own, or one that quietly borrowed when this entry is defined by dialing
+# (`activity_dial.zig`: `borrowFromWindow` is deliberately not wired to this
+# button).
 #
 # THE ORACLE FOR A. A loopback agent enumerates the same box, so "the table
 # populated" proves nothing: a panel that silently sampled THIS process would
@@ -177,6 +192,16 @@ function Get-RelayConnCount([int]$appPid, [int]$port) {
         return @(Get-NetTCPConnection -State Established -RemotePort $port `
                 -OwningProcess $appPid -ErrorAction SilentlyContinue).Count
     } catch { return -1 }
+}
+
+# The last N lines a remote pane painted, through the app's own IPC. `cmd /c`
+# rather than `& $Exe`: a native command writing to stderr inside a redirected
+# pipeline is a terminating error under some preference settings, and a read
+# that throws would take the verdict with it.
+function Read-Pane([string]$name) {
+    cmd /c "`"$Exe`" +read --name=$name --lines=40 > `"$tmp\read.txt`" 2>&1" | Out-Null
+    if (-not (Test-Path "$tmp\read.txt")) { return '' }
+    return (Get-Content "$tmp\read.txt" -Raw)
 }
 
 function Wait-RelayConnCount([int]$appPid, [int]$port, [int]$want, [int]$timeoutMs) {
@@ -407,7 +432,124 @@ try {
     }
     Remove-Item $slowFile -ErrorAction SilentlyContinue
 
+    # =====================================================================
+    Write-Host ''
+    Write-Host '4. the panel frees ONLY what it owns - a live window on the same machine'
+    # =====================================================================
+    # The window is opened with NO --token on purpose, and that is an assertion
+    # rather than a shortcut: the CLI forwards its own GHOSTTY_RELAY_TOKEN as
+    # `--token` when it has one (`cli/new_remote_window.zig`), and this script
+    # dropped that variable from its environment the moment the app was
+    # launched. So a bearer arriving at the relay can only have been resolved
+    # INSIDE the app, which is what the relay's `auth=` field reads back. (The
+    # ACCOUNT tier of that resolution - a DPAPI `account.dat` rather than the
+    # app's env - is `relay-account.ps1` section 7's subject, against a real
+    # relay and a real agent; there is no second copy of it here.)
+    $connectsBeforeD = Count-RelayLines $relaylog "CONNECT device=$DEV"
+    cmd /c "`"$Exe`" +new-remote-window --relay=http://127.0.0.1:$RelayPort --device=$DEV --name=dialwin > `"$tmp\openwin.txt`" 2>&1"
+    $openExit = $LASTEXITCODE
+    # `-Raw` answers $null for an EMPTY file, which a silent open produces, and
+    # `$null.Trim()` is a terminating error - see the `catch` at the bottom for
+    # what that used to cost.
+    $openSaid = ''
+    if (Test-Path "$tmp\openwin.txt") {
+        $raw = Get-Content "$tmp\openwin.txt" -Raw
+        if ($null -ne $raw) { $openSaid = $raw.Trim() }
+    }
+    Assert ($openExit -eq 0) `
+        "D +new-remote-window opened the machine with no --token (exit=$openExit $openSaid)"
+    Assert (Wait-RelayLines $relaylog "CONNECT device=$DEV" ($connectsBeforeD + 1) 15000) `
+        'D that open crossed the relay'
+    $authLine = (@(Get-FakeRelayLog $relaylog | Select-String "CONNECT device=$DEV") | Select-Object -Last 1)
+    Assert ($null -ne $authLine -and "$authLine" -match "auth=Bearer $TOKEN") `
+        "D the app resolved the credential itself - the relay read it off the wire ($authLine)"
+
+    if ($openExit -ne 0) {
+        Write-Host '  SKIP D: no remote window, so nothing could hold a second connection to the machine'
+        $script:skipped++
+    } else {
+        Start-Sleep -Seconds 2
+        cmd /c "`"$Exe`" +send-keys --target=dialwin `"echo dialwin-up`" Enter > nul 2>&1" | Out-Null
+        Start-Sleep -Seconds 3
+        Assert ((Read-Pane 'dialwin') -match 'dialwin-up') `
+            'D the window round-trips through the machine (positive control - the rest of D is about NOT breaking this)'
+
+        # The baseline every "gave back only its own" number below is read
+        # against: what the app holds to the relay with the WINDOW up and no
+        # panel. Measured, not assumed - the reconnect ladder is free to hold
+        # more than one and the claim here is about the DIFFERENCE.
+        $winConns = Wait-RelayConnCount $appPid $RelayPort ($idleConns + 1) 10000
+        Write-Host "      sockets app -> 127.0.0.1:${RelayPort} with the window up: $winConns (idle was $idleConns)"
+        Assert ($winConns -gt $idleConns) 'D the window holds a connection of its own'
+
+        $dialsBeforeD = Count-LogLines $errlog "activity monitor: dialing source=$DEVNAME"
+        $borrowsBeforeD = Count-LogLines $errlog "activity monitor: borrowing a window's connection"
+        $closesBeforeD = Count-LogLines $errlog "activity monitor: closed source=$DEVNAME"
+        # Counted apart from the dials on purpose: section 3's late dial is one
+        # `dialing` with no `connected` after it (it was torn down rather than
+        # adopted), so the two counters are legitimately out of step by the time
+        # this section starts.
+        $connectedBeforeD = Count-LogLines $errlog "activity monitor: connected source=$DEVNAME"
+
+        $chooser3 = Open-ChooserOnDevice $top $surface $appPid
+        Assert ($chooser3 -ne [IntPtr]::Zero) 'D the chooser opens with the remote window up'
+        $ab3 = if ($chooser3 -ne [IntPtr]::Zero) { Get-ChooserActivityButton -Chooser $chooser3 } else { $null }
+        if (-not ($ab3 -and $ab3.Visible)) {
+            Write-Host '  SKIP D: no Activity button, so no owned panel could be opened beside the window'
+            $script:skipped++
+        } else {
+            [void](Invoke-ChooserClick -Chooser $chooser3 -Control $ab3)
+            $panel3 = Wait-TestWindow -ProcessId $appPid -Class 'GhozttyActivityMonitor' -TimeoutMs 10000
+            Assert ($panel3 -ne [IntPtr]::Zero) 'D Activity opens a panel while a window is on that machine'
+
+            Assert (Wait-LogCount $errlog "activity monitor: dialing source=$DEVNAME" ($dialsBeforeD + 1) 10000) `
+                'D it DIALS its own link even though a window is already connected to that machine'
+            Assert ((Count-LogLines $errlog "activity monitor: borrowing a window's connection") -eq $borrowsBeforeD) `
+                'D ...and borrowed nothing (this entry is defined by owning what it opens)'
+            Assert (Wait-LogCount $errlog "activity monitor: connected source=$DEVNAME" ($connectedBeforeD + 1) 15000) `
+                'D the second dial connected'
+
+            $stateD = Wait-PanelState $errlog $DEVNAME
+            Assert ($null -ne $stateD -and $stateD.Total -gt 0 -and $stateD.Root -eq $wantRoot) `
+                "D the panel is sampling $rootLabel (root=$(if ($stateD) { $stateD.Root } else { 'none' }))"
+
+            $bothConns = Wait-RelayConnCount $appPid $RelayPort ($winConns + 1) 15000
+            Write-Host "      sockets with BOTH the window and the panel up: $bothConns"
+            Assert ($bothConns -gt $winConns) `
+                "D the panel's socket sits BESIDE the window's, it did not ride it (window=$winConns both=$bothConns)"
+
+            # The claim: close the OWNED panel and the window is untouched. A
+            # panel that freed the wrong transport shows up twice here - as a
+            # socket count that fell past the window's baseline, and as a pane
+            # that stopped answering.
+            [void](Send-TestWindowClose -Window $panel3)
+            Assert (Wait-LogCount $errlog "activity monitor: closed source=$DEVNAME" ($closesBeforeD + 1) 10000) `
+                'D the panel closed'
+            $afterD = Wait-RelayConnCount $appPid $RelayPort $winConns 15000
+            Assert ($afterD -eq $winConns) `
+                "D it gave back its OWN connection and kept its hands off the window's (window=$winConns after=$afterD)"
+
+            cmd /c "`"$Exe`" +send-keys --target=dialwin `"echo dialwin-alive`" Enter > nul 2>&1" | Out-Null
+            Start-Sleep -Seconds 3
+            Assert ((Read-Pane 'dialwin') -match 'dialwin-alive') `
+                'D the window STILL round-trips after the owned panel closed'
+            Assert (-not ($script:app.Process -and $script:app.Process.HasExited)) 'D the app survived'
+        }
+    }
+
     Assert (-not (Test-TestDesktopLeak -ProcessId $appPid)) 'the run never took the user''s foreground'
+} catch {
+    # A run that THREW measured nothing after the throw, and the sections that
+    # already passed must not carry it. Without this arm the verdict reads
+    # `ALL PASS` over an aborted run and - the part that outlives the run - the
+    # stamp below records every covered file as freshly proven, so the guard
+    # stops asking. Measured here in T329: a `.Trim()` on an empty file ended
+    # section 4 before its first assertion and the script still printed
+    # ALL PASS (27) and STAMPED. Failing loudly is the only honest verdict for
+    # an exception, whatever it was.
+    $script:fail++
+    Write-Host "  FAIL the run threw before it finished: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "       at line $($_.InvocationInfo.ScriptLineNumber): $($_.InvocationInfo.Line.Trim())"
 } finally {
     Stop-FakeRelay $script:relay
     if ($null -ne $script:agent) {
