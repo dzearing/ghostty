@@ -78,7 +78,14 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// init: typing a URL into a file viewer's address bar switches it to
     /// `.web`, and navigating Back over that boundary switches it home again
     /// (see `syncMode(toCommitted:)`).
-    private(set) var mode: Mode
+    ///
+    /// Whether the chrome bar is pinned open depends on the mode, so every
+    /// assignment re-evaluates it here rather than at each navigation site —
+    /// there are five of them, and a new one that forgot would silently leave
+    /// a website peeking or a document pinned.
+    private(set) var mode: Mode {
+        didSet { updateChromePin() }
+    }
 
     /// The file the template page is showing, if any. Kept separately from
     /// `mode` because the web view's URL while a file is displayed is the
@@ -308,6 +315,11 @@ final class ViewerView: NSView, Codable, ObservableObject {
         // clipping it would paint over whatever sits above this pane.
         clipsToBounds = true
         setupWebView(adopting: adoptedWebView)
+        // Before the pane has a window, so a mode that pins the bar reserves
+        // its space in the pane's first layout: the page then paints once, at
+        // its final size, instead of being pushed down by a bar sliding in
+        // over content the user is already reading.
+        updateChromePin()
         // A popup adopts a web view WebKit is already driving (see
         // `createWebViewWith`): loading our own request would fight that
         // navigation and break the opener↔popup link, and there is no file to
@@ -366,6 +378,9 @@ final class ViewerView: NSView, Codable, ObservableObject {
             chromeHost = nil
             chromeTopConstraint = nil
             chromeVisible = false
+            // The pin goes with the bar: a re-attach re-mounts from scratch,
+            // and a pinned pane has to pin the new bar too.
+            chromePinned = false
             // Same retain-cycle reasoning as the chrome bar. The composer's
             // CONTENT is safe: it lives in `feedbackModel`, which this view
             // owns, so an undo that re-attaches the pane brings the
@@ -400,6 +415,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
         } else {
             installEventMonitor()
             startWatchingDiff()
+            updateChromePin()
         }
     }
 
@@ -1006,8 +1022,37 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// unified⇄side-by-side toggle live, and a control you have to go hunting
     /// for with the mouse before every use is not a control. It also keeps the
     /// revspec visible, which is the one thing a diff pane's chrome should say.
+    /// So does a live page — a website, or a local HTML file the web view
+    /// renders as one: that is something you NAVIGATE, so the address and the
+    /// back/forward controls are part of using it, and a blank browser pane is
+    /// nothing but its address field. A markdown or code viewer is a reading
+    /// surface whose address rarely changes, so it keeps the hover peek rather
+    /// than spending a permanent strip of the document on chrome.
     private var chromeAlwaysVisible: Bool {
-        sidePanelLayout == .compact || feedbackOpen || isDiffMode
+        sidePanelLayout == .compact || feedbackOpen || isDiffMode || isLivePage
+    }
+
+    /// The pin state the chrome currently reflects, so `updateChromePin` acts
+    /// only on a real change and never re-arms the hide timer under a bar the
+    /// user is already looking at.
+    private var chromePinned = false
+
+    /// Re-evaluate `chromeAlwaysVisible` after something that can change it —
+    /// a navigation, the side panel switching layout, the composer opening or
+    /// closing. A pane's mode is not fixed at open (the address field
+    /// navigates a markdown viewer to a website, and Back brings it home), so
+    /// the pin follows where the pane IS rather than where it was opened.
+    ///
+    /// EVERY pin transition goes through here, because the conditions overlap:
+    /// a pane can be pinned by two of them at once, and one of them ending
+    /// must not un-pin a bar the other still needs.
+    private func updateChromePin() {
+        let pinned = chromeAlwaysVisible
+        guard pinned != chromePinned else { return }
+        chromePinned = pinned
+        // Newly pinned: show it now. No longer pinned: hand it back to the
+        // hover timer rather than yanking it away mid-glance.
+        if pinned { setChromeVisible(true) } else { scheduleChromeHide() }
     }
 
     /// Toggle the contents panel (the chrome bar's leading button).
@@ -1380,7 +1425,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
             // The composer's only close affordance lives in the chrome bar,
             // so the bar must stop auto-hiding while it is open (same reason
             // the compact TOC layout pins it).
-            setChromeVisible(true)
+            updateChromePin()
             applyFeedbackState(animated: window?.isVisible == true)
             focusFeedbackInput()
         } else {
@@ -1390,7 +1435,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
                let feedbackHost, responder.isDescendant(of: feedbackHost) {
                 window?.makeFirstResponder(webView)
             }
-            scheduleChromeHide()
+            updateChromePin()
         }
     }
 
@@ -1986,12 +2031,10 @@ final class ViewerView: NSView, Codable, ObservableObject {
             sidePanelLayout = layout
             // The compact layout puts the only control that opens the
             // contents panel in the chrome bar, so the bar has to stop
-            // auto-hiding. Leaving compact hands it back to hover.
-            if layout == .compact {
-                setChromeVisible(true)
-            } else {
-                scheduleChromeHide()
-            }
+            // auto-hiding. Leaving compact hands it back to hover — unless
+            // something else still pins it, which is `updateChromePin`'s job
+            // to know.
+            updateChromePin()
         }
 
         // The card hangs off the WEB VIEW's top, not the pane's: when the
