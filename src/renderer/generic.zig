@@ -1499,7 +1499,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Let our graphics API do any bookkeeping, etc.
             // that it needs to do before / after `drawFrame`.
             self.api.drawFrameStart();
-            defer self.api.drawFrameEnd();
+            defer {
+                self.api.drawFrameEnd();
+                // T1031: the frame is now on screen, so tell the GUI thread.
+                // It waits on this while a resize is in flight — a divider
+                // drag, a window-edge drag, a banner expand/collapse — so that
+                // the pane presents at its new size instead of showing
+                // background until the renderer thread happens to catch up.
+                //
+                // `signalFrameDrawn` existed and was documented as "called by
+                // the renderer thread after SwapBuffers" but had NO caller, so
+                // the wait it feeds was a 16ms sleep on an event nobody ever
+                // set. Same comptime shape as `heroSnapshot` below, and for
+                // the same reason: the concept is win32's, the hook is here
+                // because here is where the swap happens.
+                if (comptime apprt.runtime == apprt.win32) self.rt_surface.signalFrameDrawn();
+            }
 
             // Win32 hero mode (T59a): registered after the drawFrameEnd
             // defer so it runs BEFORE it (LIFO) — i.e. after the frame is

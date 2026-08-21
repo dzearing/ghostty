@@ -1780,6 +1780,16 @@ public class GhozttyTestDesktop {
         if (hbmp != 0) DeleteObject(new IntPtr(hbmp));
     }
 
+
+    // NOT here, deliberately (T1031): a WM_ERASEBKGND probe that hands the
+    // window a DC THIS process created. It was written, it went green, and the
+    // teeth check exposed it as vacuous - an HDC is a per-process handle, so
+    // the app's `FillRect` was writing into a handle that means nothing on its
+    // side and the assertion passed whether the fix was in or out. There is no
+    // fixing it from here; a paint decision made in another process has to be
+    // reported BY that process. resize-flicker.ps1 reads it out of the debug
+    // build's stderr instead ("surface erase ... fill=").
+
     // ================= interactive-desktop watcher =================
     // Threads created here inherit the PROCESS desktop (the interactive one) -
     // only the worker is ever rebound - so this samples exactly what the user

@@ -351,6 +351,18 @@ is_quick_terminal: bool = false,
 
 /// Split divider drag state.
 dragging_split: bool = false,
+
+/// A relayout the user is watching happen frame by frame — a divider drag or
+/// a banner expand/collapse (T1031).
+///
+/// Neither is a modal size loop, so neither raises `WM_ENTERSIZEMOVE`, and
+/// before this the only thing that put a pane on the synchronous-present path
+/// was a window-frame drag — which was not actually taking it either, since
+/// the event that path waits on had no caller (see `signalFrameDrawn`). So all
+/// three interactions were showing background and then text.
+/// `Surface.handleResize` reads this alongside its own `in_live_resize`, which
+/// is what gives the three of them one path instead of three.
+in_live_layout: bool = false,
 drag_split_handle: SplitTree(PaneView).Node.Handle = .root,
 drag_split_layout: SplitTree(PaneView).Split.Layout = .horizontal,
 drag_start_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
@@ -855,7 +867,17 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         _ = pane_id.generate(&self.layout_uuid);
     }
 
-    const style: u32 = if (options.is_quick_terminal)
+    // WS_CLIPCHILDREN is load-bearing, not hygiene (T1031). Without it the
+    // container's own drawing — the caption, the tab strip, the divider bands,
+    // and every parent-side erase Windows schedules when a child moves — is
+    // free to land on the pixels a pane child owns. During a divider drag or a
+    // window-edge drag that is a flat background flash over the terminal on
+    // every motion tick, which is exactly what "the panes flicker fairly
+    // badly" was. The panes and the bands TILE the content area (T155), so
+    // clipping children out of the parent DC removes nothing the parent needs
+    // to paint: a band lives in a parent-owned gap, never under a pane.
+    const clip = w32.WS_CLIPCHILDREN;
+    const style: u32 = clip | if (options.is_quick_terminal)
         w32.WS_POPUP
     else if (app.config.@"window-decoration" == .none)
         // Borderless but still resizable: thin sizing frame, no title bar.
@@ -2759,6 +2781,10 @@ fn layoutHero(self: *Window, rect: w32.RECT) void {
     const hero_w = @max(split.hero.width(), 1);
     const hero_h = @max(split.hero.height(), 1);
 
+    // One batch for every leaf: the hero swap moves ALL of them to the hero
+    // rect and flips which one is shown, and doing that a window at a time
+    // shows background between the hide and the show (T1031).
+    var hdwp = beginPaneBatch(n);
     var it = self.tab_trees[tab].iterator();
     var leaf_i: usize = 0;
     while (it.next()) |entry| : (leaf_i += 1) {
@@ -2769,10 +2795,18 @@ fn layoutHero(self: *Window, rect: w32.RECT) void {
             // hidden leaves get the same inset so their thumbnail aspect
             // matches what selection will show.
             const inset = entry.view.bannerLayoutInset(@intCast(hero_w), hero_h);
-            _ = w32.MoveWindow(h, split.hero.left, split.hero.top + inset, @intCast(hero_w), @intCast(@max(hero_h - inset, 1)), 1);
-            _ = w32.ShowWindow(h, if (leaf_i == hero_index) w32.SW_SHOW else w32.SW_HIDE);
+            placePane(
+                &hdwp,
+                h,
+                split.hero.left,
+                split.hero.top + inset,
+                @intCast(hero_w),
+                @intCast(@max(hero_h - inset, 1)),
+                leaf_i == hero_index,
+            );
         }
     }
+    endPaneBatch(hdwp);
 
     if (self.hwnd) |h| {
         // Repaint the owner-painted divider + carousel column.
@@ -2786,6 +2820,17 @@ fn layoutHero(self: *Window, rect: w32.RECT) void {
         // Thumbnail refresh heartbeat while hero is active (Mac: 0.15s).
         _ = w32.SetTimer(h, HERO_SNAP_TIMER_ID, HERO_SNAP_INTERVAL_MS, null);
     }
+}
+
+/// `layoutSplits` for a relayout the user is watching in real time: each pane
+/// blocks briefly for a frame at its new size instead of showing background
+/// until the renderer thread catches up (T1031). Restores the previous state
+/// rather than clearing it, so a nested call cannot cancel an outer one.
+pub fn layoutSplitsLive(self: *Window) void {
+    const was = self.in_live_layout;
+    self.in_live_layout = true;
+    defer self.in_live_layout = was;
+    self.layoutSplits();
 }
 
 pub fn layoutSplits(self: *Window) void {
@@ -2806,6 +2851,7 @@ pub fn layoutSplits(self: *Window) void {
     // never started) and repaint the area the carousel used to own.
     if (self.hwnd) |h| _ = w32.KillTimer(h, HERO_SNAP_TIMER_ID);
     if (tree.zoomed) |zoomed_handle| {
+        var hdwp = beginPaneBatch(self.leafCount(self.active_tab));
         var it = tree.iterator();
         while (it.next()) |entry| {
             if (entry.handle == zoomed_handle) {
@@ -2815,17 +2861,27 @@ pub fn layoutSplits(self: *Window) void {
                     const inset = entry.view.bannerLayoutInset(rect.right - rect.left, rect.bottom - rect.top);
                     const w = @max(rect.right - rect.left, 1);
                     const ht = @max(rect.bottom - rect.top - inset, 1);
-                    _ = w32.MoveWindow(h, rect.left, rect.top + inset, @intCast(w), @intCast(ht), 1);
-                    _ = w32.ShowWindow(h, w32.SW_SHOW);
+                    placePane(&hdwp, h, rect.left, rect.top + inset, @intCast(w), @intCast(ht), true);
                 }
             } else {
                 entry.view.setVisible(false);
-                if (entry.view.hwnd()) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
+                if (entry.view.hwnd()) |h| {
+                    // Hidden through the same batch so the zoom swap is one
+                    // frame: hiding the old pane and showing the zoomed one in
+                    // two separate passes shows the window background between
+                    // them (T1031).
+                    hidePane(&hdwp, h);
+                }
             }
         }
+        endPaneBatch(hdwp);
         return;
     }
-    self.layoutNode(tree, .root, rect);
+    var hdwp = beginPaneBatch(self.leafCount(self.active_tab));
+    self.layoutNode(tree, .root, rect, &hdwp);
+    // Every pane of this pass lands in ONE frame here, before the divider
+    // bands are painted below (T1031).
+    endPaneBatch(hdwp);
 
     // Paint divider lines directly using GetDC (not BeginPaint, which
     // clips to the invalid region and misses the content area gaps).
@@ -2954,7 +3010,70 @@ pub fn updatePaneBanners(self: *Window) void {
     }
 }
 
-fn layoutNode(self: *Window, tree: SplitTree(PaneView), handle: SplitTree(PaneView).Node.Handle, rect: w32.RECT) void {
+/// Place one pane child as part of a layout pass, batched when the OS gave us
+/// a defer batch and direct when it did not (T1031).
+///
+/// Batching is the difference between "this layout pass is one frame" and
+/// "this layout pass is one frame per pane". `MoveWindow` per child leaves the
+/// siblings at mismatched geometry for the rest of the walk and schedules a
+/// separate repaint for each one, which a slow divider drag shows as the two
+/// halves tearing against each other.
+///
+/// The fallback is not defensive noise: `BeginDeferWindowPos` allocates, and a
+/// failed `DeferWindowPos` INVALIDATES the batch handle — it must not be
+/// ended, and every remaining pane still has to be placed or the layout is
+/// left half-applied. So a dead batch drops to `SetWindowPos`, which is
+/// exactly the pre-T1031 behavior.
+fn placePane(
+    hdwp: *?w32.HDWP,
+    h: w32.HWND,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+    show: bool,
+) void {
+    const flags: u32 = w32.SWP_NOZORDER | w32.SWP_NOACTIVATE |
+        (if (show) w32.SWP_SHOWWINDOW else w32.SWP_HIDEWINDOW);
+    if (hdwp.*) |batch| {
+        if (w32.DeferWindowPos(batch, h, null, x, y, cx, cy, flags)) |next| {
+            hdwp.* = next;
+            return;
+        }
+        hdwp.* = null;
+    }
+    _ = w32.SetWindowPos(h, null, x, y, cx, cy, flags);
+}
+
+/// Hide one pane through the batch, leaving its geometry alone. Same batch as
+/// the shows, so a swap (zoom, hero selection) is one frame rather than a hide
+/// frame followed by a show frame with the window background in between.
+fn hidePane(hdwp: *?w32.HDWP, h: w32.HWND) void {
+    const flags: u32 = w32.SWP_NOZORDER | w32.SWP_NOACTIVATE |
+        w32.SWP_NOMOVE | w32.SWP_NOSIZE | w32.SWP_HIDEWINDOW;
+    if (hdwp.*) |batch| {
+        if (w32.DeferWindowPos(batch, h, null, 0, 0, 0, 0, flags)) |next| {
+            hdwp.* = next;
+            return;
+        }
+        hdwp.* = null;
+    }
+    _ = w32.SetWindowPos(h, null, 0, 0, 0, 0, flags);
+}
+
+/// Open a defer batch for `n` pane placements, or null when the OS says no.
+fn beginPaneBatch(n: usize) ?w32.HDWP {
+    if (n == 0) return null;
+    return w32.BeginDeferWindowPos(@intCast(n));
+}
+
+/// Commit a batch opened by `beginPaneBatch`. Null is the "we already fell
+/// back to direct placement" case and has nothing to commit.
+fn endPaneBatch(hdwp: ?w32.HDWP) void {
+    if (hdwp) |batch| _ = w32.EndDeferWindowPos(batch);
+}
+
+fn layoutNode(self: *Window, tree: SplitTree(PaneView), handle: SplitTree(PaneView).Node.Handle, rect: w32.RECT, hdwp: *?w32.HDWP) void {
     if (handle.idx() >= tree.nodes.len) return;
     switch (tree.nodes[handle.idx()]) {
         .leaf => |view| {
@@ -2965,8 +3084,7 @@ fn layoutNode(self: *Window, tree: SplitTree(PaneView), handle: SplitTree(PaneVi
                 const inset = view.bannerLayoutInset(rect.right - rect.left, rect.bottom - rect.top);
                 const w = @max(rect.right - rect.left, 1);
                 const ht = @max(rect.bottom - rect.top - inset, 1);
-                _ = w32.MoveWindow(h, rect.left, rect.top + inset, @intCast(w), @intCast(ht), 1);
-                _ = w32.ShowWindow(h, w32.SW_SHOW);
+                placePane(hdwp, h, rect.left, rect.top + inset, @intCast(w), @intCast(ht), true);
             }
         },
         .split => |s| {
@@ -2977,14 +3095,14 @@ fn layoutNode(self: *Window, tree: SplitTree(PaneView), handle: SplitTree(PaneVi
                 const a = split_geometry.axis(rect.left, rect.right, s.ratio, self.scale);
                 const left_rect = w32.RECT{ .left = a.lo_start, .top = rect.top, .right = a.band_lo, .bottom = rect.bottom };
                 const right_rect = w32.RECT{ .left = a.band_hi, .top = rect.top, .right = a.hi_end, .bottom = rect.bottom };
-                self.layoutNode(tree, s.left, left_rect);
-                self.layoutNode(tree, s.right, right_rect);
+                self.layoutNode(tree, s.left, left_rect, hdwp);
+                self.layoutNode(tree, s.right, right_rect, hdwp);
             } else {
                 const a = split_geometry.axis(rect.top, rect.bottom, s.ratio, self.scale);
                 const top_rect = w32.RECT{ .left = rect.left, .top = a.lo_start, .right = rect.right, .bottom = a.band_lo };
                 const bottom_rect = w32.RECT{ .left = rect.left, .top = a.band_hi, .right = rect.right, .bottom = a.hi_end };
-                self.layoutNode(tree, s.left, top_rect);
-                self.layoutNode(tree, s.right, bottom_rect);
+                self.layoutNode(tree, s.left, top_rect, hdwp);
+                self.layoutNode(tree, s.right, bottom_rect, hdwp);
             }
         },
     }
@@ -3453,7 +3571,7 @@ fn updateDividerDrag(self: *Window, x: i32, y: i32) void {
             @floatCast(a.ratio),
         );
     }
-    self.layoutSplits();
+    self.layoutSplitsLive();
 }
 
 fn endDividerDrag(self: *Window) void {

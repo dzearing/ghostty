@@ -1,0 +1,10 @@
+{
+    "guard":  "resize-flicker",
+    "script":  "test/win32/resize-flicker.ps1",
+    "generated":  "2026-08-20T19:05:35-07:00",
+    "commit":  "a9ebb17cf",
+    "files":  {
+                  "src/apprt/win32/resize_paint.zig":  "d53ec8b8314a515a50eefaacb392f26717944d4e10a88c89e52390d05b3288d4",
+                  "test/win32/resize-flicker.ps1":  "c050a91f04afad55923a0f56982a2cdb635efcd9bc43d5057ade7e531bc44be9"
+              }
+}

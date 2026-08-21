@@ -9,6 +9,62 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-20 - **T1031 - panes stop blanking themselves when you resize
+  them.** The user's report was that dragging a split divider, dragging the
+  window edge, or opening the sticky banner made the panes strobe: "it seems
+  like we're clearing and repainting on every frame". Four things were doing
+  that, on one layout path. The container window had no `WS_CLIPCHILDREN` and
+  the pane children no `WS_CLIPSIBLINGS`, so parent-side drawing and the
+  transient mismatched geometry of an unbatched layout pass could land on
+  pixels a pane owns. `WM_ERASEBKGND` filled the whole client with the
+  background brush unconditionally, on the reasoning that "the OpenGL renderer
+  will overwrite the entire client area on the next frame" - the NEXT frame is
+  the bug, since the erase is synchronous and the swap is not. `layoutNode`
+  moved each leaf with its own `MoveWindow`, so one layout pass was one frame
+  per pane. And the "block until the renderer has presented at the new size"
+  path was gated on `in_live_resize`, which only `WM_ENTERSIZEMOVE` sets, so
+  neither the divider drag nor the banner toggle ever took it. All four are
+  fixed: the clip styles are on, the erase decision moved into a unit-tested
+  `resize_paint.zig` that declines once the surface holds a presented frame
+  (the search and palette popups share that window class and still get the
+  fill), `layoutSplits`/`layoutHero`/the zoom path place every pane through one
+  `BeginDeferWindowPos` batch, and `layoutSplitsLive` puts the divider drag and
+  the banner relayout on the same synchronous-present path the window-edge drag
+  had.
+
+  Two things only surfaced because the acceptance script was made to fail on
+  purpose. The first oracle sent `WM_ERASEBKGND` into a DC the *script* owned
+  and checked whether a sentinel colour survived; it passed with the entire fix
+  reverted, because an HDC is a per-process handle and the app's `FillRect` was
+  writing through a value that meant nothing on its side. It is gone from
+  `lib\TestDesktop.ps1`, with a note where it was so nobody rebuilds it, and
+  the handler now states its decision in the debug log the way the banner
+  states its collapse. Measuring *that* showed `presented=false` on every line,
+  which is how `Surface.signalFrameDrawn` turned out to have no caller at all
+  despite documenting itself as "called by the renderer thread after
+  SwapBuffers" - so the synchronous-present wait had been sitting on an event
+  nobody ever set, expiring after 16ms, since it was written. It is now wired
+  into the `drawFrameEnd` defer in `src/renderer/generic.zig`, comptime-guarded
+  to win32 beside the `heroSnapshot` hook of the same shape.
+
+  `test\win32esize-flicker.ps1` is the acceptance (16 assertions, guarded by
+  a new `resize-flicker` row): the clip styles read off the live windows, the
+  erase decisions read out of the app's own log, the tiling invariant held
+  across a posted divider drag, five window resizes and a banner set/clear, and
+  every erase assertion paired with a vacuity check that the oracle is alive -
+  the lesson from the probe that wasn't. Reverted and rebuilt it reports 4
+  FAILURES. Mac seat unaffected: everything is under `src/apprt/win32/` bar the
+  one guarded renderer line, and erase-then-paint over unclipped children has
+  no AppKit counterpart.
+
+  Filed on the way out: **T1033** (a GUI acceptance script can still launch the
+  app without the build-mode pre-flight, and `banner-resize-repaint.ps1` does -
+  nothing enumerates which scripts skip it), **T1034** (sweep for other hooks
+  that document a caller they never got, the way `signalFrameDrawn` did - the
+  code compiled, the tests passed, and the feature simply did not exist), and
+  **T1035** (the synchronous-present path still has no oracle, so the wiring
+  could be removed again and every test would stay green).
+
 - 2026-08-20 - **T325 (filed T1030) - the contrast floor the design system
   states is now the floor the code enforces, with no site left allowing a
   hair under it.** `color_math.contrastAdjustedTo` binary-searches CIELAB

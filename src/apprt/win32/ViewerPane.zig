@@ -942,7 +942,9 @@ pub fn createHostWindow(
         // created hidden would depend on a layout pass to appear, which is a
         // second source of truth for the same bit. `Surface.init` shows its
         // child window for the same reason.
-        w32.WS_CHILD | w32.WS_CLIPCHILDREN | w32.WS_VISIBLE_STYLE,
+        // WS_CLIPSIBLINGS: a viewer pane sits in the same split tree as the
+        // terminal panes, so it takes the same no-overpaint contract (T1031).
+        w32.WS_CHILD | w32.WS_CLIPCHILDREN | w32.WS_CLIPSIBLINGS | w32.WS_VISIBLE_STYLE,
         rect.left,
         rect.top,
         @max(rect.right - rect.left, 1),

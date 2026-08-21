@@ -68,6 +68,7 @@ const host_defaults = @import("host_defaults.zig");
 const gui_pump = @import("gui_pump.zig");
 const surface_reap = @import("surface_reap.zig");
 const surface_window_role = @import("surface_window_role.zig");
+const resize_paint = @import("resize_paint.zig");
 const window_active = @import("window_active.zig");
 const translate_policy = @import("translate_policy.zig");
 const w32 = @import("win32.zig");
@@ -843,7 +844,9 @@ pub fn relayoutOwnerWindow(hwnd: w32.HWND) void {
     if (userdata == 0) return;
     const surface: *Surface = @ptrFromInt(@as(usize, @bitCast(userdata)));
     if (surface.hwnd == null or surface.hwnd.? != hwnd) return;
-    surface.parent_window.layoutSplits();
+    // Live: this is the banner expanding or collapsing under the user's
+    // click, so the pane below it resizes while they watch (T1031).
+    surface.parent_window.layoutSplitsLive();
 }
 
 /// Open the config file in the default editor.
@@ -8076,14 +8079,45 @@ fn surfaceWndProc(
         },
 
         w32.WM_ERASEBKGND => {
-            // Fill with the configured background color to prevent
-            // a visible flash during resize. The OpenGL renderer will
-            // overwrite the entire client area on the next frame.
-            if (surface.app.bg_brush) |brush| {
-                const hdc_erase: w32.HDC = @ptrFromInt(wparam);
-                var rect: w32.RECT = undefined;
-                if (w32.GetClientRect(hwnd, &rect) != 0) {
-                    _ = w32.FillRect(hdc_erase, &rect, brush);
+            // The fill used to be unconditional, "because the OpenGL renderer
+            // will overwrite the entire client area on the next frame". The
+            // NEXT frame was the bug (T1031): this erase is synchronous and
+            // the GL frame is not, so each one displayed a flat background
+            // rectangle before the text came back. Measured to fire on a
+            // WINDOW resize and not during a divider drag, so this is the
+            // window-edge half of the report specifically — the divider and
+            // banner halves are the clip styles, the batched layout pass and
+            // the synchronous present.
+            //
+            // `resize_paint` owns the rule and is unit tested; the two cases
+            // that still need the fill are a surface with no presented frame
+            // behind it and the search/palette popups, which share this
+            // window class and have no renderer at all.
+            const presented = surface.has_presented_frame.load(.acquire);
+            const fill = resize_paint.shouldFillBackground(.{
+                .is_surface_window = is_surface_window,
+                .has_presented_frame = presented,
+            });
+            // Debug-build oracle for resize-flicker.ps1 (T1031), and the only
+            // one there is: WM_ERASEBKGND hands the handler a DC belonging to
+            // WHOEVER SENT IT, so a test in another process cannot pose this
+            // question by sending the message — an HDC does not survive a
+            // process boundary, and the cross-process probe that tried it
+            // passed against nothing. Same shape as `banner collapse from=`:
+            // the app states the decision it made, and the script reads it out
+            // of the debug build's stderr.
+            log.debug("surface erase surface={} presented={} fill={}", .{
+                is_surface_window,
+                presented,
+                fill,
+            });
+            if (fill) {
+                if (surface.app.bg_brush) |brush| {
+                    const hdc_erase: w32.HDC = @ptrFromInt(wparam);
+                    var rect: w32.RECT = undefined;
+                    if (w32.GetClientRect(hwnd, &rect) != 0) {
+                        _ = w32.FillRect(hdc_erase, &rect, brush);
+                    }
                 }
             }
             return 1;

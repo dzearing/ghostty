@@ -1326,6 +1326,27 @@ $GuardTable = @(
             'test\win32\lib\BuildMode.ps1',
             'test\win32\build-fresh-guard.ps1'
         )
+    },
+    # The resize paint path (T1031). `resize_paint.zig` is the rule that says a
+    # pane which already holds pixels must NOT blank itself ahead of the GL
+    # frame, and the acceptance script asks a live pane that same question
+    # through a DC it owns. Neither the floor lanes nor P1-P3 look at it: the
+    # unit tests prove the rule, and nothing else proves the rule is still
+    # WIRED to the window. The failure mode is the quiet one - the app goes
+    # back to flashing background on every resize frame and every test stays
+    # green, because a flicker is a timing artifact no other assertion can see.
+    # Deliberately NARROW: Window.zig / App.zig / Surface.zig move for a
+    # hundred unrelated reasons and would make this row due every other turn,
+    # which is how a coverage table trains people to reach for -NoGuardDue.
+    # About a minute, off the input desktop.
+    [pscustomobject]@{
+        Name   = 'resize-flicker'
+        Script = 'test\win32\resize-flicker.ps1'
+        Stamp  = 'test\win32\resize-flicker.stamp.json'
+        Covers = @(
+            'src\apprt\win32\resize_paint.zig',
+            'test\win32\resize-flicker.ps1'
+        )
     }
 )
 

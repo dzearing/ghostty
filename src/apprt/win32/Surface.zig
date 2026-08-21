@@ -134,7 +134,24 @@ key_event_produced_text: bool = false,
 /// During live resize, handleResize blocks until the renderer draws
 /// one frame at the new size (or a timeout expires), eliminating the
 /// visual flicker from the DWM stretching stale content.
+///
+/// Set for a window-frame drag at WM_ENTERSIZEMOVE, and by the window for the
+/// two other interactions that relayout panes live: a divider drag and a
+/// banner expand/collapse (T1031). Those are not modal size loops, so nothing
+/// used to put them on the synchronous-present path and every relayout tick
+/// showed background before it showed text.
 in_live_resize: bool = false,
+
+/// The renderer thread has presented at least one frame into this window.
+///
+/// Read by `WM_ERASEBKGND` (T1031): once there are real pixels in the window,
+/// filling the client with the flat background brush puts a visible blank
+/// frame on screen ahead of the GL frame that is already on its way. Before
+/// the first present there is nothing to preserve and the fill is correct.
+/// Written from the renderer thread in `signalFrameDrawn`, read on the UI
+/// thread, so it is atomic — a torn bool would only ever cost one extra fill,
+/// but "only ever" is not a thing to guess about across threads.
+has_presented_frame: std.atomic.Value(bool) = .init(false),
 
 /// Manual-reset event signaled by the renderer thread after presenting
 /// a frame. The main thread waits on this during live resize to
@@ -521,11 +538,16 @@ pub fn init(
     // Create a WS_CHILD window inside the parent Window container.
     const parent_hwnd = parent.hwnd orelse return error.Win32Error;
     const sr = parent.surfaceRect();
+    // WS_CLIPSIBLINGS is the other half of the container's WS_CLIPCHILDREN
+    // (T1031): a layout pass moves several panes, and without it a pane that
+    // has already been moved can be painted over by a sibling that is still
+    // at its old geometry for the rest of the pass. With the pair in place a
+    // relayout is one frame instead of a flash per child.
     const hwnd = w32.CreateWindowExW(
         0,
         App.TERMINAL_CLASS_NAME,
         std.unicode.utf8ToUtf16LeStringLiteral(""),
-        w32.WS_CHILD,
+        w32.WS_CHILD | w32.WS_CLIPSIBLINGS,
         sr.left,
         sr.top,
         @intCast(@max(sr.right - sr.left, 1)),
@@ -3143,7 +3165,7 @@ pub fn handleResize(self: *Surface, width: u32, height: u32) void {
     // renderer has presented one frame at the new size. This prevents
     // the DWM from stretching stale framebuffer content to fill the
     // new window area, which causes visible flicker.
-    if (self.in_live_resize) {
+    if (self.in_live_resize or self.parent_window.in_live_layout) {
         if (self.frame_event) |event| {
             // Reset the event before waking the renderer, so we
             // wait for a NEW frame, not a previously drawn one.
@@ -4477,6 +4499,13 @@ fn writeWin32InputSequence(
 /// frame has been presented. Wakes the main thread if it's blocking
 /// in handleResize during live resize.
 pub fn signalFrameDrawn(self: *Surface) void {
+    // Ordered before the event: a thread woken by the event must never see
+    // "no frame yet" for a frame that has already been presented (T1031).
+    // Load-then-store so the steady state is a relaxed read rather than a
+    // cross-thread write on every frame — this runs at the display rate.
+    if (!self.has_presented_frame.load(.monotonic)) {
+        self.has_presented_frame.store(true, .release);
+    }
     if (self.frame_event) |event| {
         _ = w32.SetEvent(event);
     }

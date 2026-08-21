@@ -1455,6 +1455,7 @@ pub const WS_BORDER: u32 = 0x00800000;
 /// the pane's host window, and painting the pane background over them is a
 /// visible flash on every resize.
 pub const WS_CLIPCHILDREN: u32 = 0x02000000;
+pub const WS_CLIPSIBLINGS: u32 = 0x04000000;
 
 pub extern "user32" fn SetFocus(
     hWnd: ?HWND,
@@ -2281,6 +2282,10 @@ pub const SWP_SHOWWINDOW: u32 = 0x0040;
 /// new position. Correct whenever the whole surface is about to be
 /// repainted anyway: the copy is what smears a stale image across a resize.
 pub const SWP_NOCOPYBITS: u32 = 0x0100;
+pub const SWP_NOREDRAW: u32 = 0x0008;
+pub const SWP_HIDEWINDOW: u32 = 0x0080;
+pub const SWP_NOOWNERZORDER: u32 = 0x0200;
+pub const SWP_NOSENDCHANGING: u32 = 0x0400;
 pub const WS_EX_TOPMOST: u32 = 0x00000008;
 pub const SW_SHOWNOACTIVATE: i32 = 4;
 
@@ -2888,3 +2893,32 @@ pub const OFN_NOCHANGEDIR: u32 = 0x00000008;
 pub const OFN_EXPLORER: u32 = 0x00080000;
 
 pub extern "comdlg32" fn GetOpenFileNameW(lpofn: *OPENFILENAMEW) callconv(.winapi) BOOL;
+
+// ---------------------------------------------------------------------------
+// Batched child-window positioning (T1031).
+//
+// `MoveWindow` per child means every pane in a split layout lands in its own
+// frame: for the moments between the first and the last call the siblings sit
+// at mismatched geometry, and each move schedules its own erase+paint. The
+// defer batch is the OS-provided way to make one layout pass ONE frame.
+
+pub const HDWP = *opaque {};
+
+pub extern "user32" fn BeginDeferWindowPos(
+    nNumWindows: i32,
+) callconv(.winapi) ?HDWP;
+
+pub extern "user32" fn DeferWindowPos(
+    hWinPosInfo: HDWP,
+    hWnd: HWND,
+    hWndInsertAfter: ?HWND,
+    x: i32,
+    y: i32,
+    cx: i32,
+    cy: i32,
+    uFlags: u32,
+) callconv(.winapi) ?HDWP;
+
+pub extern "user32" fn EndDeferWindowPos(
+    hWinPosInfo: HDWP,
+) callconv(.winapi) i32;
