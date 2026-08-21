@@ -330,6 +330,7 @@ foreach ($arm in @('A', 'B', 'C')) {
             ($cyclesRun -gt 0 -and $overshoots -eq 0)
     }
 }
+Complete-TestBody  # T1039: the run reached the end of its body
 
 } finally {
     Stop-TestProcs

@@ -200,6 +200,7 @@ try {
         Assert ($b.Sessions -ge 1) `
             "B: the pane was agent-backed, so the flavour came off a real HELLO (sessions=$($b.Sessions))"
     }
+    Complete-TestBody  # T1039: the run reached the end of its body
 }
 finally {
     Remove-Item Env:\GHOZTTY_AGENT_PTY_FLAVOR -ErrorAction SilentlyContinue

@@ -360,4 +360,5 @@ Assert 'C4 the screen-DC family is exercised by a real declared script' ($screen
 Write-Host "  (screen-DC readers, all declared: $($screenDc -join ', '))"
 
 Write-Host ''
+Complete-TestBody  # T1039: the run reached the end of its body
 Write-TestVerdict -Label 'T272/T276 ACCEPTANCE' -Pass $script:pass -Fail $script:fail -MinPass 30

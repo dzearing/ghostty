@@ -571,6 +571,7 @@ Write-Host "  relay log:  $relaylog"
 # Only a CLEAN green run records the covered files: a red run must stay due, and
 # so must one that skipped a section, since a stamp over unmeasured code is the
 # green hat the T219 audit refuses.
+Complete-TestBody  # T1039: before the stamp, which is a child process reading this run's state
 if ($script:fail -eq 0 -and $script:skipped -eq 0 -and -not $NegativeControl) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
         update -Guard activity-monitor-dialed -Repo $repo 2>&1 |

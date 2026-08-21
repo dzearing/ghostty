@@ -256,6 +256,7 @@ Reset-GhozttyTestState -Exe $Exe -SettleMs 800 | Out-Null
 } 2>&1 | Tee-Object -FilePath $transcript
 
 ""
+Complete-TestBody  # T1039: the run reached the end of its body
 $verdict = Write-TestVerdict -Label 'T279 ARGV FIDELITY' -Pass $script:passes -Fail $script:failures `
     -Skipped $script:skipped -NoExit
 if ($verdict.Code -ne 0) { Add-Content $transcript $verdict.Line }

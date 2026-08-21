@@ -478,6 +478,7 @@ try {
     Assert ((Get-TestWindow -ProcessId $gpid -Class 'GhozttyConfirmDialog') -eq [IntPtr]::Zero) 'H: success stays silent - no outcome dialog'
     Stop-Process -Id $gpid -Force -ErrorAction SilentlyContinue
     Start-Sleep -Milliseconds 500
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Kill-RepoInstances
     if ($td) { Remove-TestDesktop $td }

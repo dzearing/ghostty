@@ -151,6 +151,7 @@ try {
     $r = Invoke-Inventory @('-RepoRoot', $tmp, '-OurRef', 'fork', '-UpstreamRef', 'lonely', '-NoFetch', '-OutFile', $badReport)
     Check 'C3 unrelated histories exit 2 with no-merge-base ERROR' `
         (($r.Code -eq 2) -and ($r.Text -match 'ERROR: no merge base')) ("exit=" + $r.Code + " " + $r.Text)
+    Complete-TestBody  # T1039: the run reached the end of its body
 }
 finally {
     if ($tmp -and (Test-Path -LiteralPath $tmp)) {

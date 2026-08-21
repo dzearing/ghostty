@@ -278,6 +278,7 @@ try {
     Assert (-not (Test-TestWindowExists -Window $chooser)) 'Invoke-ChooserClick on Cancel closed the chooser'
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'the app survived the whole drive'
     $script:drove = $true
+    Complete-TestBody  # T1039: the run reached the end of its body
 
 } finally {
     Remove-TestDesktop

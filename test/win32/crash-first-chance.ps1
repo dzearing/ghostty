@@ -327,6 +327,7 @@ Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 # scripts\guard-due.ps1 can answer "has anything run this harness against the
 # code as it now stands?". Only a CLEAN sweep stamps: a run with a skipped
 # section proved less than the harness claims, and a red run must stay due.
+Complete-TestBody  # T1039: before the stamp, which is a child process reading this run's state
 if ($script:failures -eq 0 -and $script:skipped -eq 0) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
         update -Guard crash-first-chance -Repo $Repo 2>&1 | ForEach-Object { "  $_" }

@@ -226,6 +226,7 @@ try {
     $healOut4 = Invoke-CacheHeal -Entries $torn 6>&1 | ForEach-Object { $_.ToString() } | Out-String
     Check 'heal deletes a hash-file entry' (-not (Test-Path $zFile)) $healOut4
     Check 'heal names the rule that fired' ($healOut4 -match 'rule: error-in-cache') $healOut4
+    Complete-TestBody  # T1039: the run reached the end of its body
 }
 finally {
     if (Test-Path $Sandbox) { Remove-Item $Sandbox -Recurse -Force -ErrorAction SilentlyContinue }

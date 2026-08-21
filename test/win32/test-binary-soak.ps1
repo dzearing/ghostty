@@ -554,6 +554,7 @@ Remove-Item $work -Recurse -Force -ErrorAction SilentlyContinue
 # by hand -- an assertion that the harness had been run, in the one place that
 # is supposed to MEASURE it. Only a clean green run stamps; a red run must stay
 # due.
+Complete-TestBody  # T1039: before the stamp, which is a child process reading this run's state
 if ($script:failures -eq 0) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
         update -Guard test-binary-soak -Repo $Repo 2>&1 | ForEach-Object { "  $_" }

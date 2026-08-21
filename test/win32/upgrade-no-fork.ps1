@@ -935,6 +935,7 @@ while ((Get-Date) -lt $deadline) {
     Assert "D4 the resume command ran anyway (no silent stall)" $ranD
     Assert "D5 the script did not claim success without running it" `
         (-not ($logD -match 'RELAUNCH FAIL'))
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     # ---- teardown ----------------------------------------------------------
     Stop-SandboxProcs

@@ -251,6 +251,7 @@ try {
     $idsNeg = @($neg.Rows | ForEach-Object { $_.id })
     Assert "no second session appeared (roster is $($idsNeg.Count))" ($idsNeg.Count -eq 1 -and $idsNeg -contains $relaySession)
     Assert 'the agent survived the whole run' (-not $agent.HasExited)
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     if ($null -ne $client -and -not $client.HasExited) {
         Stop-Process -Id $client.Id -Force -ErrorAction SilentlyContinue

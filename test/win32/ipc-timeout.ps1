@@ -236,6 +236,7 @@ if (-not $srv) {
     Assert "the message quotes the default" ($r.Out -match '30\.0s')
 }
 Stop-Servers
+Complete-TestBody  # T1039: the run reached the end of its body
 
 } finally {
     Stop-Servers

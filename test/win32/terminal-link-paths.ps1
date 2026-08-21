@@ -317,6 +317,7 @@ try {
     Assert (-not ($selF -contains 'Q')) 'F: no probed row fell back to the bare drive letter'
 
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'no crash'
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     if ($app -and $app.Pid) { Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue }
     Remove-TestDesktop

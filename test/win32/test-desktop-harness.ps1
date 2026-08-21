@@ -389,6 +389,7 @@ try {
             "capture SEPARATES the two chromes (light $lightLum - dark $darkLum >= 100)"
     }
     Stop-Process -Id $app2.Pid -Force -ErrorAction SilentlyContinue
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Remove-TestDesktop
     Kill-RepoInstances

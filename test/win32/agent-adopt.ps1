@@ -186,6 +186,7 @@ try {
     Assert 'disabled agent came up' (Wait-ForText $portFile 'pipe' 15)
     Start-Sleep -Seconds 3
     Assert 'kill switch suppresses adoption' ((Read-Shared "$tmp\a4.err") -notmatch 'adoption|adopting')
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Stop-TestProcs
     Remove-ItemProperty -Path $runKey -Name $runValueName -ErrorAction SilentlyContinue

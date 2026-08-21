@@ -390,6 +390,7 @@ Assert "D2 with its own lineage, the sandbox's agent published port.json" ($d2.p
 Assert "D2 the pane is backed by a LIVE session (got $($d2.alive) alive)" ($d2.alive -ge 1)
 Assert "D2 left every other agent on the box running" `
     ((-not $a1.HasExited) -and (-not $b.HasExited) -and (-not $c.HasExited) -and (-not $d.HasExited))
+Complete-TestBody  # T1039: the run reached the end of its body
 
 } finally {
     foreach ($id in $script:mine) {

@@ -290,6 +290,7 @@ try {
 
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'the app survived the whole run'
     Assert (-not (Test-TestDesktopLeak -ProcessId $app.Pid)) 'the run never took the user''s foreground'
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Stop-FakeRelay $script:relay
     if ($null -ne $script:agent) {

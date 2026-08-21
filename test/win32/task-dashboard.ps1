@@ -233,6 +233,7 @@ try {
 # A clean green run records the covered files so scripts\guard-due.ps1 can
 # answer "has anyone run this harness against the code as it now stands?".
 # Red or skipped runs leave the stamp alone - red must stay due.
+Complete-TestBody  # T1039: before the stamp, which is a child process reading this run's state
 if ($script:fail -eq 0) {
     if ($script:skipped -gt 0) {
         "  stamp NOT updated: $($script:skipped) section(s) skipped, so this run did not cover the whole harness"

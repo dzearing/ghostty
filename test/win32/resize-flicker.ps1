@@ -332,6 +332,7 @@ try {
         $(if ($bannerViolations.Count) { ' -- ' + ($bannerViolations -join '; ') } else { '' }))
 
     Assert (-not (Test-TestDesktopLeak -ProcessId $appPid)) 'GUI never became visible on the interactive desktop'
+    Complete-TestBody  # T1039: the run reached the end of its body
 }
 finally {
     Kill-RepoInstances

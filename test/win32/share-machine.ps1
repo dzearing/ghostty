@@ -289,6 +289,7 @@ try {
             Assert 'no relay.env from a failed enrollment' (-not (Test-Path $relayEnv))
         }
     }
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Remove-TestDesktop
     Stop-DebugGhoztty

@@ -270,6 +270,7 @@ try {
     Assert 'C7 premise: the agent is really gone' (-not (Test-Alive $off.AgentPid))
     Assert 'C8 the shell DIED with the agent (the defect T905 removes)' (
         $offShellPid -gt 0 -and -not (Test-Alive $offShellPid))
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Stop-TestProcs
     $env:LOCALAPPDATA = $savedLocalAppData

@@ -140,6 +140,7 @@ Remove-Item $outLog, $errLog -ErrorAction SilentlyContinue
 # A green run records the content of every file this harness covers, so
 # scripts\guard-due.ps1 can answer "has anything run pty-host.ps1 against the
 # code as it now stands?". A red run leaves the stamp alone - red must stay due.
+Complete-TestBody  # T1039: before the stamp, which is a child process reading this run's state
 if ($script:failures -eq 0) {
     $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `

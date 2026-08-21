@@ -186,6 +186,7 @@ Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 # can answer "has this harness been run against the checker as it now
 # stands?". Red leaves the stamp alone, and so does a run with skips -- a
 # network-less run never asked the live question it would be vouching for.
+Complete-TestBody  # T1039: before the stamp, which is a child process reading this run's state
 if ($script:failures -eq 0 -and $script:skipped -eq 0) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
         update -Guard release-parity -Repo $Repo 2>&1 | ForEach-Object { "  $_" }

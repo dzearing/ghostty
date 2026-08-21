@@ -290,6 +290,7 @@ try {
     Start-Sleep -Seconds 4
     $setF = Step $paneId 'F +split (pane halved)' $setF0
     Assert ($script:lastLost.Count -eq 0) "splitting off the pane destroyed no scrollback"
+    Complete-TestBody  # T1039: the run reached the end of its body
 }
 finally {
     Kill-RepoInstances

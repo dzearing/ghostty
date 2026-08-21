@@ -157,6 +157,7 @@ foreach ($name in $exempt.Keys) {
 
 # --- stamp (T783 / T478) ---------------------------------------------------
 # Only a CLEAN run stamps; a red one must stay due.
+Complete-TestBody  # T1039: before the stamp, which is a child process reading this run's state
 if ($script:failures -eq 0) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
         update -Guard printclient-audit -Repo $Repo 2>&1 | ForEach-Object { "  $_" }

@@ -57,7 +57,15 @@ param(
     [string]$Guard,
 
     [string]$Repo,
-    [switch]$Json
+    [switch]$Json,
+
+    # T1039 escape hatch, for the ONE caller whose subject is stamping itself:
+    # `test\win32\guard-due.ps1` drives `update` against a throwaway fixture
+    # repo from inside its own unfinished run, so the run-state gate below
+    # would refuse the very thing it is measuring. It says so in the output
+    # when it is used, because a silent hatch is how a gate stops meaning
+    # anything.
+    [switch]$IgnoreRunState
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1392,6 +1400,27 @@ $GuardTable = @(
             'src\apprt\win32\resize_paint.zig',
             'test\win32\resize-flicker.ps1'
         )
+    },
+    # The honesty of every OTHER row in this table (T1039). A harness whose body
+    # unwinds mid-run used to print ALL PASS and then STAMP - recording every
+    # file it covers as freshly proven while a whole section measured nothing -
+    # so a guard could go quiet over code nobody had tested. The scorer's
+    # completion marker and the `update` refusal above are what stop that, and
+    # this row is what notices when either one stops working. It covers
+    # `scripts\guard-due.ps1` itself, unlike every other row: a new harness row
+    # landing here makes this one due, which is a few seconds of a non-GUI
+    # script, and the alternative is leaving the stamp gate as the one piece of
+    # this machinery nothing re-checks.
+    [pscustomobject]@{
+        Name   = 'body-complete'
+        Script = 'test\win32\body-complete-audit.ps1'
+        Stamp  = 'test\win32\body-complete-audit.stamp.json'
+        Covers = @(
+            'test\win32\body-complete-audit.ps1',
+            'test\win32\lib\BodyCompleteAudit.ps1',
+            'test\win32\lib\TestScore.ps1',
+            'scripts\guard-due.ps1'
+        )
     }
 )
 
@@ -1580,6 +1609,26 @@ switch ($Action) {
     }
 
     'update' {
+        # T1039. A stamp says "this harness was run against exactly this code",
+        # and it is the half that OUTLIVES the run: a red line scrolls away, a
+        # stamp keeps the guard quiet until the files change again. A harness
+        # whose body unwound measured nothing past the throw, so it has no
+        # business recording anything as proven - and it reaches here anyway,
+        # because the stamp block sits between the `finally` and the verdict.
+        #
+        # `lib\TestScore.ps1` publishes the run's state in the environment and
+        # this is a CHILD PROCESS of the harness, so it inherits it: `pending`
+        # means armed-and-not-finished. Anything else - `complete`, or unset for
+        # a caller that is not a scored run at all (a hand `update`, a script
+        # that does not use the shared scorer) - stamps exactly as before.
+        if ($env:GHOZTTY_TEST_BODY -eq 'pending') {
+            if (-not $IgnoreRunState) {
+                "STAMP REFUSED: the calling run has not reached the end of its body (GHOZTTY_TEST_BODY=pending)."
+                "  Nothing was stamped, so this guard stays due - which is the correct answer for a run that did not finish."
+                exit 3
+            }
+            "STAMP RUN-STATE IGNORED: -IgnoreRunState was passed over an unfinished run."
+        }
         $wrote = 0
         foreach ($row in $rows) {
             $r = Write-Stamp $row

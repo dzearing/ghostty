@@ -3,8 +3,9 @@
 > Progressive-disclosure doc routed from `/CLAUDE.md`. Load this before
 > writing or running ANY test — unit lanes, `test/win32/` acceptance scripts,
 > or scripts that drive the GUI. The audit rules in here (exit-code, skip,
-> verdict, asserted-nothing, foreground/desktop, persistence declaration,
-> liveness, PS 5.1 argv fidelity) are enforced by sweeps that fail the suite.
+> verdict, asserted-nothing, body-completion, foreground/desktop, persistence
+> declaration, liveness, PS 5.1 argv fidelity) are enforced by sweeps that fail
+> the suite.
 
 ### Test lanes and acceptance scripts
 
@@ -305,6 +306,53 @@ marker. Acceptance: `test\win32\asserted-nothing.ps1` (the scorer on the wire as
 real processes, the analyzer against fixtures both directions, the suite sweep),
 whose `-TeethCheck` synthesizes a violator so the sweep keeps its teeth once the
 suite is clean.
+
+**And a run that DID NOT FINISH is not a pass either** (T1039). The rule above
+asks whether a run asserted anything; this one asks whether it got to the end.
+Almost every script here wraps its body in a top-level `try { … } finally { … }`
+with **no catch** — the finally is how the app, the agent and the test desktop
+get cleaned up. Under `$ErrorActionPreference = 'Continue'` a *statement*-
+terminating error inside that try (a division by zero, a bad cast, a method on
+`$null` — `Get-Content -Raw` answers `$null` for an empty file) unwinds the try,
+runs the finally, and then **execution continues with the statements after it**:
+the guard stamp and the verdict, with the failure count still 0. Measured in
+T329 on `activity-monitor-dialed.ps1`: a `.Trim()` ended the run at the top of
+its last section and the script printed `ALL PASS (27 assertions)` and STAMPED.
+95 of 155 scripts were in that exact shape. (`throw` is *script*-terminating and
+therefore harmless here — it ends the run with no verdict at all.)
+
+The invariant lives beside the one above in `test\win32\lib\TestScore.ps1`:
+**dot-sourcing it ARMS the run**, `Complete-TestBody` as the **last statement of
+the top-level try body** marks it finished, and `Write-TestVerdict` refuses a
+green verdict without it — `RUN DID NOT FINISH (N assertions passed)` at exit
+**2**, the same "the harness measured nothing" news as ASSERTED NOTHING. Arming
+is the dot-source rather than a call to remember, because a rule that only
+protects the scripts that opted in protects nobody; and the marker is checked
+*last*, so it only ever speaks over a verdict that would otherwise be green —
+FAILURE(S), ASSERTED NOTHING and ASSERTED TOO LITTLE keep their own wording.
+The **stamp** is gated in the same breath: the marker publishes
+`GHOZTTY_TEST_BODY` (`pending` → `complete`) into the environment, and
+`scripts\guard-due.ps1 update` — a child process of the harness — refuses to
+write a stamp while it reads `pending`, because the stamp is the half that
+outlives the run. Put the marker **before** the stamp block in scripts that
+stamp after their try. `-IgnoreRunState` is the one hatch, for
+`test\win32\guard-due.ps1`, whose subject *is* stamping; it prints that it was
+used.
+
+The sweep is `test\win32\lib\BodyCompleteAudit.ps1` — AST-based — enforcing that
+every top-level try in a scored script either **scores its own throw in a
+`catch`** (T329's shape) or **ends in `Complete-TestBody`**, and that every
+scored script marks completion somewhere (`missing`, `uncaught-try`,
+`silent-catch`, `parse-error`, all at zero). Only a *measured* try is judged:
+one whose body can lose assertions, derived per file from what that file's own
+helpers do to a pass/fail/skip counter, so the `try { $x = [int]$s } catch { $x = 0 }`
+idiom is not reported. Scope is the 58 scripts scored by `Write-TestVerdict`;
+the rest hand-roll their verdict and arrive under this rule as **T775** converts
+them. Exemption: the same stated-intent `# body-audit: <reason>` marker.
+Acceptance: `test\win32\body-complete-audit.ps1` (the scorer on the wire as real
+processes, the stamp gate against a throwaway repo, the analyzer against
+fixtures both directions, the suite sweep), whose `-TeethCheck` plants a real
+violator so the sweep keeps its teeth.
 
 **And an oracle must read the same text wherever it runs** (T526, T531, T883).
 The audits above ask whether a run happened and whether it scored itself

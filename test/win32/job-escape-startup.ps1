@@ -284,6 +284,7 @@ Set-Content -Path '$appPidFile' -Value `$app.Id
         ($null -eq (Get-Process -Id $victimPid -ErrorAction SilentlyContinue))
     Assert "C2 the escaped app SURVIVED the teardown that used to kill it" `
         ($twinPid -ne 0 -and $null -ne (Get-Process -Id $twinPid -ErrorAction SilentlyContinue))
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     if ($job -ne [IntPtr]::Zero) { [T675Job]::CloseHandle($job) | Out-Null }
     Stop-TestProcs

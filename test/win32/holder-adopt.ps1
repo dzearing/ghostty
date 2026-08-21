@@ -437,6 +437,7 @@ try {
         Start-Sleep -Milliseconds 500
     }
     Assert 'D5 its shell went with it (the holder owns the kill-on-close job)' $shellGone
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Stop-Everything
     $env:LOCALAPPDATA = $savedLocalAppData

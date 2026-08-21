@@ -494,6 +494,7 @@ try {
         @((Get-TestAgents) | Where-Object { [int]$_.ProcessId -ne $agentPidE }).Count -eq 0)
     Assert 'E7 the pane is untouched by the waiting' (
         Test-PaneLiveRetry $paneE 'E')
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Stop-Everything
     $env:LOCALAPPDATA = $savedLocalAppData

@@ -267,4 +267,5 @@ if ($td) { Remove-TestDesktop $td }
 Remove-Item $step1, $step2 -ErrorAction SilentlyContinue
 
 Write-Host ''
+Complete-TestBody  # T1039: the run reached the end of its body
 Write-TestVerdict -Pass $script:pass -Fail $script:fail

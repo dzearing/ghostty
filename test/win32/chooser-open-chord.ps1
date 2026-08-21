@@ -203,6 +203,7 @@ try {
     Assert ($topsAfter3 -eq $topsBefore3) `
         "and no plain terminal window was opened instead ($topsBefore3 -> $topsAfter3)"
     Close-Chooser $g.Top $g.Pid
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Stop-RepoProcesses @('ghoztty', 'ghoztty-agent')
     Remove-TestDesktop

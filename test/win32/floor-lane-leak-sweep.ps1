@@ -340,6 +340,7 @@ try {
         ($src -match '\$tree = @\(Get-ProcessTree') ''
     Check 'floor-lane cannot leave its watchdog loop without a verdict' `
         ($src -match 'WATCHDOG ERROR') ''
+    Complete-TestBody  # T1039: the run reached the end of its body
 }
 finally {
     foreach ($p in $Started) {

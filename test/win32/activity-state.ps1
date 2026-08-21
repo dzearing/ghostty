@@ -241,6 +241,7 @@ Remove-Item -Recurse -Force $sandbox -ErrorAction SilentlyContinue
 # --- stamp (T783) ----------------------------------------------------------
 # A clean green run records the covered files so scripts\guard-due.ps1 can
 # answer "has anyone run this harness against the code as it now stands?".
+Complete-TestBody  # T1039: before the stamp, which is a child process reading this run's state
 if ($script:fail -eq 0 -and $script:skipped -eq 0) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
         update -Guard activity-state -Repo $repo 2>&1 | ForEach-Object { Write-Host "  $_" }

@@ -241,6 +241,7 @@ Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 # answer "has this scan been run against the test tree as it now stands?". Never
 # under -TeethCheck: that mode's C1 scores a synthesized violator and never asks
 # the real sweep anything, so it must not vouch for the tree.
+Complete-TestBody  # T1039: before the stamp, which is a child process reading this run's state
 if ($script:fail -eq 0 -and -not $TeethCheck) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
         update -Guard stderr-capture -Repo $Repo 2>&1 | ForEach-Object { "  $_" }

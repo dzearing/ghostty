@@ -145,6 +145,7 @@ Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 # The verdict goes through the shared scorer (T271), which refuses to call a
 # run with zero passing assertions a pass; -NoExit is how the failure trailer
 # still reaches the transcript.
+Complete-TestBody  # T1039: the run reached the end of its body
 $verdict = Write-TestVerdict -Label 'P2 ACCEPTANCE' -Pass $script:passes -Fail $script:failures -NoExit
 if ($verdict.Code -ne 0) { Add-Content $transcript $verdict.Line }
 exit $verdict.Code

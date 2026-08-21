@@ -709,6 +709,7 @@ Assert "F4 go.md points at this acceptance script" ($goMd -match 'upgrade-stalen
 # now stands?". Stamped only on a CLEAN sweep - a run with skipped sections
 # proved less than the whole harness claims - and never on -PureOnly (that
 # path exits above without reaching here). Red leaves the stamp alone.
+Complete-TestBody  # T1039: before the stamp, which is a child process reading this run's state
 if ($script:failures -eq 0) {
     if ($script:skipped -gt 0) {
         "  stamp NOT updated: $($script:skipped) section(s) skipped, so this run did not cover the whole harness"

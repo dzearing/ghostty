@@ -345,6 +345,7 @@ if ($hotClose) { Close-TestHoverCapture $hotClose }
 $fgSeen = @(Stop-TestForegroundWatch)
 $leaked = @(Get-TestLaunchedPids | Where-Object { $fgSeen -contains $_ })
 Assert ($leaked.Count -eq 0) "the user's foreground was never taken ($($leaked -join ', '))"
+Complete-TestBody  # T1039: the run reached the end of its body
 
 } finally {
     if ($appPid) { Stop-Process -Id $appPid -Force -ErrorAction SilentlyContinue }

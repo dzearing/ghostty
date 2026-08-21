@@ -96,6 +96,10 @@ function Invoke-Due {
     $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Due, $Action, '-Repo', $target)
     if ($Guard) { $a += @('-Guard', $Guard) }
     if ($Json) { $a += '-Json' }
+    # T1039: `update` refuses to stamp while its caller's run is unfinished,
+    # and this harness IS an unfinished run every time it drives one - against
+    # a throwaway fixture repo, which is the case the gate is not about.
+    if ($Action -eq 'update') { $a += '-IgnoreRunState' }
     $out = & powershell.exe @a 2>&1
     return [pscustomobject]@{ Lines = @($out); Exit = $LASTEXITCODE; Text = (@($out) -join "`n") }
 }
@@ -363,6 +367,7 @@ try {
         ($relSrc -match '(?s)if \(\$script:failures -eq 0\) \{(?:(?!skipped).)*?-Guard release-artifacts -Repo') ''
     Check 'G11 the packaging stamp is behind a zero-skip condition' `
         ($relSrc -match '(?s)if \(\$script:skipped -eq 0\) \{(?:(?!-Guard).)*?-Guard release-artifacts-packaging') ''
+    Complete-TestBody  # T1039: the run reached the end of its body
 }
 finally {
     Remove-Item -LiteralPath $Fixture -Recurse -Force -ErrorAction SilentlyContinue

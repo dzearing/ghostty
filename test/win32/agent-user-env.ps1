@@ -236,4 +236,5 @@ Assert "no entry appears twice (case-insensitive dedupe)" (
 
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 
+Complete-TestBody  # T1039: the run reached the end of its body
 Write-TestVerdict -Pass $script:passes -Fail $script:failures

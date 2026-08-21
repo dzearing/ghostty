@@ -69,8 +69,13 @@ Write-Host '== A: the shared scorer, on the wire'
 function Invoke-Fixture([string]$Body, [string]$Tag) {
     $f = Join-Path $tmp "$Tag.ps1"
     $lib = (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
+    # `Complete-TestBody` (T1039) because these fixtures are about the WORDING
+    # of the verdicts below, not about a body that unwound: without it every
+    # green fixture here would score RUN DID NOT FINISH, which is that rule's
+    # own acceptance script's business (`body-complete-audit.ps1`).
     Set-Content -LiteralPath $f -Encoding utf8 -Value (@(
         ". '$lib'"
+        "Complete-TestBody"
         $Body
     ) -join "`r`n")
     $out = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $f 2>&1 |
@@ -234,4 +239,5 @@ Assert "C3 the uncounted-final count did not grow past $ceiling" ($uncountedFina
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
 
 Write-Host ''
+Complete-TestBody  # T1039: the run reached the end of its body
 Write-TestVerdict -Label 'T271 ACCEPTANCE' -Pass $script:pass -Fail $script:fail -MinPass 20

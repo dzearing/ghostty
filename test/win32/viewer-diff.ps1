@@ -328,6 +328,7 @@ try {
     # --- 8. the app survived all of it --------------------------------------
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'GUI process alive after all scenarios'
     Assert (-not (Test-TestDesktopLeak -ProcessId $appPid)) 'GUI never became visible on the interactive desktop'
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Remove-TestDesktop
     Stop-RepoInstances

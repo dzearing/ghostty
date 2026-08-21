@@ -48,8 +48,99 @@
 # to "asserted nothing" than to ALL PASS. It reports `ASSERTED TOO LITTLE` and
 # exits 2 as well. It is opt-in - a floor nobody set is not a floor that failed.
 
+# ---------------------------------------------------------------------------
+# T1039 - and a run that DID NOT FINISH is not a pass either.
+#
+# The shape this exists for, measured in T329 on
+# `test\win32\activity-monitor-dialed.ps1`: `Get-Content -Raw` answers $null for
+# an empty file and `$null.Trim()` is a statement-terminating error. It landed at
+# the top of the script's last section, inside the top-level
+#
+#     try { ...the whole run... } finally { ...cleanup... }
+#
+# which has NO catch. Under `$ErrorActionPreference = 'Continue'` such an error
+# unwinds the try, runs the finally, and then falls through to the statements
+# AFTER it with the failure count still 0 - so the script stamped its guard and
+# printed `ALL PASS (27 assertions)` over a section that had measured nothing.
+# 95 of the 155 scripts in `test\win32` were in exactly that shape, so fixing
+# the one script it was found in fixes nothing.
+#
+# THE RULE:
+#
+#     A pass verdict must be backed by a run that REACHED THE END OF ITS BODY.
+#     A scorer about to announce ALL PASS over a body that unwound must say so
+#     and exit nonzero.
+#
+# The marker, in the two lines a script spends on it:
+#
+#     . (Join-Path $PSScriptRoot 'lib\TestScore.ps1')   # arms the run
+#     try {
+#         ...sections...
+#         Complete-TestBody                              # the LAST statement
+#     } finally { ...cleanup... }
+#     Write-TestVerdict -Pass $script:pass -Fail $script:fail
+#
+# Arming is the dot-source itself rather than a call the script must remember:
+# a script that forgets to arm is exactly the script with the bug, and a rule
+# that only protects those who opted in protects nobody. The placement is what
+# gives the marker its meaning - as the last statement of the try body it is
+# skipped by any unwind, and reaching it proves every statement before it ran.
+# `lib\BodyCompleteAudit.ps1` is the static half that enforces the placement
+# across the suite (every top-level `try` either scores its own throw in a
+# `catch` or ends in `Complete-TestBody`).
+#
+#   * exit 2 - `RUN DID NOT FINISH (...)` - same news, and the same code, as
+#     ASSERTED NOTHING: the run is UNMEASURED past the point it unwound, which
+#     is a statement about the harness rather than about the product. A script
+#     that would rather call a throw a product failure keeps doing what T329's
+#     `catch` arm does - score it as a FAILURE - and lands on exit 1; both are
+#     red, and neither is the green this rule exists to refuse.
+#
+# THE STAMP is the half that outlives the run, and it is gated in the same
+# breath: `Complete-TestBody` publishes the state into the environment as
+# `GHOZTTY_TEST_BODY` (`pending` while armed, `complete` once reached), and
+# `scripts\guard-due.ps1 update` - a CHILD PROCESS of the harness, which
+# inherits it - refuses to write a stamp while it reads `pending`. Without that,
+# an unwound run still records every file it covers as freshly proven and the
+# guard stops asking, which is the damage that outlasts the red line.
+#
+# What this deliberately does not do: a script that runs ANOTHER scored script
+# in-process (`& .\other.ps1`) inherits that script's completion, since the
+# state is per-process. Every acceptance script in this suite is its own
+# process, which is what makes the simple state honest here.
+# ---------------------------------------------------------------------------
+
 # Deliberately sets no StrictMode: this file is dot-sourced INTO suite scripts,
 # and a mode set here would silently change how every one of them evaluates.
+
+function Reset-TestBody {
+    <#
+      Arm the run: its body has not reached its end yet. Called once by
+      the dot-source below, and by this rule's own acceptance script when it
+      needs to re-arm inside one process.
+    #>
+    $global:GhozttyTestBody = [pscustomobject]@{ Armed = $true; Complete = $false }
+    $env:GHOZTTY_TEST_BODY = 'pending'
+}
+
+function Complete-TestBody {
+    <#
+      The run reached the end of its body. The LAST statement of the top-level
+      try, so that an unwind cannot reach it.
+    #>
+    if ($null -eq $global:GhozttyTestBody) { Reset-TestBody }
+    $global:GhozttyTestBody.Complete = $true
+    $env:GHOZTTY_TEST_BODY = 'complete'
+}
+
+function Test-TestBodyComplete {
+    # Unarmed answers TRUE: nothing was claimed, so nothing is being broken.
+    # Only the dot-source above arms, so in this suite that is a caller which
+    # reached the scorer without loading it - impossible by construction.
+    if ($null -eq $global:GhozttyTestBody) { return $true }
+    if (-not $global:GhozttyTestBody.Armed) { return $true }
+    return [bool]$global:GhozttyTestBody.Complete
+}
 
 function Get-TestVerdictLine {
     <#
@@ -59,7 +150,12 @@ function Get-TestVerdictLine {
       exiting; the decision itself lives here, once.
 
       Returns an object: Line (what to print), Code (what to exit with),
-      Kind ('pass' | 'fail' | 'nothing' | 'too-little').
+      Kind ('pass' | 'fail' | 'incomplete' | 'nothing' | 'too-little').
+
+      `-Incomplete` is the T1039 half: the run unwound before the end of its
+      body. It is a PARAMETER rather than a read of the marker so this function
+      stays pure and its wording testable without arming anything;
+      `Write-TestVerdict` is what reads the marker.
     #>
     param(
         [int]$Pass,
@@ -67,7 +163,8 @@ function Get-TestVerdictLine {
         [int]$Skipped = 0,
         [string]$Label,
         [string]$Unit = 'assertions',
-        [int]$MinPass = 1
+        [int]$MinPass = 1,
+        [switch]$Incomplete
     )
 
     if ($MinPass -lt 1) { $MinPass = 1 }
@@ -98,6 +195,20 @@ function Get-TestVerdictLine {
         }
     }
 
+    # Last of the non-green arms on purpose: this one only ever fires over a
+    # verdict that would otherwise be GREEN, which is the whole rule ("a pass
+    # must be backed by a run that finished"). Putting it earlier would rewrite
+    # the wording of the deliberate early exits - a failed precondition scored
+    # by `Write-TestAssertedNothing` has not reached the end of its body either,
+    # and ASSERTED NOTHING is the honest name for that one, not an unwind.
+    if ($Incomplete) {
+        return [pscustomobject]@{
+            Kind = 'incomplete'
+            Code = 2
+            Line = "${prefix}RUN DID NOT FINISH ($Pass $Unit passed$skipNote) - the body unwound before its end; everything past that point is unmeasured, so this is not a pass"
+        }
+    }
+
     return [pscustomobject]@{
         Kind = 'pass'
         Code = 0
@@ -125,7 +236,8 @@ function Write-TestVerdict {
     )
 
     $v = Get-TestVerdictLine -Pass $Pass -Fail $Fail -Skipped $Skipped `
-        -Label $Label -Unit $Unit -MinPass $MinPass
+        -Label $Label -Unit $Unit -MinPass $MinPass `
+        -Incomplete:(-not (Test-TestBodyComplete))
 
     $color = switch ($v.Kind) {
         'pass'  { 'Green' }
@@ -153,3 +265,9 @@ function Write-TestAssertedNothing {
     if (-not [string]::IsNullOrWhiteSpace($Reason)) { Write-Host "  SKIP whole run: $Reason" }
     return Write-TestVerdict -Pass 0 -Fail 0 -Skipped $Skipped -Label $Label -NoExit:$NoExit
 }
+
+# Arm the run (T1039). The dot-source IS the arming, so there is no second
+# thing for a script to remember and no opt-in for the script with the bug to
+# have missed. Already-armed is left alone: a library dot-sourcing this file a
+# second time inside one process must not un-finish a body that has finished.
+if ($null -eq $global:GhozttyTestBody) { Reset-TestBody }

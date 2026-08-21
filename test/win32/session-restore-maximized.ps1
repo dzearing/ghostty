@@ -220,6 +220,7 @@ try {
     }
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'B: no crash'
     Stop-App
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Remove-TestDesktop
     Kill-RepoInstances

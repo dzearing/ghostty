@@ -179,6 +179,7 @@ try {
     Start-Sleep -Seconds 6
     Assert 'explanation is said once, not per tick' (([regex]::Matches((Read-Shared "$tmp\a3.err"), 'uplink cannot start')).Count -eq 1)
     Assert 'credential-less agent is still running' (-not $agent3.HasExited)
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Stop-TestAgents
     Remove-Item env:GHOZTTY_AGENT_INSTANCE -ErrorAction SilentlyContinue

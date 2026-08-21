@@ -328,6 +328,7 @@ try {
         Assert (Test-TestWindowResponsive -Window $g2.Chooser) `
             'F the chooser is still answering (the gate degrades, it does not wedge)'
     }
+    Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Stop-RepoProcesses
     Stop-BusyLoops

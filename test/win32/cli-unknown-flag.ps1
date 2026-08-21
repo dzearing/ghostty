@@ -231,6 +231,7 @@ Assert "it is not reported as an unknown flag" ($r.out -notmatch 'unknown flag')
 $r = Invoke-Verb '+set-banner --target=x -- --help'
 Assert "after a bare -- it is banner text, not help" `
     ($r.out -notmatch 'unknown flag' -and $r.out -match 'running Ghoztty instance')
+Complete-TestBody  # T1039: the run reached the end of its body
 
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
