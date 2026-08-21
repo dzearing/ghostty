@@ -1,13 +1,13 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-08-20T21:18:06-07:00",
-    "commit":  "9b0d87463",
+    "generated":  "2026-08-20T22:16:18-07:00",
+    "commit":  "2294985d3",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
-                  "test/win32/activity-monitor-dialed.ps1":  "383cc42ce06e2b0201ccc7aedb3951eef309584a36beebef0f4e0faaf8d52c07",
+                  "test/win32/activity-monitor-dialed.ps1":  "32bd7eae6c3a80898b0d16e024bd192882fba5b4aa3bfa63e7709b5504dccdf8",
                   "test/win32/activity-monitor-probe-fail.ps1":  "03192baabe1b96dd282dbab66507b452e252abbe605e4c58d198bc706ab4a9eb",
-                  "test/win32/activity-monitor-remote.ps1":  "c4b4449dd7df216285a0fdb3dc607f4336d21e320a8752833cdf062392a10034",
+                  "test/win32/activity-monitor-remote.ps1":  "a2b417f13d978482eab39ba73aa4731aa1f840454a151bef9f0b6c240826ba45",
                   "test/win32/activity-selection.ps1":  "cbfe69d243e9e1a0e67adc3dc1f624b9e4e801edec6d7ef55db9de9541dffb9f",
                   "test/win32/activity-state.ps1":  "9cf643a93354cfadd2061c0a46a0018a22ada8a3b2833bab7ce3b47293569a70",
                   "test/win32/agent-adopt.ps1":  "5d595f428e084280958590817410538241a014f4d42a9f0033e2dcb425980764",
