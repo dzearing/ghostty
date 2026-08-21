@@ -1227,6 +1227,12 @@ final class ViewerView: NSView, Codable, ObservableObject {
         if visible, chromeHost == nil {
             let host = NSHostingView(rootView: WebChromeBar(viewerView: self))
             host.translatesAutoresizingMaskIntoConstraints = false
+            // Height from the content, width from the pane. The default options
+            // publish the SwiftUI minimum as a REQUIRED width constraint, which
+            // fights the leading/trailing pins below and — because Auto Layout
+            // hands that minimum on to whoever sizes the pane — made a narrow
+            // pane grow to fit this bar instead of the bar shrinking to fit it.
+            host.sizingOptions = [.intrinsicContentSize]
             // Above the composer too: the composer parks behind the bar and
             // slides out from under it.
             addSubview(host, positioned: .above, relativeTo: feedbackHost ?? webView)
@@ -1444,6 +1450,10 @@ final class ViewerView: NSView, Codable, ObservableObject {
         let host = NSHostingView(
             rootView: ViewerFeedbackBar(viewerView: self, model: feedbackModel))
         host.translatesAutoresizingMaskIntoConstraints = false
+        // Height from the content, width from the pane -- same reason as the
+        // nav bar above: this composer spans the full pane, so a published
+        // minimum width would become the pane's minimum width.
+        host.sizingOptions = [.intrinsicContentSize]
         // Above the TOC card as well as the web view: the composer spans the
         // full pane width just under the nav bar and must never draw BEHIND the
         // table-of-contents card in the gutter. The TOC layers are mounted

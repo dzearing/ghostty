@@ -76,6 +76,9 @@ pub const TerminalOptions = extern struct {
         size: usize = @sizeOf(Extra),
         palette: bool,
         modes: bool,
+        /// Defaulted to match `TerminalFormatter.Extra.input_modes`, so a Zig
+        /// construction site that predates the field keeps emitting what it did.
+        input_modes: bool = true,
         scrolling_region: bool,
         tabstops: bool,
         pwd: bool,
@@ -93,6 +96,7 @@ pub const TerminalOptions = extern struct {
             return .{
                 .palette = self.palette,
                 .modes = self.modes,
+                .input_modes = self.input_modes,
                 .scrolling_region = self.scrolling_region,
                 .tabstops = self.tabstops,
                 .pwd = self.pwd,

@@ -28,7 +28,10 @@ struct SplitView<L: View, R: View>: View {
     let minSize: CGFloat = 10
 
     /// The current fractional width of the split view. 0.5 means L/R are equally sized, for example.
-    @Binding var split: CGFloat
+    let split: CGFloat
+
+    /// Called as the user works the divider. See `SplitViewDividerGesture`.
+    let onDividerGesture: (SplitViewDividerGesture) -> Void
 
     /// The visible size of the splitter, in points. The invisible size is a transparent hitbox that can still
     /// be used for getting a resize handle. The total width/height of the splitter is the sum of both.
@@ -46,6 +49,7 @@ struct SplitView<L: View, R: View>: View {
             let rightRect = self.rightRect(for: geo.size, leftRect: leftRect)
             let splitterPoint = self.splitterPoint(for: geo.size, leftRect: leftRect)
             let handleTotal = splitterVisibleSize + splitterInvisibleSize
+            let dim = direction == .horizontal ? geo.size.width : geo.size.height
 
             ZStack(alignment: .topLeading) {
                 left
@@ -62,16 +66,19 @@ struct SplitView<L: View, R: View>: View {
                         visibleSize: splitterVisibleSize,
                         invisibleSize: splitterInvisibleSize,
                         color: dividerColor,
-                        split: $split)
+                        split: split,
+                        onAdjust: { moveDivider(to: $0 * dim, in: dim) })
                     .position(splitterPoint)
                 DividerHandle(
                     direction: direction,
+                    onDragBegan: { onDividerGesture(.began) },
                     onDragDelta: { delta, startSplit in
-                        let dim = direction == .horizontal ? geo.size.width : geo.size.height
-                        guard dim > 0 else { return }
-                        let newPos = min(max(minSize, startSplit * dim + delta), dim - minSize)
-                        split = newPos / dim
+                        // The delta is cumulative from mouse-down and `startSplit` is
+                        // where the divider was then, so this is an absolute target
+                        // measured against the layout the drag started from.
+                        moveDivider(to: startSplit * dim + delta, in: dim)
                     },
+                    onDragEnded: { onDividerGesture(.ended) },
                     onDoubleClick: onEqualize,
                     currentSplit: { split })
                     .frame(
@@ -87,35 +94,32 @@ struct SplitView<L: View, R: View>: View {
     /// Initialize a split view that can be resized by manually dragging the divider.
     init(
         _ direction: SplitViewDirection,
-        _ split: Binding<CGFloat>,
+        _ split: CGFloat,
         dividerColor: Color,
         resizeIncrements: NSSize = .init(width: 1, height: 1),
+        onDividerGesture: @escaping (SplitViewDividerGesture) -> Void,
         @ViewBuilder left: (() -> L),
         @ViewBuilder right: (() -> R),
         onEqualize: @escaping () -> Void
     ) {
         self.direction = direction
-        self._split = split
+        self.split = split
         self.dividerColor = dividerColor
         self.resizeIncrements = resizeIncrements
+        self.onDividerGesture = onDividerGesture
         self.left = left()
         self.right = right()
         self.onEqualize = onEqualize
     }
 
-    private func dragGesture(_ size: CGSize, splitterPoint: CGPoint) -> some Gesture {
-        return DragGesture()
-            .onChanged { gesture in
-                switch direction {
-                case .horizontal:
-                    let new = min(max(minSize, gesture.location.x), size.width - minSize)
-                    split = new / size.width
-
-                case .vertical:
-                    let new = min(max(minSize, gesture.location.y), size.height - minSize)
-                    split = new / size.height
-                }
-            }
+    /// Report a new divider position, keeping a sliver of each pane on screen.
+    ///
+    /// This is a floor, not the real limit: the embedder clamps again against the
+    /// minimum of every pane the move pushes on, which can only be tighter.
+    private func moveDivider(to position: CGFloat, in dimension: CGFloat) {
+        guard dimension > 0 else { return }
+        let clamped = min(max(position, minSize), max(minSize, dimension - minSize))
+        onDividerGesture(.moved(position: clamped, dimension: dimension))
     }
 
     /// Calculates the bounding rect for the left view.
@@ -201,4 +205,22 @@ struct SplitView<L: View, R: View>: View {
 
 enum SplitViewDirection: Codable {
     case horizontal, vertical
+}
+
+/// A single step of a divider gesture: a drag, or a discrete accessibility nudge.
+enum SplitViewDividerGesture {
+    /// A drag began on the divider. Nothing has moved yet — this is the embedder's
+    /// cue to remember the layout the drag is measured against.
+    case began
+
+    /// The divider should sit `position` points from the leading edge of a split that
+    /// measures `dimension` points along its axis.
+    ///
+    /// Position is reported in points rather than as a fraction because a fraction
+    /// only means something relative to this one split. Points are what let the
+    /// embedder hold the rest of the window's dividers at fixed pixel positions.
+    case moved(position: CGFloat, dimension: CGFloat)
+
+    /// The drag on the divider finished.
+    case ended
 }

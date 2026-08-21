@@ -92,6 +92,15 @@ typedef struct {
   /** Emit terminal modes that differ from their defaults using CSI h/l. */
   bool modes;
 
+  /**
+   * Emit the INPUT-REPORTING modes (mouse tracking, bracketed paste, focus
+   * events, color-scheme and in-band size reports) among `modes`. Only
+   * meaningful when `modes` is set. Clear it when the output will be replayed
+   * into a terminal whose child process may not be the one that asked for
+   * those reports.
+   */
+  bool input_modes;
+
   /** Emit scrolling region state using DECSTBM and DECSLRM sequences. */
   bool scrolling_region;
 

@@ -26,6 +26,34 @@ private struct ViewerRepresentable: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: ViewerView, context: Context) {}
+
+    /// Take the pane exactly as offered, however narrow.
+    ///
+    /// A viewer is a leaf in the split tree just like a terminal: the tree
+    /// decides how wide the pane is and the leaf gets no vote. Left to itself
+    /// SwiftUI sizes a hosted NSView from its Auto Layout minimum — which the
+    /// nav bar, pinned leading-to-trailing inside the pane, floors at its own
+    /// row of buttons — and then CENTERS the oversized view in the smaller
+    /// frame it was given. Squeeze the pane below that floor and the viewer
+    /// spills out both sides, painting over the pane next door and off the
+    /// edge of the window.
+    func sizeThatFits(
+        _ proposal: ProposedViewSize,
+        nsView: ViewerView,
+        context: Context
+    ) -> CGSize? {
+        // A concrete proposal is the pane's size and is taken verbatim. Nothing
+        // else is: an unspecified or infinite dimension is SwiftUI asking what
+        // we would LIKE to be, and the honest answer for a pane is "whatever
+        // I'm given", so fall back to the size we already have.
+        func resolve(_ proposed: CGFloat?, current: CGFloat) -> CGFloat {
+            guard let proposed, proposed.isFinite else { return current }
+            return proposed
+        }
+        return CGSize(
+            width: resolve(proposal.width, current: nsView.frame.width),
+            height: resolve(proposal.height, current: nsView.frame.height))
+    }
 }
 
 /// Chrome bar for viewer panes: anchored flush to the pane top, stretched
