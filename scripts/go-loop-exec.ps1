@@ -344,6 +344,19 @@ switch ($Action) {
             if ($paths.Count -gt 8) { "    ... and $($paths.Count - 8) more" }
         }
 
+        # T1057: is anything committed here that origin has never seen? The
+        # tree being clean says nothing about that - a turn that committed and
+        # died before pushing leaves a spotless tree and work only this box
+        # has. Reported here and FAILED ON by `parity-tasks.ps1 validate`, the
+        # same two-ended arrangement as stranded work above, because the rule
+        # that says to push every commit (go.md step 4) had to be restated by
+        # the user twice while it was honour-system.
+        $pushGuard = Join-Path $PSScriptRoot 'git-commit-guard.ps1'
+        if (Test-Path -LiteralPath $pushGuard) {
+            $pushOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $pushGuard unpushed -Repo $Repo 2>&1 | Out-String
+            foreach ($line in ($pushOut -split "`r?`n")) { if ($line.Trim()) { "  $line" } }
+        }
+
         $dupes = @()
         foreach ($w in $windows) {
             if ($mine -and $w.Id -eq $mine.Id) { continue }

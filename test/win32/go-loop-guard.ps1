@@ -1362,6 +1362,123 @@ $remoteHead = (& git -C $wBare rev-parse HEAD 2>$null | Select-Object -First 1)
 Assert 'W18 -Push commits and pushes' `
     ($r.Code -eq 0 -and $r.Out -match 'PUSHED' -and $remoteHead -eq (WHead))
 
+# --- T1057: the push is not optional -------------------------------------
+# `-Push` was an opt-in switch and a plain `git commit` bypassed the guard
+# entirely, so "push immediately after every commit" (go.md step 4) was
+# honour-system - and the user had to state it twice, two weeks apart. These
+# arms score the mechanical version: commit pushes on its own, opting out is
+# explicit and says why, and the state "HEAD is ahead of origin" is something
+# the turn boundary can SEE.
+Set-Content -Path (Join-Path $wRepo 'default-push.txt') -Value 'no -Push flag anywhere'
+$r = CG @('commit', '-Paths', 'default-push.txt', '-Message', 'a commit with no push flag')
+$remoteHead = (& git -C $wBare rev-parse HEAD 2>$null | Select-Object -First 1)
+Assert 'W19 commit pushes by default - no flag needed' `
+    ($r.Code -eq 0 -and $r.Out -match 'PUSHED' -and $remoteHead -eq (WHead))
+$r = CG @('unpushed')
+Assert 'W20 unpushed is clean right after a pushing commit' ($r.Code -eq 0 -and $r.Out -match 'push clean')
+
+# Opting out is a decision, and a decision leaves a record.
+Set-Content -Path (Join-Path $wRepo 'held-back.txt') -Value 'deliberately local'
+$r = CG @('commit', '-NoPush', '-Reason', 'testing the opt-out', '-Paths', 'held-back.txt', '-Message', 'a commit held back')
+Assert 'W21 -NoPush skips the push and prints the reason' `
+    ($r.Code -eq 0 -and $r.Out -match 'PUSH SKIPPED \(-NoPush\)' -and $r.Out -match 'testing the opt-out')
+Assert 'W22 the held-back commit really did not reach the remote' `
+    ((& git -C $wBare rev-parse HEAD 2>$null | Select-Object -First 1) -ne (WHead))
+
+# Teeth: the planted unpushed commit is CAUGHT, with a non-zero exit, and it is
+# named rather than merely counted.
+$r = CG @('unpushed')
+Assert 'W23 unpushed catches the local-only commit (exit 7)' `
+    ($r.Code -eq 7 -and $r.Out -match 'UNPUSHED WORK: 1 commit' -and $r.Out -match 'a commit held back')
+$r = CG @('unpushed', '-Json')
+Assert 'W24 the json answer says the same thing' ($r.Code -eq 7 -and $r.Out -match '"count":\s*1' -and $r.Out -match '"clean":\s*false')
+
+# And the remedy the message names actually resolves it.
+$r = CG @('push')
+Assert 'W25 push ships the backlog' ($r.Code -eq 0 -and $r.Out -match 'PUSHED 1 commit')
+$r = CG @('unpushed')
+Assert 'W26 and unpushed goes clean again' ($r.Code -eq 0 -and $r.Out -match 'push clean')
+
+# A rejected push is the one recoverable failure, and go.md step 4 says how:
+# pull with rebase, push again. Reported-and-left is what leaves work here.
+$pBare = Join-Path $root 'reject-remote.git'
+$pRepo = Join-Path $root 'reject-mine'
+$pOther = Join-Path $root 'reject-theirs'
+git init -q --bare $pBare 2>$null
+git clone -q $pBare $pRepo 2>$null
+git -C $pRepo config user.email 't@t' 2>$null; git -C $pRepo config user.name 't' 2>$null
+Set-Content -Path (Join-Path $pRepo 'seed.txt') -Value 'seed'
+git -C $pRepo add seed.txt 2>$null
+git -C $pRepo -c core.hooksPath= commit -q -m 'seed' 2>$null
+git -C $pRepo push -q -u origin HEAD 2>$null
+git clone -q $pBare $pOther 2>$null
+git -C $pOther config user.email 't@t' 2>$null; git -C $pOther config user.name 't' 2>$null
+Set-Content -Path (Join-Path $pOther 'theirs-first.txt') -Value 'landed first'
+git -C $pOther add theirs-first.txt 2>$null
+git -C $pOther -c core.hooksPath= commit -q -m 'the other seat got there first' 2>$null
+git -C $pOther push -q origin HEAD 2>$null
+
+Set-Content -Path (Join-Path $pRepo 'mine-second.txt') -Value 'mine'
+$r = & powershell -NoProfile -ExecutionPolicy Bypass -File $cgScript commit `
+    -Repo $pRepo -Paths 'mine-second.txt' -Message 'mine, onto a branch that moved' 2>&1 |
+    ForEach-Object { $_.ToString() } | Out-String
+$pCode = $LASTEXITCODE
+$pRemote = (& git -C $pBare rev-parse HEAD 2>$null | Select-Object -First 1)
+$pLocal = (& git -C $pRepo rev-parse HEAD 2>$null | Select-Object -First 1)
+Assert 'W27 a rejected push is rebased and pushed, not reported and left' `
+    ($pCode -eq 0 -and $r -match 'push rejected' -and $r -match 'PUSHED' -and $pRemote -eq $pLocal)
+$pLog = @(& git -C $pRepo log --oneline 2>$null | Where-Object { $_ })
+Assert 'W28 the other seat''s commit survived the rebase' `
+    (@($pLog | Where-Object { $_ -match 'the other seat got there first' }).Count -gt 0)
+
+# A branch nobody has ever pushed is the same problem with a longer tail.
+$oRepo = Join-Path $root 'no-upstream-repo'
+New-Item -ItemType Directory -Force $oRepo | Out-Null
+git -C $oRepo init -q 2>$null
+git -C $oRepo config user.email 't@t' 2>$null; git -C $oRepo config user.name 't' 2>$null
+Set-Content -Path (Join-Path $oRepo 'only-here.txt') -Value 'only here'
+git -C $oRepo add only-here.txt 2>$null
+git -C $oRepo commit -q -m 'never shared' 2>$null
+$r = & powershell -NoProfile -ExecutionPolicy Bypass -File $cgScript unpushed -Repo $oRepo 2>&1 |
+    ForEach-Object { $_.ToString() } | Out-String
+Assert 'W29 a branch with no upstream counts as unpushed' ($LASTEXITCODE -eq 7 -and $r -match 'no upstream')
+# ...and committing there is not a FAILURE - the commit is fine, there is just
+# nowhere to send it. Exiting non-zero would read as "the commit failed", so the
+# skip is said out loud and the teeth stay with the gate above.
+Set-Content -Path (Join-Path $oRepo 'second.txt') -Value 'second'
+$r = & powershell -NoProfile -ExecutionPolicy Bypass -File $cgScript commit `
+    -Repo $oRepo -Paths 'second.txt' -Message 'nowhere to push this' 2>&1 |
+    ForEach-Object { $_.ToString() } | Out-String
+Assert 'W29b a commit with no upstream succeeds and says the push was skipped' `
+    ($LASTEXITCODE -eq 0 -and $r -match 'COMMITTED' -and $r -match 'PUSH SKIPPED' -and $r -match 'no upstream')
+
+# The gate end of it: `parity-tasks.ps1 validate` is what every commit passes
+# through, so that is where the answer has to have teeth. Both directions.
+$wTasks = Join-Path $root 'push-tasks'
+New-Item -ItemType Directory -Force $wTasks | Out-Null
+$wTaskLines = @('---', 'id: T1', 'title: "fixture T1"', 'deps: []', 'status: "todo"',
+    'commits: []', '---', '', '# T1 - fixture', '', '## Progress log', '')
+[System.IO.File]::WriteAllText((Join-Path $wTasks 'T1.md'), ($wTaskLines -join "`n"), (New-Object System.Text.UTF8Encoding $false))
+function WValidate([string[]]$extra) {
+    $env:GHOZTTY_UNPUSHED_REPO = $wRepo
+    try {
+        $out = & powershell -NoProfile -File $taskScript validate -TaskDir $wTasks @extra 2>&1 |
+            ForEach-Object { $_.ToString() } | Out-String
+        return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
+    } finally { Remove-Item Env:GHOZTTY_UNPUSHED_REPO -ErrorAction SilentlyContinue }
+}
+$r = WValidate @()
+Assert 'W30 validate passes while the branch is level with its upstream' ($r.Code -eq 0 -and $r.Out -notmatch 'UNPUSHED WORK')
+Set-Content -Path (Join-Path $wRepo 'gate-me.txt') -Value 'unpushed on purpose'
+CG @('commit', '-NoPush', '-Reason', 'planting one for the gate', '-Paths', 'gate-me.txt', '-Message', 'a commit the gate must catch') | Out-Null
+$r = WValidate @()
+Assert 'W31 validate FAILS over an unpushed commit' ($r.Code -ne 0 -and $r.Out -match 'UNPUSHED WORK')
+$r = WValidate @('-NoPushCheck')
+Assert 'W32 the -NoPushCheck hatch is open, and says it was taken' ($r.Code -eq 0 -and $r.Out -match 'PUSH CHECK SKIPPED')
+CG @('push') | Out-Null
+$r = WValidate @()
+Assert 'W33 validate goes green once the commit is pushed' ($r.Code -eq 0 -and $r.Out -notmatch 'UNPUSHED WORK')
+
 # The one arm about THIS box: claim arms the guard every turn, so the real repo
 # should be wired right now. Read-only - nothing here reconfigures the real repo.
 $realHooks = (& git -C $Repo config --local --get core.hooksPath 2>$null)

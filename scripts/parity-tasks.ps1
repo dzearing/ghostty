@@ -129,7 +129,14 @@ param(
     # The hatch is for the genuinely stuck case (a harness that cannot run on
     # this box at all); it PRINTS that it was used, so a commit made under it
     # can be explained rather than silently excused.
-    [switch]$NoGuardDue
+    [switch]$NoGuardDue,
+
+    # `validate` also asks scripts\git-commit-guard.ps1 whether this branch is
+    # ahead of its upstream (T1057) - a commit that never left the box is
+    # invisible to the other seat and dies with the box. Same hatch shape as
+    # -NoGuardDue, for the genuinely stuck case (no network), and it PRINTS
+    # that it was used.
+    [switch]$NoPushCheck
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1029,6 +1036,33 @@ switch ($Command) {
                         Write-Host ("STRANDED WORK ACKNOWLEDGED: {0} path(s) are {1}'s to resolve (not blocking while it is open)" -f $still.Count, $ackId)
                     }
                 }
+            }
+        }
+
+        # T1057: unpushed work. The rule ("push immediately after EVERY commit",
+        # go.md step 4) predates this gate by two weeks and had to be restated
+        # by the user on 2026-08-21, which is the tell that an honour-system
+        # rule is not a rule. This is the same division of labour as the two
+        # checks above - go-loop-exec.ps1's claim REPORTS it at the top of the
+        # turn, and this gate, the one every commit passes through, FAILS on it
+        # - so the loop cannot narrate a finished task over a commit that only
+        # exists here. GHOZTTY_UNPUSHED_REPO points the question at a fixture
+        # tree for the acceptance harness; unset in every real run.
+        $pushScript = Join-Path $PSScriptRoot 'git-commit-guard.ps1'
+        if ($TaskDirGiven -and -not $env:GHOZTTY_UNPUSHED_REPO) {
+            # A fixture run is somebody testing the tracker, not the loop's
+            # pre-commit gate (same reason as the guard-due check above).
+        }
+        elseif ($NoPushCheck) {
+            Write-Host "PUSH CHECK SKIPPED (-NoPushCheck): nobody checked whether this branch is ahead of its upstream"
+        }
+        elseif (Test-Path -LiteralPath $pushScript) {
+            $pushRepo = $RepoRoot
+            if ($env:GHOZTTY_UNPUSHED_REPO) { $pushRepo = $env:GHOZTTY_UNPUSHED_REPO }
+            $pushOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $pushScript unpushed -Repo $pushRepo -Quiet 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) {
+                foreach ($line in ($pushOut -split "`r?`n")) { if ($line.Trim()) { Write-Host $line } }
+                $problems++
             }
         }
 

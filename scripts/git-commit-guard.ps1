@@ -48,18 +48,29 @@
 #   $env:GHOZTTY_COMMIT_LOCK_KEY = $k; git commit -m '...'
 #   scripts\git-commit-guard.ps1 release -Force
 #
-# Actions: install | status | hold | release | commit | verify
+# PUSHING IS PART OF COMMITTING (T1057). `commit` pushes by default and
+# `-NoPush` is the way out, because the other arrangement is the one that
+# failed: the rule "push immediately after every commit" is go.md step 4, it is
+# what makes a commit visible to the other seat and survivable across a dead
+# box, and with `-Push` as an opt-in it stayed honour-system - the user had to
+# state it twice (2026-08-07, 2026-08-21). A rule restated is a rule not
+# enforced. `unpushed` is the same question asked at a turn boundary, and it is
+# wired into both ends of the turn: go-loop-exec.ps1's claim reports it, and
+# parity-tasks.ps1's validate FAILS on it, so a finished task cannot be
+# narrated over a commit that never left this machine.
+#
+# Actions: install | status | hold | release | commit | verify | push | unpushed
 # Exit codes: 0 ok, 2 usage/error, 3 lock held by another session,
 #             4 not the owner (release), 5 the commit contains foreign paths,
-#             6 git refused the commit.
+#             6 git refused the commit, 7 HEAD is ahead of its upstream.
 #
 #   powershell -NoProfile -File scripts\git-commit-guard.ps1 install
 #   powershell -NoProfile -File scripts\git-commit-guard.ps1 commit `
 #       -Paths 'src\apprt\win32\App.zig','docs\design\windows-parity-log.md' `
-#       -MessageFile temp\msg.txt -Push
+#       -MessageFile temp\msg.txt
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('install', 'status', 'hold', 'release', 'commit', 'verify')]
+    [ValidateSet('install', 'status', 'hold', 'release', 'commit', 'verify', 'push', 'unpushed')]
     [string]$Action = 'status',
 
     [string]$Repo,
@@ -76,7 +87,14 @@ param(
     # hold; passed explicitly only by tests.
     [string]$Key,
     [int]$TtlSeconds = 0,
+    # Kept so the documented `-Push` invocations that predate T1057 still bind;
+    # pushing is the default now, so it asks for what already happens.
     [switch]$Push,
+    # The explicit way NOT to push, which is the only way a commit is allowed to
+    # stay on this box. It prints that it was used and why, so a turn that took
+    # it can be explained rather than silently excused.
+    [switch]$NoPush,
+    [string]$Reason,
     [switch]$Force,
     [switch]$Json,
     [switch]$Quiet
@@ -174,6 +192,100 @@ function Normalize-Path([string]$p) {
 # the same thing.
 function Expand-Paths([string[]]$raw) {
     return @($raw | ForEach-Object { $_ -split ',' } | ForEach-Object { Normalize-Path $_ } | Where-Object { $_ })
+}
+
+# Where this branch stands against the thing it is supposed to be shared
+# through. Kind is one of:
+#   ok          - there is an upstream; Count says how far ahead HEAD is
+#   no-upstream - the branch has never been pushed anywhere, so every commit on
+#                 it is local-only. Not a lesser problem than being ahead: it is
+#                 the same problem with a longer tail.
+#   detached    - mid-rebase / a checked-out sha. Nothing to push, nothing to say.
+#   no-repo     - caller's problem.
+#
+# Every git call here goes through Git-Run, and both reasons are traps this
+# script has already been bitten by. `& git ... 2>$null` does NOT protect
+# against $ErrorActionPreference = 'Stop' - a git that writes to stderr (asking
+# for the upstream of a branch that has none does exactly that) still raises a
+# terminating NativeCommandError. And `| Select-Object -First 1` tears the
+# pipeline down before git exits, so the $LASTEXITCODE read afterwards belongs
+# to a killed process: that alone made a branch with a perfectly good upstream
+# report as having none.
+function Get-PushState {
+    $b = Git-Run @('symbolic-ref', '--quiet', '--short', 'HEAD')
+    if ($b.Code -ne 0 -or -not $b.Out) {
+        $inside = Git-Run @('rev-parse', '--is-inside-work-tree')
+        if ($inside.Code -ne 0) { return @{ Kind = 'no-repo' } }
+        return @{ Kind = 'detached'; Branch = ''; Upstream = ''; Count = 0 }
+    }
+    $branch = ($b.Out -split "`r?`n")[0].Trim()
+    $u = Git-Run @('rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}')
+    if ($u.Code -ne 0 -or -not $u.Out) {
+        return @{ Kind = 'no-upstream'; Branch = $branch; Upstream = ''; Count = 0 }
+    }
+    $up = ($u.Out -split "`r?`n")[0].Trim()
+    $c = Git-Run @('rev-list', '--count', "$up..HEAD")
+    $n = 0
+    if ($c.Code -eq 0) { [int]::TryParse((($c.Out -split "`r?`n")[0].Trim()), [ref]$n) | Out-Null }
+    $subjects = @()
+    if ($n -gt 0) {
+        $l = Git-Run @('log', '--oneline', '--no-decorate', '-n', '8', "$up..HEAD")
+        if ($l.Code -eq 0) { $subjects = @($l.Out -split "`r?`n" | Where-Object { $_.Trim() }) }
+    }
+    return @{ Kind = 'ok'; Branch = $branch; Upstream = $up; Count = $n; Subjects = $subjects }
+}
+
+# The state as the lines a human acts on: @{ Ok; Lines }. A function that both
+# printed and answered would be unusable here - PowerShell folds everything a
+# function writes into its return value, so `$ok = Report ...` would swallow the
+# very lines the report exists to show.
+function Get-PushReport($st) {
+    $lines = @()
+    switch ($st.Kind) {
+        'detached' { return @{ Ok = $true; Lines = @('push check skipped (detached HEAD - nothing to push)') } }
+        'no-upstream' {
+            $lines += "UNPUSHED WORK: branch $($st.Branch) has no upstream - nothing on it has ever been shared."
+            $lines += "  (set one and push: git -C $Repo push -u origin $($st.Branch))"
+            return @{ Ok = $false; Lines = $lines }
+        }
+        'ok' {
+            if ($st.Count -eq 0) { return @{ Ok = $true; Lines = @("push clean ($($st.Branch) == $($st.Upstream))") } }
+            $lines += "UNPUSHED WORK: $($st.Count) commit(s) on $($st.Branch) are not on $($st.Upstream):"
+            foreach ($s in $st.Subjects) { $lines += "  $s" }
+            $lines += "  (go.md step 4: every commit is pushed, mid-task ones included - an unpushed commit is"
+            $lines += "   invisible to the other seat and dies with the box. Push them:"
+            $lines += "   powershell -NoProfile -File scripts\git-commit-guard.ps1 push)"
+            return @{ Ok = $false; Lines = $lines }
+        }
+    }
+    return @{ Ok = $true; Lines = @() }
+}
+
+# Push, and treat the one recoverable failure as recoverable: a rejected push
+# means somebody else moved the branch, which go.md step 4 answers with
+# pull/rebase and push again. Deliberately NO autostash - the working tree is
+# shared with the other Claude window, and quietly stashing its half-written
+# edits to get a push through is a worse outcome than saying the push is stuck.
+# Narration comes back in Lines rather than being written here, for the same
+# reason Get-PushReport does not print: a bare string inside a function is not
+# output, it is part of the RETURN VALUE, and one stray line turns the result
+# hashtable into an array whose .Ok is a collection. That shape "worked" by
+# accident on the first run of this code.
+function Invoke-PushWithRebase {
+    $lines = @()
+    $res = Git-Run @('push')
+    if ($res.Code -eq 0) { return @{ Ok = $true; Out = $res.Out; Rebased = $false; Lines = $lines } }
+    if ($res.Out -notmatch 'non-fast-forward|fetch first|Updates were rejected|behind its remote') {
+        return @{ Ok = $false; Out = $res.Out; Rebased = $false; Lines = $lines }
+    }
+    $lines += 'push rejected (the branch moved under us) - pulling with rebase, per go.md step 4'
+    $pull = Git-Run @('-c', 'rebase.autoStash=false', 'pull', '--rebase')
+    if ($pull.Code -ne 0) {
+        return @{ Ok = $false; Rebased = $true; Lines = $lines
+            Out = ("push was rejected and the rebase did not run:`n" + $pull.Out) }
+    }
+    $res2 = Git-Run @('push')
+    return @{ Ok = ($res2.Code -eq 0); Out = $res2.Out; Rebased = $true; Lines = $lines }
 }
 
 function Test-PathCovered([string]$file, [string[]]$requested) {
@@ -343,18 +455,87 @@ switch ($Action) {
         }
         "COMMITTED $short ($($actual.Count) path(s), all requested)"
 
-        if ($Push) {
-            # git push narrates progress on stderr even when it works - the same
-            # trap Git-Run exists for, and here it would report a good push as a
-            # failure right after a commit that is already made.
-            # NOT $push: PowerShell variable names are case-insensitive, so that
-            # would assign a hashtable to the [switch]$Push parameter and die in
-            # its type conversion before a line of this block ran.
-            $pushRes = Git-Run @('push')
-            if ($pushRes.Code -ne 0) { "ERROR push failed:"; $pushRes.Out; exit 6 }
+        # T1057: the push is not a switch any more. A commit that stays on this
+        # box is invisible to the other seat and dies with the box, and the rule
+        # saying so had to be restated twice while it was opt-in.
+        if ($NoPush) {
+            $why = if ($Reason) { $Reason } else { 'no reason given' }
+            "PUSH SKIPPED (-NoPush): $why"
+            "  $short is now local-only; the next claim and the next validate will both say so until it is pushed."
+            exit 0
+        }
+        # Nowhere to push TO is not the same failure as a push that did not
+        # work: the commit is made and correct, and exiting non-zero over it
+        # would read as "the commit failed". Say it, and leave the teeth to the
+        # gate - `unpushed` counts a branch with no upstream as unpushed work,
+        # so this cannot go quiet.
+        $st = Get-PushState
+        if ($st.Kind -eq 'detached') { "PUSH SKIPPED: detached HEAD - there is no branch to push"; exit 0 }
+        if ($st.Kind -eq 'no-upstream') {
+            "PUSH SKIPPED: branch $($st.Branch) has no upstream - $short is local-only until one is set"
+            "  (set one and push: git -C $Repo push -u origin $($st.Branch))"
+            exit 0
+        }
+        # git push narrates progress on stderr even when it works - the same
+        # trap Git-Run exists for, and here it would report a good push as a
+        # failure right after a commit that is already made.
+        # NOT $push: PowerShell variable names are case-insensitive, so that
+        # would assign a hashtable to the [switch]$Push parameter and die in
+        # its type conversion before a line of this block ran.
+        $pushRes = Invoke-PushWithRebase
+        $pushRes.Lines
+        if (-not $pushRes.Ok) { "ERROR push failed:"; $pushRes.Out; exit 6 }
+        if ($pushRes.Rebased) {
+            # A rebase rewrites the commit, so the sha reported before it is no
+            # longer the one on the remote - and `set-status -Commit <sha>`
+            # would pin the task to a commit that no longer exists.
+            $short = (& git -C $Repo rev-parse --short HEAD 2>$null | Select-Object -First 1)
+            "PUSHED $short (rebased onto the moved branch; the sha above is the pre-rebase one)"
+        } else {
             "PUSHED $short"
         }
         exit 0
+    }
+
+    # ------------------------------------------------------------------- push
+    # The remedy `unpushed` names, so the answer to "you have unpushed work" is
+    # one command rather than a decision about how to handle a rejection.
+    'push' {
+        $st = Get-PushState
+        if ($st.Kind -eq 'no-repo') { Fail "ERROR not a git repo: $Repo" 2 }
+        if ($st.Kind -eq 'detached') { "push check skipped (detached HEAD - nothing to push)"; exit 0 }
+        if ($st.Kind -eq 'no-upstream') { (Get-PushReport $st).Lines; exit 7 }
+        if ($st.Count -eq 0) { "push clean ($($st.Branch) == $($st.Upstream))"; exit 0 }
+        $res = Invoke-PushWithRebase
+        $res.Lines
+        if (-not $res.Ok) { "ERROR push failed:"; $res.Out; exit 6 }
+        "PUSHED $($st.Count) commit(s) to $($st.Upstream)$(if ($res.Rebased) { ' (after a rebase onto the moved branch)' })"
+        exit 0
+    }
+
+    # --------------------------------------------------------------- unpushed
+    # "Is anything committed here that origin has never seen?" Asked at both
+    # ends of a turn: reported by go-loop-exec.ps1 claim, failed on by
+    # parity-tasks.ps1 validate. Exit 7 is the whole point - a report nobody is
+    # obliged to act on is how the same rule ends up being restated twice.
+    'unpushed' {
+        $st = Get-PushState
+        if ($st.Kind -eq 'no-repo') { Fail "ERROR not a git repo: $Repo" 2 }
+        if ($Json) {
+            ([ordered]@{
+                kind     = $st.Kind
+                branch   = [string]$st.Branch
+                upstream = [string]$st.Upstream
+                count    = [int]$st.Count
+                clean    = ($st.Kind -eq 'detached' -or ($st.Kind -eq 'ok' -and $st.Count -eq 0))
+            } | ConvertTo-Json -Depth 3)
+            if ($st.Kind -eq 'no-upstream' -or ($st.Kind -eq 'ok' -and $st.Count -gt 0)) { exit 7 }
+            exit 0
+        }
+        $report = Get-PushReport $st
+        if (-not ($Quiet -and $report.Ok)) { $report.Lines }
+        if ($report.Ok) { exit 0 }
+        exit 7
     }
 
     # ----------------------------------------------------------------- verify

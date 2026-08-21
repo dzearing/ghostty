@@ -468,7 +468,7 @@ Concretely, in order, with no stops in between:
    window:
 
    ```
-   powershell -NoProfile -File scripts\git-commit-guard.ps1 commit -Push ^
+   powershell -NoProfile -File scripts\git-commit-guard.ps1 commit ^
        -Paths 'src\...','docs\design\windows-parity-log.md' -MessageFile temp\msg.txt
    ```
 
@@ -485,6 +485,16 @@ Concretely, in order, with no stops in between:
    `git pull`. `status` / `release -Force` are the escape hatches, and a hold
    older than its ttl is cleared rather than obeyed, so a crashed holder cannot
    wedge the repo. Acceptance: section W of `test\win32\go-loop-guard.ps1`.
+
+   **That commit PUSHES on its own** (T1057) — `commit` pushes by default, and
+   a rejected push is answered the way step 4 says to (pull with rebase, push
+   again) rather than reported and left. `-NoPush -Reason "<why>"` is the only
+   way to leave a commit on this box, and it says so on the way past. The other
+   half is a gate: `validate` FAILS when HEAD is ahead of its upstream, and
+   step 0's claim reports the same thing at the top of the turn, so a finished
+   task cannot be narrated over a commit that never left the machine. The
+   `-NoPushCheck` hatch is for a box with no network and prints that it was
+   used. Acceptance: section W of `test\win32\go-loop-guard.ps1`.
 
    Since T783 `validate` is also the gate with TEETH for harness staleness: it
    fails when `scripts\guard-due.ps1` reports an acceptance harness that has not
