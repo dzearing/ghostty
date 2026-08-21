@@ -246,21 +246,13 @@ function Send-ChooserKey($chooser, $filter, $key) {
 # Returns $true when focus actually landed on the button, which the caller
 # asserts BEFORE pressing anything.
 #
-# Each Tab is re-aimed at whatever now holds focus, and that is not a nicety:
-# `Send-TestKeys` SetFocus()es its -Target before posting (TestDesktop's
-# SendChord attaches to the GUI thread to do it), so five Tabs all aimed at the
-# filter walk the SAME first step five times and focus never leaves the list.
+# The walk itself is `Focus-ChooserControl` in lib\ChooserControls.ps1 (T342):
+# this file, -remote and -adopt each kept a byte-identical private copy that
+# sampled focus once at a fixed 300ms and treated a transient 0 as fatal, which
+# is the flake T342 was filed for. The shared walk polls for the move and
+# prints the trail that names the step when one is lost.
 function Focus-RestoreAll($chooser, $filter, $btn) {
-    $cur = $filter
-    for ($i = 0; $i -lt 6; $i++) {
-        Send-TestKeys -Window $chooser -Target $cur -Key Tab | Out-Null
-        Start-Sleep -Milliseconds 300
-        $f = Get-TestFocusedWindow -Window $chooser
-        if ([int64]$f -eq 0) { return $false }
-        $cur = [IntPtr]$f
-        if ([int64]$f -eq [int64]$btn) { return $true }
-    }
-    return $false
+    return Focus-ChooserControl -Chooser $chooser -From $filter -To $btn
 }
 
 function Wait-RosterLoaded($errlog, $timeoutMs = 10000) {

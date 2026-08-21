@@ -317,21 +317,12 @@ function Count-RelayConnects($log, $device) {
     return @(Select-String -Path $log -Pattern "CONNECT device=$device" -ErrorAction SilentlyContinue).Count
 }
 
-# Tab from the filter onto Restore All. Each Tab is re-aimed at whatever now
-# holds focus, and that is not a nicety: `Send-TestKeys` SetFocus()es its
-# -Target before posting, so six Tabs all aimed at the filter walk the SAME
-# first step six times and focus never leaves the list.
+# Tab from the filter onto Restore All. Returns $true only when focus actually
+# LANDED on the button. The walk is `Focus-ChooserControl` in
+# lib\ChooserControls.ps1 (T342) - the private copy this replaced sampled focus
+# once at a fixed 300ms and treated a transient 0 as fatal.
 function Focus-RestoreAll($chooser, $filter, $btn) {
-    $cur = $filter
-    for ($i = 0; $i -lt 6; $i++) {
-        Send-TestKeys -Window $chooser -Target $cur -Key Tab | Out-Null
-        Start-Sleep -Milliseconds 300
-        $f = Get-TestFocusedWindow -Window $chooser
-        if ([int64]$f -eq 0) { return $false }
-        $cur = [IntPtr]$f
-        if ([int64]$f -eq [int64]$btn) { return $true }
-    }
-    return $false
+    return Focus-ChooserControl -Chooser $chooser -From $filter -To $btn
 }
 
 $TOKEN = 'faketoken-t336'

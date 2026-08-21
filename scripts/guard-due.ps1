@@ -1109,6 +1109,24 @@ $GuardTable = @(
             'test\win32\restore-late-agent.ps1'
         )
     },
+    # The chooser's control LOCATOR (T294) and its Tab walk (T342) - the module
+    # every other chooser script asks "which control is this", and the one place
+    # that answer is checked against MachineChooser.zig's own ids. It went red
+    # unnoticed for the fortnight between T547 adding a SHARE_ID and T342
+    # running this script for another reason: nothing tied an id added to the
+    # dialog to the harness table that mirrors it, which is precisely the drift
+    # section A exists to catch. Coverage is the id-bearing half of the dialog
+    # plus the module and its script; the run is short and opens one chooser.
+    [pscustomobject]@{
+        Name   = 'chooser-controls'
+        Script = 'test\win32\chooser-controls.ps1'
+        Stamp  = 'test\win32\chooser-controls.stamp.json'
+        Covers = @(
+            'src\apprt\win32\MachineChooser.zig',
+            'test\win32\lib\ChooserControls.ps1',
+            'test\win32\chooser-controls.ps1'
+        )
+    },
     # The chooser's session-list sort (T602): the headers are owner-drawn and
     # the order is asserted through log oracles only this harness reads - the
     # P1-P3 floor opens no chooser, so a sort/cursor regression is invisible to

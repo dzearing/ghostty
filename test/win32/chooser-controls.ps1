@@ -29,6 +29,14 @@
 #      exactly two controls of which one is visible) are assertions here, which
 #      is the point: a lookup keyed on a label cannot also test the label.
 #
+#      B also scores the module's one non-lookup, `Focus-ChooserControl` (T342):
+#      the Tab walk three restore-all scripts used to keep a private copy of.
+#      It is a POSITIVE CONTROL wherever it is used, so both directions are
+#      scored - it lands on a reachable control, AND a walk at an unreachable
+#      one comes back false with a trail naming the step that lost focus. A
+#      walk that fails intermittently and says nothing is what T342 was filed
+#      for.
+#
 # -NegativeControl inverts B's hidden-control assertion to expect Activity to be
 # MISSING while it is hidden, which MUST fail; it is how a run proves the lookup
 # really does see through visibility rather than getting lucky.
@@ -106,6 +114,7 @@ $mirror = @{
     activity    = 'ACTIVITY_ID'
     accountLink = 'ACCOUNT_LINK_ID'
     restoreAll  = 'RESTORE_ALL_ID'
+    share       = 'SHARE_ID'
 }
 foreach ($k in ($mirror.Keys | Sort-Object)) {
     $want = $mirror[$k]
@@ -269,7 +278,48 @@ try {
         Assert ((Get-ChooserHintText -Chooser $chooser) -eq $hintBottom.Text) 'Get-ChooserHintText reads the lowest STATIC'
     }
 
-    # (9) the click helper reaches the control it names: Cancel closes the
+    # (9) the Tab walk, and - the part that matters - its ORACLE (T342).
+    #
+    # `Focus-ChooserControl` is a POSITIVE CONTROL wherever it is used: the
+    # caller presses the control it lands on and then claims something about
+    # the result, so a walk that quietly answers $false turns the assertion
+    # after it into "nothing happened", which is what a broken key press looks
+    # like too. T342 was filed for exactly that: one FAIL, one PASS, same
+    # binary, and neither run said which step lost focus.
+    #
+    # So both directions are scored here. The walk lands on a reachable
+    # control and its TRAIL names the controls it passed through; and a walk
+    # at an UNREACHABLE one (Restore All is hidden with a single session, so
+    # no number of Tabs can reach it) comes back false with a trail that says
+    # LOST and why - proving the trail reports rather than decorating.
+    $filterCtl = Get-ChooserFilterField -Chooser $chooser
+    $primaryCtl = Get-ChooserPrimaryButton -Chooser $chooser
+    $hiddenCtl = Get-ChooserRestoreAllButton -Chooser $chooser
+    Assert ($null -ne $filterCtl -and $null -ne $primaryCtl -and $null -ne $hiddenCtl) `
+        'the walk has a start, a reachable target and an unreachable one'
+    Assert ($null -ne $hiddenCtl -and -not $hiddenCtl.Visible) `
+        'Restore All is HIDDEN here (one session), so it is genuinely unreachable by Tab'
+    if ($filterCtl -and $primaryCtl -and $hiddenCtl) {
+        $landed = Focus-ChooserControl -Chooser $chooser `
+            -From ([IntPtr]$filterCtl.Hwnd) -To ([IntPtr]$primaryCtl.Hwnd)
+        $trail = $script:ChooserFocusTrail
+        Assert $landed 'Tab walks focus from the filter onto New Window'
+        Assert ([int64](Get-TestFocusedWindow -Window $chooser) -eq [int64]$primaryCtl.Hwnd) `
+            'and focus is READ BACK on that button, not merely reported'
+        Assert ($trail -match '^focus walk: filter ->' -and $trail -match 'primary@') `
+            "the trail names the controls it walked ($trail)"
+
+        # The oracle's negative control. Three tabs is plenty to prove the
+        # point and keeps the deliberate failure short.
+        $lost = Focus-ChooserControl -Chooser $chooser `
+            -From ([IntPtr]$filterCtl.Hwnd) -To ([IntPtr]$hiddenCtl.Hwnd) -MaxSteps 3
+        $lostTrail = $script:ChooserFocusTrail
+        Assert (-not $lost) 'a walk at a HIDDEN control does not claim to have landed'
+        Assert ($lostTrail -match 'LOST:') `
+            "and the trail says which step lost it ($lostTrail)"
+    }
+
+    # (10) the click helper reaches the control it names: Cancel closes the
     # dialog. Nothing else in this script proves the geometry it computes lands
     # inside the right window.
     Assert ($null -ne $named['cancel']) 'there is a Cancel to click'
@@ -301,5 +351,16 @@ if ($NegativeControl -and -not $script:negReached) {
 }
 
 Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+
+# --- stamp (T783) ------------------------------------------------------------
+# A clean green run records the covered files so scripts\guard-due.ps1 can
+# answer "has anyone run this harness against the code as it now stands?". The
+# row exists because section A's answer went red unnoticed for a fortnight
+# (T547 added SHARE_ID to the dialog; nothing asked this script about it).
+if ($script:fail -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard chooser-controls -Repo $repo 2>&1 | ForEach-Object { Write-Host "  $_" }
+}
+
 Write-Host ''
 Write-TestVerdict -Label 'CHOOSER-CONTROLS ACCEPTANCE' -Pass $script:pass -Fail $script:fail

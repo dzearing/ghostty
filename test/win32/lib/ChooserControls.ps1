@@ -71,6 +71,7 @@ $script:ChooserIds = @{
     activity    = 104   # ACTIVITY_ID   - "Activity", created hidden
     accountLink = 105   # ACCOUNT_LINK_ID - the "Sign Out" link (signed IN)
     restoreAll  = 106   # RESTORE_ALL_ID  - "Restore All", created hidden
+    share       = 107   # SHARE_ID      - the account band's "Share this machine" checkbox
 }
 
 # The action row's composition, in the order `chooser_layout.actionRow` packs it
@@ -159,6 +160,15 @@ function Get-ChooserActivityButton {
 function Get-ChooserRestoreAllButton {
     param([Parameter(Mandatory = $true)][IntPtr]$Chooser, $Desktop)
     return Get-ChooserControl -Chooser $Chooser -Name restoreAll -Desktop $Desktop
+}
+
+# "Share this machine" (T547) - the account band's CHECKBOX, at the band's
+# leading edge in every account state. A plain BS_CHECKBOX, not an autocheckbox:
+# its check state is set only from persisted or pending truth, so reading it is
+# reading what the app believes rather than what the last click did.
+function Get-ChooserShareToggle {
+    param([Parameter(Mandatory = $true)][IntPtr]$Chooser, $Desktop)
+    return Get-ChooserControl -Chooser $Chooser -Name share -Desktop $Desktop
 }
 
 # Cancel - alone in the footer.
@@ -257,4 +267,164 @@ function Invoke-ChooserClick {
     $cy = [int](($Control.Top + $Control.Bottom) / 2)
     return [bool](Send-TestMouse -Window $Chooser -Target ([IntPtr]$Control.Hwnd) `
             -X $cx -Y $cy -Button $Button -Desktop $Desktop)
+}
+
+# --- walking focus with the keyboard -----------------------------------------
+
+# What control an HWND IS, in the chooser's own vocabulary, for a trail a human
+# can read: "filter", "restoreAll", "Button#0" for something this dialog owns
+# under no id of ours, "none" for 0.
+#
+# -Own is the set of windows the chooser owns. Pass it: an id is only the
+# chooser's WORD for a control when the window is the chooser's, and every one
+# of the app's windows lives on the same GUI thread, so a focus read can land on
+# a window that shares an id with one of these and would otherwise be labelled
+# as it. A window outside the set is named by class and handle instead: at that
+# point WHICH window this is, is the whole question, and the chooser's word for
+# an id would be an answer to a different one.
+function Get-ChooserFocusLabel {
+    param([Parameter(Mandatory = $true)][int64]$Hwnd, $Own, $Desktop)
+    if ($Hwnd -eq 0) { return 'none' }
+    $h = [IntPtr]$Hwnd
+    $cls = Get-TestWindowClass -Window $h -Desktop $Desktop
+    if (-not $cls) { $cls = 'window' }
+    $id = Get-TestControlId -Control $h -Desktop $Desktop
+    if ($null -ne $Own -and -not $Own.ContainsKey($Hwnd)) {
+        return ("{0}#{1}!0x{2:X}" -f $cls, $id, $Hwnd)
+    }
+    foreach ($name in $script:ChooserIds.Keys) {
+        if ($script:ChooserIds[$name] -eq $id) { return $name }
+    }
+    return "$cls#$id"
+}
+
+# Every window the chooser owns, as a hwnd set. One `EnumChildWindows` sweep,
+# so treat it as a positive answer only: a hwnd it does not list is a reason to
+# sweep again, not a foreign window. The dialog also grows and drops controls
+# while it is open (the action row's composition follows the selected machine),
+# which is the other reason one snapshot cannot be believed for a whole walk.
+function Get-ChooserOwnWindows {
+    param([Parameter(Mandatory = $true)][IntPtr]$Chooser, $Desktop)
+    $own = @{}
+    $own[[int64]$Chooser] = $true
+    foreach ($c in @(Get-TestChildWindows -Window $Chooser -Class '*' -Desktop $Desktop)) {
+        $own[[int64]$c.Hwnd] = $true
+    }
+    return $own
+}
+
+<#
+Tab from `$From` onto `$To`, and answer whether focus actually LANDED there.
+
+Every call site is a POSITIVE CONTROL: what follows presses the control and
+then claims something about the result, and "nothing happened" is equally
+consistent with the keys never having arrived (the T240 lesson). So this has to
+be able to say WHY it failed and not merely that it did - a control that fails
+intermittently and says nothing trains a turn to re-run until green, which is
+exactly what T258 objects to. T342 was that failure: one FAIL and one PASS back
+to back on the same binary, with nothing in either run naming a step.
+
+Two properties make the walk work, and the private copies had only the first:
+
+  * Each Tab is RE-AIMED at whatever now holds focus. `Send-TestKeys`
+    SetFocus()es its -Target before posting, so six Tabs all aimed at the
+    filter walk the SAME first step six times and focus never leaves the list.
+    The copies got this right, and it is why the READ has to be right too:
+    every step is aimed at whatever the previous read returned.
+  * The move is POLLED FOR, not sampled once at a guessed delay. Focus here is
+    asynchronous twice over - the app's SetFocus is deferred since T48, and the
+    dialog manager moves focus on the app's own message loop - so a single read
+    at a fixed 300ms is a race that reads the PREVIOUS control whenever the box
+    is busy. Aimed at that stale control, the next Tab's SetFocus walks focus
+    BACKWARDS and the step is spent for nothing; and a read that lands in the
+    gap between two controls returns 0, which the copies treated as fatal on
+    the spot. Both are transient states of a move in flight, not defects.
+
+The TRAIL - what focus sat on after each Tab, how long each move took, and
+which reads a 300ms sample would have got wrong - is printed as one line and
+left in `$script:ChooserFocusTrail` for a caller that wants to assert on it.
+#>
+function Focus-ChooserControl {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Chooser,
+        [Parameter(Mandatory = $true)][IntPtr]$From,
+        [Parameter(Mandatory = $true)][IntPtr]$To,
+        [int]$MaxSteps = 6,
+        [int]$SettleMs = 2000,
+        [switch]$Quiet,
+        $Desktop
+    )
+    # Which windows are the chooser's, so a walk can tell "focus moved on" from
+    # "focus LEFT the dialog". Every window the app owns lives on ONE GUI
+    # thread, so `Get-TestFocusedWindow` reads that thread's focus and will
+    # happily name a control in another of its windows - which the old copies
+    # then re-aimed the next Tab at, typing into whatever that was.
+    $mine = Get-ChooserOwnWindows -Chooser $Chooser -Desktop $Desktop
+
+    $steps = @("$(Get-ChooserFocusLabel -Hwnd ([int64]$From) -Own $mine -Desktop $Desktop)")
+    $stale = 0
+    $cur = [int64]$From
+    $landed = $false
+    $why = "focus never reached the target within $MaxSteps tabs"
+
+    for ($i = 1; $i -le $MaxSteps; $i++) {
+        Send-TestKeys -Window $Chooser -Target ([IntPtr]$cur) -Key Tab -Desktop $Desktop | Out-Null
+
+        # The first read is taken where the private copies took theirs, so a
+        # run says how often that sample WOULD have been wrong; the walk then
+        # keeps polling for the move it is actually waiting on.
+        Start-Sleep -Milliseconds 300
+        $sample = [int64](Get-TestFocusedWindow -Window $Chooser -Desktop $Desktop)
+        $f = $sample
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        while (($f -eq 0 -or $f -eq $cur) -and $sw.ElapsedMilliseconds -lt $SettleMs) {
+            Start-Sleep -Milliseconds 50
+            $f = [int64](Get-TestFocusedWindow -Window $Chooser -Desktop $Desktop)
+        }
+        $sw.Stop()
+        $ms = 300 + $sw.ElapsedMilliseconds
+
+        # A hwnd the snapshot does not know is asked about AGAIN before it is
+        # called an escape, because the snapshot is not evidence of absence: it
+        # is one `EnumChildWindows` sweep of a dialog that adds and drops
+        # controls while it is open, taken while the app is busy. T342's own
+        # measurement is the reason - a walk reported focus on a window
+        # carrying LIST_ID as foreign, in a run whose app log shows exactly one
+        # chooser was ever opened, so the window can only have been that
+        # chooser's own list and the first sweep simply did not have it.
+        $rechecked = $false
+        if ($f -ne 0 -and -not $mine.ContainsKey($f)) {
+            $mine = Get-ChooserOwnWindows -Chooser $Chooser -Desktop $Desktop
+            $rechecked = $mine.ContainsKey($f)
+        }
+
+        $label = "$(Get-ChooserFocusLabel -Hwnd $f -Own $mine -Desktop $Desktop)@$([math]::Round($ms / 1000, 2))s"
+        if ($rechecked) { $label += '(re-read)' }
+        if ($sample -ne $f) {
+            $stale++
+            $label += "(sample@0.3s=$(Get-ChooserFocusLabel -Hwnd $sample -Own $mine -Desktop $Desktop))"
+        }
+        $steps += $label
+
+        if ($f -eq 0) {
+            $why = "tab $i left focus UNREADABLE (0) for ${SettleMs}ms - the chooser's GUI thread has no focus at all"
+            break
+        }
+        if ($f -eq $cur) {
+            $why = "tab $i did not move focus off '$(Get-ChooserFocusLabel -Hwnd $cur -Own $mine -Desktop $Desktop)' within ${SettleMs}ms - the key never arrived"
+            break
+        }
+        if (-not $mine.ContainsKey($f)) {
+            $why = "tab $i moved focus onto $(Get-ChooserFocusLabel -Hwnd $f -Own $mine -Desktop $Desktop), which is NOT one of this chooser's $($mine.Count) windows (chooser=0x$('{0:X}' -f [int64]$Chooser)) - another of the app's windows took the GUI thread's focus mid-walk"
+            break
+        }
+        $cur = $f
+        if ($f -eq [int64]$To) { $landed = $true; break }
+    }
+
+    $verdict = if ($landed) { "landed in $($steps.Count - 1) tab(s)" } else { "LOST: $why" }
+    if ($stale -gt 0) { $verdict += "; $stale sample(s) at 0.3s read a move still in flight" }
+    $script:ChooserFocusTrail = "focus walk: $($steps -join ' -> ') ($verdict)"
+    if (-not $Quiet) { Write-Host "  $script:ChooserFocusTrail" }
+    return $landed
 }

@@ -262,21 +262,12 @@ function Wait-LogLine($path, $pattern, $timeoutMs) {
     return $null
 }
 
-# Tab from the filter to Restore All, re-aiming each Tab at whatever now holds
-# focus (Send-TestKeys SetFocus()es its -Target first, so five Tabs aimed at
-# the filter would walk the same first step five times). Returns $true only
-# when focus actually LANDED on the button.
+# Tab from the filter to Restore All. Returns $true only when focus actually
+# LANDED on the button. The walk is `Focus-ChooserControl` in
+# lib\ChooserControls.ps1 (T342) - the private copy this replaced sampled focus
+# once at a fixed 300ms and treated a transient 0 as fatal.
 function Focus-RestoreAll($chooser, $filter, $btn) {
-    $cur = $filter
-    for ($i = 0; $i -lt 6; $i++) {
-        Send-TestKeys -Window $chooser -Target $cur -Key Tab | Out-Null
-        Start-Sleep -Milliseconds 300
-        $f = Get-TestFocusedWindow -Window $chooser
-        if ([int64]$f -eq 0) { return $false }
-        $cur = [IntPtr]$f
-        if ([int64]$f -eq [int64]$btn) { return $true }
-    }
-    return $false
+    return Focus-ChooserControl -Chooser $chooser -From $filter -To $btn
 }
 
 function Wait-RosterLoaded($errlog, $timeoutMs = 10000) {
