@@ -1,10 +1,10 @@
 {
     "guard":  "body-complete",
     "script":  "test/win32/body-complete-audit.ps1",
-    "generated":  "2026-08-21T07:00:13-07:00",
-    "commit":  "0e24dd44b",
+    "generated":  "2026-08-21T08:00:06-07:00",
+    "commit":  "de8ab7545",
     "files":  {
-                  "scripts/guard-due.ps1":  "b3bf2d4eab9113907d282138b4df4b1850cf9fec40bddc83c277da51f1214f4c",
+                  "scripts/guard-due.ps1":  "b0c4ab71ba42a8b0732cd7882d50ba366dbd8bae4a1081cb723a028ad8998a0c",
                   "test/win32/body-complete-audit.ps1":  "9da2ab2336bc36df1d9243e85becb7b0f9223c7382849b842a9180015b652c9c",
                   "test/win32/lib/BodyCompleteAudit.ps1":  "5adfbff59b4fe5cd317adfdafd798630016f623a4cc94bf5c481544b6c3cd042",
                   "test/win32/lib/TestScore.ps1":  "1bc571121b1b60ce5d9b63a0e1c8ebf23f6da575f8e9f7dab1a410cbc2888acc"

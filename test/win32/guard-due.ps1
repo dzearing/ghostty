@@ -294,7 +294,7 @@ try {
     Check 'F2 a run with skipped sections does not stamp' `
         ($guardSrc -match '(?s)if \(\$script:skipped -gt 0\) \{\s*\r?\n\s*"\s*stamp NOT updated') ''
 
-    # --- G. a harness with a Docker-gated section: two rows, two bars -------
+    # --- G. a harness with a Docker-gated section: three rows, three bars ---
     # T898. release-artifacts.ps1 stamped ONE row and only on a zero-skip run.
     # That bar is right for the payload sections and wrong for the workflow
     # files, and on a box where Docker is deliberately kept down it made the
@@ -308,14 +308,27 @@ try {
     # is the whole substance of the split, so it is asserted where it ships.
     $wiring = Invoke-Due list -Guard 'release-artifacts' -AtRepo $Repo
     $packaging = Invoke-Due list -Guard 'release-artifacts-packaging' -AtRepo $Repo
+    $ziprow = Invoke-Due list -Guard 'release-artifacts-zip' -AtRepo $Repo
     Check 'G1 the wiring row covers the workflow files' `
         ($wiring.Text -match '\.github/workflows/fork-ci\.yml' -and
          $wiring.Text -match '\.github/workflows/release-windows\.yml') $wiring.Text
-    Check 'G2 and does NOT cover the Docker-only payload scripts' `
+    Check 'G2 and does NOT cover the payload scripts' `
         ($wiring.Text -notmatch 'build-msi\.sh' -and $wiring.Text -notmatch 'build-portable-zip\.sh') $wiring.Text
-    Check 'G3 the packaging row covers exactly those two' `
-        ($packaging.Text -match 'build-msi\.sh' -and $packaging.Text -match 'build-portable-zip\.sh' -and
+    # T1052 split the payload row in two: the MSI needs Linux msitools (Docker
+    # here), the portable ZIP needs only bash + python3 and is built for real on
+    # any box. One row for both meant the ZIP could not be proved where the work
+    # happens - and a ZIP that had shipped for months without ghoztty.com was
+    # the cost.
+    Check 'G3 the packaging row covers the MSI builder and only it' `
+        ($packaging.Text -match 'build-msi\.sh' -and
+         $packaging.Text -notmatch 'build-portable-zip\.sh' -and
          $packaging.Text -notmatch 'fork-ci\.yml') $packaging.Text
+    Check 'G3b the ZIP row covers the ZIP builder and only it' `
+        ($ziprow.Text -match 'build-portable-zip\.sh' -and
+         $ziprow.Text -notmatch 'build-msi\.sh' -and
+         $ziprow.Text -notmatch 'fork-ci\.yml') $ziprow.Text
+    Check 'G3c and the ZIP row does not demand Docker to clear it' `
+        ($ziprow.Text -notmatch '-RequireDocker') $ziprow.Text
 
     # G4-G7 measure the behaviour itself, over a fixture shaped like both rows.
     $RelFixture = Join-Path $env:TEMP ("ghoztty-guard-due-rel-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
@@ -367,6 +380,11 @@ try {
         ($relSrc -match '(?s)if \(\$script:failures -eq 0\) \{(?:(?!skipped).)*?-Guard release-artifacts -Repo') ''
     Check 'G11 the packaging stamp is behind a zero-skip condition' `
         ($relSrc -match '(?s)if \(\$script:skipped -eq 0\) \{(?:(?!-Guard).)*?-Guard release-artifacts-packaging') ''
+    # G12: the ZIP stamp is earned by having BUILT a ZIP, not by the run merely
+    # reaching the end. A skipped ZIP half that stamped anyway would be the same
+    # lie as a Docker-less run vouching for the MSI (T1052).
+    Check 'G12 the ZIP stamp is behind having actually built a ZIP' `
+        ($relSrc -match '(?s)if \(\$builtZip\) \{(?:(?!-Guard).)*?-Guard release-artifacts-zip') ''
 
     # H: every row must be CLEARABLE. A row whose harness never calls
     # `guard-due update` goes due the moment anything it covers moves and stays

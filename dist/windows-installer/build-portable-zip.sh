@@ -3,12 +3,19 @@
 # terminal (T38).
 #
 # The portable ZIP is the no-installer counterpart of the MSI: the SAME
-# payload (ghoztty.exe + ghoztty-agent.exe + the share/ resource tree) laid
-# out under a single top-level "Ghoztty" folder, so unzipping anywhere and
-# double-clicking ghoztty.exe works. The layout must match the MSI's
-# INSTALLDIR exactly -- src/os/resourcesdir.zig climbs from the exe to
+# payload (ghoztty.exe + ghoztty.com + ghoztty-agent.exe + the share/ resource
+# tree) laid out under a single top-level "Ghoztty" folder, so unzipping
+# anywhere and double-clicking ghoztty.exe works. The layout must match the
+# MSI's INSTALLDIR exactly -- src/os/resourcesdir.zig climbs from the exe to
 # share/terminfo, and the session-persistence agent is spawned by relative
 # location (T89h).
+#
+# ghoztty.com is the console-subsystem twin (T245, src/cli/com_shim.zig): the
+# same image with one word of the PE optional header flipped. PATHEXT resolves
+# .COM ahead of .EXE, so it is the binary a shell actually runs, and without it
+# `ghoztty +list` from PowerShell prints nothing and redirects write 0 bytes --
+# a windowed program is not waited for. Both released artifacts shipped without
+# it until T1052, so every downloaded install had a dead command line.
 #
 # Usage:
 #   dist/windows-installer/build-portable-zip.sh --semver <X.Y.Z>
@@ -51,12 +58,17 @@ command -v python3 >/dev/null || { echo "error: python3 not found" >&2; exit 1; 
 cd "$REPO_ROOT"
 
 EXE="$REPO_ROOT/zig-out/bin/ghoztty.exe"
+COM_EXE="$REPO_ROOT/zig-out/bin/ghoztty.com"
 AGENT_EXE="$REPO_ROOT/zig-out/bin/ghoztty-agent.exe"
 SHARE="$REPO_ROOT/zig-out/share"
 [[ -f "$EXE" ]] || { echo "error: $EXE not found (build first)" >&2; exit 1; }
 # Same required-sibling rule the MSI enforces (T89h): a layout without the
 # agent silently degrades every pane to non-persistent exec.
 [[ -f "$AGENT_EXE" ]] || { echo "error: $AGENT_EXE not found -- the portable ZIP must carry the session-persistence agent (T89h); build first" >&2; exit 1; }
+# And the console twin (T245/T1052): without it the ZIP is a terminal with no
+# working command line. `zig build` installs it on every Windows target,
+# cross-builds included, so a missing one means the build did not run.
+[[ -f "$COM_EXE" ]] || { echo "error: $COM_EXE not found -- the portable ZIP must carry the console twin or the ghoztty command line does nothing from PowerShell (T245); build first" >&2; exit 1; }
 [[ -f "$SHARE/terminfo/ghostty.terminfo" ]] || { echo "error: $SHARE/terminfo/ghostty.terminfo missing -- resourcesDir sentinel would break" >&2; exit 1; }
 
 if [[ -z "$STAMP" ]]; then
@@ -75,6 +87,7 @@ ROOT="$WORK/Ghoztty"
 mkdir -p "$ROOT"
 
 cp "$EXE" "$ROOT/ghoztty.exe"
+cp "$COM_EXE" "$ROOT/ghoztty.com"
 cp "$AGENT_EXE" "$ROOT/ghoztty-agent.exe"
 # -L would follow the symlinks zig's terminfo tree contains; the MSI skips
 # them for the same reason (a ZIP consumer on Windows cannot represent one,
@@ -95,6 +108,10 @@ No installer. Just run the terminal:
 
 Tip: copy this folder to a local disk first so it does not run off a
 network share.
+
+Want the "ghoztty" command line too? Add this folder to your PATH, then
+"ghoztty +list" works from PowerShell or cmd. (ghoztty.com is what your
+shell runs there -- keep it beside ghoztty.exe.)
 
 Prefer an installer? Ghoztty-$SEMVER-x64.msi in the same release installs
 per-user (no admin) and puts ghoztty on your PATH.
@@ -125,10 +142,11 @@ PYEOF
 # Validate what we produced, rather than trusting that the write succeeded:
 # every payload the MSI guarantees must also be in the ZIP, under Ghoztty/.
 python3 - "$OUT" <<'PYEOF'
-import sys, zipfile
+import struct, sys, zipfile
 out = sys.argv[1]
 required = [
     "Ghoztty/ghoztty.exe",
+    "Ghoztty/ghoztty.com",
     "Ghoztty/ghoztty-agent.exe",
     "Ghoztty/share/terminfo/ghostty.terminfo",
     "Ghoztty/READ-ME-FIRST.txt",
@@ -136,6 +154,16 @@ required = [
 with zipfile.ZipFile(out) as z:
     names = set(z.namelist())
     bad = z.testzip()
+    # The twin is only worth shipping if it is actually the console-subsystem
+    # image: a plain copy of the GUI exe under a .com name is WORSE than no
+    # twin at all, because PATHEXT prefers it and the shell still does not
+    # wait. Read the packaged bytes rather than trusting the copy (T1052).
+    if "Ghoztty/ghoztty.com" in names:
+        head = z.read("Ghoztty/ghoztty.com")[:1024]
+        pe = struct.unpack_from("<I", head, 0x3C)[0]
+        subsystem = struct.unpack_from("<H", head, pe + 0x5C)[0]
+        if subsystem != 3:
+            sys.exit(f"error: Ghoztty/ghoztty.com has PE subsystem {subsystem}, expected 3 (console)")
 missing = [r for r in required if r not in names]
 if missing:
     sys.exit(f"error: portable ZIP is missing {missing}")

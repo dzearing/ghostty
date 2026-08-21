@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # build-msi.sh — build the per-user Windows MSI for the Ghoztty terminal.
 #
-# Generates a WiX source (wixl/WiX-v3 subset) that packages ghoztty.exe plus
-# the share/ resource tree (themes, shell-integration, terminfo sentinel that
+# Generates a WiX source (wixl/WiX-v3 subset) that packages ghoztty.exe, its
+# console twin ghoztty.com, the session-persistence agent and the share/
+# resource tree (themes, shell-integration, terminfo sentinel that
 # src/os/resourcesdir.zig climbs for), compiles it with wixl (GNOME msitools)
 # and validates the result with msiinfo — no Windows box needed.
 #
@@ -122,9 +123,15 @@ if [[ "$SKIP_BUILD" -eq 0 ]]; then
 fi
 
 EXE="$REPO_ROOT/zig-out/bin/ghoztty.exe"
+COM_EXE="$REPO_ROOT/zig-out/bin/ghoztty.com"
 AGENT_EXE="$REPO_ROOT/zig-out/bin/ghoztty-agent.exe"
 SHARE="$REPO_ROOT/zig-out/share"
 [[ -f "$EXE" ]] || { echo "error: $EXE not found (build first)" >&2; exit 1; }
+# ghoztty.com is the console-subsystem twin (T245, src/cli/com_shim.zig) and it
+# is what the MSI's PATH entry actually resolves: PATHEXT prefers .COM over
+# .EXE, and the GUI ghoztty.exe is not waited for by PowerShell or cmd, so an
+# install without the twin puts a dead `ghoztty` on the user's PATH (T1052).
+[[ -f "$COM_EXE" ]] || { echo "error: $COM_EXE not found — the MSI puts INSTALLDIR on PATH, and without the console twin the ghoztty command line does nothing (T245); build first" >&2; exit 1; }
 # The session-persistence agent ships as a REQUIRED sibling of ghoztty.exe
 # (T89h): the app spawns it by that relative location (LocalAgent.zig), and
 # a Windows install without it silently degrades every pane to non-persistent
@@ -178,12 +185,12 @@ WXS="$WORK/ghoztty.wxs"
 # Generate the WiX source. Directory tree + one component per file with
 # GUIDs derived deterministically from the install path (uuid5) so component
 # identity is stable across builds (MSI component rules).
-python3 - "$EXE" "$AGENT_EXE" "$SHARE" "$WXS" "$TEST_IDENTITY" <<'PYEOF'
+python3 - "$EXE" "$COM_EXE" "$AGENT_EXE" "$SHARE" "$WXS" "$TEST_IDENTITY" <<'PYEOF'
 import os, sys, uuid, hashlib
 from xml.sax.saxutils import escape
 
-exe, agent_exe, share, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-identity = sys.argv[5] if len(sys.argv) > 5 else ""
+exe, com_exe, agent_exe, share, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+identity = sys.argv[6] if len(sys.argv) > 6 else ""
 
 # Stable namespace for component GUID derivation. NEVER change this, or
 # every component changes identity and upgrades misbehave.
@@ -250,10 +257,12 @@ def emit_dir(fs_dir, rel_install_dir, indent):
         else:
             emit_file_component(rel_install_dir, p, indent)
 
-# INSTALLDIR contents: ghoztty.exe + ghoztty-agent.exe + share tree. The
-# agent is a required sibling: session persistence spawns it by relative
-# location (T89h).
+# INSTALLDIR contents: ghoztty.exe + ghoztty.com + ghoztty-agent.exe + share
+# tree. The agent is a required sibling: session persistence spawns it by
+# relative location (T89h). The .com twin is what INSTALLDIR-on-PATH resolves
+# for a bare `ghoztty` (T245/T1052).
 emit_file_component("", exe, 12)
+emit_file_component("", com_exe, 12)
 emit_file_component("", agent_exe, 12)
 lines.append(f'            <Directory Id="{ident("d", "share")}" Name="share">')
 emit_dir(share, "share", 14)
@@ -416,7 +425,10 @@ msibuild "$OUT" -i "$WORK/Environment.idt"
 # release semver and can repeat or even decrease across rebuilds; an
 # equal/lower table version would re-trigger the T23 vanishing-file rule on
 # upgrade). Table version > on-disk version ⇒ InstallFiles always recopies.
-echo "==> patch File table (ghoztty.exe + ghoztty-agent.exe Version = $EXE_FILE_VERSION)"
+# ghoztty.com carries ghoztty.exe's version resource verbatim (it IS that
+# image with the subsystem word flipped), so it needs the same row or an
+# upgrade would leave last release's CLI behind next to a fresh app (T1052).
+echo "==> patch File table (ghoztty.exe + ghoztty.com + ghoztty-agent.exe Version = $EXE_FILE_VERSION)"
 msiinfo export "$OUT" File > "$WORK/File.idt"
 python3 - "$WORK/File.idt" "$EXE_FILE_VERSION" <<'PYEOF'
 import sys
@@ -425,7 +437,7 @@ with open(path, "r", encoding="utf-8", newline="") as f:
     content = f.read()
 sep = "\r\n" if "\r\n" in content else "\n"
 lines = content.split(sep)
-want = {"ghoztty.exe": 0, "ghoztty-agent.exe": 0}
+want = {"ghoztty.exe": 0, "ghoztty.com": 0, "ghoztty-agent.exe": 0}
 for i, line in enumerate(lines):
     fields = line.split("\t")
     if len(fields) >= 5 and fields[2] in want:

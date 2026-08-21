@@ -491,21 +491,34 @@ $GuardTable = @(
             'test\win32\release-artifacts.ps1'
         )
     },
-    # The PACKAGING half of the same harness (T898): the two scripts that
-    # actually build the payload, whose only real proof is section B running
-    # them under the msitools-local image. A Docker-less run vouching for the
-    # MSI/ZIP payload is the exact lie T783's mechanism exists to prevent, so
-    # this row is stamped ONLY by a zero-skip run - which means that when Docker
-    # is down it stays due, and honestly so. The harness itself is deliberately
-    # NOT covered here: it is the wiring row's subject, and an edit to a static
-    # assertion must not put this row out of reach until someone starts Docker.
+    # The PACKAGING half of the same harness (T898): the scripts that actually
+    # build the payload, whose only real proof is section B running them and
+    # reading the artifact back. A run that could not build vouching for the
+    # payload is the exact lie T783's mechanism exists to prevent.
+    #
+    # Split in two by T1052, because the two payloads no longer have the same
+    # requirement. The MSI needs wixl/msitools, which is Linux tooling and
+    # therefore Docker on this box; the portable ZIP needs bash + python3 and
+    # nothing else, so section B builds it through Git Bash and reads its entry
+    # set back on any box with git installed. Keeping them on one row meant the
+    # ZIP - the artifact that had silently shipped without ghoztty.com for
+    # months - could not be proved here at all. The harness itself is
+    # deliberately NOT covered by either row: it is the wiring row's subject,
+    # and an edit to a static assertion must not put these rows out of reach.
     [pscustomobject]@{
         Name    = 'release-artifacts-packaging'
         Script  = 'test\win32\release-artifacts.ps1'
         RunArgs = '-RequireDocker'
         Stamp   = 'test\win32\release-artifacts-packaging.stamp.json'
         Covers  = @(
-            'dist\windows-installer\build-msi.sh',
+            'dist\windows-installer\build-msi.sh'
+        )
+    },
+    [pscustomobject]@{
+        Name   = 'release-artifacts-zip'
+        Script = 'test\win32\release-artifacts.ps1'
+        Stamp  = 'test\win32\release-artifacts-zip.stamp.json'
+        Covers = @(
             'dist\windows-installer\build-portable-zip.sh'
         )
     },
