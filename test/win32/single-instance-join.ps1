@@ -285,6 +285,149 @@ $bare = Invoke-GhozttyIpc -Action 'new-window' -PipeName $pipeA -TimeoutMs 20000
 Assert 'C9 a launch too old to send a build identity stays silent' (
     $null -ne $bare -and $bare.success -and [string]$bare.note -eq '')
 
+# A launch that ALREADY asked (T1023) still earns the caveat on the reply - the
+# CLI and this script read it - but the running app does not repeat it as a
+# balloon, which after a dialog the user just answered would be the same fact
+# twice. Only the note is readable from here; the balloon's absence is the
+# `prompted` branch in IpcHandlers.handoffNote, pinned by the unit tests.
+$asked = Invoke-GhozttyIpc -Action 'new-window' -PipeName $pipeA -TimeoutMs 20000 -Extra @{
+    handoff = @{
+        version  = '0.0.0-not-this-build'
+        commit   = '0000000'
+        exe      = 'D:\somewhere\else\Ghoztty-portable-x64\ghoztty.exe'
+        prompted = $true
+    }
+}
+Assert 'C10 a launch that already asked still gets the caveat on the reply' (
+    $null -ne $asked -and $asked.success -and [string]$asked.note -ne '')
+
+# ============================================================================
+"== D: a launch of a DIFFERENT build asks before it hands the window over"
+# ============================================================================
+# T1023, and D79's mitigation ("two DIFFERENT versions still start
+# independently") landing where it actually can. The agent's pipe and the saved
+# layout are shared on purpose - both have to survive an update, which is the
+# one moment the build changes underneath them - so a stale copy cannot become a
+# second app without reopening every window twice and fighting over the layout.
+# What the mitigation buys the user instead is the CHOICE: the launch names both
+# builds and opens nothing until it is answered.
+#
+# The mismatch is unreachable from outside otherwise - the only exe here is the
+# one in zig-out, so both sides of a real handoff report the same build. The
+# debug-only GHOZTTY_HANDOFF_VERSION / GHOZTTY_HANDOFF_COMMIT seam makes the
+# launch CLAIM another build, which is exactly the input the comparison takes.
+# The dialog is answered by posting its own WM_COMMAND (IDOK / IDCANCEL): no
+# SendInput, so this arm works on the background test desktop.
+if (-not ('GhozttyTestDlg' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class GhozttyTestDlg {
+    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
+    public static extern IntPtr FindWindowW(string cls, string title);
+    [DllImport("user32.dll")]
+    public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
+}
+'@
+}
+
+# [NullString]::Value, never $null: a $null bound to a .NET string parameter
+# arrives as "", and FindWindowW then matches only a window whose title is
+# empty - which the dialog's never is.
+function Find-Prompt {
+    return [GhozttyTestDlg]::FindWindowW('GhozttyConfirmDialog', [NullString]::Value)
+}
+function Wait-Prompt($timeoutSec = 40) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $h = Find-Prompt
+        if ($h -ne [IntPtr]::Zero) { return $h }
+        Start-Sleep -Milliseconds 250
+    }
+    return [IntPtr]::Zero
+}
+function Answer-Prompt($hwnd, $id) {
+    # WM_COMMAND with BN_CLICKED in the high word, the control id in the low
+    # word - the shape the dialog's own buttons send.
+    [void][GhozttyTestDlg]::PostMessageW($hwnd, 0x0111, [IntPtr]$id, [IntPtr]::Zero)
+}
+function Wait-PromptGone($timeoutSec = 20) {
+    $deadline = (Get-Date).AddSeconds($timeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if ((Find-Prompt) -eq [IntPtr]::Zero) { return $true }
+        Start-Sleep -Milliseconds 250
+    }
+    return $false
+}
+
+# A launch that claims to be another build. Everything else about it is a normal
+# launch: same exe, same endpoint, same lineage.
+function Launch-AsBuild($suffix, $version, $commit, $mode, $launchArgs) {
+    $savedSuffix = $env:GHOZTTY_PIPE_SUFFIX
+    $savedVersion = $env:GHOZTTY_HANDOFF_VERSION
+    $savedCommit = $env:GHOZTTY_HANDOFF_COMMIT
+    $savedMode = $env:GHOZTTY_HANDOFF_PROMPT
+    $env:GHOZTTY_PIPE_SUFFIX = $suffix
+    $env:GHOZTTY_HANDOFF_VERSION = $version
+    $env:GHOZTTY_HANDOFF_COMMIT = $commit
+    if ($mode) { $env:GHOZTTY_HANDOFF_PROMPT = $mode } else { $env:GHOZTTY_HANDOFF_PROMPT = $null }
+    Start-Process -FilePath $Exe -WindowStyle Minimized `
+        -ArgumentList (@('--session-persistence=false') + $launchArgs) | Out-Null
+    $env:GHOZTTY_PIPE_SUFFIX = $savedSuffix
+    $env:GHOZTTY_HANDOFF_VERSION = $savedVersion
+    $env:GHOZTTY_HANDOFF_COMMIT = $savedCommit
+    $env:GHOZTTY_HANDOFF_PROMPT = $savedMode
+}
+
+Assert 'D0 no question is on screen before this section' ((Find-Prompt) -eq [IntPtr]::Zero)
+
+$appsBeforeD = @(Get-AppPids).Count
+$countBeforeD = @(Get-Windows-On $pipeA).Count
+
+Launch-AsBuild $suffixA '0.0.0-older-copy' '0000000' $null @()
+$dlg = Wait-Prompt 45
+Assert 'D1 the launch of a different build put a question on screen' ($dlg -ne [IntPtr]::Zero)
+Assert 'D2 ...and opened nothing while it waited for an answer' (
+    @(Get-Windows-On $pipeA).Count -eq $countBeforeD)
+
+# Cancel: the user would rather quit the running copy themselves.
+Answer-Prompt $dlg 2
+Assert 'D3 the question closed when it was answered' (Wait-PromptGone 20)
+Start-Sleep -Seconds 4
+Assert 'D4 cancelling opened no window in the running app' (
+    @(Get-Windows-On $pipeA).Count -eq $countBeforeD)
+Assert 'D5 ...and the copy the user started exited rather than becoming a second app' (
+    @(Get-AppPids).Count -eq $appsBeforeD)
+
+# Open Window: the same launch, answered the other way.
+Launch-AsBuild $suffixA '0.0.0-older-copy' '0000000' $null @()
+$dlg2 = Wait-Prompt 45
+Assert 'D6 the question comes up again for the next such launch' ($dlg2 -ne [IntPtr]::Zero)
+Answer-Prompt $dlg2 1
+$winsD = @(Wait-WindowCount $pipeA ($countBeforeD + 1) 45)
+Assert 'D7 answering "Open Window" opens one in the app already running' (
+    $winsD.Count -eq $countBeforeD + 1)
+Start-Sleep -Seconds 4
+Assert 'D8 ...still without starting a second app' (
+    @(Get-AppPids).Count -eq $appsBeforeD)
+
+# A SAME-build launch is never asked - that is the everyday case and the one
+# that must stay invisible.
+$countBeforeSame = @(Get-Windows-On $pipeA).Count
+Launch $suffixA @()
+$winsSame = @(Wait-WindowCount $pipeA ($countBeforeSame + 1) 45)
+Assert 'D9 a same-build launch is never asked, it just opens its window' (
+    $winsSame.Count -eq $countBeforeSame + 1 -and (Find-Prompt) -eq [IntPtr]::Zero)
+
+# And a launch told to skip the question keeps the old behaviour exactly, so a
+# scripted launch of a mismatched build can never block on a modal dialog.
+$countBeforeJoin = @(Get-Windows-On $pipeA).Count
+Launch-AsBuild $suffixA '0.0.0-older-copy' '0000000' 'join' @()
+$winsJoin = @(Wait-WindowCount $pipeA ($countBeforeJoin + 1) 45)
+Assert 'D10 GHOZTTY_HANDOFF_PROMPT=join hands off without asking' (
+    $winsJoin.Count -eq $countBeforeJoin + 1)
+Assert 'D11 ...and put no question on screen' ((Find-Prompt) -eq [IntPtr]::Zero)
+
 # ============================================================================
 "== cleanup"
 Stop-TestProcs

@@ -532,6 +532,12 @@ pub fn buildRequestWithHandoff(
             jws.write(id.commit) catch break :write;
             jws.objectField("exe") catch break :write;
             jws.write(id.exe) catch break :write;
+            // T1023: only ever true when the launch already asked the user, so
+            // an older server that ignores the field behaves exactly as it did
+            // before — it repeats the fact as a balloon, which is noisy but
+            // never wrong.
+            jws.objectField("prompted") catch break :write;
+            jws.write(id.prompted) catch break :write;
             jws.endObject() catch break :write;
         }
         jws.endObject() catch break :write;
@@ -749,6 +755,59 @@ pub fn sendActionWithHandoff(
     }
 
     return true;
+}
+
+/// Ask the instance that already owns the endpoint WHICH BUILD it is (T1023).
+///
+/// The launch that lost the race calls this before it hands its window over,
+/// so a user who started one build and would silently get a window from
+/// another is asked first. Everything about it is best-effort: a running
+/// instance that does not answer, answers slowly, or answers something
+/// unparseable yields null, and the caller then joins exactly as it did before
+/// this existed. Being unable to name the other build is not a reason to
+/// interrupt a launch.
+///
+/// Diagnostics are discarded rather than printed: the caller is a GUI launch
+/// with no console, and this exchange is an internal question the user never
+/// asked. Strings are allocated from `alloc` and owned by the caller.
+pub fn queryIdentity(alloc: Allocator) ?handoff.Identity {
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+
+    const path = clientEndpointPath(alloc) catch return null;
+    defer alloc.free(path);
+    const conn = connectPath(alloc, path) catch return null;
+    defer conn.close();
+
+    const json_bytes = buildRequest(alloc, "version", null) catch return null;
+    defer alloc.free(json_bytes);
+
+    const resp = exchange(alloc, conn, json_bytes, .{
+        .action = "+version",
+    }, &discard.writer) catch return null;
+    defer alloc.free(resp);
+
+    const parsed = std.json.parseFromSlice(
+        struct {
+            success: bool = false,
+            data: struct {
+                version: []const u8 = "",
+                commit: []const u8 = "",
+                exe: []const u8 = "",
+            } = .{},
+        },
+        alloc,
+        resp,
+        .{ .ignore_unknown_fields = true },
+    ) catch return null;
+    defer parsed.deinit();
+    if (!parsed.value.success) return null;
+
+    // The parse borrows from `resp`, which this function frees.
+    return .{
+        .version = alloc.dupe(u8, parsed.value.data.version) catch return null,
+        .commit = alloc.dupe(u8, parsed.value.data.commit) catch return null,
+        .exe = alloc.dupe(u8, parsed.value.data.exe) catch return null,
+    };
 }
 
 test "buildRequest: no handoff object unless a launch supplies one (T1022)" {

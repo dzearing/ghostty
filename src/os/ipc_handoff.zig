@@ -39,6 +39,14 @@ pub const Identity = struct {
     commit: []const u8 = "",
     /// Absolute path of the executable.
     exe: []const u8 = "",
+    /// Whether the LAUNCH already told the user about the difference and got
+    /// their answer (T1023's prompt). Not part of the build's identity — it
+    /// rides the same object because it is the same handoff — and deliberately
+    /// ignored by `sameBuild`: it only decides whether the running instance
+    /// repeats the fact as a desktop balloon, which after a dialog the user
+    /// just dismissed is noise. The reply's `note` is unaffected, so a CLI or
+    /// an acceptance script still reads the caveat either way.
+    prompted: bool = false,
 };
 
 /// Whether two identities describe the SAME build.
@@ -118,6 +126,79 @@ pub fn mismatchNotice(
             },
         ),
     };
+}
+
+/// How much of an executable path the PROMPT keeps. A dialog is wider than a
+/// balloon, but `DT_WORDBREAK` only breaks between words, so a path longer than
+/// the dialog's wrap width would be clipped rather than wrapped — bounding it
+/// here is what keeps the last, identifying part of the path on screen.
+pub const prompt_exe_tail_max = 64;
+
+/// What the user is ASKED before a launch hands its window to a different
+/// build (T1023, D79's mitigation: "two DIFFERENT versions still start
+/// independently").
+///
+/// D79 chose one app per lineage, and the three things two same-lineage copies
+/// share — the IPC endpoint, the local agent's pipe, and the saved layout —
+/// cannot all be re-keyed per build: the agent and the layout have to survive
+/// an upgrade, which is precisely the case where the build changes underneath
+/// them. So a stale copy cannot become a second app without reintroducing the
+/// cons the user rejected (two apps over one agent, one saved layout).
+///
+/// What CAN honour the mitigation is the choice: the launch never silently
+/// becomes a window of another build. It says which build is running, which
+/// build the user started, and lets them take the window or back out and quit
+/// the running one first.
+pub const Prompt = struct {
+    /// Dialog caption.
+    title: []const u8,
+    /// Dialog body. Multi-line; wrapped by the dialog.
+    text: []const u8,
+    /// Affirmative: take the window from the build already running.
+    ok_label: []const u8,
+    /// Dismissive: open nothing, leave the running app alone.
+    cancel_label: []const u8,
+};
+
+/// Build the prompt for a launch whose build differs from the one already
+/// running, or null when they match and the join is invisible by design.
+///
+/// Everything is allocated from `alloc`; the caller owns the strings.
+pub fn mismatchPrompt(
+    alloc: Allocator,
+    launcher: Identity,
+    running: Identity,
+) Allocator.Error!?Prompt {
+    if (sameBuild(launcher, running)) return null;
+
+    // A path goes on its own line under the sentence it belongs to; without one
+    // the sentence simply ends. Formatting it inline would leave the period
+    // hanging off the end of a path, where it reads as part of the filename.
+    const running_where = try where(alloc, running);
+    defer alloc.free(running_where);
+    const launcher_where = try where(alloc, launcher);
+    defer alloc.free(launcher_where);
+
+    return .{
+        .title = "A different Ghoztty is already running",
+        .text = try std.fmt.allocPrint(
+            alloc,
+            "Ghoztty {s} is already running{s}\n\n" ++
+                "The copy you started is {s}{s}\n\n" ++
+                "Two versions cannot run at the same time. Open a window in the " ++
+                "Ghoztty already running, or cancel and quit it first to run the " ++
+                "copy you started.",
+            .{ describe(running), running_where, describe(launcher), launcher_where },
+        ),
+        .ok_label = "Open Window",
+        .cancel_label = "Cancel",
+    };
+}
+
+/// The ":\n<path>" tail of a prompt sentence, or "." when the path is unknown.
+fn where(alloc: Allocator, id: Identity) Allocator.Error![]u8 {
+    if (id.exe.len == 0) return alloc.dupe(u8, ".");
+    return std.fmt.allocPrint(alloc, ":\n{s}", .{tail(id.exe, prompt_exe_tail_max)});
 }
 
 /// The most identifying thing we can say about a build in one phrase.
@@ -212,6 +293,68 @@ test "mismatchNotice: an empty running exe still produces a sentence" {
     try testing.expect(std.mem.indexOf(u8, notice.body, "already open") != null);
     // No dangling "from " with nothing after it.
     try testing.expect(std.mem.indexOf(u8, notice.note, "running from ") == null);
+}
+
+test "mismatchPrompt: the same build is never asked about" {
+    const testing = std.testing;
+    const id: Identity = .{ .version = "1.4.0", .commit = "abc1234", .exe = "C:\\a\\ghoztty.exe" };
+    try testing.expect(try mismatchPrompt(testing.allocator, id, id) == null);
+    // `prompted` is not part of the build's identity: a launch that has already
+    // asked is still the SAME build and must stay silent.
+    var asked = id;
+    asked.prompted = true;
+    try testing.expect(try mismatchPrompt(testing.allocator, asked, id) == null);
+    try testing.expect(try mismatchNotice(testing.allocator, asked, id) == null);
+}
+
+test "mismatchPrompt: names both builds and offers both ways out" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const prompt = (try mismatchPrompt(
+        arena,
+        .{ .version = "1.3.0", .commit = "aaaaaaa", .exe = "D:\\Users\\David\\Desktop\\Ghoztty-portable-x64\\ghoztty.exe" },
+        .{ .version = "1.4.0", .commit = "bbbbbbb", .exe = "C:\\Users\\David\\AppData\\Local\\Programs\\Ghoztty\\ghoztty.exe" },
+    )).?;
+
+    // Which build owns the app right now, and which one the user just started:
+    // the whole point is that neither is left to be guessed from a window.
+    try testing.expect(std.mem.indexOf(u8, prompt.text, "1.4.0") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt.text, "1.3.0") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt.text, "Programs\\Ghoztty\\ghoztty.exe") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt.text, "Ghoztty-portable-x64\\ghoztty.exe") != null);
+    // ...with no period glued to the end of a path, where it reads as filename.
+    try testing.expect(std.mem.indexOf(u8, prompt.text, ".exe.") == null);
+
+    // Both ways out are named, and the dismissive one says what to do instead.
+    try testing.expect(prompt.ok_label.len > 0 and prompt.cancel_label.len > 0);
+    try testing.expect(std.mem.indexOf(u8, prompt.text, "quit it first") != null);
+
+    // No line is long enough to be clipped by the dialog's word wrap: paths are
+    // tailed, and every other line is prose that breaks between words.
+    var lines = std.mem.splitScalar(u8, prompt.text, '\n');
+    while (lines.next()) |line| {
+        var words = std.mem.splitScalar(u8, line, ' ');
+        while (words.next()) |word| try testing.expect(word.len <= prompt_exe_tail_max + 1);
+    }
+}
+
+test "mismatchPrompt: a build with no exe path still produces both sentences" {
+    const testing = std.testing;
+    var arena_state = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const prompt = (try mismatchPrompt(
+        arena,
+        .{ .version = "1.3.0", .commit = "aaaaaaa" },
+        .{ .version = "1.4.0", .commit = "bbbbbbb" },
+    )).?;
+    // No dangling colon-newline with nothing after it.
+    try testing.expect(std.mem.indexOf(u8, prompt.text, ":\n") == null);
+    try testing.expect(std.mem.indexOf(u8, prompt.text, "1.4.0 is already running.") != null);
 }
 
 test "tail: cuts on a character boundary" {

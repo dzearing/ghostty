@@ -1,8 +1,8 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-21T10:37:02-07:00",
-    "commit":  "ea429c401",
+    "generated":  "2026-08-21T11:26:01-07:00",
+    "commit":  "f2c690ba8",
     "files":  {
                   "docs/claude/testing.md":  "f939385433e03ecf218cb22140f2cf8aea0821f43d934f0d15101935c778a330",
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
@@ -216,7 +216,7 @@
                   "test/win32/sessions-agent-build.ps1":  "a54adedd012376c5ec12ae1d7c1ecf1f9ffeda89817df8aeabc4e75fd11ac10f",
                   "test/win32/session-snapshot-reattach.ps1":  "60af4d23ff7fd68b35e4d061e5ec85654308cc0fcdf75762311db46fb922b3ca",
                   "test/win32/share-machine.ps1":  "e73db9d168f63d50d002de3881193d129aacbd47df8015caec17799ff1b79b5b",
-                  "test/win32/single-instance-join.ps1":  "eb389e12af433cbd41efe59858b51e6f5f5c00a8f550d3a04f8c8af042ed4cd1",
+                  "test/win32/single-instance-join.ps1":  "c9376e3fbaf392c0db6888b6066eb94b1909778d223600ce53c463976a8cd16c",
                   "test/win32/skip-visibility.ps1":  "c757621d0e3bb387d615cc74968e708190720f712eb6484d8438180c8ee870e2",
                   "test/win32/soak.ps1":  "0896bf5a4a307162215d32072c67b2fa71a949975bab859f2c2c814566901b69",
                   "test/win32/split-dim.ps1":  "fd8a5b8ec1f19be08d297fb84c92c3b0fed60d7cb1845a6256b3fb1a35fc1b19",

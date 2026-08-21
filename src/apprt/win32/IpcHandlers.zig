@@ -491,10 +491,15 @@ fn handoffNote(ctx: Context, arena: Allocator, request: Request) Allocator.Error
 
     const notice = (try ipc_handoff.mismatchNotice(arena, launcher, running)) orelse return null;
     log.warn(
-        "launch handoff from a different build: launcher={s} running={s}",
-        .{ launcher.version, running.version },
+        "launch handoff from a different build: launcher={s} running={s} prompted={}",
+        .{ launcher.version, running.version, launcher.prompted },
     );
-    ctx.app.showLaunchHandoffNotice(notice.title, notice.body);
+    // T1023: a launch that already put the difference in front of the user and
+    // got an answer has said it better than a balloon can. Repeating it as a
+    // toast the moment they click through the dialog is the same fact twice.
+    // The note is returned either way — a CLI reads it, and so does the
+    // acceptance harness.
+    if (!launcher.prompted) ctx.app.showLaunchHandoffNotice(notice.title, notice.body);
     return notice.note;
 }
 

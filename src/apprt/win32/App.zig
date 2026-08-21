@@ -685,11 +685,23 @@ pub fn init(
             // differ; when they match it stays silent, because two copies of
             // the same build are indistinguishable and the join is invisible
             // on purpose.
+            // T1023: and ASK first when the build that owns the endpoint is
+            // not the build the user started. D79's mitigation says two
+            // different versions must not quietly become one app; they cannot
+            // become two apps either (the local agent and the saved layout are
+            // shared on purpose, so they survive an upgrade), so what the
+            // mitigation buys the user is the CHOICE — take the window from the
+            // build already running, or back out and quit it first.
+            var id = launchIdentity(alloc);
+            if (self.handoffChoice(alloc, &id) == .cancel) {
+                log.info("launch cancelled: a different build owns the endpoint", .{});
+                std.process.exit(0);
+            }
             const ok = internal_os.ipc_client.sendActionWithHandoff(
                 alloc,
                 "new-window",
                 fwd_args,
-                launchIdentity(alloc),
+                id,
             ) catch false;
             std.process.exit(if (ok) 0 else 1);
         },
@@ -995,10 +1007,109 @@ pub fn pumpIpc(self: *App) void {
 /// frees it.
 fn launchIdentity(alloc: Allocator) internal_os.ipc_handoff.Identity {
     return .{
-        .version = provenance.version,
-        .commit = provenance.commit,
+        .version = launchVersion(alloc),
+        .commit = launchCommit(alloc),
         .exe = std.fs.selfExePathAlloc(alloc) catch "",
     };
+}
+
+/// DEBUG-ONLY test seam (T1023): the version/commit a launch REPORTS.
+///
+/// Two copies of one lineage at different commits is the case the prompt
+/// exists for, and there is no way to produce it from outside — the only exe
+/// an acceptance script has is the one build in `zig-out`, and both sides of
+/// the handoff would report it. Setting these makes the launch claim to be a
+/// different build without pretending to be one anywhere else, which is
+/// exactly the input the comparison takes. Gated on the build mode rather than
+/// on an env value alone, so a release build has no such lever at all.
+const version_override_env = "GHOZTTY_HANDOFF_VERSION";
+const commit_override_env = "GHOZTTY_HANDOFF_COMMIT";
+
+fn launchVersion(alloc: Allocator) []const u8 {
+    return envOverride(alloc, version_override_env) orelse provenance.version;
+}
+
+fn launchCommit(alloc: Allocator) []const u8 {
+    return envOverride(alloc, commit_override_env) orelse provenance.commit;
+}
+
+fn envOverride(alloc: Allocator, name: []const u8) ?[]const u8 {
+    if (comptime !build_config.is_debug) return null;
+    const value = std.process.getEnvVarOwned(alloc, name) catch return null;
+    if (value.len == 0) {
+        alloc.free(value);
+        return null;
+    }
+    return value;
+}
+
+/// What a losing launch does with the window it asked for (T1023).
+const HandoffChoice = enum {
+    /// Open it in the instance that already owns the endpoint.
+    join,
+    /// Open nothing: the user would rather quit that instance and start this
+    /// copy themselves.
+    cancel,
+};
+
+/// Test/automation hook: `join` skips the T1023 prompt and hands off exactly
+/// as the build before it did. An acceptance script that drives a deliberate
+/// mismatch has no one to answer a modal dialog, and a scripted launch must
+/// never be able to block on one.
+const handoff_prompt_env = "GHOZTTY_HANDOFF_PROMPT";
+
+/// Ask the user before handing this launch's window to a DIFFERENT build, and
+/// report what they chose. `id` is this launch's identity; on an answered
+/// prompt it is marked `prompted` so the running instance does not repeat the
+/// fact as a balloon.
+///
+/// Everything here fails toward the old behavior. Same build, no answer from
+/// the running instance, a request to skip the prompt, or an allocation
+/// failure all return `.join` — the case this exists for is rare (it needs two
+/// copies of one lineage at different commits), and a launch that cannot ask
+/// must still open a window rather than die on the question.
+fn handoffChoice(
+    self: *App,
+    alloc: Allocator,
+    id: *internal_os.ipc_handoff.Identity,
+) HandoffChoice {
+    if (std.process.getEnvVarOwned(alloc, handoff_prompt_env)) |mode| {
+        defer alloc.free(mode);
+        if (std.mem.eql(u8, mode, "join")) return .join;
+    } else |_| {}
+
+    const running = internal_os.ipc_client.queryIdentity(alloc) orelse return .join;
+    const prompt = (internal_os.ipc_handoff.mismatchPrompt(alloc, id.*, running) catch
+        return .join) orelse return .join;
+    log.warn(
+        "launch of a different build: launcher={s} running={s}; asking",
+        .{ id.version, running.version },
+    );
+
+    const title_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, prompt.title) catch return .join;
+    const text_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, prompt.text) catch return .join;
+    const ok_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, prompt.ok_label) catch return .join;
+    const cancel_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, prompt.cancel_label) catch return .join;
+
+    // There is no window to own the dialog — this process lost the race before
+    // it created one — so it centers on the screen and takes the foreground it
+    // is entitled to as the process the user just started. The scale comes from
+    // the message-only window rather than the 1.0 an ownerless caller would
+    // otherwise pass, so the dialog is sized for the display it lands on.
+    const dpi: f32 = @floatFromInt(if (self.msg_hwnd) |h| w32.GetDpiForWindow(h) else 96);
+    const result = ConfirmDialog.show(self, null, @max(1.0, dpi / 96.0), null, .{
+        .title = title_w.ptr,
+        .text = text_w,
+        .icon = .warning,
+        // The affirmative is the non-destructive one — it opens a window and
+        // touches nothing else — so Enter takes it and Escape backs out.
+        .default_cancel = false,
+        .ok_label = ok_w,
+        .cancel_label = cancel_w,
+    });
+    if (result != .ok) return .cancel;
+    id.prompted = true;
+    return .join;
 }
 
 fn forwardedNewWindowArgs(
