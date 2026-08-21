@@ -442,6 +442,14 @@ pub fn cappedLuminance(base: Rgb, max_lum: f64) Rgb {
 /// hue and chroma preserved, for the SMALLEST change that clears
 /// `contrast_target` against `bg_lum`. Null when even the endpoint of that
 /// direction misses the target, which is the caller's cue to try elsewhere.
+///
+/// Every probe is evaluated on the QUANTIZED candidate — the 8-bit color this
+/// function would return — rather than on the continuous one (T325). A search
+/// that accepts a float probe and hands back `toRgb()` of it can land just
+/// under the floor it just cleared: measured 2.9905 against a 3.0 target on
+/// the light Fluent surface, which is where the search travels farthest.
+/// Rounding to nearest is monotone per channel, so the step function this
+/// probes is still monotone in L* and the bisection cannot stall on it.
 fn searchLightness(base: Rgb, bg_lum: f64, darker: bool, target: f64) ?Rgb {
     var lab: Lab = .fromRgb(base);
     const base_l = lab.l;
@@ -450,7 +458,10 @@ fn searchLightness(base: Rgb, bg_lum: f64, darker: bool, target: f64) ?Rgb {
     // The endpoint bounds what this direction can do, so it decides
     // reachability up front — a binary search converging toward it never
     // evaluates it, and would otherwise report its last (failing) probe as
-    // a success.
+    // a success. It is also `best_l`'s seed, so it is measured the same
+    // quantized way as the probes: a direction whose own endpoint only
+    // clears the floor before rounding has no answer, and saying so is what
+    // sends the caller to the other side (and then to black/white).
     lab.l = endpoint;
     if (ratioAgainst(lab, bg_lum) < target) return null;
 
@@ -474,14 +485,11 @@ fn searchLightness(base: Rgb, bg_lum: f64, darker: bool, target: f64) ?Rgb {
 }
 
 /// WCAG contrast of a Lab color against an already-computed background
-/// luminance. Works off `toSrgb` (not `toRgb`) so gamut clamping is seen
-/// but 8-bit quantization is not.
+/// luminance, measured on the 8-bit color the search would hand back — so a
+/// probe that passes here cannot fail once it is returned. Gamut clamping and
+/// quantization are both seen, because `toRgb` does both.
 fn ratioAgainst(lab: Lab, bg_lum: f64) f64 {
-    const r, const g, const b = lab.toSrgb();
-    const lum = 0.2126 * srgbLinearize(r) +
-        0.7152 * srgbLinearize(g) +
-        0.0722 * srgbLinearize(b);
-    return wcagContrastRatio(lum, bg_lum);
+    return wcagContrastRatio(wcagLuminance(lab.toRgb()), bg_lum);
 }
 
 /// The full 16-color palette adjusted against `bg`.
@@ -710,13 +718,13 @@ test "contrastAdjusted: failing colors reach the 4.5 target" {
     const bg: Rgb = .{ .r = 0x10, .g = 0x10, .b = 0x14 };
     const adjusted = contrastAdjusted(default_ansi_colors[0], bg);
     const ratio = wcagContrastRatio(wcagLuminance(adjusted), wcagLuminance(bg));
-    try testing.expect(ratio >= contrast_target - 0.1);
+    try testing.expect(ratio >= contrast_target);
 
     // Light background: dark colors that pass stay, light ones darken.
     const light_bg: Rgb = .{ .r = 0xF5, .g = 0xF5, .b = 0xF0 };
     const bright_white = contrastAdjusted(default_ansi_colors[15], light_bg);
     const wr = wcagContrastRatio(wcagLuminance(bright_white), wcagLuminance(light_bg));
-    try testing.expect(wr >= contrast_target - 0.1);
+    try testing.expect(wr >= contrast_target);
     try testing.expect(luminance(bright_white) < luminance(default_ansi_colors[15]));
 }
 
@@ -731,11 +739,80 @@ test "contrastAdjustedTo: a lower floor moves the color less" {
 
     const r3 = wcagContrastRatio(wcagLuminance(at3), wcagLuminance(bg));
     const r45 = wcagContrastRatio(wcagLuminance(at45), wcagLuminance(bg));
-    try testing.expect(r3 >= 3.0 - 0.05);
-    try testing.expect(r45 >= contrast_target - 0.1);
+    try testing.expect(r3 >= 3.0);
+    try testing.expect(r45 >= contrast_target);
     // Both cleared their own floor, and the 3.0 answer stayed closer to the
     // color the user picked.
     try testing.expect(r3 < r45);
+}
+
+test "contrastAdjustedTo: the floor holds on the 8-bit color it returns" {
+    // T325. The search used to accept a CONTINUOUS probe and hand back
+    // `toRgb()` of it, so the color a caller actually paints could sit under
+    // the floor the search had just cleared — measured 2.9905 against a 3.0
+    // target for the `good` badge on Fluent's light card. Three test sites
+    // had grown a `- 0.05` tolerance around it. The floor is now measured on
+    // the returned color, so these assertions carry NO epsilon: a single
+    // 1/255 step of slack is the whole defect.
+    //
+    // The two Fluent surfaces and the chrome bases that ride on them, which
+    // is the case the defect was found in.
+    const dark: Rgb = .{ .r = 0x20, .g = 0x20, .b = 0x20 };
+    const light: Rgb = .{ .r = 0xF3, .g = 0xF3, .b = 0xF3 };
+    const chrome_bases = [_]Rgb{
+        .{ .r = 0xC4, .g = 0x2B, .b = 0x1C }, // chrome_theme.danger_base
+        .{ .r = 0xFF, .g = 0x3B, .b = 0x30 }, // status_danger_base
+        .{ .r = 0x34, .g = 0xC7, .b = 0x59 }, // good_base
+        .{ .r = 0xFF, .g = 0x95, .b = 0x00 }, // warn_base
+        .{ .r = 0x68, .g = 0x00, .b = 0x81 }, // this box's real accent
+        .{ .r = 0x00, .g = 0x78, .b = 0xD4 }, // Fluent's default accent
+    };
+    for ([_]Rgb{ dark, light }) |surface| {
+        // The card the badges actually sit on is a wash off the surface, so
+        // probe the surface AND a step either side of it.
+        for ([_]Rgb{ surface, mix(surface, contrastForeground(surface), 0.05) }) |bg| {
+            const bg_lum = wcagLuminance(bg);
+            for (chrome_bases) |base| {
+                for ([_]f64{ 3.0, contrast_target }) |target| {
+                    const out = contrastAdjustedTo(base, bg, target);
+                    try testing.expect(
+                        wcagContrastRatio(wcagLuminance(out), bg_lum) >= target,
+                    );
+                }
+            }
+        }
+    }
+
+    // And the general claim, since every `accentOn` caller inherits this: a
+    // sweep of backgrounds against the whole hue circle. `contrastAdjustedTo`
+    // either clears the floor exactly or falls back to black/white, which
+    // clears any target at or under 4.5 — so there is no "best effort" answer
+    // left that lands under the number it promised.
+    var level: u16 = 0;
+    while (level <= 255) : (level += 51) {
+        const grey: u8 = @intCast(level);
+        for ([_]Rgb{
+            .{ .r = grey, .g = grey, .b = grey },
+            .{ .r = grey, .g = @intCast(255 - level), .b = grey },
+        }) |bg| {
+            const bg_lum = wcagLuminance(bg);
+            // `hsbToRgb` takes hue as a 0..1 turn, not degrees.
+            var h: f64 = 0;
+            while (h < 1.0) : (h += 1.0 / 12.0) {
+                for ([_]f64{ 0.35, 1.0 }) |s| {
+                    for ([_]f64{ 0.45, 1.0 }) |b| {
+                        const base = hsbToRgb(.{ .h = h, .s = s, .b = b });
+                        for ([_]f64{ 3.0, contrast_target }) |target| {
+                            const out = contrastAdjustedTo(base, bg, target);
+                            try testing.expect(
+                                wcagContrastRatio(wcagLuminance(out), bg_lum) >= target,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 test "cappedLuminance: the ceiling holds on the 8-bit color it returns" {
@@ -855,7 +932,7 @@ test "scheme: every derived color clears its floor across the lightness range" {
         // ...and for every ANSI color a program can select.
         for (s.palette) |c| {
             const ratio = wcagContrastRatio(wcagLuminance(c), bg_lum);
-            try testing.expect(ratio >= contrast_target - 0.1);
+            try testing.expect(ratio >= contrast_target);
         }
 
         // Unconfigured selection is a straight fg/bg swap, so its text
@@ -883,7 +960,7 @@ test "adjustedPalette: all 16 meet the target against both extremes" {
         const bg_lum = wcagLuminance(bg);
         for (adjustedPalette(bg)) |c| {
             const ratio = wcagContrastRatio(wcagLuminance(c), bg_lum);
-            try testing.expect(ratio >= contrast_target - 0.1);
+            try testing.expect(ratio >= contrast_target);
         }
     }
 }

@@ -147,10 +147,12 @@ pub fn glyphColor(fill: Rgb) Rgb {
 }
 
 /// `contrastAdjustedTo`, then VERIFIED against the color that will actually be
-/// painted. The shared search evaluates in continuous sRGB and returns 8-bit,
-/// so a result sitting exactly on the floor mid-search can land a hair under
-/// it once quantized. Black/white always clears both floors, so the fallback
-/// is a real guarantee. (Same reasoning, same shape, as `readonly_badge`.)
+/// painted. Since T325 the shared search measures the 8-bit color it returns,
+/// so this re-measure no longer catches a real gap — it is kept as the local
+/// statement of the guarantee, one line that cannot be invalidated from
+/// another module. Black/white always clears both floors, so the fallback is a
+/// real answer rather than another approximation. (Same reasoning, same shape,
+/// as `readonly_badge`.)
 fn atLeast(base: Rgb, fill: Rgb, target: f64) Rgb {
     const c = color_math.contrastAdjustedTo(base, fill, target);
     if (ratio(c, fill) >= target) return c;

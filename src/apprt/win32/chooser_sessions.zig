@@ -1022,14 +1022,13 @@ test "clampScroll pins a short roster and stops at the last pixel" {
 }
 
 test "badge and dot colors clear the chrome contrast floor on both themes" {
-    // The floor carries `chrome_theme`'s own 0.05 tolerance (its palette tests
-    // at :295/:336 use the same one): the shared contrast search runs in Lab
-    // and sRGB floats, then quantizes to 8 bits, which can land a hair under
-    // the target it just cleared — measured 2.9905 for `good` on the light
-    // surface. That is a property of `color_math.contrastAdjustedTo` and every
-    // accent on the surface pays it, so it is filed as its own task rather than
-    // papered over with a per-tone nudge here.
-    const floor = chrome_theme.ui_contrast_target - 0.05;
+    // No tolerance on the floor. It used to carry `chrome_theme`'s 0.05: the
+    // shared contrast search ran in Lab and sRGB floats and then quantized to
+    // 8 bits, so a badge could land a hair under the target the search had
+    // just cleared — measured 2.9905 for `good` on the light surface. T325
+    // moved the search's own acceptance test onto the quantized color, so the
+    // number the design system states is the number this asserts.
+    const floor = chrome_theme.ui_contrast_target;
     const dark: Rgb = .{ .r = 32, .g = 32, .b = 32 };
     const light: Rgb = .{ .r = 0xF3, .g = 0xF3, .b = 0xF3 };
     for ([_]Rgb{ dark, light }) |surface| {

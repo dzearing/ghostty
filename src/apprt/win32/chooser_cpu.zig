@@ -406,10 +406,11 @@ test "the meter's ink clears the chrome contrast floor on both themes" {
     for ([_]Rgb{ dark, light }) |bg| {
         for ([_]f32{ 0, 55, 250 }) |pct| {
             const ink = meterInk(bg, pct);
-            // The same 0.05 slack `chooser_sessions` allows its badge inks: the
-            // shared search runs in Lab and lands a hair under the target on
-            // some surfaces.
-            try testing.expect(contrast(ink, bg) >= chrome_theme.ui_contrast_target - 0.05);
+            // No slack. This used to allow 0.05, like every other floor
+            // assertion in the chrome, because the shared search ran in Lab
+            // floats and quantized afterwards; T325 moved its acceptance test
+            // onto the color it returns.
+            try testing.expect(contrast(ink, bg) >= chrome_theme.ui_contrast_target);
         }
         // The track is a container, not a boundary: it only has to be VISIBLE
         // against the card it sits on.

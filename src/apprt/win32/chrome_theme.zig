@@ -378,7 +378,7 @@ fn expectWhiteOnDanger(p: Palette) !void {
     // clears the 3:1 chrome floor, or it is sitting ON the ceiling because no
     // white-safe red could.
     try testing.expect(
-        ratio(p.danger, p.bar) >= ui_contrast_target - 0.05 or
+        ratio(p.danger, p.bar) >= ui_contrast_target or
             color_math.wcagLuminance(p.danger) >= danger_fill_max_luminance - 0.004,
     );
 }
@@ -397,7 +397,7 @@ test "resolve: the close glyph is WHITE on every theme (T528)" {
     // The INK is a different answer to a different question and keeps its own
     // floor: the tab strip's close glyph is a red mark ON the band, so it has
     // to lift off the band rather than carry a foreground.
-    try testing.expect(ratio(p.danger_ink, p.bar) >= ui_contrast_target - 0.05);
+    try testing.expect(ratio(p.danger_ink, p.bar) >= ui_contrast_target);
 
     // A light theme never needed the cap and must not be moved by it: Windows'
     // own red already carries white there.
@@ -574,7 +574,7 @@ test "resolve: the accent survives as the user's color when it already clears 3:
     try testing.expect(!p.accent.eql(deep));
     try testing.expect(p.accent.b > p.accent.g);
     try testing.expect(p.accent.r > p.accent.g);
-    try testing.expect(ratio(p.accent, p.bar) >= ui_contrast_target - 0.05);
+    try testing.expect(ratio(p.accent, p.bar) >= ui_contrast_target);
     // Still well under the text floor — proof it stopped at the UI floor
     // instead of being dragged onto the text ramp.
     try testing.expect(ratio(p.accent, p.bar) < 4.5);
@@ -648,8 +648,8 @@ test "debugChromeBase: the marker survives resolve with every floor intact" {
                 const p = resolve(debugChromeBase(bg), a);
                 try testing.expect(ratio(p.text, p.bar) >= 4.4);
                 try testing.expect(ratio(p.text_secondary, p.bar) >= 4.4);
-                try testing.expect(ratio(p.accent, p.bar) >= ui_contrast_target - 0.05);
-                try testing.expect(ratio(p.danger_ink, p.bar) >= ui_contrast_target - 0.05);
+                try testing.expect(ratio(p.accent, p.bar) >= ui_contrast_target);
+                try testing.expect(ratio(p.danger_ink, p.bar) >= ui_contrast_target);
                 try testing.expect(ratio(p.on_accent, p.accent) >= 4.4);
                 try expectWhiteOnDanger(p);
 
@@ -698,8 +698,8 @@ test "resolve: every floor holds across the whole background x accent space" {
             try testing.expect(ratio(p.text_secondary, p.bar) >= 4.4);
 
             // UI floors.
-            try testing.expect(ratio(p.accent, p.bar) >= ui_contrast_target - 0.05);
-            try testing.expect(ratio(p.danger_ink, p.bar) >= ui_contrast_target - 0.05);
+            try testing.expect(ratio(p.accent, p.bar) >= ui_contrast_target);
+            try testing.expect(ratio(p.danger_ink, p.bar) >= ui_contrast_target);
             try testing.expect(ratio(p.on_accent, p.accent) >= 4.4);
             try expectWhiteOnDanger(p);
 

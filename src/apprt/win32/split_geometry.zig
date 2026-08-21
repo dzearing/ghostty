@@ -149,20 +149,19 @@ fn channelDelta(a: color_math.Rgb, b: color_math.Rgb) i32 {
     return @max(dr, @max(dg, db));
 }
 
-/// Slack asked for on top of `CONTRAST_FLOOR` when searching for a legible
-/// color. `contrastAdjustedTo` searches in CIELAB and quantizes back to 8 bits
-/// only at the end, so its answer can land a hair UNDER the ratio it searched
-/// for — measured at up to ~0.04 against a black background. A hair under a
-/// floor is a failed floor, so the search is aimed slightly past it and the
-/// quantized answer is re-measured below.
-const QUANTIZE_MARGIN: f64 = 0.15;
 
 /// `base` lifted to the chrome contrast floor against `bg`, hue preserved
 /// where that is reachable. A color already clearing the floor is returned
 /// untouched — this is a floor, not a restyle.
 fn floored(base: color_math.Rgb, bg: color_math.Rgb, bg_lum: f64) color_math.Rgb {
     if (contrastAgainst(base, bg_lum) >= CONTRAST_FLOOR) return base;
-    const adjusted = color_math.contrastAdjustedTo(base, bg, CONTRAST_FLOOR + QUANTIZE_MARGIN);
+    // No margin on the floor. This used to aim 0.15 PAST it, because the
+    // search quantized only at the end and could answer a hair under the ratio
+    // it searched for (~0.04 against a black background) — which also dragged
+    // the boundary further from the color it started as than the floor needed.
+    // T325 moved the search's acceptance test onto the color it returns; the
+    // re-measure below stays as the local statement of the floor.
+    const adjusted = color_math.contrastAdjustedTo(base, bg, CONTRAST_FLOOR);
     if (contrastAgainst(adjusted, bg_lum) >= CONTRAST_FLOOR) return adjusted;
     // A saturated color can clamp against the sRGB gamut before its luminance
     // gets where it needs to be, on BOTH sides of a mid-tone background. Plain

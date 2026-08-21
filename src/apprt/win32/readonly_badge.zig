@@ -101,11 +101,11 @@ pub fn borderColor(fill: Rgb) Rgb {
 /// `contrastAdjustedTo`, then VERIFIED against the color that will actually
 /// be painted.
 ///
-/// The shared search evaluates its candidates in continuous sRGB and returns
-/// an 8-bit color, so a result that sat exactly on the floor mid-search can
-/// land a hair under it once quantized. That is invisible on a palette entry
-/// and not invisible here: this is the one control whose color is the whole
-/// message. Plain black/white always clears both floors (the worst case of
+/// Since T325 the shared search measures the 8-bit color it returns, so this
+/// re-measure no longer catches a real gap — it is kept because this is the
+/// one control whose color IS the whole message, and a floor stated where the
+/// control is drawn cannot be invalidated by an edit in another module.
+/// Plain black/white always clears both floors (the worst case of
 /// "the better of black and white" is 4.58:1, at a mid-tone background), so
 /// the fallback is a real guarantee rather than another approximation.
 fn atLeast(base: Rgb, fill: Rgb, target: f64) Rgb {

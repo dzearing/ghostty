@@ -9,6 +9,44 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-20 - **T325 (filed T1030) - the contrast floor the design system
+  states is now the floor the code enforces, with no site left allowing a
+  hair under it.** `color_math.contrastAdjustedTo` binary-searches CIELAB
+  lightness for the smallest move that clears a target, and it judged each
+  probe on the CONTINUOUS sRGB color while returning the 8-bit one - so the
+  color a caller actually paints could sit just below the ratio the search
+  had cleared. Measured 2.9905 against a 3.0 target for the `good` badge on
+  Fluent's light card, and 2.9918 for the connection pill's green dot on a
+  white band. Invisible to look at, and that was the problem: eight
+  assertion sites across five modules had each independently grown a `-
+  0.05` plus a comment explaining why the number in the design system was
+  not quite the number they checked, which is how a floor stops being a
+  floor. `ratioAgainst` now measures `wcagLuminance(lab.toRgb())` - the
+  color the search will hand back - for the endpoint reachability probe and
+  every bisection probe alike. Round-to-nearest is monotone per channel, so
+  the step function it now probes is still monotone in L* and the bisection
+  cannot stall on it; and a direction whose own endpoint clears the floor
+  only BEFORE rounding now correctly reports no answer, which sends the
+  caller to the other side and then to black/white. Every epsilon is gone:
+  `chrome_theme` (five), `chooser_sessions`, `chooser_cpu`, `panel_theme`,
+  `remote_pill`'s `mark_floor`/`text_floor`, and `color_math`'s own older `-
+  0.1` assertions. So are the two runtime workarounds - `split_geometry`'s
+  `QUANTIZE_MARGIN` aimed the search 0.15 PAST the floor, which also dragged
+  a split boundary further from its own color than the floor ever asked for,
+  and the re-measure guards in `key_state_pill`/`readonly_badge` are now
+  documented as local statements of the guarantee rather than as fixes for a
+  search that could miss it. The proof is a new sweep test over both Fluent
+  surfaces, every chrome base, and a hue circle against a grid of
+  backgrounds at both the 3.0 and 4.5 targets, asserted with no tolerance; a
+  copy of the pre-fix search run against that test FAILS at the
+  Fluent-surface block, so it measures the defect rather than describing it.
+  Floor all four lanes PASS, P1-P3 ALL PASS, and the three harnesses the
+  edits made due (printclient-audit, chooser-resume, chooser-selection)
+  re-ran green and re-stamped. Filed T1030: the `cappedLuminance` hue sweep
+  next door passes degrees to a hue parameter that wants a 0..1 turn, so all
+  72 of its "hues" are pure red - the safety net for "white stays legible on
+  a colored fill" is a twelfth the size it looks.
+
 - 2026-08-20 - **T316 (filed T1028) - the machine chooser stops telling you
   three times that you are not signed in.** Open it signed out and the surface
   said so with the button's caption ("Sign in with Google..."), with a "Not

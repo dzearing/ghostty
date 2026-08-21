@@ -511,16 +511,14 @@ test "layout: a squeezed pill drops its label, then refuses to draw at all" {
     }
 }
 
-/// The §2.3 floors, carrying `chrome_theme`'s own 0.05 tolerance — the same
-/// one `chooser_sessions`' badge test documents at :880. The shared contrast
-/// search runs in Lab and sRGB floats and then quantizes to 8 bits, which can
-/// land a hair under the target it just cleared (measured 2.9918 for the green
-/// dot on a white band). That is a property of
-/// `color_math.contrastAdjustedTo`, paid by every accent on every surface, so
-/// it is filed as its own task rather than papered over with a per-tone nudge
-/// here.
-const mark_floor: f64 = chrome_theme.ui_contrast_target - 0.05;
-const text_floor: f64 = 4.5 - 0.05;
+/// The §2.3 floors, exactly as the design system states them. They used to
+/// carry a 0.05 tolerance: the shared contrast search ran in Lab and sRGB
+/// floats and then quantized to 8 bits, so a mark could land a hair under the
+/// target it had just cleared (measured 2.9918 for the green dot on a white
+/// band). T325 moved that search's acceptance test onto the quantized color,
+/// so the floor no longer needs slack anywhere.
+const mark_floor: f64 = chrome_theme.ui_contrast_target;
+const text_floor: f64 = 4.5;
 
 test "ink: every state clears its contrast floor on a sweep of bands" {
     // A spread of chrome bands: near-black, near-white, and saturated hues that

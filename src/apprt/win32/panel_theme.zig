@@ -406,9 +406,9 @@ test "resolve: every floor holds across the whole surface x accent space" {
 
             // Non-text floors: marks and boundaries.
             for ([_]Rgb{ p.accent, p.boundary, p.boundary_active, p.cpu, p.mem, p.good, p.pending, p.bad }) |c| {
-                try testing.expect(ratio(c, p.bg) >= chrome_theme.ui_contrast_target - 0.05);
+                try testing.expect(ratio(c, p.bg) >= chrome_theme.ui_contrast_target);
             }
-            try testing.expect(ratio(p.card_border, p.card) >= chrome_theme.ui_contrast_target - 0.05);
+            try testing.expect(ratio(p.card_border, p.card) >= chrome_theme.ui_contrast_target);
 
             // Every surface is distinguishable from the one it sits on — the
             // half a contrast floor does not cover, and the half that actually
