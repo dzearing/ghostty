@@ -587,17 +587,29 @@ ghoztty +close --target=doc
   still serve that stylesheet from WebKit's memory cache. `+reload`/Cmd+R
   bypasses the cache (`reloadFromOrigin`) and is the way to pick up a changed
   subresource.
-- **Navigation chrome**: hovering the thin strip at a pane's top slides in a
-  bar with back / forward / reload / **home** and an **editable address
-  field** — in every mode, files included. Typing an `http(s)` address (or a
-  bare `example.com`, completed omnibox-style) navigates the pane to the web;
-  typing an absolute or `~` path points it back at a file. Back and forward
-  reflect real history (disabled when there is none) and work across the
-  file↔web boundary — going Back from a website re-renders the file. **Home**
-  returns to the location the pane was originally opened with, which is
-  remembered separately from where the user has navigated to (and both
-  survive a session restore). Clicking into the address field selects the
-  whole address; clicking again inside it just moves the caret.
+- **Navigation chrome**: every mode gets a bar with back / forward / reload /
+  **home** and an **editable address field**; what differs is whether it is
+  always there. A **live page** — a website, or a local HTML file the web view
+  renders as one — **pins it open**: that is something you navigate, so the
+  address and the history controls are part of using it, and a blank browser
+  pane is nothing but its address field. A **markdown or code** viewer is a
+  reading surface whose address rarely changes, so it keeps the **hover peek**:
+  the bar slides in when the mouse reaches the thin strip at the pane's top and
+  auto-hides after inactivity. The pin follows the pane's CURRENT mode, not the
+  location it was opened with — a markdown pane that browses to a website gains
+  the pinned bar, and Back to the file hands it back to the hover timer. Either
+  way a visible bar **reserves** its space (the page is inset below it, never
+  covered), so a pinned pane's content is laid out below the bar from the first
+  frame. (A diff pane and the compact side-panel layout pin it too, for their
+  own reasons — see Git diff panes and Table of contents.) Typing an `http(s)`
+  address (or a bare `example.com`, completed omnibox-style) navigates the pane
+  to the web; typing an absolute or `~` path points it back at a file. Back and
+  forward reflect real history (disabled when there is none) and work across
+  the file↔web boundary — going Back from a website re-renders the file.
+  **Home** returns to the location the pane was originally opened with, which
+  is remembered separately from where the user has navigated to (and both
+  survive a session restore). Clicking into the address field selects the whole
+  address; clicking again inside it just moves the caret.
 - **Keyboard** (pane-scoped: live only while keyboard focus is inside a
   viewer pane — its page, its nav bar, or its feedback composer — in any
   viewer mode):
@@ -727,7 +739,8 @@ answers "what changed in abc123". Use `a..b` when you mean a comparison.
   another pane shows up without a reload and without a flicker. A commit or a
   range is a fixed pair of trees and is not polled.
 - The nav bar **stays pinned open** in a diff pane (it carries the change and
-  layout controls, and shows the revspec).
+  layout controls, and shows the revspec) — one of several pinned cases, along
+  with live pages and the compact side-panel layout (see Navigation chrome).
 
 ### Worktree feedback capture
 

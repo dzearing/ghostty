@@ -381,11 +381,16 @@ struct ViewerNavigationTests {
         viewer.navigate(to: "\(base)/one.html")
         await poll { viewer.currentURL == "\(base)/one.html" && !viewer.webView.isLoading && viewer.canGoBack }
         #expect(viewer.canGoBack)
+        // A live page pins the nav bar (see ViewerChromePinTests).
+        #expect(viewer.chromeVisible)
 
         viewer.goBack()
         await poll { !viewer.isWebURL && viewer.currentURL == file.absoluteString && !viewer.webView.isLoading }
         #expect(!viewer.isWebURL)
         #expect(viewer.currentURL == file.absoluteString)
+        // ...and landing back on the rendered file releases it: the pin
+        // follows the committed mode, not where the pane was opened.
+        #expect(await poll(timeout: 10) { !viewer.chromeVisible })
     }
 
     /// Home is where the pane STARTED, even after navigating on to a third
