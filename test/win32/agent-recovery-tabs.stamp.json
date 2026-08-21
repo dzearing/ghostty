@@ -1,0 +1,10 @@
+{
+    "guard":  "agent-recovery-tabs",
+    "script":  "test/win32/agent-recovery-tabs.ps1",
+    "generated":  "2026-08-21T12:15:19-07:00",
+    "commit":  "1731fae83",
+    "files":  {
+                  "src/apprt/win32/session_layout.zig":  "4b4ab6a4f1df4bf55014286afacb7fa3abb76e501a901787b8954cd2f9568532",
+                  "test/win32/agent-recovery-tabs.ps1":  "2a1c7e6689faa50f9c0e69f346f8225ad64fac8997145667d711d4320b7f468c"
+              }
+}

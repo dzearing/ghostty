@@ -2219,6 +2219,10 @@ fn captureWindow(
         const color = win.tab_colors[ti];
         tabs[ti] = .{
             .nodes = nodes,
+            // The tab identity that survives this app run (T1048): what
+            // in-place recovery pairs on, instead of counting positions in a
+            // list that can move while the re-dial blocks.
+            .uuid = try arena.dupe(u8, win.tabUuid(ti)),
             .color = if (color == .none) null else @tagName(color),
             .hero_ratio = win.tab_hero_ratio[ti],
             .title = if (win.tab_title_pinned[ti])
@@ -3613,6 +3617,11 @@ fn restoreTab(
     // whenever its first recorded leaf was one, and narrowing to `*Surface`
     // here would fail the whole tab on a null (T90h).
     const first_pane = window.tab_active_pane[tab_index];
+    // Re-adopt the tab's layout identity (T1048) before anything else can
+    // capture this window again, so the rebuilt tab keeps the key its
+    // predecessor used rather than the fresh one `insertPaneAsTab` just made.
+    // Absent in a pre-T1048 manifest, and then the fresh id stands.
+    if (tab.uuid) |u| window.adoptTabUuid(tab_index, u);
     try self.restoreBuildSubtree(window, tab.nodes, 0, first_pane, tr, attach, 0);
 
     if (tab.color) |c| {
@@ -4602,10 +4611,23 @@ pub fn rebuildWindowInPlace(
     // `remote_dialed` (its own field) before it gets here.
     if (tr.local_agent) window.local_agent_conn = tr.conn;
 
+    // Match captured tabs to live ones BY IDENTITY (T1048) — the same move
+    // T343 made one level up, for the same reason. This used to be
+    // `captured.tabs[ti]` for live tab `ti`, which held only while the tab list
+    // had not moved since the capture; the capture is followed by a re-dial
+    // that can block for seconds, so a tab closed (or opened, or dragged) in
+    // that gap shifted every later tab into its neighbour's tree.
+    // `rebuildTabInPlace`'s shape check could not catch it: two single-pane
+    // tabs have the same shape. A live tab the capture has no entry for is left
+    // alone, which is the conservative answer for a tab born after the capture.
+    const live_tab_keys = try arena.alloc([]const u8, window.tab_count);
+    for (0..window.tab_count) |ti| live_tab_keys[ti] = window.tabUuid(ti);
+    const tab_pairing = try session_layout.pairTabs(arena, captured.tabs, live_tab_keys);
+
     var attached: usize = 0;
-    const tab_count = @min(window.tab_count, captured.tabs.len);
-    for (0..tab_count) |ti| {
-        attached += self.rebuildTabInPlace(arena, window, ti, captured.tabs[ti], tr, attach) catch |err| {
+    for (0..window.tab_count) |ti| {
+        const ci = tab_pairing[ti] orelse continue;
+        attached += self.rebuildTabInPlace(arena, window, ti, captured.tabs[ci], tr, attach) catch |err| {
             log.warn("in-place recovery: tab {d} failed err={}", .{ ti, err });
             continue;
         };

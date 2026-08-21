@@ -431,6 +431,27 @@ $GuardTable = @(
             'test\win32\session-relaunch-notify.ps1'
         )
     },
+    # T1048: the only harness that measures WHICH captured tree a rebuilt tab is
+    # rebuilt from. It drives the one window nothing else can reach - the tab
+    # list moving between `captureSessionLayout` and the rebuild, while the
+    # re-dial is blocked on a frozen agent - and scores the shell pid at each tab
+    # POSITION. agent-recovery.ps1 covers the same recovery on a single-tab
+    # window, where a positional join and an identity join agree, so a pairing
+    # regression is invisible there and green everywhere else: the panes all come
+    # back, just holding each other's sessions.
+    [pscustomobject]@{
+        Name   = 'agent-recovery-tabs'
+        Script = 'test\win32\agent-recovery-tabs.ps1'
+        Stamp  = 'test\win32\agent-recovery-tabs.stamp.json'
+        Covers = @(
+            'test\win32\agent-recovery-tabs.ps1',
+            # The pairing itself, and the identity it pairs on. `App.zig` is
+            # deliberately not here for the same reason session-relaunch keeps it
+            # out: it is edited by most tasks and would leave this GUI run due
+            # every turn.
+            'src\apprt\win32\session_layout.zig'
+        )
+    },
     # The clipboard is a machine-wide resource with a give-up-at-once API, so
     # its regressions are INTERMITTENT by construction: a copy that vanishes one
     # time in ten reads to a user as flakiness in their own hands, and to every

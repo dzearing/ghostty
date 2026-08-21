@@ -209,8 +209,17 @@ pub const Node = struct {
 /// One tab: its split tree (flat, `nodes[0]` = root; a single-pane tab is one
 /// leaf), plus per-tab presentation state (color T72, hero carousel ratio T59,
 /// a pinned tab title T92). `active` marks the tab that was frontmost.
+///
+/// `uuid` is the tab's stable identity ACROSS runs (T1048), the tab-level
+/// analogue of `Window.uuid`: generated once when the tab is created and
+/// re-adopted by every restore, so in-place recovery can pair a captured tab
+/// with the live one it actually came from instead of counting positions.
+/// Additive and optional — a manifest written by a pre-T1048 build has none,
+/// and a tab without one simply never pairs (see `pairTabs`), which is the
+/// conservative half of that failure rather than the destructive one.
 pub const Tab = struct {
     nodes: []const Node = &.{},
+    uuid: ?[]const u8 = null,
     color: ?[]const u8 = null,
     hero_ratio: ?f32 = null,
     title: ?[]const u8 = null,
@@ -438,18 +447,74 @@ pub fn pairWindows(
     captured: []const Window,
     live_keys: []const []const u8,
 ) ![]const ?usize {
+    const keys = try alloc.alloc([]const u8, captured.len);
+    defer alloc.free(keys);
+    for (captured, 0..) |cap, ci| keys[ci] = windowKey(cap);
+    return pairByKey(alloc, keys, live_keys);
+}
+
+/// The stable key a tab is matched under: its cross-run `uuid` (T1048), or the
+/// empty string for a tab captured by a pre-T1048 build, which never matches.
+pub fn tabKey(tab: Tab) []const u8 {
+    return tab.uuid orelse "";
+}
+
+/// Pair a LIVE tab walk against a CAPTURED one by identity (T1048) — the
+/// tab-level analogue of `pairWindows`, and for the same reason one level down.
+///
+/// In-place recovery used to hand `captured.tabs[i]` to live tab `i`, which is
+/// correct only while the window's tab list has not moved since the capture —
+/// and the capture is followed by a re-dial that can block for seconds. A tab
+/// closed, inserted or dragged in that gap shifts every later tab, and each one
+/// was then rebuilt from its NEIGHBOUR's tree: its sessions re-ATTACHed into
+/// the wrong panes. `rebuildTabInPlace`'s correspondence check cannot catch it,
+/// because it compares node SHAPES — and two single-pane tabs, the common case,
+/// have the same shape.
+///
+/// `live_keys` holds one key per live tab in walk order (`Window.tabUuid`); the
+/// result holds one entry per live tab: the index of the captured tab it owns,
+/// or `null` when the capture has none. `null` is always the safe answer — the
+/// caller leaves that tab alone, keeping its current panes rather than
+/// replacing them with somebody else's.
+pub fn pairTabs(
+    alloc: Allocator,
+    captured: []const Tab,
+    live_keys: []const []const u8,
+) ![]const ?usize {
+    const keys = try alloc.alloc([]const u8, captured.len);
+    defer alloc.free(keys);
+    for (captured, 0..) |cap, ci| keys[ci] = tabKey(cap);
+    return pairByKey(alloc, keys, live_keys);
+}
+
+/// The join both pairings are: first unused captured entry whose key matches,
+/// else `null`.
+///
+/// Every captured entry is handed out AT MOST ONCE, so even a duplicated key
+/// cannot make two live entries rebuild from the same topology — the second is
+/// skipped, which is the conservative half of that failure rather than the
+/// destructive one. An EMPTY key never matches anything, on either side: it is
+/// how "this entry has no identity to key on" is spelled (a pre-T1048 captured
+/// tab), and pairing on it would be the positional guess this replaces.
+fn pairByKey(
+    alloc: Allocator,
+    captured_keys: []const []const u8,
+    live_keys: []const []const u8,
+) ![]const ?usize {
     const out = try alloc.alloc(?usize, live_keys.len);
     errdefer alloc.free(out);
 
-    const used = try alloc.alloc(bool, captured.len);
+    const used = try alloc.alloc(bool, captured_keys.len);
     defer alloc.free(used);
     @memset(used, false);
 
     for (live_keys, 0..) |key, li| {
         out[li] = null;
-        for (captured, 0..) |cap, ci| {
+        if (key.len == 0) continue;
+        for (captured_keys, 0..) |cap, ci| {
             if (used[ci]) continue;
-            if (!std.mem.eql(u8, windowKey(cap), key)) continue;
+            if (cap.len == 0) continue;
+            if (!std.mem.eql(u8, cap, key)) continue;
             used[ci] = true;
             out[li] = ci;
             break;
@@ -1376,4 +1441,113 @@ test "T343: a pre-T338 capture with no uuid still pairs on its id" {
     const pairing = try pairWindows(alloc, &captured, &live);
     defer alloc.free(pairing);
     try testing.expectEqual(@as(?usize, 0), pairing[0]);
+}
+
+// -- pairTabs (T1048) ---------------------------------------------------------
+
+/// A captured tab with the given uuid and a one-leaf tree, for the pairing
+/// tests below. The nodes never matter here — only the key does.
+fn pairTestTab(uuid: ?[]const u8, nodes: []Node) Tab {
+    nodes[0] = .{ .leaf = .{} };
+    return .{ .nodes = nodes, .uuid = uuid };
+}
+
+test "T1048: tab pairing follows the uuid when a tab closes mid-recovery" {
+    const alloc = testing.allocator;
+    var an: [1]Node = undefined;
+    var bn: [1]Node = undefined;
+    var cn: [1]Node = undefined;
+    // Three single-pane tabs — the case `capturedNodeShapes` cannot tell apart,
+    // which is why the shape check was never the backstop it looked like.
+    const captured = [_]Tab{
+        pairTestTab("tab-a", &an),
+        pairTestTab("tab-b", &bn),
+        pairTestTab("tab-c", &cn),
+    };
+
+    // The middle tab was closed while `reconnectForRecovery` blocked, so the
+    // survivors shifted up. A positional join would rebuild C from B's tree.
+    const live = [_][]const u8{ "tab-a", "tab-c" };
+    const pairing = try pairTabs(alloc, &captured, &live);
+    defer alloc.free(pairing);
+
+    try testing.expectEqual(@as(usize, 2), pairing.len);
+    try testing.expectEqual(@as(?usize, 0), pairing[0]);
+    try testing.expectEqual(@as(?usize, 2), pairing[1]);
+}
+
+test "T1048: a tab opened after the capture is skipped, not mispaired" {
+    const alloc = testing.allocator;
+    var an: [1]Node = undefined;
+    const captured = [_]Tab{pairTestTab("tab-a", &an)};
+
+    const live = [_][]const u8{ "tab-new", "tab-a" };
+    const pairing = try pairTabs(alloc, &captured, &live);
+    defer alloc.free(pairing);
+
+    try testing.expect(pairing[0] == null);
+    try testing.expectEqual(@as(?usize, 0), pairing[1]);
+}
+
+test "T1048: a reordered tab keeps its own tree" {
+    const alloc = testing.allocator;
+    var an: [1]Node = undefined;
+    var bn: [1]Node = undefined;
+    const captured = [_]Tab{
+        pairTestTab("tab-a", &an),
+        pairTestTab("tab-b", &bn),
+    };
+
+    // Dragged into the other order between the two walks.
+    const live = [_][]const u8{ "tab-b", "tab-a" };
+    const pairing = try pairTabs(alloc, &captured, &live);
+    defer alloc.free(pairing);
+
+    try testing.expectEqual(@as(?usize, 1), pairing[0]);
+    try testing.expectEqual(@as(?usize, 0), pairing[1]);
+}
+
+test "T1048: a captured tab is handed out at most once" {
+    const alloc = testing.allocator;
+    var an: [1]Node = undefined;
+    const captured = [_]Tab{pairTestTab("tab-dup", &an)};
+
+    const live = [_][]const u8{ "tab-dup", "tab-dup" };
+    const pairing = try pairTabs(alloc, &captured, &live);
+    defer alloc.free(pairing);
+
+    try testing.expectEqual(@as(?usize, 0), pairing[0]);
+    try testing.expect(pairing[1] == null);
+}
+
+test "T1048: a pre-T1048 capture with no tab uuid pairs nothing" {
+    const alloc = testing.allocator;
+    var an: [1]Node = undefined;
+    const captured = [_]Tab{pairTestTab(null, &an)};
+
+    // An identity-less captured tab must never match, including against a live
+    // tab whose own key is somehow empty — otherwise "no identity" would pair
+    // with "no identity" and reintroduce the positional guess.
+    const live = [_][]const u8{ "tab-a", "" };
+    const pairing = try pairTabs(alloc, &captured, &live);
+    defer alloc.free(pairing);
+
+    try testing.expect(pairing[0] == null);
+    try testing.expect(pairing[1] == null);
+}
+
+test "T1048: an empty capture pairs nothing and an empty live walk is empty" {
+    const alloc = testing.allocator;
+    var an: [1]Node = undefined;
+    const captured = [_]Tab{pairTestTab("tab-a", &an)};
+
+    const live = [_][]const u8{"tab-a"};
+    const none = try pairTabs(alloc, &.{}, &live);
+    defer alloc.free(none);
+    try testing.expectEqual(@as(usize, 1), none.len);
+    try testing.expect(none[0] == null);
+
+    const empty = try pairTabs(alloc, &captured, &.{});
+    defer alloc.free(empty);
+    try testing.expectEqual(@as(usize, 0), empty.len);
 }
