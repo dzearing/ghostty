@@ -7,8 +7,12 @@ import SwiftUI
 /// line plus a few points of grab zone on each side.
 struct DividerHandle: NSViewRepresentable {
     let direction: SplitViewDirection
+    /// Called on mouse-down, before the divider has moved at all.
+    let onDragBegan: () -> Void
     /// Called during a drag with (cumulative delta in points, split at drag start).
     let onDragDelta: (CGFloat, CGFloat) -> Void
+    /// Called when a drag finishes. Not called for a double-click.
+    let onDragEnded: () -> Void
     let onDoubleClick: () -> Void
     /// Reads the current split fraction (captured at mouse-down).
     let currentSplit: () -> CGFloat
@@ -25,14 +29,18 @@ struct DividerHandle: NSViewRepresentable {
 
     private func update(_ view: DividerHandleView) {
         view.direction = direction
+        view.onDragBegan = onDragBegan
         view.onDragDelta = onDragDelta
+        view.onDragEnded = onDragEnded
         view.onDoubleClick = onDoubleClick
         view.currentSplit = currentSplit
     }
 
     final class DividerHandleView: NSView {
         var direction: SplitViewDirection = .horizontal
+        var onDragBegan: (() -> Void)?
         var onDragDelta: ((CGFloat, CGFloat) -> Void)?
+        var onDragEnded: (() -> Void)?
         var onDoubleClick: (() -> Void)?
         var currentSplit: (() -> CGFloat)?
 
@@ -47,6 +55,7 @@ struct DividerHandle: NSViewRepresentable {
             }
             dragOrigin = event.locationInWindow
             dragStartSplit = currentSplit?() ?? 0.5
+            onDragBegan?()
         }
 
         override func mouseDragged(with event: NSEvent) {
@@ -62,7 +71,9 @@ struct DividerHandle: NSViewRepresentable {
         }
 
         override func mouseUp(with event: NSEvent) {
+            guard dragOrigin != nil else { return }
             dragOrigin = nil
+            onDragEnded?()
         }
 
         override func resetCursorRects() {
@@ -80,7 +91,10 @@ extension SplitView {
         let visibleSize: CGFloat
         let invisibleSize: CGFloat
         let color: Color
-        @Binding var split: CGFloat
+        let split: CGFloat
+        /// Called with the divider's new fractional position when it is adjusted
+        /// from the keyboard via accessibility.
+        let onAdjust: (CGFloat) -> Void
 
         private var visibleWidth: CGFloat? {
             switch direction {
@@ -162,9 +176,9 @@ extension SplitView {
                 let adjustment: CGFloat = 0.025
                 switch direction {
                 case .increment:
-                    split = min(split + adjustment, 0.9)
+                    onAdjust(min(split + adjustment, 0.9))
                 case .decrement:
-                    split = max(split - adjustment, 0.1)
+                    onAdjust(max(split - adjustment, 0.1))
                 @unknown default:
                     break
                 }

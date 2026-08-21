@@ -9,8 +9,13 @@ enum TerminalSplitOperation {
     case drop(Drop)
 
     struct Resize {
+        /// The split node whose divider the gesture is on.
         let node: SplitTree<PaneView>.Node
-        let ratio: Double
+
+        /// What the gesture is doing. A `.moved` reports the divider's position in
+        /// POINTS rather than a ratio, which is what lets the embedder move that one
+        /// edge and leave the rest of the window's dividers where they are.
+        let gesture: SplitViewDividerGesture
     }
 
     struct Drop {
@@ -73,13 +78,10 @@ private struct TerminalSplitSubtreeView: View {
 
             SplitView(
                 splitViewDirection,
-                .init(get: {
-                    CGFloat(split.ratio)
-                }, set: {
-                    action(.resize(.init(node: node, ratio: $0)))
-                }),
+                CGFloat(split.ratio),
                 dividerColor: ghostty.config.splitDividerColor,
                 resizeIncrements: .init(width: 1, height: 1),
+                onDividerGesture: { action(.resize(.init(node: node, gesture: $0))) },
                 left: {
                     TerminalSplitSubtreeView(node: split.left, action: action)
                 },
