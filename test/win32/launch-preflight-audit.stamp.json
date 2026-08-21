@@ -1,8 +1,8 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-08-20T23:06:22-07:00",
-    "commit":  "f6ec7c789",
+    "generated":  "2026-08-20T23:53:11-07:00",
+    "commit":  "62c40738d",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
                   "test/win32/activity-monitor-dialed.ps1":  "3fdfd164a3565c9b770f09bb7295b4011df7e07646b60ab89210f90f2ba3ca64",
@@ -45,6 +45,7 @@
                   "test/win32/chooser-restore-all-adopt.ps1":  "5e664296efe3f5fbe082fe27acad82dcea982c417af18a90fa949c59c89d1fdc",
                   "test/win32/chooser-restore-all-remote.ps1":  "ffd03fee78f88eff04d6711a715046801f4b64e8fa9b5a74107e8157a54c3f4e",
                   "test/win32/chooser-resume.ps1":  "3e43d66ab78f3fa0ac7c6066d39e8a61a6515d7f76dd23b620079d18fb55656d",
+                  "test/win32/chooser-resume-remote.ps1":  "770cee25715c8b64fed801f5926177b0848e08bed67d91a9c2e3d82ea6b040fc",
                   "test/win32/chooser-roster-refetch.ps1":  "073da9db34976a4464927cbc1ee1bbc12be691a56514372a2b6f7bf5793bb3b3",
                   "test/win32/chooser-selection.ps1":  "4e138abf4c0187cd89e0d1a01788c87d63b0ed99076c7543e98290e49e0c4b49",
                   "test/win32/chooser-session-cpu.ps1":  "fce5d17143f23d23c6af1fd9ce21746d98f3e644e99fc6d0968fa022125a2632",

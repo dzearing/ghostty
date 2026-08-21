@@ -1147,6 +1147,27 @@ $GuardTable = @(
             'test\win32\chooser-resume.ps1'
         )
     },
+    # The chooser's session resume against a REMOTE machine (T331): the same
+    # keystroke as the row above, on a machine reached over the relay. Separate
+    # from `chooser-resume` because the two prove different halves - that one
+    # ends at the local agent, this one is the ONLY thing on box that runs
+    # `App.resumeRelaySession`, the `.remote` arm of `resumeRow`, and the ATTACH
+    # shape of `openDialedWindow` (a resume must NOT send the machine's per-host
+    # default cwd, because an attach does not spawn). Coverage is that open tail
+    # and the per-host store it deliberately skips, plus the shared roster the
+    # cursor walks and the harness itself. `MachineChooser.zig` is left out for
+    # the reason the row above states.
+    [pscustomobject]@{
+        Name   = 'chooser-resume-remote'
+        Script = 'test\win32\chooser-resume-remote.ps1'
+        Stamp  = 'test\win32\chooser-resume-remote.stamp.json'
+        Covers = @(
+            'src\apprt\win32\SessionRoster.zig',
+            'src\apprt\win32\chooser_sessions.zig',
+            'src\apprt\win32\host_defaults.zig',
+            'test\win32\chooser-resume-remote.ps1'
+        )
+    },
     # The chooser's ACCOUNT ROW (T316): the sign-in flow and the four
     # compositions the row takes (signed in / signing in / signed out /
     # unconfigured). No other harness drives it - the P1-P3 floor opens no
