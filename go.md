@@ -569,6 +569,44 @@ Concretely, in order, with no stops in between:
    attended delivery. Once per day: the watermark is stamped BEFORE the launch,
    so a failed refresh cannot re-fire on the next push and restart the user's
    terminal all day. Acceptance: `test\win32\morning-refresh.ps1`.
+6.9. **The ship workflow — where a turn's commit goes** (T1058). Today it goes
+   straight onto `users/dzearing/windows-amd64`, and steps 1 and 6 above are
+   written for that. That is the CURRENT path and it stays the current path
+   until the cutover happens; nothing below changes what you do today.
+
+   What changes it is the cutover to `origin/main` plus per-feature worktrees
+   and pull requests (user directive, 2026-08-21). The whole transition — entry
+   criteria, the merge itself, and the turn shape after it — is
+   `docs/design/windows-parity-ship-workflow.md`. Two commands and one rule are
+   worth knowing before you get there:
+
+   ```
+   powershell -NoProfile -File scripts\ship-readiness.ps1 -RunLanes
+   powershell -NoProfile -File scripts\ship-feature.ps1 list
+   ```
+
+   - `ship-readiness.ps1` answers whether the branch may become the trunk. Ten
+     criteria, each a number or an exit code, and an **unmeasured** criterion
+     counts as unmet — a lane that was green yesterday says nothing about
+     today's tree. Exit 0 is the only thing that authorises the cutover.
+   - `ship-feature.ps1 new|list|pr|done` is the lifecycle afterwards: a worktree
+     off a freshly fetched `main`, a branch, a PR against the fork, and a
+     teardown that refuses to delete unpushed work. **After the cutover,
+     `list` runs BEFORE step 1's `next`**: an open, unmerged PR is inherited
+     work and outranks a fresh task, exactly the way a `RESUME:` outranks a
+     `NEXT:`.
+   - **Never run a repository-scoped `gh` command here without `--repo`.** This
+     repo has `upstream` (ghostty-org/ghostty) as a remote and `gh` resolves to
+     it by default; a bare `gh pr create` would offer this fork's Windows work
+     to the public Ghostty project, and that is not retractable. The scripts
+     pass `--repo dzearing/ghoztty` on every call and
+     `test\win32\ship-workflow.ps1` section C fails if one stops.
+
+   The cutover is gated on work that is not this seat's: **T87** (the Mac
+   regression build) and the 93 `origin/main` commits that must be merged into
+   this branch first. `ship-readiness.ps1` names both every time it runs, so the
+   gap is a report rather than a thing to remember.
+
 7. **`/reset-context read go.md and go`, and end the turn there.**
 
 **Ending a turn any other way is a failure, not a pause.** The loop

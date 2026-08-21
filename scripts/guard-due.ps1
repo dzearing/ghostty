@@ -95,6 +95,28 @@ $GuardTable = @(
             'test\win32\go-loop-guard.ps1'
         )
     },
+    # The ship workflow (T1058): the cutover readiness gate and the per-feature
+    # worktree/branch/PR lifecycle. Neither is touched by any lane - one only
+    # reads git and the tracker, the other only runs when somebody starts or
+    # finishes a feature - so an edit that broke a REFUSAL would be invisible
+    # until the day it deleted a worktree holding unpushed work, or opened a
+    # pull request against the upstream Ghostty project. The doc is covered too,
+    # because section D asserts the workflow is reachable from it and that wiring
+    # is what rots first. go.md is deliberately NOT covered: it is edited by
+    # almost every process change in the project, so a row for it would leave
+    # this harness permanently due, and a gate that is always red is a gate
+    # nobody reads. Section D still asserts go.md's wiring on every run.
+    [pscustomobject]@{
+        Name   = 'ship-workflow'
+        Script = 'test\win32\ship-workflow.ps1'
+        Stamp  = 'test\win32\ship-workflow.stamp.json'
+        Covers = @(
+            'scripts\ship-readiness.ps1',
+            'scripts\ship-feature.ps1',
+            'test\win32\ship-workflow.ps1',
+            'docs\design\windows-parity-ship-workflow.md'
+        )
+    },
     # Stage 0 of the merge-back (T957): the upstream remote and the union merge
     # drivers. Neither is exercised by any lane - the remote is git config and
     # the drivers only fire inside a merge - so nothing else would notice a
