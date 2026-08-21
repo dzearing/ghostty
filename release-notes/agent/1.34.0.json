@@ -1,0 +1,14 @@
+{
+  "version": "1.34.0",
+  "sections": [
+    {
+      "title": "Session persistence",
+      "items": [
+        { "title": "An app update no longer ends your sessions", "text": "Updating Ghoztty replaces the bundled background-agent binary, and the app treated that build-stamp gap as a reason to restart the agent — which tombstoned every live session. The 1.33.0 update did exactly that to 95 of them. A running agent that still speaks a compatible protocol is now left strictly alone and adopted at the next natural cold start. The restart prompt is reserved for a genuinely incompatible version, and its default button is now **Later**, so a stray Return during a post-update relaunch can't end your work." },
+        { "title": "Liveness comes from the agent, not the window count", "text": "The app decided whether any sessions were running by counting its own windows — which reads zero during a slow restore, after you close your last window while pinned sessions keep running, and in a second app instance. Each of those meant a silent shutdown of live sessions. The agent's own session roster is the authority now, and an unavailable roster is treated as \"unknown\" rather than as permission to restart." },
+        { "title": "Large layouts restore much faster", "text": "Checking which sessions were still alive used one round trip per session at up to five seconds each — a 95-pane layout sat there before showing its first window. It's one request for the whole table now." },
+        { "title": "A restored pane no longer reads your mouse as typing", "text": "The saved screen snapshot recorded a dead TUI's \"keep sending me pointer reports\" agreement along with the picture, so a restored pane echoed `35;106;15M` at the prompt as you moved the mouse. Snapshots no longer carry input-reporting modes at all, and snapshots already on disk are neutralised right after they paint — while a genuinely live TUI keeps its mouse." }
+      ]
+    }
+  ]
+}

@@ -26,7 +26,12 @@ extension Ghostty {
                 if !surfaceView.inspectorVisible {
                     SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)
                 } else {
-                    SplitView(.vertical, $split, dividerColor: ghostty.config.splitDividerColor, left: {
+                    SplitView(.vertical, split, dividerColor: ghostty.config.splitDividerColor, onDividerGesture: { gesture in
+                        // Two panes and one divider: there is nothing else to hold in
+                        // place, so a fraction of this view is all the state we need.
+                        guard case .moved(let position, let dimension) = gesture, dimension > 0 else { return }
+                        split = position / dimension
+                    }, left: {
                         SurfaceWrapper(surfaceView: surfaceView, isSplit: isSplit)
                     }, right: {
                         InspectorViewRepresentable(surfaceView: surfaceView)

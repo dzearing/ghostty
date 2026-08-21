@@ -1285,3 +1285,25 @@ test "flags: a bare --enter with no text is a legal send that presses Enter" {
     try std.testing.expectEqual(@as(usize, 1), resolved.segments.len);
     try std.testing.expectEqual(Kind.key, resolved.segments[0].kind);
 }
+
+test "flags: the known flags are recorded and consumed" {
+    var arena = ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // From main (a7f7476e1), kept through the merge: the four consuming flags
+    // land in `Options` and leave nothing behind as text.
+    const opts = try testCheckArgs(alloc, &.{
+        "--target=dev",
+        "--when-idle",
+        "--idle-timeout=90",
+        "--enter",
+    });
+
+    try std.testing.expect(opts.unknown_flag == null);
+    try std.testing.expectEqualStrings("--target=dev", opts.target.?);
+    try std.testing.expect(opts.when_idle);
+    try std.testing.expectEqual(@as(u32, 90), opts.idle_timeout);
+    try std.testing.expect(opts.enter);
+    try std.testing.expectEqual(@as(usize, 0), opts._arguments.items.len);
+}

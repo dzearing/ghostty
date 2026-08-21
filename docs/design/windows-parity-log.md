@@ -9,6 +9,61 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-21 - **T1073 (filed T1079) - the Windows branch is no longer behind
+  main; 93 commits came across and the floor is green on the other side.** The
+  first hard blocker `ship-readiness.ps1` names is gone: `behind` was 93 and is
+  now 0. 117 files, 15.7k insertions, and the merge ran in THIS direction on
+  purpose - a three-way resolution performed inside the merge *to* main would
+  land straight on the trunk with no lane able to judge it.
+
+  13 files conflicted, 73 hunks, and they have one shape rather than 73: **both
+  seats built the same two features independently.** `session-relaunch=restore`
+  is one - main respawns a login shell through `RELAUNCH` with a synthesized
+  argv, this branch opens a FRESH session and holds `session_notice` above the
+  viewport, because a ConPTY shell's startup repaint erases an in-stream line
+  (T230/T823/T922). `+send-keys` is the other - ours already contains main's
+  `--enter` and trailing-newline peel and adds `--keys-file=`, `--busy-marker=`
+  and CRLF-counts-once (T210/T517/T604/T661). Those went to ours, as did the
+  CLAUDE.md hunks (this branch split it into `docs/claude/*`; main edited the
+  monolith) and the `Config.zig` cwd wording, where main's replacement text is
+  simply false here - it says a `restore` comes back where the session was
+  OPENed, and T425 refreshes the recorded cwd every ten reaper ticks. Main's
+  `LocalAgentManager` agent-refresh policy went the other way: `deferUntilIdle`
+  ("never end live sessions to adopt a newer agent") is newer than what we had.
+  Grafted rather than dropped: main's `restart_divider` const, which is
+  byte-identical to the agent's `reboot_divider` by contract and replaced two
+  inline copies of the string; its known-flags test; and the whole
+  `--caller-pane` anchoring feature.
+
+  **The merge produced three real breakages and the floor found all three**,
+  which is the argument for merging here rather than there. `rearrange.zig`
+  called `ipc.seedCallerPane` with no `apprt/ipc.zig` import - auto-merge took
+  the call from main and the import block from us, and each side lacked the
+  other's half. `send_keys.zig` ended up with two `const Split` definitions, one
+  of them main's copy left standing as context beside a conflict boundary. And
+  main's `seedCallerPane` reads `std.posix.getenv`, which is not a runtime
+  failure on Windows but a **hard compile error** - POSIX-only code arriving
+  through shared `src/`, caught by the `lib` lane, which is the entire reason
+  that lane exists. It now takes the same `comptime` branch `socketPath` takes
+  ten lines above it. A fourth, smaller one: `docs-routing.ps1` caught main's
+  new Swift test citing a `CLAUDE.md` section that lives under `docs/claude/`
+  here.
+
+  Filed **T1079** (P1, M1): caller anchoring landed HALF shipped. Its CLI half
+  is in shared `src/`, so a Windows `+split` already sends
+  `--caller-pane=$GHOZTTY_PANE_ID`; `IpcHandlers.zig` has no case for it and its
+  if/else-if argument loops ignore what they do not recognise, so a target-less
+  split from inside a pane still lands in whatever window was last focused. The
+  gap is written down in `docs/claude/cli.md` under Caller anchoring rather than
+  left to be rediscovered.
+
+  Validation, all after the merge: floor `lib/none/win32/agent` ALL LANES PASS;
+  P1/P2/P3 25/20/16 ALL PASS; the four harnesses the merge made due
+  (`session-relaunch-notify` 129, `ipc-when-idle`, `agent-relay-session-e2e` 18,
+  `docs-routing` 20) green and re-stamped, `guard-due.ps1 check` exit 0. Next on
+  the cutover: `ship-readiness.ps1` still holds on **T87** (the Mac regression
+  build, not this seat's) and on two open mac-seat P0s.
+
 - 2026-08-20 - **T1037 (filed T1038) - the terminal is RIGHT not to ask before
   the background session helper updates itself, and the harness now says so.**
   `test\win32\agent-upgrade.ps1` ran 27 FAILURE(S) / 79 passed at HEAD and every

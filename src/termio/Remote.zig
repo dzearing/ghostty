@@ -480,6 +480,14 @@ pub const replay_mode_reset =
     "\x1b[?25h" ++ // DECTCEM: cursor visible again
     "\x1b[0m"; // SGR: default text attributes
 
+/// The marker printed above a relaunched session's fresh output.
+///
+/// Byte-identical to `agent/session.zig`'s `reboot_divider` by contract (main
+/// a7f7476e1): the agent bakes that string into a preloaded ring snapshot, so
+/// when it replays scrollback it owns the divider and the client suppresses its
+/// own — there is exactly one canonical string either way.
+const restart_divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
+
 /// The INPUT-REPORTING modes — the subset of `replay_mode_reset` that is an
 /// agreement between the terminal and a **process**, not a description of the
 /// picture: "send me mouse reports, in this encoding; tell me about focus; frame
@@ -1294,8 +1302,7 @@ pub fn threadEnter(
             @call(.always_inline, termio.Termio.processOutput, .{ io, banner });
         }
     } else if (did_relaunch and !relaunch_replayed) {
-        const divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
-        @call(.always_inline, termio.Termio.processOutput, .{ io, divider });
+        @call(.always_inline, termio.Termio.processOutput, .{ io, restart_divider });
     } else if (self.awaiting_relaunch) {
         // Prompt policy (T12c2): the pane is a dead tombstone with no child. Show
         // an interactive affordance — `queueWrite` respawns it on the first key.
@@ -1675,13 +1682,20 @@ fn performAwaitedRelaunch(self: *Remote, td: *termio.Termio.ThreadData) void {
     // The respawned child has a fresh pid + pty; re-publish for `getProcessInfo`
     // (`sendRelaunchOnPane` updated the pane's pid/tty on ok).
     self.publishProcessInfo(rd.pane);
-    const divider = "\r\n\x1b[2m--- session restarted ---\x1b[0m\r\n";
-    @call(.always_inline, termio.Termio.processOutput, .{ rd.io, divider });
+    @call(.always_inline, termio.Termio.processOutput, .{ rd.io, restart_divider });
 
     // The respawned session's DATA arrives on the ring (armed since threadEnter);
     // drain once immediately in case it landed while we were parked on the RPC (the
     // async notify is coalesced, so ringReady will also run, but this is prompt).
     drainRing(td);
+
+    // Same post-replay mode reset as `threadEnter`: consenting to a relaunch also
+    // replays the dead session's raw byte stream, which re-enables whatever modes
+    // (mouse tracking above all) the dead program had on. See `replay_mode_reset`.
+    // Only ours to inject when the agent didn't splice it into the stream itself.
+    if (res.replayed and !agent_owns_notice) {
+        @call(.always_inline, termio.Termio.processOutput, .{ rd.io, replay_mode_reset });
+    }
 }
 
 pub fn childExitedAbnormally(

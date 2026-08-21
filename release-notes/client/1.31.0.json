@@ -1,0 +1,28 @@
+{
+  "version": "1.31.0",
+  "sections": [
+    {
+      "title": "Agent integrations",
+      "items": [
+        { "title": "Copilot CLI is a first-class agent runtime", "text": "Ghoztty now sets itself up with GitHub Copilot CLI the same way it does with Claude Code, so a Copilot pane gets Ghoztty's banner automation and session-start wiring too. The setup path was rebuilt around a runtime abstraction, so adding the next agent is a spec file rather than a fork of the whole flow." },
+        { "title": "Skills and hooks now ship inside Ghoztty", "text": "The skills that teach your agent how to drive panes, splits, viewers, and banners are bundled with the app instead of arriving as a separately-versioned Claude plugin. A skill can no longer describe a CLI flag your installed Ghoztty doesn't have." },
+        { "title": "An Agent Integrations panel", "text": "See at a glance which runtimes are set up, which are out of date, and which aren't installed — and set up, update, or cleanly uninstall each one. Installs are atomic and roll back on failure, and Ghoztty only ever touches files it wrote itself." },
+        { "title": "The Claude plugin hands over automatically", "text": "If you had the standalone Ghoztty Claude plugin, the first launch after updating asks once whether to retire it. Say yes and Ghoztty uninstalls it through Claude's own CLI, carries your banner state across, and cleans up the leftover symlink. Either answer retires the prompt for good." },
+        { "title": "Panes stay busy while background work is still running", "text": "The activity state a pane reports is now Ghoztty's own, and it understands background subagents. A pane no longer flips to idle the moment the main loop goes quiet while its subagents are still working, and a killed or cancelled agent can't strand a pane on *busy* forever." }
+      ]
+    },
+    {
+      "title": "Command line",
+      "items": [
+        { "title": "`+send-keys` submits when you meant to submit", "text": "`--target=t \"prompt\\n\"` now presses Enter, and so does `--enter`. Interior newlines still paste as content, so a multi-line prompt arrives intact and submits once. Any misspelled flag is now a loud error naming the three spellings that work, instead of being silently typed into your pane." }
+      ]
+    },
+    {
+      "title": "Machine chooser",
+      "items": [
+        { "title": "A taller, sortable session list", "text": "The machine's identity moved up into the header band, giving the list back about 50pt of rows. **CPU** and **Name** are clickable column headers — click to sort, click again to flip — and your choice sticks. Rows sort by the percentage you can actually see, so idle machines stop reshuffling under the cursor." },
+        { "title": "Cmd-W over the chooser closes the chooser", "text": "It used to sail past the dialog and close a pane in the terminal window behind it, one you weren't even looking at." }
+      ]
+    }
+  ]
+}

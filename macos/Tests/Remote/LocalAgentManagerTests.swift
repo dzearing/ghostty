@@ -203,3 +203,79 @@ struct SharedLinkDropVerdictTests {
         #expect(verdict == .agentRestarted(previousPid: 0, currentPid: 0))
     }
 }
+
+/// The lazy agent-upgrade decision (docs/claude/sessions.md "Agent contract &
+/// upgrade compatibility"). An app update replaces the bundled agent binary while the
+/// RUNNING agent keeps every PTY attached — and that skew is compatible by
+/// construction, because a `proto_version` mismatch is fatal to the handshake
+/// (`protocol.negotiate` → `error.Incompatible`), so an agent we are talking to
+/// has already agreed on the wire contract. A newer bundled BUILD STAMP is
+/// therefore never a reason to end live sessions.
+struct AgentRefreshDecisionTests {
+    private let bundled = "20260812-c76b5c89d"
+    private let older = "20260803-04c854450"
+
+    @Test func aCurrentAgentIsLeftAlone() {
+        #expect(LocalAgentManager.agentRefreshDecision(
+            running: bundled, bundled: bundled, aliveSessionCount: 0) == .none)
+    }
+
+    @Test func aNewerRunningAgentIsNeverDowngraded() {
+        #expect(LocalAgentManager.agentRefreshDecision(
+            running: "20260901-deadbeef", bundled: bundled, aliveSessionCount: 0) == .none)
+    }
+
+    @Test func anIdleStaleAgentIsAdoptedSilently() {
+        #expect(LocalAgentManager.agentRefreshDecision(
+            running: older, bundled: bundled, aliveSessionCount: 0) == .refreshSilently)
+        // A pre-versioned agent (no stamp at all) is stale too.
+        #expect(LocalAgentManager.agentRefreshDecision(
+            running: nil, bundled: bundled, aliveSessionCount: 0) == .refreshSilently)
+    }
+
+    /// The bug: an ordinary app update found a merely-OLDER (fully compatible)
+    /// agent holding 95 live sessions and offered a restart that ended every one
+    /// of them. A compatible agent is adopted at the next natural cold start, and
+    /// the user is never asked to trade their sessions for a binary refresh.
+    @Test func aStaleAgentWithLiveSessionsIsDeferredNeverRestarted() {
+        #expect(LocalAgentManager.agentRefreshDecision(
+            running: older, bundled: bundled, aliveSessionCount: 95)
+            == .deferUntilIdle(aliveSessionCount: 95))
+        #expect(LocalAgentManager.agentRefreshDecision(
+            running: older, bundled: bundled, aliveSessionCount: 1)
+            == .deferUntilIdle(aliveSessionCount: 1))
+    }
+
+    /// The roster RPC is the only authority on what a restart would destroy.
+    /// A nil count means we could not ask (older agent, timeout, malformed
+    /// reply) — that is NOT proof the agent is empty, so we never restart on it.
+    /// This is the same "only a positive answer may destroy state" discipline
+    /// `SessionLayoutRestore.probeSessions` uses.
+    @Test func anUnknownRosterNeverAuthorizesARestart() {
+        #expect(LocalAgentManager.agentRefreshDecision(
+            running: older, bundled: bundled, aliveSessionCount: nil) == .none)
+        #expect(LocalAgentManager.agentRefreshDecision(
+            running: nil, bundled: bundled, aliveSessionCount: nil) == .none)
+    }
+
+    /// Counting the APP's windows is what made this destructive: closing the last
+    /// Ghoztty window (or a restore that built none) reads as "idle" while the
+    /// agent still owns every pinned session. The decision takes the AGENT's
+    /// alive-session count, so those two can no longer be confused.
+    @Test func onlyAliveSessionsCountTowardWhatARestartWouldLose() throws {
+        // A real LIST_SESSIONS roster: two live children (a bootout kills these),
+        // one reboot-floor tombstone and one exited session (already dead, so a
+        // restart costs them nothing).
+        let json = """
+        [
+          {"id":"a","alive":true,"pid":101},
+          {"id":"b","alive":true,"pid":102},
+          {"id":"c","alive":false,"relaunchable":true,"pid":0},
+          {"id":"d","alive":false,"relaunchable":false,"exit_code":0,"pid":0}
+        ]
+        """
+        let roster = try JSONDecoder().decode(
+            [BrowsedSession].self, from: Data(json.utf8))
+        #expect(LocalAgentManager.aliveSessionCount(roster) == 2)
+    }
+}

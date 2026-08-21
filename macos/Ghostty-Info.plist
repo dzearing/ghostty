@@ -64,6 +64,25 @@
 			</array>
 		</dict>
 	</array>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleURLName</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER).url</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<!-- GHOZTTY_URL_SCHEME is per build configuration: the
+				     release builds register "ghoztty" and the debug build
+				     registers "ghoztty-debug", so the two never compete for
+				     the scheme in LaunchServices - the same split as the
+				     bundle id and the IPC socket. Focus-only capability;
+				     see GhozttyURLScheme.swift. -->
+				<string>$(GHOZTTY_URL_SCHEME)</string>
+			</array>
+		</dict>
+	</array>
 	<key>GhosttyBuild</key>
 	<string></string>
 	<key>GhosttyCommit</key>

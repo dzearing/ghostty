@@ -45,6 +45,13 @@ class BaseTerminalController: NSWindowController,
         didSet { surfaceTreeDidChange(from: oldValue, to: surfaceTree) }
     }
 
+    /// The layout a divider drag started from, while one is in progress.
+    ///
+    /// Every update within a single drag is applied to this snapshot rather than to
+    /// the result of the previous one, so the gesture stays reversible even after it
+    /// has squashed a pane against its minimum. See `splitDidResize(_:)`.
+    private var dividerDragOrigin: (tree: SplitTree<PaneView>, node: SplitTree<PaneView>.Node)?
+
     let heroModeState = HeroModeState()
     private var heroSelectionCancellable: AnyCancellable?
 
@@ -1732,18 +1739,41 @@ class BaseTerminalController: NSWindowController,
     func performSplitAction(_ action: TerminalSplitOperation) {
         switch action {
         case .resize(let resize):
-            splitDidResize(node: resize.node, to: resize.ratio)
+            splitDidResize(resize)
         case .drop(let drop):
             splitDidDrop(source: drop.payload, destination: drop.destination, zone: drop.zone)
         }
     }
 
-    private func splitDidResize(node: SplitTree<PaneView>.Node, to newRatio: Double) {
-        let resizedNode = node.resizing(to: newRatio)
-        do {
-            surfaceTree = try surfaceTree.replacing(node: node, with: resizedNode)
-        } catch {
-            Ghostty.logger.warning("failed to replace node during split resize: \(error)")
+    private func splitDidResize(_ resize: TerminalSplitOperation.Resize) {
+        switch resize.gesture {
+        case .began:
+            dividerDragOrigin = (surfaceTree, resize.node)
+
+        case .ended:
+            dividerDragOrigin = nil
+
+        case .moved(let position, let dimension):
+            // A drag reports an absolute position measured from the layout it started
+            // on, so replay it against that layout rather than against the previous
+            // frame's result: dragging past a pane's minimum and back then puts the
+            // squashed panes back exactly where they were.
+            if let origin = dividerDragOrigin,
+               origin.tree.structuralIdentity != surfaceTree.structuralIdentity {
+                // The tree changed shape under the drag (a pane closed, a split was
+                // added). Replaying onto the stale snapshot would resurrect it.
+                dividerDragOrigin = nil
+            }
+
+            // With no drag behind it -- the accessibility nudge -- there is no
+            // snapshot and the live tree is the right thing to move.
+            let origin = dividerDragOrigin ?? (tree: surfaceTree, node: resize.node)
+            do {
+                surfaceTree = try origin.tree.movingDivider(
+                    of: origin.node, to: position, in: dimension)
+            } catch {
+                Ghostty.logger.warning("failed to move split divider: \(error)")
+            }
         }
     }
 
@@ -2142,22 +2172,18 @@ class BaseTerminalController: NSWindowController,
                     }
                 }
 
-                // Non-destructive agent upgrade (idle trigger): if no OTHER live
-                // persistent window remains, the agent just went idle — a safe
-                // moment to adopt a newer bundled build. Deferred so this close
-                // fully settles first; the refresh re-checks liveness (0 live →
-                // silent refresh, so a stale agent self-heals the next quiet moment
-                // instead of waiting for a reboot).
+                // Non-destructive agent upgrade (idle trigger): closing the last
+                // persistent WINDOW is only a hint that the agent may now be idle,
+                // never proof — pinned sessions outlive the viewer by design, so
+                // the refresh asks the agent's own roster before it restarts
+                // anything. Deferred so this close fully settles first.
                 let otherPersistent = TerminalController.all.contains {
                     $0 !== self && $0.sessionLayoutEntryID != nil
                 }
                 if !otherPersistent {
                     DispatchQueue.main.async {
-                        let live = TerminalController.all.filter {
-                            $0.sessionLayoutEntryID != nil
-                        }.count
                         LocalAgentManager.shared.refreshLocalAgentIfStale(
-                            liveSessionCount: live, reason: "last persistent window closed")
+                            reason: "last persistent window closed")
                     }
                 }
             } else {

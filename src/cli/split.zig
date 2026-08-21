@@ -5,6 +5,7 @@ const Action = @import("../cli.zig").ghostty.Action;
 const apprt = @import("../apprt.zig");
 const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
+const ipc = @import("../apprt/ipc.zig");
 const lib = @import("../lib/main.zig");
 const view_arg = @import("view_arg.zig");
 const verb_flags = @import("verb_flags.zig");
@@ -89,9 +90,11 @@ pub const Options = struct {
 
 /// Create a new split pane in a running Ghoztty window.
 ///
-/// If `--target` is specified, the split will be added to the window
-/// with that name. If not specified, the split is added to the most
-/// recently focused window.
+/// If `--target`/`--pane` is specified, the split will be added to the
+/// window/pane with that name. If not specified, the split is anchored at
+/// the pane the command was INVOKED FROM (`$GHOZTTY_PANE_ID`), falling back
+/// to the most recently focused window when there is no such pane — a plain
+/// non-Ghoztty shell, or a pane that has since closed.
 ///
 /// This command is idempotent: if `--name` is specified and a pane with
 /// that name already exists, the existing pane is focused instead of
@@ -101,6 +104,7 @@ pub const Options = struct {
 ///
 ///   * `--target=<name>`: The target window name to add the split to.
 ///     The target must have been created with `+new-window --target=<name>`.
+///     Overrides the calling pane as the anchor.
 ///
 ///   * `--name=<name>`: Register this split pane with a name for later
 ///     targeting. If a pane with this name already exists, it will be
@@ -114,14 +118,16 @@ pub const Options = struct {
 ///     1-99 return an error.
 ///
 ///   * `--pane=<name>`: Split adjacent to the named pane instead of the
-///     focused surface. The pane must exist (returns an error if not
-///     found). Can be used without `--target` to search across all
+///     calling one. The pane must exist (returns an error if not
+///     found — unlike the implicit calling-pane default, which falls back).
+///     Can be used without `--target` to search across all
 ///     registered targets.
 ///
-///   * `--from-focused`: Split the app's currently focused window/surface,
-///     mirroring a keyboard split exactly. On a remote window the new pane
-///     inherits the SAME machine/connection plus the parent's command and
-///     cwd (full remote inheritance). Ignores `--command`/`--name`/`--target`.
+///   * `--from-focused`: Split the app's currently focused window/surface
+///     (NOT the calling pane), mirroring a keyboard split exactly. On a
+///     remote window the new pane inherits the SAME machine/connection plus
+///     the parent's command and cwd (full remote inheritance). Ignores
+///     `--command`/`--name`/`--target`.
 ///
 ///   * `--view=<path-or-url-or-diff>`: Open a VIEWER pane instead of a
 ///     terminal: a rendered markdown file, a syntax-highlighted text/code
@@ -197,6 +203,7 @@ fn runArgs(
 
     try view_arg.resolve(alloc, opts._arguments.items);
     try seedViewWorkingDirectory(alloc, &opts._arguments);
+    try ipc.seedCallerPane(alloc, &opts._arguments);
 
     if (apprt.App.performIpc(
         alloc,

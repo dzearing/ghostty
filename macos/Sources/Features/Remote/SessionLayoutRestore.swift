@@ -131,12 +131,12 @@ extension AppDelegate {
             undoManager.enableUndoRegistration()
         }
         // Non-destructive agent upgrade: restore has settled, so this is a safe
-        // moment to adopt a newer bundled agent build. Idle (no live persistent
-        // windows) → silent refresh; otherwise a confirmation is shown. This is
-        // what un-sticks an agent that survived app upgrades on an old build.
-        let liveCount = TerminalController.all.filter { $0.sessionLayoutEntryID != nil }.count
-        LocalAgentManager.shared.refreshLocalAgentIfStale(
-            liveSessionCount: liveCount, reason: "launch restore finished")
+        // moment to adopt a newer bundled agent build. Liveness is decided by the
+        // AGENT's own session roster, never by counting the windows this restore
+        // happened to build — a restore that built none (empty/stale manifest,
+        // an unreachable agent, windows still under construction) is not evidence
+        // that the agent is empty, and the refresh boots out its children.
+        LocalAgentManager.shared.refreshLocalAgentIfStale(reason: "launch restore finished")
     }
 
     /// The tri-state liveness of every recorded session id (T06b). Blocking
@@ -151,24 +151,76 @@ extension AppDelegate {
     /// entry is kept.
     enum SessionLiveness { case alive, dead, unknown }
 
-    private static func probeSessions(
-        entries: [SessionLayoutManifest.Entry],
-        handle: ghostty_remote_connection_t
-    ) -> [String: SessionLiveness] {
-        var result = [String: SessionLiveness]()
+    /// Every session id recorded across `entries`, in manifest order, deduped.
+    static func recordedSessionIDs(
+        _ entries: [SessionLayoutManifest.Entry]
+    ) -> [String] {
+        var seen = Set<String>()
+        var ids: [String] = []
         for entry in entries {
             guard let tree = entry.tree else { continue }
             for leaf in SessionLayoutManifest.leaves(of: tree) {
                 guard let sid = leaf.sessionID, !sid.isEmpty,
-                      result[sid] == nil else { continue }
-                let code = sid.withCString {
-                    ghostty_remote_connection_probe_session(handle, $0, 5000)
-                }
-                result[sid] = switch code {
-                case 1: .alive
-                case 0: .dead
-                default: .unknown
-                }
+                      seen.insert(sid).inserted else { continue }
+                ids.append(sid)
+            }
+        }
+        return ids
+    }
+
+    /// Map a `LIST_SESSIONS` roster onto the same tri-state the per-session probe
+    /// produces: an id the agent listed is `.alive` in the probe's sense of
+    /// "the agent still knows this session" (a retained tombstone included — it
+    /// is RELAUNCH-able, and dropping its window is exactly the reboot-floor
+    /// regression the drop policy exists to prevent), an id absent from a roster
+    /// the agent DID return is a positive not-found, and no roster at all
+    /// (`nil`) is not an answer, so every id stays `.unknown`. Pure/static so
+    /// the mapping is testable without an agent.
+    static func liveness(
+        forRecorded ids: [String],
+        roster: [BrowsedSession]?
+    ) -> [String: SessionLiveness] {
+        guard let roster else {
+            return Dictionary(uniqueKeysWithValues: ids.map { ($0, .unknown) })
+        }
+        let known = Set(roster.map(\.id))
+        return Dictionary(uniqueKeysWithValues: ids.map {
+            ($0, known.contains($0) ? SessionLiveness.alive : .dead)
+        })
+    }
+
+    /// The tri-state liveness of every recorded session id, in ONE round trip.
+    /// Blocking — background queue only.
+    ///
+    /// This used to be a sequential `GET_CWD` probe PER SESSION, each with a 5s
+    /// timeout, and restore presents no window until the whole loop finishes: a
+    /// 95-session layout paid 95 serial round trips (and up to 95×5s if the agent
+    /// was slow) before the first window appeared. `LIST_SESSIONS` returns the
+    /// agent's entire table at once and answers exactly the same question.
+    ///
+    /// The per-session probe stays as the fallback for a roster we could not get
+    /// (transport failure, or an agent that answers `LIST_SESSIONS` with nothing
+    /// we can decode): the slow path is better than treating every session as
+    /// unknown, and it keeps this identical to today's behavior across a skew.
+    private static func probeSessions(
+        entries: [SessionLayoutManifest.Entry],
+        handle: ghostty_remote_connection_t
+    ) -> [String: SessionLiveness] {
+        let ids = recordedSessionIDs(entries)
+        if ids.isEmpty { return [:] }
+        if let roster = RemoteSessionRoster.list(handle: handle, timeoutMs: 5000) {
+            return liveness(forRecorded: ids, roster: roster)
+        }
+        Self.logger.warning("session restore: LIST_SESSIONS unavailable; falling back to \(ids.count) per-session probes")
+        var result = [String: SessionLiveness]()
+        for sid in ids {
+            let code = sid.withCString {
+                ghostty_remote_connection_probe_session(handle, $0, 5000)
+            }
+            result[sid] = switch code {
+            case 1: .alive
+            case 0: .dead
+            default: .unknown
             }
         }
         return result

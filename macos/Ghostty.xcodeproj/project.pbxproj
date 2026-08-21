@@ -25,6 +25,7 @@
 		A586167C2B7703CC009BDB1D /* fish in Resources */ = {isa = PBXBuildFile; fileRef = A586167B2B7703CC009BDB1D /* fish */; };
 		A5985CE62C33060F00C57AD3 /* man in Resources */ = {isa = PBXBuildFile; fileRef = A5985CE52C33060F00C57AD3 /* man */; };
 		A5A1F8852A489D6800D1E8BC /* terminfo in Resources */ = {isa = PBXBuildFile; fileRef = A5A1F8842A489D6800D1E8BC /* terminfo */; };
+		E2711859A0FA413F8D35D13C /* Ghoztty in Resources */ = {isa = PBXBuildFile; fileRef = D133FE4FC67A498AA0719898 /* Ghoztty */; };
 		A5B30539299BEAAB0047F10C /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A5B30538299BEAAB0047F10C /* Assets.xcassets */; };
 		FC5218FA2D10FFCE004C93E0 /* zsh in Resources */ = {isa = PBXBuildFile; fileRef = FC5218F92D10FFC7004C93E0 /* zsh */; };
 		FC9ABA9C2D0F53F80020D4C8 /* bash-completion in Resources */ = {isa = PBXBuildFile; fileRef = FC9ABA9B2D0F538D0020D4C8 /* bash-completion */; };
@@ -86,6 +87,7 @@
 		A586167B2B7703CC009BDB1D /* fish */ = {isa = PBXFileReference; lastKnownFileType = folder; name = fish; path = "../zig-out/share/fish"; sourceTree = "<group>"; };
 		A5985CE52C33060F00C57AD3 /* man */ = {isa = PBXFileReference; lastKnownFileType = folder; name = man; path = "../zig-out/share/man"; sourceTree = "<group>"; };
 		A5A1F8842A489D6800D1E8BC /* terminfo */ = {isa = PBXFileReference; lastKnownFileType = folder; name = terminfo; path = "../zig-out/share/terminfo"; sourceTree = "<group>"; };
+		D133FE4FC67A498AA0719898 /* Ghoztty */ = {isa = PBXFileReference; lastKnownFileType = folder; name = Ghoztty; path = Resources/Ghoztty; sourceTree = "<group>"; };
 		A5B30531299BEAAA0047F10C /* Ghoztty.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Ghoztty.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A5B30538299BEAAB0047F10C /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		A5B3053D299BEAAB0047F10C /* Ghostty.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = Ghostty.entitlements; sourceTree = "<group>"; };
@@ -334,6 +336,7 @@
 				A5985CE52C33060F00C57AD3 /* man */,
 				9351BE8E2D22937F003B3499 /* nvim */,
 				A5A1F8842A489D6800D1E8BC /* terminfo */,
+				D133FE4FC67A498AA0719898 /* Ghoztty */,
 				552964E52B34A9B400030505 /* vim */,
 				FC5218F92D10FFC7004C93E0 /* zsh */,
 			);
@@ -586,6 +589,7 @@
 				A5985CE62C33060F00C57AD3 /* man in Resources */,
 				9351BE8E3D22937F003B3499 /* nvim in Resources */,
 				A5A1F8852A489D6800D1E8BC /* terminfo in Resources */,
+				E2711859A0FA413F8D35D13C /* Ghoztty in Resources */,
 				552964E62B34A9B400030505 /* vim in Resources */,
 				FC5218FA2D10FFCE004C93E0 /* zsh in Resources */,
 				A5B30539299BEAAB0047F10C /* Assets.xcassets in Resources */,
@@ -757,6 +761,7 @@
 				EXECUTABLE_NAME = ghoztty;
 				GCC_OPTIMIZATION_LEVEL = fast;
 				GENERATE_INFOPLIST_FILE = YES;
+				GHOZTTY_URL_SCHEME = "ghoztty";
 				INFOPLIST_FILE = "Ghostty-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Ghoztty;
 				INFOPLIST_KEY_CFBundleName = Ghoztty;
@@ -1157,6 +1162,7 @@
 				ENABLE_PREVIEWS = YES;
 				EXECUTABLE_NAME = ghoztty;
 				GENERATE_INFOPLIST_FILE = YES;
+				GHOZTTY_URL_SCHEME = "ghoztty-debug";
 				INFOPLIST_FILE = "Ghostty-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = "Ghoztty[DEBUG]";
 				INFOPLIST_KEY_CFBundleName = Ghoztty;
@@ -1214,6 +1220,7 @@
 				EXECUTABLE_NAME = ghoztty;
 				GCC_OPTIMIZATION_LEVEL = fast;
 				GENERATE_INFOPLIST_FILE = YES;
+				GHOZTTY_URL_SCHEME = "ghoztty";
 				INFOPLIST_FILE = "Ghostty-Info.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Ghoztty;
 				INFOPLIST_KEY_CFBundleName = Ghoztty;

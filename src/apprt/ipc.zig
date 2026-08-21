@@ -110,6 +110,185 @@ test "socketPath: falls back to this build's own socket when unset or empty" {
     ));
 }
 
+/// Environment variable naming the pane the calling process runs in. Every
+/// pane's environment is baked with its own stable, ghoztty-owned pane id at
+/// spawn (and re-baked across session restore and agent relaunch), so a CLI
+/// run from inside a pane knows WHERE IT IS without a `+list` round trip.
+///
+/// This is the targeting twin of `socket_env`: that one says which app to talk
+/// to, this one says which pane is asking.
+pub const pane_env = "GHOZTTY_PANE_ID";
+
+/// The flag `seedCallerPane` adds to carry `$GHOZTTY_PANE_ID` to the app.
+///
+/// It is deliberately NOT `--pane=`: an explicit `--pane=` that names nothing
+/// is a typo and must stay a hard error, while an implicit caller pane that no
+/// longer resolves (the script's own pane was closed — ordinary) must fall
+/// back to the app's focused window. The server tells the two apart by which
+/// flag carried the name.
+pub const caller_pane_flag = "--caller-pane=";
+
+/// Tell the app which pane a command was invoked FROM, so a command that
+/// anchors at a pane can default to the CALLER's rather than to whatever
+/// window happens to be focused when the app gets around to the message.
+///
+/// Without this the default anchor is resolved on the app's main queue at
+/// handle time, which is racy by construction: the user can switch windows
+/// between the CLI invocation and the app's turn, and an agent's command is
+/// asynchronous with respect to focus even when nobody touches anything.
+///
+/// This is the ONE place the implicit target is resolved on the CLI side;
+/// `IPCServer.callerAnchorPane` is its one consumer on the app side.
+pub fn seedCallerPane(
+    alloc: Allocator,
+    arguments: *std.ArrayList([:0]const u8),
+) Allocator.Error!void {
+    // Windows: `std.posix.getenv` is a hard compile error there (environment
+    // strings are WTF-16), the same trap `socketPath` above steps around. Read
+    // the variable the cross-platform way instead and free the copy as soon as
+    // the flag has been formatted out of it — a missing/unset var is simply
+    // "no caller pane", which is the same no-op as an empty one.
+    if (comptime builtin.os.tag == .windows) {
+        const baked = std.process.getEnvVarOwned(alloc, pane_env) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.EnvironmentVariableNotFound,
+            error.InvalidWtf8,
+            => return seedCallerPaneFrom(alloc, arguments, null),
+        };
+        defer alloc.free(baked);
+        return seedCallerPaneFrom(alloc, arguments, baked);
+    }
+
+    return seedCallerPaneFrom(alloc, arguments, std.posix.getenv(pane_env));
+}
+
+/// `seedCallerPane` with the baked value injected, so the rule is testable
+/// without mutating the process environment.
+fn seedCallerPaneFrom(
+    alloc: Allocator,
+    arguments: *std.ArrayList([:0]const u8),
+    baked: ?[]const u8,
+) Allocator.Error!void {
+    const pane = baked orelse return;
+    if (pane.len == 0) return;
+
+    // Everything from `-e` on is the user's command, verbatim. The flag has to
+    // go in FRONT of it — appended, it would be typed into their shell — and
+    // the scan below has to stop there too, so a `--target=` that is an
+    // argument of that command isn't read as an anchor.
+    var insert_at: usize = arguments.items.len;
+    for (arguments.items, 0..) |arg, i| {
+        if (std.mem.eql(u8, arg, "-e")) {
+            insert_at = i;
+            break;
+        }
+
+        // Only a DEFAULT. Anything the caller said about where the command
+        // should land — a window/pane name, a pane id, or "wherever is
+        // focused" — wins.
+        if (std.mem.startsWith(u8, arg, "--target=")) return;
+        if (std.mem.startsWith(u8, arg, "--pane=")) return;
+        if (std.mem.startsWith(u8, arg, caller_pane_flag)) return;
+        if (std.mem.eql(u8, arg, "--from-focused")) return;
+    }
+
+    try arguments.insert(alloc, insert_at, try std.fmt.allocPrintSentinel(
+        alloc,
+        caller_pane_flag ++ "{s}",
+        .{pane},
+        0,
+    ));
+}
+
+/// Seed an argument list built out of `given` and return the whole result
+/// joined by spaces, so both WHETHER and WHERE the flag landed are visible.
+fn testSeed(given: []const []const u8, baked: ?[]const u8, out: *[256]u8) ![]const u8 {
+    const testing = std.testing;
+    var arguments: std.ArrayList([:0]const u8) = .empty;
+    defer {
+        for (arguments.items) |a| testing.allocator.free(a);
+        arguments.deinit(testing.allocator);
+    }
+    for (given) |a| try arguments.append(testing.allocator, try testing.allocator.dupeZ(u8, a));
+
+    try seedCallerPaneFrom(testing.allocator, &arguments, baked);
+
+    var len: usize = 0;
+    for (arguments.items, 0..) |a, i| {
+        if (i > 0) {
+            out[len] = ' ';
+            len += 1;
+        }
+        @memcpy(out[len..][0..a.len], a);
+        len += a.len;
+    }
+    return out[0..len];
+}
+
+test "callerPane: seeds the invoking pane when the caller named no anchor" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "--direction=right --caller-pane=PANE-1",
+        try testSeed(&.{"--direction=right"}, "PANE-1", &buf),
+    );
+}
+
+test "callerPane: an anchor the caller named explicitly wins" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+
+    // The env var is only the DEFAULT: --target, --pane, and --from-focused
+    // are the caller saying where it wants the pane, and each one wins.
+    try testing.expectEqualStrings(
+        "--target=dev --direction=right",
+        try testSeed(&.{ "--target=dev", "--direction=right" }, "PANE-1", &buf),
+    );
+    try testing.expectEqualStrings(
+        "--pane=logs",
+        try testSeed(&.{"--pane=logs"}, "PANE-1", &buf),
+    );
+    try testing.expectEqualStrings(
+        "--from-focused",
+        try testSeed(&.{"--from-focused"}, "PANE-1", &buf),
+    );
+}
+
+test "callerPane: an absent or empty pane id changes nothing" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+
+    // A plain non-Ghoztty shell, or a pane baked by an app/agent that predates
+    // the var, leaves the server on its focused-window fallback.
+    try testing.expectEqualStrings(
+        "--direction=right",
+        try testSeed(&.{"--direction=right"}, null, &buf),
+    );
+    try testing.expectEqualStrings(
+        "--direction=right",
+        try testSeed(&.{"--direction=right"}, "", &buf),
+    );
+}
+
+test "callerPane: the flag goes in front of -e, never inside the command" {
+    const testing = std.testing;
+    var buf: [256]u8 = undefined;
+
+    // Everything after `-e` is the user's command, verbatim: appending there
+    // would type `--caller-pane=<uuid>` into their shell.
+    try testing.expectEqualStrings(
+        "--direction=down --caller-pane=PANE-1 -e echo hi",
+        try testSeed(&.{ "--direction=down", "-e", "echo", "hi" }, "PANE-1", &buf),
+    );
+
+    // And a flag-looking word inside that command is the command's, not an
+    // anchor the caller named.
+    try testing.expectEqualStrings(
+        "--caller-pane=PANE-1 -e echo --target=x",
+        try testSeed(&.{ "-e", "echo", "--target=x" }, "PANE-1", &buf),
+    );
+}
+
 /// Connect to an IPC socket by path. Caller owns the returned fd.
 pub fn connect(path: [:0]const u8) !std.posix.fd_t {
     const fd = try std.posix.socket(

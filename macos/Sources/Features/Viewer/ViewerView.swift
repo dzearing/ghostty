@@ -5,13 +5,15 @@ import SwiftUI
 import WebKit
 
 /// A non-terminal pane content view that renders a markdown file, a text/code
-/// file, or a website inside a WKWebView.
+/// file, an HTML file, or a website inside a WKWebView.
 ///
-/// File modes are fully offline: the page template and renderer libraries are
-/// bundled app resources served through a custom URL scheme
-/// (`ghoztty-viewer://`), which also grants the page read access to the viewed
-/// file's directory so relative images resolve. Websites load directly over
-/// the network. View-only — no editing.
+/// Template-backed modes (markdown, code, diff) are fully offline: the page
+/// template and renderer libraries are bundled app resources served through a
+/// custom URL scheme (`ghoztty-viewer://`), which also grants the page read
+/// access to the viewed file's directory so relative images resolve. An HTML
+/// file skips the template entirely — the web view loads the file itself, so
+/// the page is the document. Websites load directly over the network.
+/// View-only — no editing.
 final class ViewerView: NSView, Codable, ObservableObject {
     fileprivate static let logger = Logger(
         subsystem: Bundle.main.bundleIdentifier ?? "com.dzearing.ghoztty",
@@ -61,6 +63,13 @@ final class ViewerView: NSView, Codable, ObservableObject {
         case code(URL)
         /// A git diff, rendered through the same page (see ViewerDiffSpec).
         case diff(ViewerDiffSpec)
+        /// A local HTML file, loaded straight into the web view as a live
+        /// page. There is no template and nothing to inject: the file IS the
+        /// document, so its own CSS/JS/images run exactly as they would if it
+        /// were served over http — which is the point, since hosting a static
+        /// file behind `python3 -m http.server` was the only way to see it
+        /// before.
+        case html(URL)
         /// A website; the web view navigates to it directly.
         case web(URL)
     }
@@ -69,12 +78,23 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// init: typing a URL into a file viewer's address bar switches it to
     /// `.web`, and navigating Back over that boundary switches it home again
     /// (see `syncMode(toCommitted:)`).
-    private(set) var mode: Mode
+    ///
+    /// Whether the chrome bar is pinned open depends on the mode, so every
+    /// assignment re-evaluates it here rather than at each navigation site —
+    /// there are five of them, and a new one that forgot would silently leave
+    /// a website peeking or a document pinned.
+    private(set) var mode: Mode {
+        didSet { updateChromePin() }
+    }
 
     /// The file the template page is showing, if any. Kept separately from
     /// `mode` because the web view's URL while a file is displayed is the
     /// template's `ghoztty-viewer://` address, not the file's — this is what
     /// lets Back cross from a website into the file view and land correctly.
+    ///
+    /// An HTML file is deliberately NOT recorded here: the web view loads it
+    /// directly, so its own URL already names it, and overwriting this would
+    /// lose the document the template still holds behind it in history.
     private var fileLocation: URL?
 
     /// The diff the template page is showing, if any. The other half of
@@ -227,6 +247,25 @@ final class ViewerView: NSView, Codable, ObservableObject {
         return false
     }
 
+    /// True while the web view is showing a page it loaded itself — a website
+    /// or a local HTML file — rather than our render template. Such a page
+    /// owns its own navigation, history, and media, so the swipe gestures and
+    /// the media pause apply to both.
+    var isLivePage: Bool {
+        switch mode {
+        case .web, .html: return true
+        case .markdown, .code, .diff: return false
+        }
+    }
+
+    /// True while the bundled template page is what the web view is actually
+    /// displaying. Derived from the committed URL rather than tracked, so it
+    /// stays right across Back/Forward, which move between the template and
+    /// directly-loaded pages without going through `openLocation`.
+    private var showingTemplatePage: Bool {
+        webView?.url?.scheme == ViewerSchemeHandler.scheme
+    }
+
     /// True while this pane is rendering a git diff. Drives which side panel
     /// the card shows, which controls the nav bar carries, and whether the
     /// bar may auto-hide.
@@ -238,7 +277,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// The file URL for file-backed modes, nil for websites and diffs.
     var fileURL: URL? {
         switch mode {
-        case .markdown(let url), .code(let url): return url
+        case .markdown(let url), .code(let url), .html(let url): return url
         case .web, .diff: return nil
         }
     }
@@ -268,7 +307,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
         self.originDirectory = originDirectory
         let mode = Self.mode(for: location)
         self.mode = mode
-        self.fileLocation = mode.fileURL
+        self.fileLocation = mode.templateFileURL
         self.diffSpec = mode.diffSpec
         self.title = Self.initialTitle(for: location)
         super.init(frame: .zero)
@@ -276,6 +315,11 @@ final class ViewerView: NSView, Codable, ObservableObject {
         // clipping it would paint over whatever sits above this pane.
         clipsToBounds = true
         setupWebView(adopting: adoptedWebView)
+        // Before the pane has a window, so a mode that pins the bar reserves
+        // its space in the pane's first layout: the page then paints once, at
+        // its final size, instead of being pushed down by a bar sliding in
+        // over content the user is already reading.
+        updateChromePin()
         // A popup adopts a web view WebKit is already driving (see
         // `createWebViewWith`): loading our own request would fight that
         // navigation and break the opener↔popup link, and there is no file to
@@ -334,6 +378,9 @@ final class ViewerView: NSView, Codable, ObservableObject {
             chromeHost = nil
             chromeTopConstraint = nil
             chromeVisible = false
+            // The pin goes with the bar: a re-attach re-mounts from scratch,
+            // and a pinned pane has to pin the new bar too.
+            chromePinned = false
             // Same retain-cycle reasoning as the chrome bar. The composer's
             // CONTENT is safe: it lives in `feedbackModel`, which this view
             // owns, so an undo that re-attaches the pane brings the
@@ -362,12 +409,13 @@ final class ViewerView: NSView, Codable, ObservableObject {
             // is kept, so an undo re-attaches a pane that is already populated
             // and simply resumes refreshing.
             stopWatchingDiff()
-            if isWebURL {
+            if isLivePage {
                 webView.pauseAllMediaPlayback()
             }
         } else {
             installEventMonitor()
             startWatchingDiff()
+            updateChromePin()
         }
     }
 
@@ -377,19 +425,38 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// Main frame only: the toolbar positions itself in viewport coordinates,
     /// which a subframe's own coordinate space would not match.
     static func selectionUserScript() -> WKUserScript? {
+        userScript(named: "selection", degradesTo: "quoting", forMainFrameOnly: true)
+    }
+
+    /// The bundled link-context-menu user script, or nil if the resource is
+    /// missing (a broken bundle degrades to WebKit's own menu, never a crash).
+    ///
+    /// ALL frames, unlike the selection toolbar: this script reports a click
+    /// and the menu is drawn natively at the pointer, so a subframe's own
+    /// coordinate space is irrelevant and a link inside an iframe gets the
+    /// same menu as one outside it.
+    static func linkMenuUserScript() -> WKUserScript? {
+        userScript(named: "links", degradesTo: "the link menu", forMainFrameOnly: false)
+    }
+
+    private static func userScript(
+        named name: String,
+        degradesTo feature: String,
+        forMainFrameOnly: Bool
+    ) -> WKUserScript? {
         guard let url = Bundle.main.url(
-            forResource: "selection",
+            forResource: name,
             withExtension: "js",
             subdirectory: "ghostty/viewer"),
             let source = try? String(contentsOf: url, encoding: .utf8)
         else {
-            logger.warning("selection.js missing from bundle; quoting disabled")
+            logger.warning("\(name).js missing from bundle; \(feature) disabled")
             return nil
         }
         return WKUserScript(
             source: source,
             injectionTime: .atDocumentEnd,
-            forMainFrameOnly: true)
+            forMainFrameOnly: forMainFrameOnly)
     }
 
     /// Classify a location as a diff, a website, or a file to render.
@@ -412,6 +479,8 @@ final class ViewerView: NSView, Codable, ObservableObject {
         switch url.pathExtension.lowercased() {
         case "md", "markdown", "mdown", "mkd", "mdwn":
             return .markdown(url)
+        case "html", "htm":
+            return .html(url)
         default:
             return .code(url)
         }
@@ -427,10 +496,13 @@ final class ViewerView: NSView, Codable, ObservableObject {
         return (path as NSString).expandingTildeInPath
     }
 
+    /// A file viewer is titled by its file, INCLUDING a rendered HTML page:
+    /// the pane names the thing on disk the user asked for, the same way every
+    /// other `--view=<path>` pane does. Only a website supplies its own title.
     private static func initialTitle(for location: String) -> String {
         switch mode(for: location) {
         case .web(let url): return url.host ?? location
-        case .markdown(let url), .code(let url): return url.lastPathComponent
+        case .markdown(let url), .code(let url), .html(let url): return url.lastPathComponent
         case .diff(let spec): return spec.title
         }
     }
@@ -489,6 +561,16 @@ final class ViewerView: NSView, Codable, ObservableObject {
                 config.userContentController.addUserScript(script)
             }
 
+            // Link context menu, injected into every page for the same reason.
+            // It only decides whether a right-click landed on a link Ghoztty
+            // has actions for and suppresses WebKit's menu when it did; the
+            // menu itself is native (see `presentLinkMenu`). A right-click on
+            // anything else — page background, an image, selected text, a
+            // `mailto:` — still gets WebKit's own menu, unchanged.
+            if let script = Self.linkMenuUserScript() {
+                config.userContentController.addUserScript(script)
+            }
+
             webView = WKWebView(frame: .zero, configuration: config)
         }
 
@@ -499,7 +581,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
         // drops them), and it lets a popup itself spawn further popups. Weak,
         // like `navigationDelegate`, so assigning `self` is not a retain cycle.
         webView.uiDelegate = self
-        webView.allowsBackForwardNavigationGestures = isWebURL
+        webView.allowsBackForwardNavigationGestures = isLivePage
         // Trackpad pinch magnifies the pane (native pixel zoom, like Safari's
         // two-finger pinch), for every viewer kind — web, markdown, and code all
         // render in this one web view. This is independent of keyboard page zoom
@@ -580,6 +662,18 @@ final class ViewerView: NSView, Codable, ObservableObject {
             } else {
                 load()
             }
+        case .html:
+            // Re-arm the watcher like the other file modes, then re-fetch the
+            // page from disk. `reloadFromOrigin` rather than `reload` because
+            // an explicit reload is also how you pick up an edited sibling
+            // stylesheet or script — the watcher only sees the HTML file
+            // itself, and those subresources sit in WebKit's memory cache.
+            startWatchingFile()
+            if pageLoaded, !showingTemplatePage {
+                webView.reloadFromOrigin()
+            } else {
+                load()
+            }
         case .diff:
             // Re-runs git, so an explicit reload picks up commits, staging,
             // and edits made since the pane was opened. The selected file and
@@ -642,6 +736,20 @@ final class ViewerView: NSView, Codable, ObservableObject {
             webView.allowsBackForwardNavigationGestures = true
             webView.load(URLRequest(url: url))
             stopWatchingDiff()
+        case .html(let url):
+            // Structurally a website — the web view loads it and owns its
+            // navigation — so `fileLocation`/`diffSpec` are left alone and
+            // Back still lands on whatever the template was rendering. What it
+            // adds over `.web` is the file watcher, since it has a file.
+            mode = newMode
+            location = url.path
+            title = url.lastPathComponent
+            currentURL = addressText(for: url)
+            webView.allowsBackForwardNavigationGestures = true
+            pageLoaded = false
+            stopWatchingDiff()
+            startWatchingFile()
+            load()
         case .markdown(let url), .code(let url):
             mode = newMode
             fileLocation = url
@@ -681,6 +789,12 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// "Enter URL" placeholder visible to type into.
     private func addressText(for url: URL?) -> String {
         guard let url else { return "" }
+        if Self.sameFile(url, as: fileURL), let known = fileURL {
+            // A directly-loaded HTML file: show the path the pane was opened
+            // with rather than WebKit's symlink-resolved rewrite of it, so the
+            // field matches `location` and what the user typed.
+            return known.absoluteString
+        }
         if url.scheme == ViewerSchemeHandler.scheme {
             // The template renders either a file or a diff; the address shows
             // whichever it currently holds, in the form the user can retype.
@@ -908,8 +1022,37 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// unified⇄side-by-side toggle live, and a control you have to go hunting
     /// for with the mouse before every use is not a control. It also keeps the
     /// revspec visible, which is the one thing a diff pane's chrome should say.
+    /// So does a live page — a website, or a local HTML file the web view
+    /// renders as one: that is something you NAVIGATE, so the address and the
+    /// back/forward controls are part of using it, and a blank browser pane is
+    /// nothing but its address field. A markdown or code viewer is a reading
+    /// surface whose address rarely changes, so it keeps the hover peek rather
+    /// than spending a permanent strip of the document on chrome.
     private var chromeAlwaysVisible: Bool {
-        sidePanelLayout == .compact || feedbackOpen || isDiffMode
+        sidePanelLayout == .compact || feedbackOpen || isDiffMode || isLivePage
+    }
+
+    /// The pin state the chrome currently reflects, so `updateChromePin` acts
+    /// only on a real change and never re-arms the hide timer under a bar the
+    /// user is already looking at.
+    private var chromePinned = false
+
+    /// Re-evaluate `chromeAlwaysVisible` after something that can change it —
+    /// a navigation, the side panel switching layout, the composer opening or
+    /// closing. A pane's mode is not fixed at open (the address field
+    /// navigates a markdown viewer to a website, and Back brings it home), so
+    /// the pin follows where the pane IS rather than where it was opened.
+    ///
+    /// EVERY pin transition goes through here, because the conditions overlap:
+    /// a pane can be pinned by two of them at once, and one of them ending
+    /// must not un-pin a bar the other still needs.
+    private func updateChromePin() {
+        let pinned = chromeAlwaysVisible
+        guard pinned != chromePinned else { return }
+        chromePinned = pinned
+        // Newly pinned: show it now. No longer pinned: hand it back to the
+        // hover timer rather than yanking it away mid-glance.
+        if pinned { setChromeVisible(true) } else { scheduleChromeHide() }
     }
 
     /// Toggle the contents panel (the chrome bar's leading button).
@@ -1084,6 +1227,12 @@ final class ViewerView: NSView, Codable, ObservableObject {
         if visible, chromeHost == nil {
             let host = NSHostingView(rootView: WebChromeBar(viewerView: self))
             host.translatesAutoresizingMaskIntoConstraints = false
+            // Height from the content, width from the pane. The default options
+            // publish the SwiftUI minimum as a REQUIRED width constraint, which
+            // fights the leading/trailing pins below and — because Auto Layout
+            // hands that minimum on to whoever sizes the pane — made a narrow
+            // pane grow to fit this bar instead of the bar shrinking to fit it.
+            host.sizingOptions = [.intrinsicContentSize]
             // Above the composer too: the composer parks behind the bar and
             // slides out from under it.
             addSubview(host, positioned: .above, relativeTo: feedbackHost ?? webView)
@@ -1282,7 +1431,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
             // The composer's only close affordance lives in the chrome bar,
             // so the bar must stop auto-hiding while it is open (same reason
             // the compact TOC layout pins it).
-            setChromeVisible(true)
+            updateChromePin()
             applyFeedbackState(animated: window?.isVisible == true)
             focusFeedbackInput()
         } else {
@@ -1292,7 +1441,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
                let feedbackHost, responder.isDescendant(of: feedbackHost) {
                 window?.makeFirstResponder(webView)
             }
-            scheduleChromeHide()
+            updateChromePin()
         }
     }
 
@@ -1301,6 +1450,10 @@ final class ViewerView: NSView, Codable, ObservableObject {
         let host = NSHostingView(
             rootView: ViewerFeedbackBar(viewerView: self, model: feedbackModel))
         host.translatesAutoresizingMaskIntoConstraints = false
+        // Height from the content, width from the pane -- same reason as the
+        // nav bar above: this composer spans the full pane, so a published
+        // minimum width would become the pane's minimum width.
+        host.sizingOptions = [.intrinsicContentSize]
         // Above the TOC card as well as the web view: the composer spans the
         // full pane width just under the nav bar and must never draw BEHIND the
         // table-of-contents card in the gutter. The TOC layers are mounted
@@ -1672,6 +1825,8 @@ final class ViewerView: NSView, Codable, ObservableObject {
             activeHeadingID = payload["id"] as? String
         case "quote":
             handleQuoteMessage(payload)
+        case "linkMenu":
+            presentLinkMenu(payload)
         case "diffNavOverflow":
             // The open file has no further hunk in that direction; the next
             // change is in the next FILE.
@@ -1679,6 +1834,26 @@ final class ViewerView: NSView, Codable, ObservableObject {
         default:
             break
         }
+    }
+
+    /// The page reported a right-click on a link (see `links.js`, which has
+    /// already suppressed WebKit's own menu for it). Shows the SAME menu a
+    /// banner link shows — one menu, one modifier scheme, one place the
+    /// ordering contract lives, with the first item the left-click default.
+    ///
+    /// Positioned from the POINTER rather than from the click's page
+    /// coordinates: those are CSS pixels inside a view that may be page-zoomed
+    /// and pinch-magnified, while the pointer has not moved in the time it took
+    /// the message to cross the bridge.
+    private func presentLinkMenu(_ payload: [String: Any]) {
+        guard let href = payload["href"] as? String,
+              let url = URL(string: href),
+              let target = resolvedLinkURL(for: url),
+              let window
+        else { return }
+        let point = convert(window.convertPoint(fromScreen: NSEvent.mouseLocation), from: nil)
+        BannerLinkOpener(anchor: self).menu(for: target)
+            .popUp(positioning: nil, at: point, in: self)
     }
 
     /// The page's selection toolbar sent a passage to quote. Opens the
@@ -1866,12 +2041,10 @@ final class ViewerView: NSView, Codable, ObservableObject {
             sidePanelLayout = layout
             // The compact layout puts the only control that opens the
             // contents panel in the chrome bar, so the bar has to stop
-            // auto-hiding. Leaving compact hands it back to hover.
-            if layout == .compact {
-                setChromeVisible(true)
-            } else {
-                scheduleChromeHide()
-            }
+            // auto-hiding. Leaving compact hands it back to hover — unless
+            // something else still pins it, which is `updateChromePin`'s job
+            // to know.
+            updateChromePin()
         }
 
         // The card hangs off the WEB VIEW's top, not the pane's: when the
@@ -2020,7 +2193,9 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// instead of the markdown page's, leaving a visible seam down the edge
     /// of the gutter in both light and dark.
     private func pushSidePanelGutter() {
-        guard pageLoaded else { return }
+        // Only our own template has a `window.__viewer` to talk to; a website
+        // or a rendered HTML file has no panel and no gutter to reserve.
+        guard pageLoaded, showingTemplatePage else { return }
         webView.evaluateJavaScript("window.__viewer.setGutter(\(sidePanelGutterWidth))")
     }
 
@@ -2412,11 +2587,32 @@ final class ViewerView: NSView, Codable, ObservableObject {
     private func load() {
         switch mode {
         case .markdown, .code, .diff:
-            guard let pageURL = URL(string: "\(ViewerSchemeHandler.scheme)://page/viewer.html") else { return }
-            webView.load(URLRequest(url: pageURL))
+            loadTemplatePage()
+        case .html(let url):
+            // Read access is scoped to the file's own directory: that is what
+            // makes sibling (and nested) CSS, JS, images, and fonts resolve,
+            // which is the whole point of rendering the file rather than its
+            // source. It is deliberately not widened to the repo root — the
+            // grant lets the page's subresource loads read anything beneath
+            // it, and a scaffolded mock keeps its assets next to itself. A
+            // page reaching UP out of its folder (`../shared/app.css`) is the
+            // documented cost of that.
+            guard FileManager.default.isReadableFile(atPath: url.path) else {
+                // Fall back to the template so a missing file gets the same
+                // in-page error card every other file mode gets, instead of
+                // WebKit's blank failure page (see renderFileContent).
+                loadTemplatePage()
+                return
+            }
+            webView.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
         case .web(let url):
             webView.load(URLRequest(url: url))
         }
+    }
+
+    private func loadTemplatePage() {
+        guard let pageURL = URL(string: "\(ViewerSchemeHandler.scheme)://page/viewer.html") else { return }
+        webView.load(URLRequest(url: pageURL))
     }
 
     /// (Re-)inject the file's content into the loaded page. Safe to call
@@ -2434,6 +2630,16 @@ final class ViewerView: NSView, Codable, ObservableObject {
         }
         guard let fileURL else { return }
 
+        if case .html = mode {
+            // An HTML file has no content to inject — the web view loaded it
+            // directly. Reaching here means `load()` could not open it and
+            // fell back to the template, which is now up and waiting for its
+            // error card.
+            webView.evaluateJavaScript(
+                "window.__viewer.setError(\(Self.js("Cannot read file")), \(Self.js(fileURL.path)))")
+            return
+        }
+
         let call: String
         do {
             let data = try Data(contentsOf: fileURL)
@@ -2448,7 +2654,7 @@ final class ViewerView: NSView, Codable, ObservableObject {
             case .code:
                 let lang = Self.highlightLanguage(forExtension: fileURL.pathExtension.lowercased())
                 call = "window.__viewer.setCode(\(Self.js(text)), \(Self.js(lang ?? "")))"
-            case .web, .diff:
+            case .html, .web, .diff:
                 return
             }
         } catch {
@@ -2498,10 +2704,33 @@ final class ViewerView: NSView, Codable, ObservableObject {
                 // The path was atomically replaced; track the new inode.
                 self.startWatchingFile()
             }
-            self.renderFileContent()
+            self.reloadAfterFileChange()
         }
         reloadDebounce = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1, execute: work)
+    }
+
+    /// The watched file changed on disk. Template-backed modes re-inject the
+    /// new text; an HTML file is the page itself, so re-fetching it from disk
+    /// IS its render.
+    ///
+    /// `reload()` rather than a fresh `loadFileURL`: it replaces the current
+    /// history entry instead of pushing one (so live-saving does not fill the
+    /// Back stack), and WebKit restores the scroll offset across it, which is
+    /// what keeps a save from throwing you back to the top of a long page.
+    private func reloadAfterFileChange() {
+        guard case .html = mode else {
+            renderFileContent()
+            return
+        }
+        // Showing the error card means the file was unreadable when we last
+        // looked; go through `load()` so it gets re-checked and the real page
+        // takes over once it is back.
+        if showingTemplatePage || !pageLoaded {
+            load()
+        } else {
+            webView.reload()
+        }
     }
 
     /// Encode a string as a JS string literal (JSON is a subset of JS).
@@ -2803,8 +3032,17 @@ extension ViewerView.Mode {
     /// The file this mode renders, nil for a website or a diff.
     var fileURL: URL? {
         switch self {
-        case .markdown(let url), .code(let url): return url
+        case .markdown(let url), .code(let url), .html(let url): return url
         case .web, .diff: return nil
+        }
+    }
+
+    /// The file the TEMPLATE page renders, nil for everything the web view
+    /// loads itself. An HTML file is excluded on purpose — see `fileLocation`.
+    var templateFileURL: URL? {
+        switch self {
+        case .markdown(let url), .code(let url): return url
+        case .html, .web, .diff: return nil
         }
     }
 
@@ -2847,23 +3085,50 @@ extension ViewerView: WKNavigationDelegate {
             title = fileLocation.lastPathComponent
             webView.allowsBackForwardNavigationGestures = false
             pageLoaded = false
+        } else if url.isFileURL {
+            // A local file the web view loaded itself: the HTML page this pane
+            // was opened with, or one its links led to. Whatever the extension
+            // says, WebKit — not our template — is what is rendering it, so
+            // the pane is in `.html` mode by definition.
+            let file = Self.sameFile(url, as: fileURL) ? (fileURL ?? url) : url
+            mode = .html(file)
+            location = file.path
+            title = file.lastPathComponent
+            webView.allowsBackForwardNavigationGestures = true
+            leftTemplatePage()
+            // Follow the file the pane actually landed on, so a link from one
+            // local page to another keeps live-reloading the right one.
+            startWatchingFile()
         } else if url.scheme == "http" || url.scheme == "https" || url.scheme == "about" {
             mode = .web(url)
             location = url.absoluteString
             webView.allowsBackForwardNavigationGestures = true
-            // A website is not a rendered document: whatever headings the
-            // template page last reported are gone with it. (Nothing will
-            // arrive to clear them — the bridge only exists in our template.)
-            clearTOC()
-            // Same for a diff pane the user has navigated off: stop polling
-            // git and empty the file tree. `diffSpec` survives, so Back over
-            // this boundary re-renders the diff.
-            stopWatchingDiff()
-            diffFiles = []
-            diffRows = []
-            activeDiffFileID = nil
+            leftTemplatePage()
         }
         currentURL = addressText(for: url)
+    }
+
+    /// The template page is off screen. Whatever it was rendering — a
+    /// document's headings, a diff's file tree — is not what the pane is
+    /// showing any more, and nothing will arrive to say so (the bridge only
+    /// exists inside our template). `fileLocation`/`diffSpec` survive, so
+    /// Back over this boundary re-renders it.
+    private func leftTemplatePage() {
+        clearTOC()
+        stopWatchingDiff()
+        diffFiles = []
+        diffRows = []
+        activeDiffFileID = nil
+    }
+
+    /// Whether two file URLs name the same file on disk. WebKit hands back a
+    /// symlink-resolved URL for a file load (`/var/…` becomes `/private/var/…`
+    /// on macOS), and letting that churn `location` would follow the pane into
+    /// the session manifest and out of `+list`.
+    private static func sameFile(_ lhs: URL?, as rhs: URL?) -> Bool {
+        guard let lhs, let rhs, lhs.isFileURL, rhs.isFileURL else { return false }
+        return lhs.resolvingSymlinksInPath().standardizedFileURL
+            == rhs.resolvingSymlinksInPath().standardizedFileURL
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -2873,6 +3138,11 @@ extension ViewerView: WKNavigationDelegate {
         if zoomFactor != 1.0 { pushZoomToWebView() }
         if case .web = mode { return }
         pageLoaded = true
+        // An HTML file IS the page — there is no template to inject into, and
+        // calling into `window.__viewer` on someone else's document would only
+        // throw. (Unless the load failed and we fell back to the template, in
+        // which case it is up and waiting for its error card.)
+        if case .html = mode, !showingTemplatePage { return }
         renderFileContent()
         // A reload/renavigation resets the document, taking the body padding
         // the TOC gutter relies on with it.
@@ -2889,8 +3159,45 @@ extension ViewerView: WKNavigationDelegate {
             return
         }
 
-        // Websites navigate freely within the pane.
-        if case .web = mode {
+        // A `ghoztty://` link is Ghoztty addressing itself: handle it here, in
+        // process, and never navigate. This comes FIRST — ahead of the live-page
+        // allow below — for two reasons. WebKit cannot load the scheme at all,
+        // so an allowed navigation is a dead click; and handing it to
+        // LaunchServices instead would route it to whichever BUILD registered
+        // the scheme, so a link clicked in a debug build's pane would raise a
+        // window in the release app. Handled here it always means "this app".
+        if GhozttyURLScheme.handles(url) {
+            decisionHandler(.cancel)
+            GhozttyURLScheme.handle(url)
+            return
+        }
+
+        // Websites navigate freely within the pane — and so does a local HTML
+        // file, which is a page in every way that matters. Its links behave
+        // exactly as they would if the folder were served over http, which is
+        // how these mocks and prototypes had to be viewed before.
+        //
+        // The ONE exception is a link the user clicked that leads out of the
+        // page's own origin (see `isExternalLivePageLink`): Ghoztty's WKWebView
+        // keeps its own cookie store, so a hop to another site renders
+        // logged-out here, and the browser is where that session lives. It
+        // leaves through the SAME scheme a banner link does — plain click to
+        // the system, Cmd to a side pane, Cmd-Shift to a surface of its own —
+        // so there is one modifier scheme across every link surface.
+        //
+        // Narrowly gated on a main-frame `.linkActivated`: a page's own
+        // redirects, form posts, script navigations, iframe loads, and
+        // subresource fetches are the page's business, not the user's click.
+        if isLivePage {
+            if navigationAction.navigationType == .linkActivated,
+               navigationAction.targetFrame?.isMainFrame == true,
+               Self.isExternalLivePageLink(from: webView.url, to: url) {
+                decisionHandler(.cancel)
+                BannerLinkOpener(anchor: self).perform(
+                    BannerLinkOpener.action(for: url, modifiers: navigationAction.modifierFlags),
+                    on: url)
+                return
+            }
             decisionHandler(.allow)
             return
         }
@@ -2907,7 +3214,8 @@ extension ViewerView: WKNavigationDelegate {
 
     /// Route a clicked link in a markdown/code viewer:
     /// - http(s) → default browser
-    /// - relative/local markdown file → new viewer split next to this pane
+    /// - relative/local markdown or HTML file → new viewer split next to this
+    ///   pane (both are things a viewer can now render)
     /// - other local files → open with the default app
     private func handleFileModeLink(_ url: URL) {
         if url.scheme == "http" || url.scheme == "https" {
@@ -2915,26 +3223,99 @@ extension ViewerView: WKNavigationDelegate {
             return
         }
 
-        // Relative links render as ghoztty-viewer:// URLs; map them back to
-        // a real file next to the viewed file. file:// links come through
-        // as-is (markdown-it linkify or explicit file URLs).
-        let fileURL: URL?
-        if url.scheme == ViewerSchemeHandler.scheme {
-            let relative = String(url.path.dropFirst())
-            fileURL = schemeHandler?.resolveForNavigation(relative)
-        } else if url.isFileURL {
-            fileURL = url
-        } else {
-            fileURL = nil
-        }
-        guard let fileURL else { return }
+        // Relative links render as ghoztty-viewer:// URLs; `resolvedLinkURL`
+        // maps them back to a real file next to the viewed file, and passes
+        // file:// links (markdown-it linkify or explicit file URLs) straight
+        // through. Anything else is a scheme this pane has nothing to do with.
+        guard let fileURL = resolvedLinkURL(for: url), fileURL.isFileURL else { return }
 
         switch Self.mode(for: fileURL.path) {
-        case .markdown:
+        case .markdown, .html:
             openViewerSplit(location: fileURL.path)
         default:
             NSWorkspace.shared.open(fileURL)
         }
+    }
+
+    /// Whether a link clicked in a LIVE-PAGE viewer (a website, or a local HTML
+    /// file, both of which own their own navigation) leads OUT of the page's
+    /// own origin, and so belongs somewhere other than this pane.
+    ///
+    /// "Origin" here is deliberately NOT the web platform's origin. That one
+    /// decides what a script may read; this one decides where a PERSON wants a
+    /// page to open, and the two want different rules:
+    ///
+    /// - **http(s) → http(s):** the same **host**, and the same **port as
+    ///   written**. The scheme is excluded on purpose, so an `http` → `https`
+    ///   upgrade on the same host — the most common same-site hop there is —
+    ///   keeps navigating in the pane. The port is included on purpose:
+    ///   `localhost:3000` → `localhost:5173` is a hop between two different dev
+    ///   servers. A subdomain is a different host and therefore external, which
+    ///   is what "a link out to another site" means to a person.
+    /// - **file:// → file://:** inside the page's own directory, recursively —
+    ///   exactly the read grant `loadFileURL(_:allowingReadAccessTo:)` gave the
+    ///   pane, so a scaffolded mock clicks through its own pages while a link
+    ///   reaching UP out of the folder (which this pane could never load) stops
+    ///   being a dead click. Existence is not checked: a link to a missing
+    ///   sibling is the page's own broken link and should get the page's own
+    ///   error, not Finder.
+    /// - **Across those two families** — a local mock linking to github.com, a
+    ///   dev server linking to a `file://` path — there is no shared origin at
+    ///   all, so the link is external.
+    /// - **Every other scheme** (`javascript:`, `data:`, `blob:`, `about:`,
+    ///   `mailto:`, some app's custom scheme) is left exactly as it is today and
+    ///   followed in the pane. `javascript:` links are ordinary page machinery,
+    ///   and handing an arbitrary scheme to `NSWorkspace` would resolve it to
+    ///   whatever handler happens to be registered — the same reason
+    ///   `popupDestination(for:modifiers:)` guards its scheme.
+    static func isExternalLivePageLink(from page: URL?, to link: URL) -> Bool {
+        guard let page else { return false }
+        if let pageSite = Self.site(of: page) {
+            // A web page. Another site is external; a `file://` link is too
+            // (WebKit refuses that navigation outright, so following it in the
+            // pane is a dead click).
+            guard let linkSite = Self.site(of: link) else { return link.isFileURL }
+            return pageSite != linkSite
+        }
+        guard page.isFileURL else { return false }
+        if Self.site(of: link) != nil { return true }
+        guard link.isFileURL else { return false }
+        return !Self.path(link, isUnder: page.deletingLastPathComponent())
+    }
+
+    /// A live page's site: its host plus the port as written, or nil when it is
+    /// not an http(s) location at all. A default port is dropped so
+    /// `http://x.com:80` and `https://x.com` are the same site.
+    private static func site(of url: URL) -> String? {
+        guard let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              let host = url.host?.lowercased(), !host.isEmpty
+        else { return nil }
+        guard let port = url.port,
+              port != (scheme == "http" ? 80 : 443)
+        else { return host }
+        return "\(host):\(port)"
+    }
+
+    /// Whether `url` names a path inside `directory`. Purely by path: this
+    /// decides where a link opens, not whether a file can be served, so a link
+    /// to a not-yet-existing sibling still counts as inside the page's folder.
+    private static func path(_ url: URL, isUnder directory: URL) -> Bool {
+        let target = url.resolvingSymlinksInPath().standardizedFileURL.path
+        let root = directory.resolvingSymlinksInPath().standardizedFileURL.path
+        return target == root || target.hasPrefix(root + "/")
+    }
+
+    /// The real destination a clicked link names. A relative link inside the
+    /// render template arrives as a `ghoztty-viewer://` URL — an implementation
+    /// detail of how the page is served — so it maps back to the file it names;
+    /// every other link already IS its destination.
+    ///
+    /// Nil only when a template link names a file that is not there, which is
+    /// also exactly what a left-click on it does: nothing.
+    func resolvedLinkURL(for url: URL) -> URL? {
+        guard url.scheme == ViewerSchemeHandler.scheme else { return url }
+        return schemeHandler?.resolveForNavigation(String(url.path.dropFirst()))
     }
 
     /// Open another viewer as a split next to this pane.
@@ -2959,6 +3340,8 @@ extension ViewerView: WKUIDelegate {
     enum PopupDestination: Equatable {
         /// Hand the URL to the system default browser and cancel the popup.
         case defaultBrowser(URL)
+        /// A `ghoztty://` command: run it in process and cancel the popup.
+        case ghozttyCommand(URL)
         /// Open it as its own Ghoztty viewer window.
         case ghosttyWindow
     }
@@ -2973,6 +3356,13 @@ extension ViewerView: WKUIDelegate {
         for url: URL?,
         modifiers: NSEvent.ModifierFlags
     ) -> PopupDestination {
+        // A `ghoztty://` link is a command, not a destination, and it outranks
+        // the Cmd modifier: there is nothing to put in a window. Without this
+        // it fell through to `.ghosttyWindow` as a "non-web scheme" and a
+        // `target="_blank"` focus link OPENED A VIEWER WINDOW pointed at the
+        // command — window creation from the one scheme that must never create
+        // anything.
+        if let url, GhozttyURLScheme.handles(url) { return .ghozttyCommand(url) }
         guard !modifiers.contains(.command),
               let url,
               url.scheme == "http" || url.scheme == "https"
@@ -3005,11 +3395,17 @@ extension ViewerView: WKUIDelegate {
         for navigationAction: WKNavigationAction,
         windowFeatures: WKWindowFeatures
     ) -> WKWebView? {
-        if case .defaultBrowser(let url) = Self.popupDestination(
+        switch Self.popupDestination(
             for: navigationAction.request.url,
             modifiers: navigationAction.modifierFlags) {
+        case .defaultBrowser(let url):
             NSWorkspace.shared.open(url)
             return nil
+        case .ghozttyCommand(let url):
+            GhozttyURLScheme.handle(url)
+            return nil
+        case .ghosttyWindow:
+            break
         }
 
         // Without a host controller there is nowhere to put a window; drop the
@@ -3064,6 +3460,20 @@ extension ViewerView: WKUIDelegate {
         else { return }
         controller.closeSurface(node, withConfirmation: false)
     }
+}
+
+// MARK: - Link anchor
+
+/// A viewer pane is a link surface too: the links on its page use the same
+/// actions, modifier scheme, and right-click menu a banner's do.
+extension ViewerView: LinkAnchor {
+    var anchorWindow: NSWindow? { window }
+
+    func anchorPane(in tree: SplitTree<PaneView>) -> PaneView? {
+        tree.first(where: { $0.viewerView === self })
+    }
+
+    var anchorDirectory: String? { originDirectory }
 }
 
 // MARK: - TOC script bridge

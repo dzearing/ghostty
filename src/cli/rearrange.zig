@@ -4,6 +4,7 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const Action = @import("../cli.zig").ghostty.Action;
 const args = @import("args.zig");
 const diagnostics = @import("diagnostics.zig");
+const ipc = @import("../apprt/ipc.zig");
 const ipc_client = @import("../os/ipc_client.zig");
 const verb_flags = @import("verb_flags.zig");
 
@@ -49,12 +50,15 @@ pub const Options = struct {
 /// Accepts a declarative JSON layout description and rebuilds the split
 /// tree to match, preserving terminal state (running processes, scrollback,
 /// focus). Panes are referenced by name and must already exist in the
-/// target window.
+/// target window. A layout may name VIEWER panes (`--view=`) alongside
+/// terminals; a viewer keeps its rendered page and scroll position.
 ///
 /// Flags:
 ///
 ///   * `--target=<name>`: The target window name to rearrange. If not
-///     specified, the most recently focused window is used.
+///     specified, the window containing the calling pane
+///     (`$GHOZTTY_PANE_ID`) is used, falling back to the most recently
+///     focused window when there is no such pane.
 ///
 ///   * `--layout=<json>`: A JSON layout descriptor. The layout is a tree
 ///     of split nodes and leaf panes:
@@ -105,6 +109,8 @@ fn runArgs(
     var arena = ArenaAllocator.init(alloc_gpa);
     defer arena.deinit();
     const alloc = arena.allocator();
+
+    try ipc.seedCallerPane(alloc, &opts._arguments);
 
     sendRearrange(alloc, opts._arguments.items, stderr) catch |err| switch (err) {
         error.NoRunningInstance => {

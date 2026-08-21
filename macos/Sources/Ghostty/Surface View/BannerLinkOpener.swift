@@ -1,10 +1,39 @@
 #if canImport(AppKit)
 import AppKit
 
-/// The standard set of actions for a clickable banner link, plus the
-/// right-click menu that exposes them. Kept as one component so link behavior
-/// is consistent wherever banner links render — and so other link surfaces
-/// (terminal, viewer) can adopt the same menu later.
+/// The pane a link opener is anchored to. Supplies the three things that
+/// differ between link surfaces: the window whose controller owns the split
+/// tree, the anchor's own place in that tree (what a side pane opens beside),
+/// and the directory a viewer opened from it inherits as its feedback origin.
+///
+/// Two surfaces render links — a terminal pane's banner and a viewer pane's
+/// page — and everything else about a link is identical between them (the
+/// actions, the modifier scheme, the menu and its order). That lives once, in
+/// `BannerLinkOpener`, and reaches the surface through here.
+@MainActor
+protocol LinkAnchor: AnyObject {
+    /// The window hosting the anchor; its controller owns the split tree.
+    var anchorWindow: NSWindow? { get }
+
+    /// The anchor's own pane within `tree`, or nil if it is not in one.
+    func anchorPane(in tree: SplitTree<PaneView>) -> PaneView?
+
+    /// Working directory a viewer opened from this anchor inherits, so a chain
+    /// of links keeps filing feedback to the same repo.
+    var anchorDirectory: String? { get }
+}
+
+extension Ghostty.SurfaceView: LinkAnchor {
+    var anchorWindow: NSWindow? { window }
+    func anchorPane(in tree: SplitTree<PaneView>) -> PaneView? { tree.pane(for: self) }
+    var anchorDirectory: String? { pwd }
+}
+
+/// The standard set of actions for a clickable link, plus the right-click menu
+/// that exposes them. Kept as one component so link behavior is consistent
+/// wherever links render: a terminal pane's banner (where it started, hence the
+/// name) and a viewer pane's page, which adopts it whole rather than forking
+/// the modifier scheme.
 ///
 /// A banner link is either a web URL or a local file (bare file paths
 /// autolink). A plain click hands the link *out* of Ghoztty — a URL to the
@@ -13,25 +42,30 @@ import AppKit
 /// `Cmd-Shift` gives it a surface of its own — a new Ghoztty viewer window for
 /// a URL, the file's own default app for a path.
 ///
+/// A `ghoztty://` link is the exception to all of that: it names a window or
+/// pane rather than content, so it runs in process (see `GhozttyURLScheme`)
+/// under every modifier and never opens anything.
+///
 /// A URL leaves by default because Ghoztty's `WKWebView` keeps its own cookie
 /// store with no relationship to Safari or Chrome: anything behind a login
 /// renders logged-out in a viewer pane and OAuth sign-in never completes. The
 /// browser is where the user's session already lives. Viewing in Ghoztty is
 /// still one modifier — or one right-click — away.
 ///
-/// Everything is resolved from a weak anchor surface at action time: the
+/// Everything is resolved from a weak `LinkAnchor` at action time: the
 /// window's `BaseTerminalController` (for the `ghostty` app instance and viewer
-/// splits) and the surface's working directory (viewer provenance). With no
+/// splits) and the anchor's working directory (viewer provenance). With no
 /// anchor or controller, every action falls back to the system browser so a
 /// link is never dead.
 @MainActor
 struct BannerLinkOpener {
-    /// The pane the banner belongs to; supplies the controller and the viewer
-    /// origin directory. Weak so the opener never keeps a pane alive.
-    weak var surface: Ghostty.SurfaceView?
+    /// The pane the link belongs to; supplies the controller, the pane a side
+    /// split anchors at, and the viewer origin directory. Weak so the opener
+    /// never keeps a pane alive.
+    weak var anchor: (any LinkAnchor)?
 
     private var controller: BaseTerminalController? {
-        surface?.window?.windowController as? BaseTerminalController
+        anchor?.anchorWindow?.windowController as? BaseTerminalController
     }
 
     /// What a click on a banner link does. Naming the outcome instead of
@@ -48,13 +82,24 @@ struct BannerLinkOpener {
         case openInSidePane
         /// A new one-pane Ghoztty viewer window.
         case openInNewWindow
+        /// A `ghoztty://` link: run the command in process. Not a destination,
+        /// so none of the "open it somewhere" actions apply.
+        case runGhozttyCommand
     }
 
     /// What a click on `url` with `modifiers` held does. Plain click leaves
     /// Ghoztty, `Cmd` opens a side pane, `Cmd-Shift` asks for a surface of the
     /// link's own — which for a file is the app that owns it, since a viewer
     /// can display a file but never edit one.
+    ///
+    /// A `ghoztty://` link sits outside that scheme entirely and ignores every
+    /// modifier: it addresses Ghoztty itself rather than naming content, so
+    /// there is nothing to put in a pane, a window, or a browser. Handling it
+    /// here also keeps it out of the viewer path it would otherwise fall into
+    /// — a Cmd-click used to open a side pane whose "location" was the
+    /// command string.
     static func action(for url: URL, modifiers: NSEvent.ModifierFlags) -> Action {
+        if GhozttyURLScheme.handles(url) { return .runGhozttyCommand }
         guard modifiers.contains(.command) else {
             return url.isFileURL ? .revealInFinder : .openWithSystem
         }
@@ -69,6 +114,7 @@ struct BannerLinkOpener {
         case .revealInFinder: revealInFinder(url)
         case .openInSidePane: openInSidePane(url)
         case .openInNewWindow: openInNewWindow(url)
+        case .runGhozttyCommand: GhozttyURLScheme.handle(url)
         }
     }
 
@@ -87,7 +133,7 @@ struct BannerLinkOpener {
         guard let controller else { openWithSystem(url); return }
         let pane = PaneView(viewer: ViewerView(
             location: viewerLocation(for: url),
-            originDirectory: surface?.pwd))
+            originDirectory: anchor?.anchorDirectory))
         _ = TerminalController.newWindow(
             controller.ghostty,
             tree: SplitTree<PaneView>(root: .leaf(view: pane), zoomed: nil))
@@ -95,14 +141,18 @@ struct BannerLinkOpener {
     }
 
     /// Cmd-click, for either kind of link: open it in a viewer split beside
-    /// the banner's pane — the same thing `+split --view=<url>` does. The
+    /// the anchoring pane — the same thing `+split --view=<url>` does. The
     /// viewer renders local files too, so this works for a file path.
     func openInSidePane(_ url: URL) {
-        guard let controller, let surface else { openWithSystem(url); return }
+        guard let controller, let anchor,
+              let pane = anchor.anchorPane(in: controller.surfaceTree)
+        else { openWithSystem(url); return }
         controller.newViewerSplit(
-            at: surface,
+            atPane: pane,
             direction: .right,
-            viewer: ViewerView(location: viewerLocation(for: url), originDirectory: surface.pwd))
+            viewer: ViewerView(
+                location: viewerLocation(for: url),
+                originDirectory: anchor.anchorDirectory))
     }
 
     /// Left-click default for a file path: select it in Finder rather than
@@ -142,6 +192,17 @@ struct BannerLinkOpener {
     /// only system handoff, so it appears once.
     func menu(for url: URL) -> NSMenu {
         let menu = NSMenu()
+        // A `ghoztty://` link has exactly one thing it can do, so the menu is
+        // that plus Copy Link. Offering Side Pane / New Window here would
+        // advertise destinations the command has no content for.
+        if GhozttyURLScheme.handles(url) {
+            menu.addItem(item("Focus in Ghoztty", symbol: "macwindow", url) {
+                GhozttyURLScheme.handle($0)
+            })
+            menu.addItem(.separator())
+            menu.addItem(item("Copy Link", symbol: "doc.on.doc", url) { copy($0) })
+            return menu
+        }
         if url.isFileURL {
             menu.addItem(item("Reveal in Finder", symbol: "folder", url) { revealInFinder($0) })
         } else {

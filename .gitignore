@@ -59,3 +59,11 @@ sprite_face_test-*.png
 # MSYS tools drop these next to the cwd when they crash (e.g. grep -F
 # aborting under Git Bash on this box); never source.
 *.stackdump
+# Local, non-committed working files (dot-issues reviews, scratch)
+.local/
+
+# `msiinfo export <msi> Binary` dumps binary-stream columns to ./Binary/ in the
+# CWD. build-msi.sh exports from a scratch dir so this shouldn't appear, but a
+# manual msiinfo run from the repo root still would — and one such dump got
+# committed once already.
+/Binary/

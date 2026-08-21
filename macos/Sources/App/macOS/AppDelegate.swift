@@ -450,6 +450,10 @@ class AppDelegate: NSObject,
         // most once ever.
         checkCommandLineToolOnLaunch()
 
+        // Hand Claude's integration over from the standalone plugin, which the
+        // app now supersedes. Asks at most once, ever, either way.
+        checkClaudePluginMigrationOnLaunch()
+
         switch Ghostty.launchSource {
         case .app:
             // Don't have to do anything.
@@ -633,6 +637,26 @@ class AppDelegate: NSObject,
         // No visible windows, open a new one.
         _ = TerminalController.newWindow(ghostty)
         return false
+    }
+
+    /// LaunchServices delivered one or more `ghoztty://` URLs — a link clicked
+    /// in a browser, `open ghoztty://…`, or anything else macOS routes by
+    /// scheme. `GhozttyURLScheme` owns the whole grammar, the reasoning behind
+    /// its one verb, and the failure reporting (which coalesces, since the
+    /// caller can be any web page and this callback takes an array).
+    ///
+    /// If this launched the app there is nothing registered yet, so the focus
+    /// resolves to nothing and reports that. We deliberately do NOT suppress
+    /// the app's normal launch behavior in that case: LaunchServices launches
+    /// a registered handler whether we like it or not, and the initial window
+    /// (per `initial-window`) belongs to launching Ghoztty — exactly what
+    /// `open -a Ghoztty` does — not to the focus verb, which still creates
+    /// nothing. Suppressing it would leave a windowless app that reads as
+    /// broken in the one case where the link could never have worked anyway.
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls {
+            GhozttyURLScheme.handle(url)
+        }
     }
 
     func application(_ sender: NSApplication, openFile filename: String) -> Bool {

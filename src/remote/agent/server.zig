@@ -5818,3 +5818,151 @@ test "P1: idle-TTL reaper evicts an orphaned session once past the TTL" {
     try testing.expect(store.table.getByChannel(channel) == null);
     try testing.expect(fc.wasTerminated());
 }
+
+test "OPEN records the session cwd so a RELAUNCH respawns in it" {
+    // `session-relaunch=restore` promises "a shell in the session's recorded
+    // working directory", and the recorded cwd is the only thing that can deliver
+    // it — `RELAUNCH` carries no cwd, so `handleRelaunch` reads `s.cwd`. That
+    // field was never written on `handleOpen`, so it was permanently null and
+    // every reboot-floor respawn (this policy and the old re-run alike) landed in
+    // whatever cwd the AGENT happened to have.
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc0: FakeChild = .{ .alloc = alloc };
+    defer fc0.deinit();
+    var fc1: FakeChild = .{ .alloc = alloc };
+    defer fc1.deinit();
+    var kids = [_]*FakeChild{ &fc0, &fc1 };
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    try h.client.sendControlJson(.open, protocol.control_channel, protocol.Open{
+        .cwd = "/tmp/worktree",
+        .command = "cl --resume",
+        .rows = 24,
+        .cols = 80,
+    });
+    const of = try h.client.waitControl(.opened);
+    var op = try protocol.parseJson(protocol.Opened, alloc, of.payload);
+    defer op.deinit();
+    try testing.expectEqualStrings("/tmp/worktree", sp.lastCwd().?);
+
+    // Recorded on the session, hence in `sessions.json` and hence survivable
+    // across the agent restart the reboot floor exists for.
+    h.server.store.mutex.lock();
+    const s = h.server.store.table.getByIdStr(op.value.session_id).?;
+    try testing.expectEqualStrings("/tmp/worktree", s.cwd.?);
+    // Fake a reboot-materialized tombstone in place: the child is gone but the
+    // relaunch metadata is what came back off disk.
+    s.alive = false;
+    s.relaunchable = true;
+    const sid = s.id_str;
+    h.server.store.mutex.unlock();
+
+    // The `restore` client sends a plain login-shell argv, which nulls the
+    // recorded command in the synthesized OPEN. The cwd must survive that.
+    const shell_argv = [_][]const u8{ "/bin/zsh", "-li" };
+    try h.client.sendControlJson(.relaunch, protocol.control_channel, protocol.Relaunch{
+        .session_id = &sid,
+        .rows = 24,
+        .cols = 80,
+        .argv = &shell_argv,
+    });
+    const rf = try h.client.waitControl(.relaunched);
+    var rp = try protocol.parseJson(protocol.Relaunched, alloc, rf.payload);
+    defer rp.deinit();
+    try testing.expect(rp.value.ok and rp.value.found);
+    try testing.expectEqualStrings("/tmp/worktree", sp.lastCwd().?);
+}
+
+test "RELAUNCH: the viewer's notice is spliced into the replay, not after it" {
+    // Bug-1/bug-2 UX: a client that prints its "session was lost" line locally
+    // loses it — the inject lands after the respawned shell owns the screen and
+    // the shell's first prompt repaint blanks the line (the agent-baked divider
+    // one row up survives, which is what makes the diagnosis unambiguous). So the
+    // agent has to put it in the STREAM: after the restored scrollback + divider,
+    // and before the child's first byte.
+    const ring_snapshot = @import("ring_snapshot.zig");
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(0xC0DE5);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 1 << 16, prng.random());
+
+    var tmp = testing.tmpDir(.{});
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    const meta = try std.fs.path.join(alloc, &.{ dir_path, "sessions.json" });
+    const rings = try std.fs.path.join(alloc, &.{ dir_path, "rings" });
+    h.store.meta_path = meta;
+    h.store.rings_dir = rings;
+    // Same deinit-then-free ordering as the sibling replay test: the store only
+    // BORROWS these paths and the reader threads touch them after acking a frame.
+    defer {
+        h.deinit();
+        alloc.free(rings);
+        alloc.free(meta);
+        alloc.free(dir_path);
+        tmp.cleanup();
+    }
+
+    const rec_id = "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd";
+    const scrollback = "PANE=3 PID=4242\r\ntick-3-0\r\n";
+    {
+        const recs = [_]@import("session_meta.zig").Record{.{ .id = rec_id, .argv = "cl --resume", .pinned = true, .created_ms = 50 }};
+        const body = try @import("session_meta.zig").serialize(alloc, &recs);
+        defer alloc.free(body);
+        try @import("session_meta.zig").writeAtomic(alloc, meta, body);
+        const rp = try ring_snapshot.pathFor(alloc, rings, rec_id);
+        defer alloc.free(rp);
+        try ring_snapshot.writeAtomic(alloc, rp, 0, 80, 24, scrollback);
+    }
+    try testing.expectEqual(@as(usize, 1), h.store.loadPersisted(1 << 16));
+
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = rec_id,
+        .rows = 24,
+        .cols = 80,
+    });
+    _ = try h.client.waitControl(.attached);
+
+    const notice = "\r\n--- previous session was lost ---\r\n";
+    try h.client.sendControlJson(.relaunch, protocol.control_channel, protocol.Relaunch{
+        .session_id = rec_id,
+        .rows = 24,
+        .cols = 80,
+        .notice = notice,
+    });
+
+    const d = try h.client.nextData();
+    const dp = try protocol.DataPayload.decode(d.?.payload);
+    const idx_back = std.mem.indexOf(u8, dp.bytes, "PANE=3 PID=4242").?;
+    const idx_div = std.mem.indexOf(u8, dp.bytes, session.reboot_divider).?;
+    const idx_notice = std.mem.indexOf(u8, dp.bytes, notice).?;
+    try testing.expect(idx_back < idx_div);
+    try testing.expect(idx_div < idx_notice);
+    // The notice is the TAIL of the replay, so the respawned child's first output
+    // continues immediately after it rather than landing on top of it.
+    try testing.expectEqual(dp.bytes.len, idx_notice + notice.len);
+
+    const rf = try h.client.waitControl(.relaunched);
+    var rp2 = try protocol.parseJson(protocol.Relaunched, alloc, rf.payload);
+    defer rp2.deinit();
+    // `replayed` still means "there was a real snapshot" — sampled before the
+    // notice was appended — so a notice alone can never make the viewer suppress
+    // its own divider.
+    try testing.expect(rp2.value.replayed);
+}

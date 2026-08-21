@@ -25,7 +25,8 @@
   }).use(window.markdownitTaskLists, { enabled: false, label: true });
 
   // DOMPurify's default URI allowlist plus `ghoztty:` / `ghoztty-debug:` —
-  // the focus-only custom scheme (src/apprt/ipc/url_scheme.zig). Without this an
+  // the focus-only custom scheme (src/apprt/ipc/url_scheme.zig on Windows,
+  // GhozttyURLScheme.swift on macOS). Without this an
   // `[open the worktree](ghoztty://focus/dev)` link in a rendered document
   // survives markdown-it and is then stripped of its href by the sanitizer,
   // rendering as dead text. Everything else is verbatim DOMPurify default, so

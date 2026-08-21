@@ -748,15 +748,69 @@ final class LocalAgentManager {
         return true
     }
 
+    /// What the lazy agent-upgrade check should do about the running agent.
+    enum AgentRefreshDecision: Equatable {
+        /// Nothing to adopt, or nothing we may safely act on.
+        case none
+        /// The agent owns no live child: restarting it loses nothing.
+        case refreshSilently
+        /// A newer binary is bundled but the agent still owns live sessions.
+        /// Adopt it at the next natural cold start; never end sessions for it.
+        case deferUntilIdle(aliveSessionCount: Int)
+    }
+
+    /// The lazy-upgrade decision, given the running agent's build stamp and the
+    /// AGENT's own count of live sessions. Pure so the policy is testable without
+    /// a live agent.
+    ///
+    /// The load-bearing rule: **a newer bundled build is not an incompatibility.**
+    /// The wire contract is negotiated in HELLO and a `proto_version` mismatch is
+    /// fatal there (`protocol.negotiate` → `error.Incompatible`), so any agent we
+    /// are talking to has already agreed on the protocol; everything since rides
+    /// additive, intersection-negotiated capabilities that degrade on their own.
+    /// Ending live sessions to pick up a fresher binary therefore buys nothing and
+    /// costs the user every running process — which is exactly what happened on
+    /// the 1.33.0 update (95 sessions tombstoned by a restart nothing required).
+    /// docs/claude/sessions.md's mandatory-update prompt is reserved for a skew the handshake
+    /// actually flags as incompatible, which by construction cannot be this one.
+    ///
+    /// `aliveSessionCount == nil` means we could not ask the agent (older agent,
+    /// timeout, malformed reply). That is not proof it is empty, so it never
+    /// authorizes a restart — the same "only a positive answer may destroy state"
+    /// discipline `SessionLayoutRestore.probeSessions` uses.
+    static func agentRefreshDecision(
+        running: String?,
+        bundled: String,
+        aliveSessionCount: Int?
+    ) -> AgentRefreshDecision {
+        guard agentIsStale(running: running, bundled: bundled) else { return .none }
+        guard let alive = aliveSessionCount else { return .none }
+        return alive == 0 ? .refreshSilently : .deferUntilIdle(aliveSessionCount: alive)
+    }
+
+    /// How many sessions a bootout would actually destroy: the ALIVE ones. A dead
+    /// tombstone (reboot-floor or genuinely exited) has no child to lose, so it
+    /// must not hold the upgrade back forever.
+    static func aliveSessionCount(_ sessions: [BrowsedSession]) -> Int {
+        sessions.reduce(0) { $0 + ($1.alive ? 1 : 0) }
+    }
+
     /// Lazily adopt a newer bundled agent build, called ONLY at safe moments:
-    /// layout restore finished with no live panes, or the last persistent pane
-    /// just closed. Idle (`liveSessionCount == 0`) ⇒ restart silently — nothing
-    /// to lose — logged + a subtle notice. Live sessions ⇒ NEVER silent: a
-    /// mandatory confirmation before any destructive restart (docs/claude/sessions.md's "never
-    /// silently reset live sessions"). No-op when the agent is already current,
-    /// the bundled build is unknown, or there is no shared connection.
+    /// layout restore finished, or the last persistent pane just closed.
+    ///
+    /// The liveness question is put to the **agent**, not to this app's window
+    /// list: `LIST_SESSIONS` is the fact, an open-window count is a proxy that
+    /// reads 0 in all the wrong situations — a partial or slow restore, a window
+    /// list emptied by the user closing their last window while ninety pinned
+    /// sessions keep running, a second app instance. Every one of those used to
+    /// mean "idle ⇒ safe to bootout", and a bootout ends the agent's children.
+    ///
+    /// A stale agent that still owns live sessions is left strictly alone (the
+    /// plist argv is stable, so the next reboot / KeepAlive respawn / all-sessions-
+    /// closed moment execs the new binary). No-op when the agent is already
+    /// current, the bundled build is unknown, or there is no shared connection.
     @MainActor
-    func refreshLocalAgentIfStale(liveSessionCount: Int, reason: String) {
+    func refreshLocalAgentIfStale(reason: String) {
         guard let bundled = Self.bundledAgentVersion else { return }
         // Resolve the shared connection (reuse the warm one, or dial the running
         // agent) so this works even on a no-session launch — the most common
@@ -767,12 +821,29 @@ final class LocalAgentManager {
             guard let self, let owner else { return }
             let running = owner.agentBuildVersion
             guard Self.agentIsStale(running: running, bundled: bundled) else { return }
-            if liveSessionCount == 0 {
-                Self.logger.info("local agent stale (running \(running ?? "<pre-versioned>", privacy: .public) != bundled \(bundled, privacy: .public)); idle → refreshing [\(reason, privacy: .public)]")
-                self.forceRefreshLocalAgent(reconnect: false)
-                self.postAgentRefreshNotice(to: bundled)
-            } else {
-                self.promptAndRefreshLocalAgent(liveSessionCount: liveSessionCount, running: running, bundled: bundled)
+            // The roster RPC blocks on a reply — never on the main thread. The
+            // closure captures `owner` STRONGLY: `RemoteConnection.deinit` frees
+            // the handle, so a weak capture could hand a freed handle to the RPC.
+            DispatchQueue.global(qos: .utility).async { [weak self] in
+                let alive = RemoteSessionRoster.list(handle: owner.handle)
+                    .map(Self.aliveSessionCount)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    switch Self.agentRefreshDecision(
+                        running: running, bundled: bundled, aliveSessionCount: alive)
+                    {
+                    case .none:
+                        if alive == nil {
+                            Self.logger.info("local agent stale but its session roster is unknown; leaving it alone [\(reason, privacy: .public)]")
+                        }
+                    case .refreshSilently:
+                        Self.logger.info("local agent stale (running \(running ?? "<pre-versioned>", privacy: .public) != bundled \(bundled, privacy: .public)); agent holds no live session → refreshing [\(reason, privacy: .public)]")
+                        self.forceRefreshLocalAgent(reconnect: false)
+                        self.postAgentRefreshNotice(to: bundled)
+                    case .deferUntilIdle(let n):
+                        Self.logger.info("local agent stale (running \(running ?? "<pre-versioned>", privacy: .public) != bundled \(bundled, privacy: .public)) but owns \(n, privacy: .public) live session(s); it is protocol-compatible, so deferring adoption to the next cold start [\(reason, privacy: .public)]")
+                    }
+                }
             }
         }
     }
@@ -803,6 +874,10 @@ final class LocalAgentManager {
     /// Build the mandatory agent-restart confirmation, including the offline
     /// "What's new" accessory when bundled notes are available. Free of side
     /// effects (no runModal) so it is unit-testable.
+    ///
+    /// Reserved for a skew the HELLO handshake actually flags as INCOMPATIBLE
+    /// (docs/claude/sessions.md's mandatory-update process). A merely older-but-compatible
+    /// agent never reaches here — see `agentRefreshDecision`.
     @MainActor
     static func makeUpgradeAlert(
         liveSessionCount n: Int,
@@ -817,6 +892,13 @@ final class LocalAgentManager {
         alert.addButton(withTitle: "Update Now")
         alert.addButton(withTitle: "Later")
         alert.alertStyle = .warning
+        // "Later" is the default. AppKit gives Return to the FIRST button, which
+        // would make a stray keystroke — during a post-update relaunch, when the
+        // app has just come to the front — silently end every live session. The
+        // destructive choice must be deliberate; the return-value mapping is
+        // unchanged (Update Now is still `.alertFirstButtonReturn`).
+        alert.buttons[0].keyEquivalent = ""
+        alert.buttons[1].keyEquivalent = "\r"
 
         let split = store.partitioned(previousSeen: previousSeen, current: current)
         if !split.new.isEmpty || !split.installed.isEmpty {
@@ -831,8 +913,15 @@ final class LocalAgentManager {
     /// The mandatory confirmation before a destructive agent restart while
     /// sessions are live. On confirm → refresh (live windows recover/relaunch);
     /// on defer → nothing (the agent refreshes automatically once idle).
+    ///
+    /// This is docs/claude/sessions.md's mandatory-update mechanism, kept intact and reachable
+    /// for the case it exists for: a protocol skew the handshake reports as
+    /// INCOMPATIBLE, where the sessions genuinely cannot be carried across. It is
+    /// deliberately NOT wired to the build-stamp staleness check any more — a
+    /// compatible agent is adopted lazily instead (`agentRefreshDecision`), so an
+    /// ordinary app update can no longer offer to end the user's sessions.
     @MainActor
-    private func promptAndRefreshLocalAgent(liveSessionCount n: Int, running: String?, bundled: String) {
+    func promptAndRefreshLocalAgent(liveSessionCount n: Int, running: String?, bundled: String) {
         let alert = Self.makeUpgradeAlert(
             liveSessionCount: n,
             previousSeen: WhatsNewTracking.previousSeenVersion,

@@ -1,0 +1,14 @@
+{
+  "version": "1.32.0",
+  "sections": [
+    {
+      "title": "Links that jump to a terminal",
+      "items": [
+        { "title": "A `ghoztty://` link can raise a window or pane", "text": "Write `ghoztty://focus/<name>` anywhere a link can live and clicking it brings that Ghoztty window or pane to the front. `<name>` is anything `--target` already accepts: a window name, an auto `window-3`, a pane name, or a pane id (`$GHOZTTY_PANE_ID`). A generated dashboard, a build report, or a status page can finally say \"jump to that terminal\" and have it work." },
+        { "title": "It works everywhere a link renders", "text": "From your browser, from a page or rendered markdown in a viewer pane, and from a pane banner. Banner focus links get their own right-click menu (Focus in Ghoztty / Copy Link) instead of the side-pane and new-window options, which don't mean anything for a link that names a window rather than content." },
+        { "title": "Focus is the only thing a link can do, on purpose", "text": "Any web page you visit can fire a registered URL scheme with no prompt and no way to tell who asked. A link that could open a shell or type into a pane would be remote code execution behind an `<a href>`, so raising an existing window is the whole feature. Nothing is ever created: a link naming a window that's gone tells you so instead of quietly focusing something else, and a burst of links produces one message rather than one per link." },
+        { "title": "Debug builds keep their links to themselves", "text": "The debug build registers `ghoztty-debug://`, so macOS can't decide to route your links into a development build. Links clicked inside Ghoztty are handled in-process, so a document that hardcodes `ghoztty://` still lands in whichever build is rendering it." }
+      ]
+    }
+  ]
+}

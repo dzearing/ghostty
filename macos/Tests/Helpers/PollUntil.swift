@@ -27,6 +27,15 @@ import Foundation
 /// `timeout` plenty of headroom — it is a failure deadline, not a delay, and
 /// costs nothing when the condition arrives early.
 ///
+/// Which is why the default is deliberately generous rather than tuned. It was
+/// 15s, and `addressTracksSameDocumentNavigation` still flaked on a contended
+/// CI runner: python's interpreter startup ate most of `startServer`'s budget,
+/// and the WebKit load that followed had a fresh 15s that a loaded box can
+/// blow through. On an idle machine these conditions land in tens of
+/// milliseconds, so a larger deadline changes nothing except whether a busy
+/// runner reports a real failure. Do not trim it back to make the suite "feel"
+/// faster — a passing test never waits.
+///
 /// Do NOT use this while a `withCheckedContinuation` is in flight — turning the
 /// run loop re-enters and races the continuation's resumption. Tests in that
 /// shape (`ViewerTOCTests`, which awaits `evaluateJavaScript`) keep their own
@@ -34,7 +43,7 @@ import Foundation
 @MainActor
 @discardableResult
 func poll(
-    timeout: TimeInterval = 15,
+    timeout: TimeInterval = 60,
     until condition: () -> Bool
 ) async -> Bool {
     let deadline = Date().addingTimeInterval(timeout)

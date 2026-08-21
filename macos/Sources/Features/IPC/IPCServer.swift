@@ -55,6 +55,18 @@ class IPCServer {
             case .viewerPane(_, let ref): return ref.value != nil
             }
         }
+
+        /// Whether this entry names `pane`: a terminal by the surface it
+        /// wraps, a viewer by identity. A collected weak ref names nothing —
+        /// without that guard a viewer pane (`surfaceView` nil) matches every
+        /// dead terminal entry.
+        func names(_ pane: PaneView) -> Bool {
+            switch self {
+            case .window: return false
+            case .pane(_, let ref): return ref.value != nil && ref.value === pane.surfaceView
+            case .viewerPane(_, let ref): return ref.value === pane
+            }
+        }
     }
 
     private class WeakRef<T: AnyObject> {
@@ -359,6 +371,10 @@ class IPCServer {
         // A path or http(s) URL to open as a viewer pane instead of a terminal
         // (mutually exclusive with command/-e).
         var view: String?
+        // The pane the command was invoked FROM: `$GHOZTTY_PANE_ID`, forwarded
+        // by the CLI as `--caller-pane=`. A DEFAULT anchor only — see
+        // `callerAnchorPane`.
+        var callerPane: String?
         // When true, `+new-window` mirrors the keyboard/menu "New Window" action:
         // it resolves the focused/preferred window as the parent and inherits its
         // REMOTE host + command + cwd (§WP4). Lets the inheriting path be driven
@@ -648,6 +664,14 @@ class IPCServer {
                 )
             }
             return .ok
+        }
+
+        // No explicit anchor: split off the pane this command was invoked FROM
+        // rather than whatever window is focused by the time we get here.
+        // Assigning `parsed.pane` routes it down the ordinary `--pane` path, so
+        // a caller-anchored split is the same split an explicit one would be.
+        if let callerPane = callerAnchorPane(parsed) {
+            parsed.pane = callerPane
         }
 
         // Resolve --pane targeting: find the named pane (terminal surface or
@@ -1538,14 +1562,6 @@ class IPCServer {
 
     // MARK: - Rearrange
 
-    private final class LayoutNode: Decodable {
-        let pane: String?
-        let direction: String?
-        let ratio: Double?
-        let left: LayoutNode?
-        let right: LayoutNode?
-    }
-
     private func handleRearrange(_ request: IPCRequest) -> IPCResponse {
         let parsed: ParsedArguments
         if let arguments = request.arguments {
@@ -1556,37 +1572,6 @@ class IPCServer {
 
         guard let layoutJSON = parsed.layout else {
             return IPCResponse(success: false, error: "--layout is required for +rearrange")
-        }
-
-        guard let layoutData = layoutJSON.data(using: .utf8) else {
-            return IPCResponse(success: false, error: "invalid UTF-8 in layout JSON")
-        }
-
-        let layout: LayoutNode
-        do {
-            layout = try JSONDecoder().decode(LayoutNode.self, from: layoutData)
-        } catch {
-            return IPCResponse(success: false, error: "invalid layout JSON: \(error.localizedDescription)")
-        }
-
-        // Collect all pane names referenced in the layout
-        var layoutPaneNames: [String] = []
-        if let err = collectPaneNames(layout, into: &layoutPaneNames) {
-            return err
-        }
-
-        // Check for duplicates
-        let nameSet = Set(layoutPaneNames)
-        if nameSet.count != layoutPaneNames.count {
-            let dupes = layoutPaneNames.filter { name in
-                layoutPaneNames.filter { $0 == name }.count > 1
-            }
-            return IPCResponse(success: false, error: "duplicate pane name in layout: '\(Set(dupes).first ?? "")'")
-        }
-
-        // Must have at least one pane
-        if layoutPaneNames.isEmpty {
-            return IPCResponse(success: false, error: "layout must contain at least one pane")
         }
 
         var result: IPCResponse = .ok
@@ -1611,6 +1596,13 @@ class IPCServer {
                         result = IPCResponse(success: false, error: "target window '\(target)' not found")
                         return
                     }
+                } else if let callerController = self.callerAnchorController(parsed) {
+                    // "Rearrange this window" means the caller's window, not
+                    // whichever one the user has clicked into since. Same race
+                    // as `+split`, same fix; the layout names panes that live in
+                    // a particular window, so the focused-window guess made the
+                    // command fail outright as often as it moved the wrong one.
+                    controller = callerController
                 } else {
                     controller = TerminalController.preferredParent
                     if controller == nil {
@@ -1621,152 +1613,77 @@ class IPCServer {
 
                 guard let controller else { return }
 
-                // Resolve all pane names to panes in this controller's tree.
-                // We reuse the EXISTING PaneView wrappers so leaf identity (and
-                // therefore SwiftUI structural identity) is preserved across the
-                // rearrange.
-                var panesByName: [String: PaneView] = [:]
-                for name in layoutPaneNames {
-                    guard let entry = self.resolveTarget(name) else {
-                        result = IPCResponse(success: false, error: "pane '\(name)' not found in registry")
-                        return
-                    }
-                    guard let surface = entry.surfaceView else {
-                        result = IPCResponse(success: false, error: "pane '\(name)' is no longer alive")
-                        return
-                    }
-                    guard let pane = controller.surfaceTree.pane(for: surface) else {
-                        result = IPCResponse(success: false, error: "pane '\(name)' is not in the target window")
-                        return
-                    }
-                    panesByName[name] = pane
-                }
-
-                // Build the new split tree from the layout
+                // Build the new tree out of the panes this window already has.
+                // The EXISTING PaneView wrappers are reused, so leaf identity
+                // (and therefore SwiftUI structural identity) is preserved
+                // across the rearrange.
                 let newRoot: SplitTree<PaneView>.Node
-                do {
-                    newRoot = try self.buildSplitNode(from: layout, panes: panesByName)
-                } catch {
-                    result = IPCResponse(success: false, error: "failed to build layout: \(error)")
+                switch RearrangeLayout.build(
+                    layoutJSON: layoutJSON,
+                    in: controller.surfaceTree,
+                    resolve: { name in
+                        guard let entry = self.resolveTarget(name) else { return nil }
+                        return .init(
+                            surface: entry.surfaceView,
+                            viewerPane: entry.viewerPaneView,
+                            isAlive: entry.isAlive)
+                    }
+                ) {
+                case .success(let root):
+                    newRoot = root
+                case .failure(let failure):
+                    result = IPCResponse(success: false, error: failure.message)
                     return
                 }
 
                 // Collect all current panes in the tree
                 let currentPanes = Set(controller.surfaceTree.map { $0 })
-                let keptPanes = Set(panesByName.values)
+                let keptPanes = Set(newRoot.leaves())
                 let removedPanes = currentPanes.subtracting(keptPanes)
 
-                // Remember the currently focused surface
+                // Focus stays where it was if the layout kept that pane, and
+                // otherwise lands on the layout's first one. A focused VIEWER
+                // is not `focusedSurface` (it has no surface); it is whichever
+                // pane's content holds first responder.
                 let focusedSurface = controller.focusedSurface
-                let newFocus: Ghostty.SurfaceView? = if let focusedSurface,
-                    keptPanes.contains(where: { $0.surfaceView === focusedSurface }) {
-                    focusedSurface
+                let focusedPane = controller.surfaceTree.first { pane in
+                    if let focusedSurface { return pane.surfaceView === focusedSurface }
+                    return pane.contentIsFirstResponder
+                }
+                let newFocus: PaneView = if let focusedPane, keptPanes.contains(focusedPane) {
+                    focusedPane
                 } else {
-                    newRoot.leftmostLeaf().surfaceView
+                    newRoot.leftmostLeaf()
                 }
 
                 // Replace the tree
                 let newTree = SplitTree<PaneView>(root: newRoot, zoomed: nil)
                 controller.replaceSurfaceTree(
                     newTree,
-                    moveFocusTo: newFocus,
+                    moveFocusTo: newFocus.surfaceView,
                     moveFocusFrom: focusedSurface,
                     undoAction: "Rearrange Layout"
                 )
 
+                // A viewer has no surface for `replaceSurfaceTree` to focus,
+                // so it is focused the way the close path does it.
+                if newFocus.surfaceView == nil {
+                    DispatchQueue.main.async { Ghostty.moveFocus(to: newFocus) }
+                }
+
                 // Remove registry entries for panes no longer in the tree
                 for pane in removedPanes {
-                    for (name, entry) in self.targetRegistry {
-                        if case .pane(_, let surfaceRef) = entry, surfaceRef.value === pane.surfaceView {
-                            self.targetRegistry.removeValue(forKey: name)
-                            break
-                        }
+                    for (name, entry) in self.targetRegistry where entry.names(pane) {
+                        self.targetRegistry.removeValue(forKey: name)
                     }
                 }
 
-                Self.logger.info("IPC: rearranged layout with \(layoutPaneNames.count) panes")
+                Self.logger.info("IPC: rearranged layout with \(keptPanes.count) panes")
             }
         }
 
         semaphore.wait()
         return result
-    }
-
-    private func collectPaneNames(_ node: LayoutNode, into names: inout [String]) -> IPCResponse? {
-        if let pane = node.pane {
-            names.append(pane)
-            return nil
-        }
-
-        guard node.direction != nil else {
-            return IPCResponse(success: false, error: "layout node must have either 'pane' or 'direction'")
-        }
-        guard let left = node.left else {
-            return IPCResponse(success: false, error: "split node must have 'left' child")
-        }
-        guard let right = node.right else {
-            return IPCResponse(success: false, error: "split node must have 'right' child")
-        }
-
-        if let err = collectPaneNames(left, into: &names) { return err }
-        if let err = collectPaneNames(right, into: &names) { return err }
-        return nil
-    }
-
-    @MainActor
-    private func buildSplitNode(
-        from layout: LayoutNode,
-        panes: [String: PaneView]
-    ) throws -> SplitTree<PaneView>.Node {
-        if let paneName = layout.pane {
-            guard let pane = panes[paneName] else {
-                throw RearrangeError.paneNotFound(paneName)
-            }
-            return .leaf(view: pane)
-        }
-
-        guard let dirStr = layout.direction else {
-            throw RearrangeError.invalidNode
-        }
-
-        let direction: SplitTree<PaneView>.Direction = switch dirStr.lowercased() {
-        case "horizontal": .horizontal
-        case "vertical": .vertical
-        default: throw RearrangeError.invalidDirection(dirStr)
-        }
-
-        guard let leftLayout = layout.left, let rightLayout = layout.right else {
-            throw RearrangeError.missingSplitChildren
-        }
-
-        let ratioPercent = layout.ratio ?? 50
-        let clampedRatio = min(0.9, max(0.1, ratioPercent / 100.0))
-
-        let leftNode = try buildSplitNode(from: leftLayout, panes: panes)
-        let rightNode = try buildSplitNode(from: rightLayout, panes: panes)
-
-        return .split(.init(
-            direction: direction,
-            ratio: clampedRatio,
-            left: leftNode,
-            right: rightNode
-        ))
-    }
-
-    private enum RearrangeError: Error, CustomStringConvertible {
-        case paneNotFound(String)
-        case invalidNode
-        case invalidDirection(String)
-        case missingSplitChildren
-
-        var description: String {
-            switch self {
-            case .paneNotFound(let name): return "pane '\(name)' not found"
-            case .invalidNode: return "node must have 'pane' or 'direction'"
-            case .invalidDirection(let dir): return "invalid direction '\(dir)' (expected 'horizontal' or 'vertical')"
-            case .missingSplitChildren: return "split node must have 'left' and 'right' children"
-            }
-        }
     }
 
     private func handleList() -> IPCResponse {
@@ -2065,6 +1982,40 @@ class IPCServer {
         return DispatchQueue.main.sync(execute: scan)
     }
 
+    /// Raise the window owning `target` and focus the pane within it, or do
+    /// nothing at all if the target names nothing that is currently open.
+    /// Returns whether a target was found.
+    ///
+    /// This is the whole of what the `ghoztty://` URL scheme can do (see
+    /// `GhozttyURLScheme`), factored out so the untrusted caller shares the
+    /// resolver — and therefore the naming system — with `--target`, rather
+    /// than getting a parallel one. Never creates anything: a link that
+    /// LAUNCHED the app finds an empty registry and correctly does nothing.
+    @MainActor
+    @discardableResult
+    func focusTarget(_ target: String) -> Bool {
+        pruneStaleTargets()
+        guard let entry = resolveTarget(target), entry.isAlive else { return false }
+
+        // Same two shapes the idempotent `+split --name=` / `+new-window
+        // --target=` focus paths use: a terminal pane gets real focus inside
+        // its window (which `focusSurface` also raises and activates), while a
+        // viewer pane has no surface to focus, so raising its window is all
+        // there is.
+        if let surface = entry.surfaceView, let controller = entry.controller {
+            controller.focusSurface(surface)
+        } else if let pane = entry.viewerPaneView {
+            pane.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        } else if let controller = entry.controller {
+            controller.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        } else {
+            return false
+        }
+        return true
+    }
+
     private func windowName(for controller: TerminalController) -> String? {
         for (name, entry) in targetRegistry {
             if case .window(let ref) = entry, ref.value === controller {
@@ -2148,6 +2099,55 @@ class IPCServer {
 
         // Adjust ANSI palette for contrast
         Ghostty.SurfaceView.adjustPaletteForContrast(surface: surface, background: resolved)
+    }
+
+    /// The pane a command with no explicit target should anchor at: the one it
+    /// was invoked FROM (`$GHOZTTY_PANE_ID`, which the CLI forwards as
+    /// `--caller-pane=`), or nil to keep the `preferredParent` focused-window
+    /// fallback.
+    ///
+    /// This is the ONE place the app consumes the caller's pane, as
+    /// `apprt.ipc.seedCallerPane` is the ONE place the CLI produces it. It
+    /// exists because `preferredParent` is read on the main queue at HANDLE
+    /// time: the user can switch windows between the CLI invocation and the
+    /// app's turn, and an agent's command is asynchronous with respect to
+    /// focus even when nobody touches anything.
+    ///
+    /// Three ways to get nil, all of them ordinary:
+    ///
+    ///   * The caller named an anchor of its own. `--target`, `--pane`, and
+    ///     `--from-focused` all say where the command should land, and each
+    ///     wins over the environment's default.
+    ///   * Nothing was forwarded — a plain non-Ghoztty shell, or a pane baked
+    ///     by an app/agent that predates the flag.
+    ///   * The pane id no longer resolves. A script outliving its own pane is
+    ///     normal, so this falls back rather than failing the command — which
+    ///     is exactly why the CLI sends `--caller-pane=` and not `--pane=`,
+    ///     where a name that resolves to nothing is a typo and a hard error.
+    static func callerAnchorPane(
+        _ parsed: ParsedArguments,
+        isAlive: (String) -> Bool
+    ) -> String? {
+        guard parsed.target == nil,
+              parsed.pane == nil,
+              !parsed.fromFocused,
+              let caller = parsed.callerPane,
+              !caller.isEmpty,
+              isAlive(caller)
+        else { return nil }
+        return caller
+    }
+
+    /// `callerAnchorPane` against the live registry.
+    private func callerAnchorPane(_ parsed: ParsedArguments) -> String? {
+        Self.callerAnchorPane(parsed, isAlive: { self.resolveTarget($0)?.isAlive == true })
+    }
+
+    /// The window owning the pane the command was invoked from, for the
+    /// commands that act on a WINDOW rather than anchoring beside a pane.
+    private func callerAnchorController(_ parsed: ParsedArguments) -> TerminalController? {
+        guard let pane = callerAnchorPane(parsed) else { return nil }
+        return resolveTarget(pane)?.controller
     }
 
     private static func parseSplitDirection(_ value: String) -> SplitTree<PaneView>.NewDirection? {
@@ -2238,6 +2238,11 @@ class IPCServer {
 
             if let value = arg.dropPrefix("--pane=") {
                 result.pane = String(value)
+                continue
+            }
+
+            if let value = arg.dropPrefix("--caller-pane=") {
+                result.callerPane = String(value)
                 continue
             }
 
