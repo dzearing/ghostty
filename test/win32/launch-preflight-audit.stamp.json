@@ -1,8 +1,8 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-08-21T13:33:36-07:00",
-    "commit":  "687ed987e",
+    "generated":  "2026-08-21T15:38:03-07:00",
+    "commit":  "5930e40bb",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
                   "test/win32/activity-monitor-dialed.ps1":  "3fdfd164a3565c9b770f09bb7295b4011df7e07646b60ab89210f90f2ba3ca64",
@@ -214,7 +214,7 @@
                   "test/win32/session-restore-maximized.ps1":  "f1d51789dea2a462468e8f27da0f912594ad3deece41d6fd7a18bd3c2b8bd3ff",
                   "test/win32/session-resume-offset.ps1":  "8386aad5e6f2a402ad9e23034fa4ef771be1a08cffead37b1224b3cee73b2258",
                   "test/win32/sessions-agent-build.ps1":  "a54adedd012376c5ec12ae1d7c1ecf1f9ffeda89817df8aeabc4e75fd11ac10f",
-                  "test/win32/session-snapshot-reattach.ps1":  "60af4d23ff7fd68b35e4d061e5ec85654308cc0fcdf75762311db46fb922b3ca",
+                  "test/win32/session-snapshot-reattach.ps1":  "d0420f8eb18ecd22d7d86f15ee9bfa369ca65e7a2421376ccf79871cccd20085",
                   "test/win32/share-machine.ps1":  "e73db9d168f63d50d002de3881193d129aacbd47df8015caec17799ff1b79b5b",
                   "test/win32/ship-workflow.ps1":  "8e3a1a7cdc228cd8b9add1b7fc07e95e325f9f346067d119acc8b91ffa9dd818",
                   "test/win32/single-instance-join.ps1":  "c9376e3fbaf392c0db6888b6066eb94b1909778d223600ce53c463976a8cd16c",

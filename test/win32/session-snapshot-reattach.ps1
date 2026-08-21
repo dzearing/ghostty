@@ -23,9 +23,12 @@
 #      both N and M > 0, N equal to the offset the manifest recorded) rather
 #      than the full-ring path (`offset=0 snapshot=0`) - and that the pane's
 #      pre-quit content survived.
-#   M. INPUT-MODE half (T1055) - a pane arms the mouse-tracking family the way
-#      a TUI does; the snapshot the app records for it carries none of those
-#      "keep sending me reports" modes, while still describing the picture.
+#   M. INPUT-MODE half (T1055/T1067) - a pane runs a child shaped like a real
+#      mouse-driven TUI, which arms the mouse-tracking family; a click posted at
+#      the pane comes back to that child as an SGR pointer report (so the
+#      agreement WORKS while the program lives), and the snapshot the app
+#      records carries none of those "keep sending me reports" modes (so the
+#      agreement DIES with it), while still describing the picture.
 #
 # The log line is the oracle because the two paths are indistinguishable from
 # outside: both end with a pane full of the right text. `-NegativeControl`
@@ -422,51 +425,183 @@ Assert "C7 the restored pane records a fresh snapshot at an offset >= the first"
     $null -ne $leafC -and [uint64]$leafC.screen_snapshot_offset -ge $offsetA)
 
 # ============================================================================
-Say "== M: a snapshot never carries a dead TUI's input-reporting modes (T1055)"
+Say "== M: pointer reports reach a TUI in a persistent pane, and no snapshot re-arms them (T1055/T1067)"
 # ============================================================================
-# The snapshot is a PICTURE of a grid, persisted at quit and repainted at the
-# next launch - but "keep sending me mouse reports" is an agreement with the
-# PROCESS that asked for it, and between the two app runs an agent restart can
-# relaunch a session as a plain login shell. A snapshot that carries `?1003h`
-# re-arms mouse tracking against that shell, which then reads every pointer move
-# as typed input (`35;106;15M35;103;14M...` at the prompt). So: a pane arms the
-# full input-reporting set the way a TUI does, and the snapshot the app records
-# for it must contain none of them - while still describing the picture.
+# Two halves of one agreement. "Keep sending me mouse reports" is a deal with a
+# PROCESS: it has to WORK while that process lives (T1067) and it has to DIE
+# with it (T1055).
 #
-# Byte-level assertions on the recorded blob rather than a synthetic pointer
-# move: the acceptance run is on a BACKGROUND desktop where SendInput is dead
-# (lib\TestDesktop.ps1), and the blob is what a restore actually replays. The
-# unit half (`src/terminal/formatter.zig`, "keeps the picture, drops the
+# T1055's half: the snapshot is a PICTURE of a grid, persisted at quit and
+# repainted at the next launch - and between the two app runs an agent restart
+# can relaunch a session as a plain login shell. A snapshot that carries
+# `?1003h` re-arms mouse tracking against that shell, which then reads every
+# pointer move as typed input (`35;106;15M35;103;14M...` at the prompt). So the
+# snapshot must contain none of the family while still describing the picture.
+# The unit half (`src/terminal/formatter.zig`, "keeps the picture, drops the
 # reports") pins the same rule at the serializer.
 #
-# MEASURED, not assumed (2026-08-21): built with `input_modes` left ON, this
-# exact arm scores `M3 ... found: [?1004h [?2004h`, so the oracle has teeth.
-# ConPTY does eat `?1003h`/`?1006h` on the way out of the child - a Windows-only
-# narrowing of the upstream repro, and the reason M3 checks the whole family
-# rather than mouse tracking alone.
+# T1067's half, and why the arming child below is what it is. On Windows the
+# child's DECSETs cross a ConPTY, and conhost forwards a mouse-tracking DECSET
+# out of the pty ONLY WHILE THE CHILD HAS `ENABLE_VIRTUAL_TERMINAL_INPUT` SET on
+# its console input handle. MEASURED 2026-08-21 with a standalone
+# CreatePseudoConsole probe: a `cmd /c type` child (cooked input) emits
+# `ESC[?1003h ESC[?1006h ESC[?1004h ESC[?2004h` and conhost swallows every one
+# of them; the same bytes from a child that first sets that one bit come out of
+# the pty verbatim, as they do from a real TUI (node in raw mode). The
+# `?1004h`/`?2004h` that a `type` child appears to get through are not its own -
+# conhost emits `?9001h ?1004h ?2004h` as its OWN ConPTY preamble. `?7l` never
+# survives either way, because conhost owns the screen buffer's autowrap.
+#
+# So this arm runs a child shaped like a real mouse-driven program: VT input on,
+# cooked input off, arm the family, then sit in a raw read. That makes M3 a test
+# of the serializer with the WHOLE family actually armed (a `type` child only
+# ever left conhost's two preamble modes to be dropped), and it makes M1b
+# possible at all.
+#
+# M1b is the end-to-end claim, and it needs no real pointer: a click POSTED to
+# the pane's surface is a client message the surface handles like any other, so
+# the report is written to the pty, crosses the agent, is re-encoded by conhost
+# for a VT-input client, and lands in the child's raw read. That whole path
+# is what "the mouse works in my editor" means, and nothing else covered it.
+#
+# BOTH oracles measured, not assumed (2026-08-21). M1b scores
+# `E[IE[<35;33;11M` - the focus-in from `?1004h` and then a motion report from
+# `?1003h`, so the family really is live end to end. M3 was re-measured against
+# a build with `input_modes` left ON and scores
+# `found: [?1003h [?1006h [?1004h [?2004h`; with the pre-T1067 `cmd /c type`
+# arming child the same control could only ever find conhost's two preamble
+# modes, so this arm now tests the serializer against the whole family.
 $armMarker = "MOUSEARM$($PID)XYZ"
-$armBin = Join-Path $tmp 'arm.bin'
+$armCs = Join-Path $tmp 'arm.cs'
+$armPs = Join-Path $tmp 'arm.ps1'
 $armCmd = Join-Path $tmp 'arm.cmd'
 $esc = [char]27
-$armPayload = "$esc[?1003h$esc[?1006h$esc[?1004h$esc[?2004h$armMarker`r`n"
-[System.IO.File]::WriteAllText($armBin, $armPayload, [System.Text.Encoding]::ASCII)
+
+# The C# lives in its own file so the arming script can keep a single
+# here-string: an `Add-Type -TypeDefinition @'...'@` nested inside the
+# here-string that WRITES it would end the outer one at the inner terminator.
+$armCsText = @'
+using System;
+using System.Text;
+using System.Threading;
+using System.Runtime.InteropServices;
+
+// A mouse-driven TUI, reduced to the two things this arm needs it to be: it
+// sets ENABLE_VIRTUAL_TERMINAL_INPUT (without which conhost never forwards the
+// mouse DECSETs out of the ConPTY at all - T1067), and it reads its input raw.
+public static class GhozttyMouseArm {
+    [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr GetStdHandle(int n);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetConsoleMode(IntPtr h, out uint m);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool SetConsoleMode(IntPtr h, uint m);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool ReadFile(IntPtr h, byte[] b, uint n, out uint r, IntPtr o);
+    [DllImport("kernel32.dll", SetLastError=true)] static extern bool WriteFile(IntPtr h, byte[] b, uint n, out uint w, IntPtr o);
+
+    const int STD_IN = -10;
+    const int STD_OUT = -11;
+    const uint ENABLE_LINE_INPUT = 0x0002;
+    const uint ENABLE_ECHO_INPUT = 0x0004;
+    const uint ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200;
+    const uint ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004;
+
+    static IntPtr hin;
+    static IntPtr hout;
+    static StringBuilder got = new StringBuilder();
+
+    static void Emit(string s) {
+        byte[] b = Encoding.ASCII.GetBytes(s);
+        uint w;
+        WriteFile(hout, b, (uint)b.Length, out w, IntPtr.Zero);
+    }
+
+    // Arms the input-reporting family, prints the ready marker, then blocks in a
+    // raw read for up to waitMs waiting for an SGR pointer report. Returns what
+    // it read with ESC rendered as "E" so it survives a +read of the screen.
+    //
+    // Deliberately does NOT disarm on the way out: the modes must still be set
+    // in the app's terminal when the snapshot below is taken, because a dead
+    // program's leftover arming is the exact thing M3 exists to catch.
+    public static string Arm(string marker, int waitMs) {
+        hin = GetStdHandle(STD_IN);
+        hout = GetStdHandle(STD_OUT);
+        uint mi, mo;
+        if (!GetConsoleMode(hin, out mi)) { return "NOCONSOLEIN"; }
+        if (!GetConsoleMode(hout, out mo)) { return "NOCONSOLEOUT"; }
+        SetConsoleMode(hin, (mi | ENABLE_VIRTUAL_TERMINAL_INPUT) & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT));
+        SetConsoleMode(hout, mo | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        Emit("\u001b[?1003h\u001b[?1006h\u001b[?1004h\u001b[?2004h\u001b[?7l");
+        Emit(marker + "\r\n");
+        Thread t = new Thread(delegate() {
+            byte[] buf = new byte[512];
+            while (true) {
+                uint r;
+                if (!ReadFile(hin, buf, (uint)buf.Length, out r, IntPtr.Zero)) { break; }
+                if (r == 0) { break; }
+                lock (got) {
+                    got.Append(Encoding.ASCII.GetString(buf, 0, (int)r));
+                    if (got.ToString().Contains("[<")) { break; }
+                }
+            }
+        });
+        t.IsBackground = true;
+        t.Start();
+        t.Join(waitMs);
+        string s;
+        lock (got) { s = got.ToString(); }
+        return s.Replace("\u001b", "E");
+    }
+}
+'@
+[System.IO.File]::WriteAllText($armCs, $armCsText, [System.Text.Encoding]::ASCII)
+[System.IO.File]::WriteAllText(
+    $armPs,
+    ("Add-Type -TypeDefinition ([System.IO.File]::ReadAllText('$armCs'))`r`n" +
+     "`$r = [GhozttyMouseArm]::Arm('$armMarker', 40000)`r`n" +
+     "Write-Host (`"T1067GOT[`" + `$r + `"]`")`r`n"),
+    [System.Text.Encoding]::ASCII)
 [System.IO.File]::WriteAllText(
     $armCmd,
-    "@echo off`r`ntype `"$armBin`"`r`n",
+    "@echo off`r`npowershell -NoProfile -ExecutionPolicy Bypass -File `"$armPs`"`r`n",
     [System.Text.Encoding]::ASCII)
 
-# One space-free token, the same way A plants its marker: `type` dumps the raw
-# bytes so the CHILD emits them, which is the only way the pane's terminal ends
-# up with the modes actually set.
+# One space-free token, the same way A plants its marker.
 Run-Cli "+send-keys --target=$paneC $armCmd Enter" "$tmp\arm-send.txt" 12 | Out-Null
 $armOk = $false
-$deadline = (Get-Date).AddSeconds(30)
+$deadline = (Get-Date).AddSeconds(45)
 while ((Get-Date) -lt $deadline) {
     Run-Cli "+read --name=$paneC --lines=200" "$tmp\read-arm.txt" 10 | Out-Null
     if (((Out-Text "$tmp\read-arm.txt") -replace '\s', '') -match $armMarker) { $armOk = $true; break }
     Start-Sleep -Milliseconds 600
 }
-Assert "M1 the pane's child emitted the arming sequence (marker on screen)" $armOk
+Assert "M1 the pane's child armed the input-reporting family (marker on screen)" $armOk
+
+# --- M1b (T1067): the arming is not decorative - a pointer report gets back ---
+$sgrSeen = ''
+$topM = Wait-TestWindow -ProcessId $relaunched.Pid -TimeoutMs 15000
+$surfaceM = if ($topM -ne [IntPtr]::Zero) {
+    Get-TestChildWindow -Window $topM -Class 'GhozttyTerminal'
+} else { [IntPtr]::Zero }
+if ($surfaceM -eq [IntPtr]::Zero) {
+    Assert "M1b a click in the pane reaches the child as an SGR pointer report" $false
+    Say "  DIAG: no GhozttyTerminal surface under the restored window (top=$topM)"
+} else {
+    $rc = Get-TestWindowRect -Window $surfaceM
+    $cx = [int](($rc.Left + $rc.Right) / 2)
+    $cy = [int](($rc.Top + $rc.Bottom) / 2)
+    # A move first: mode 1003 reports motion too, so a build that reports only
+    # buttons still scores, and the click that follows lands on a focused pane.
+    [void](Send-TestMouse -Window $topM -Target $surfaceM -X $cx -Y $cy -Action move)
+    Start-Sleep -Milliseconds 300
+    [void](Send-TestMouse -Window $topM -Target $surfaceM -X $cx -Y $cy -Action click)
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Get-Date) -lt $deadline) {
+        Run-Cli "+read --name=$paneC --lines=200" "$tmp\read-sgr.txt" 10 | Out-Null
+        $flat = (Out-Text "$tmp\read-sgr.txt") -replace '\s', ''
+        if ($flat -match 'T1067GOT\[([^\]]*)\]') { $sgrSeen = $Matches[1]; break }
+        Start-Sleep -Milliseconds 600
+    }
+    Assert "M1b a click in the pane reaches the child as an SGR pointer report (got: $sgrSeen)" (
+        $sgrSeen -match 'E\[<\d+;\d+;\d+[Mm]')
+}
 
 # Provoke the debounced capture and wait for the one that POST-DATES the arming.
 Run-Cli "+rename --target=$paneC --title=t1055-mouse" "$tmp\ren3.txt" 12 | Out-Null
