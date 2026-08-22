@@ -81,6 +81,13 @@ What that means in practice:
   detect capability at runtime via the HELLO handshake, and route any breaking
   change through the mandatory update process — full contract in
   `docs/claude/sessions.md`.
+- **Ghoztty is a permanent hard fork of Ghostty, and `origin` is the only
+  remote.** Nothing is ever merged, cherry-picked, or rebased from
+  ghostty-org/ghostty, and nothing is ever pushed anywhere but
+  `github.com/dzearing/ghoztty`. The `upstream` remote was removed on
+  2026-08-22; do not re-add it, do not fetch it by URL, and do not file or
+  accept a task that depends on absorbing upstream. This is settled (D80,
+  reversed by user directive) - it is not a question a future turn may re-open.
 - **Everything gets tests**: pure logic → unit tests in the `none` lane;
   behavior → an on-box acceptance script in `test/win32/`. The harness rules in
   `docs/claude/testing.md` are enforced by sweeps and are not optional.
