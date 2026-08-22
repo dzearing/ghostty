@@ -59,6 +59,7 @@ $env:GHOZTTY_ORPHAN_RENOTIFY_MS = '3600000'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\PipeBridge.ps1')  # Get-LocalAgentPipeName
+. (Join-Path $PSScriptRoot 'lib\ChooserCursor.ps1')  # Walk-ChooserCursorToId (T602/T620)
 
 $script:pass = 0
 $script:fail = 0
@@ -129,6 +130,25 @@ function Open-Chooser($g) {
 function Count-NotifyLines($path) {
     if (-not (Test-Path $path)) { return 0 }
     return @(Select-String -Path $path -Pattern 'orphan notify: session=' -ErrorAction SilentlyContinue).Count
+}
+
+# Resuming from the chooser is ASYNCHRONOUS: the app opens a window, dials the
+# agent, and only then does the ATTACH land and clear the clock. Waiting a fixed
+# number of seconds for that makes the assertion a race against box load, which
+# is how this script scored `2 FAILURE(S)` in the 242-script sweep against code
+# that is byte-identical to the code it passes on today (T1107). So poll for the
+# transition and report how long it took: a genuinely broken attach still fails
+# at the timeout, and a merely slow one is visible as a number instead of a red.
+function Wait-Attached([string]$id, [int]$timeoutMs = 20000) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $row = @()
+    while ($sw.ElapsedMilliseconds -lt $timeoutMs) {
+        $row = @(Get-Sessions | Where-Object { $_.id -eq $id })
+        if ($row.Count -eq 1 -and $row[0].attached) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    $sw.Stop()
+    return @{ Row = $row; ElapsedMs = [int]$sw.ElapsedMilliseconds }
 }
 
 function Wait-NotifyLine($path, [int]$after, $timeoutMs) {
@@ -216,21 +236,23 @@ try {
     $filter = ConvertTo-TestHwnd (Get-ChooserFilterField -Chooser $chooser)
     Assert ($filter -ne [IntPtr]::Zero) 'the chooser has its filter field'
 
+    # Walk by the app's own cursor log, not by an index counted off
+    # `+sessions --json` (T602/T620, shared in lib\ChooserCursor.ps1): the
+    # displayed roster is sorted, and Right no-ops entirely while the roster
+    # is still being fetched - after which Return resumes NOTHING and opens a
+    # plain window on the machine row instead. Counting Downs blind cannot
+    # tell that apart from a broken attach, and did not (T1107).
     $rendered = @(Get-RenderedSessions)
-    $targetIdx = -1
-    for ($i = 0; $i -lt $rendered.Count; $i++) {
-        if ($rendered[$i].id -eq $loose[0].id) { $targetIdx = $i; break }
-    }
-    Assert ($targetIdx -ge 0) "the orphan is rendered to resume (index $targetIdx of $($rendered.Count))"
-    if ($targetIdx -lt 0) { Write-Host 'SETUP FAIL: orphan not in rendered list'; exit 1 }
+    $landed = Walk-ChooserCursorToId -Chooser $chooser -Filter $filter -Log $errlog `
+        -TargetIds @($loose[0].id) -MaxRows ([Math]::Max(4, $rendered.Count + 2))
+    Assert ($landed -eq $loose[0].id) "the roster cursor parks on the orphan ($landed of $($rendered.Count) rendered)"
+    if ($landed -ne $loose[0].id) { Write-Host 'SETUP FAIL: cursor never reached the orphan'; exit 1 }
 
-    Send-TestKeys -Window $chooser -Target $filter -Key 'Right' | Out-Null
-    for ($i = 0; $i -lt $targetIdx; $i++) { Send-TestKeys -Window $chooser -Target $filter -Key 'Down' | Out-Null }
-    Start-Sleep -Milliseconds 400
     Send-TestKeys -Window $chooser -Target $filter -Key 'Return' | Out-Null
-    Start-Sleep -Seconds 3
 
-    $row = @(Get-Sessions | Where-Object { $_.id -eq $loose[0].id })
+    $attach = Wait-Attached $loose[0].id
+    $row = $attach.Row
+    Write-Host "     (attach landed after $($attach.ElapsedMs) ms)"
     Assert ($row.Count -eq 1 -and $row[0].attached) 'the agent reports the resumed session ATTACHED'
     Assert ($row.Count -eq 1 -and $null -eq $row[0].unattached_since) 'the attach reset unattached_since to null'
 } finally {

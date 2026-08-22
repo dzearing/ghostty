@@ -746,7 +746,8 @@ $GuardTable = @(
         Covers = @(
             'src\apprt\win32\orphan_notify.zig',
             'src\apprt\win32\tray_notify.zig',
-            'test\win32\orphan-notify.ps1'
+            'test\win32\orphan-notify.ps1',
+            'test\win32\lib\ChooserCursor.ps1'
         )
     },
     # The activity-state machine (T605): main's own oracle run verbatim under
@@ -1282,7 +1283,8 @@ $GuardTable = @(
         Covers = @(
             'src\apprt\win32\SessionRoster.zig',
             'src\apprt\win32\chooser_sessions.zig',
-            'test\win32\chooser-resume.ps1'
+            'test\win32\chooser-resume.ps1',
+            'test\win32\lib\ChooserCursor.ps1'
         )
     },
     # The chooser's session resume against a REMOTE machine (T331): the same
@@ -1303,7 +1305,8 @@ $GuardTable = @(
             'src\apprt\win32\SessionRoster.zig',
             'src\apprt\win32\chooser_sessions.zig',
             'src\apprt\win32\host_defaults.zig',
-            'test\win32\chooser-resume-remote.ps1'
+            'test\win32\chooser-resume-remote.ps1',
+            'test\win32\lib\ChooserCursor.ps1'
         )
     },
     # The chooser's ACCOUNT ROW (T316): the sign-in flow and the four

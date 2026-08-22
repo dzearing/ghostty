@@ -1,12 +1,13 @@
 {
     "guard":  "chooser-resume-remote",
     "script":  "test/win32/chooser-resume-remote.ps1",
-    "generated":  "2026-08-21T22:21:54-07:00",
-    "commit":  "56e310ef0",
+    "generated":  "2026-08-22T14:10:44-07:00",
+    "commit":  "a41a0bc45",
     "files":  {
                   "src/apprt/win32/chooser_sessions.zig":  "de267bf5e49cea23f0e9e304b718a9169038b159bf185318923b522a2fd48b66",
                   "src/apprt/win32/host_defaults.zig":  "994b374543855d65b0203cfd687650c1d07d6ff5ff645d0455854f50e4ca59be",
                   "src/apprt/win32/SessionRoster.zig":  "2b44fdbee15514c64f285cfa5eb69d1eeee39ff880c94cc22e15946ee4b4e28b",
-                  "test/win32/chooser-resume-remote.ps1":  "b167abd7ef038e745be6f0ce8be63697dcb254e3e4bb77e085e3c096197edc8a"
+                  "test/win32/chooser-resume-remote.ps1":  "603e9a875589185a0a10243b4941acf1ae523c96c650ea633865ab2c3719f2f9",
+                  "test/win32/lib/ChooserCursor.ps1":  "07632267956e7b2647f6227181d98c0ca50e8d68556c7e987e1817424d583e74"
               }
 }

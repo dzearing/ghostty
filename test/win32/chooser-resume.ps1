@@ -62,6 +62,7 @@ $env:GHOZTTY_PIPE_SUFFIX = "-t320$PID"
 Remove-Item Env:\GHOZTTY_RESTORE_SKIP -ErrorAction SilentlyContinue
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+. (Join-Path $PSScriptRoot 'lib\ChooserCursor.ps1')  # Step-ChooserCursor / Walk-ChooserCursorToId
 
 $script:pass = 0
 $script:fail = 0
@@ -168,51 +169,19 @@ function Send-ChooserKey($chooser, $filter, $key) {
     return Send-TestKeys -Window $chooser -Target $filter -Key $key
 }
 
-# --- Cursor-log navigation (T602/T620) --------------------------------------
-# Since T602 the displayed roster is SORTED (name or CPU, a persisted
-# preference), so an index computed from the agent's `+sessions` order is NOT
-# the cursor's index space - walking "down N rows" lands somewhere else. The
-# app now says where the cursor lands after every step ("chooser roster:
-# cursor on session id=..."), and the walk reads that back instead of
-# assuming an order.
-
-# Send one cursor key and wait for the app to log where the cursor landed.
-# Returns the landed session id, '' when the cursor left the list, or $null
-# when no landing was logged (the key was not roster navigation).
+# --- Cursor-log navigation (T602/T620, shared in lib\ChooserCursor.ps1) ------
+# The walk that reads the app's own cursor log back instead of assuming the
+# roster's displayed order lives in one place now (T1107) - it had been copied
+# into chooser-resume-remote.ps1 with a different timeout, and orphan-notify.ps1
+# was still counting Downs blind. These two keep their positional shape so the
+# call sites below read as they always did.
 function Step-Cursor($chooser, $filter, $log, $key) {
-    $pattern = 'chooser roster: cursor (on session id=([0-9a-fA-F]+)|left the list)'
-    $before = Count-LogLines $log $pattern
-    Send-ChooserKey $chooser $filter $key | Out-Null
-    $waited = 0
-    while ($waited -lt 3000) {
-        $m = @(Select-String -Path $log -Pattern $pattern -ErrorAction SilentlyContinue)
-        if ($m.Count -gt $before) {
-            $last = $m[-1]
-            if ($last.Matches[0].Groups[2].Success) { return $last.Matches[0].Groups[2].Value }
-            return ''
-        }
-        Start-Sleep -Milliseconds 100
-        $waited += 100
-    }
-    return $null
+    return Step-ChooserCursor -Chooser $chooser -Filter $filter -Log $log -Key $key
 }
 
-# Park the cursor on the first displayed row whose id is in $TargetIds: reset
-# to the top (Left leaves the list, Right re-enters at displayed row 0), then
-# Down-scan reading each landing back from the log. Returns the landed id, or
-# $null when the scan walked off the end without a match.
 function Walk-CursorToId($chooser, $filter, $log, [string[]]$TargetIds, [int]$MaxRows) {
-    Step-Cursor $chooser $filter $log 'Left' | Out-Null
-    $cur = Step-Cursor $chooser $filter $log 'Right'
-    for ($i = 0; $i -le $MaxRows; $i++) {
-        if ($null -eq $cur -or $cur -eq '') { return $null }
-        if ($TargetIds -contains $cur) { return $cur }
-        $prev = $cur
-        $cur = Step-Cursor $chooser $filter $log 'Down'
-        # The last row clamps: a Down that lands on the same id is the end.
-        if ($cur -eq $prev) { return $null }
-    }
-    return $null
+    return Walk-ChooserCursorToId -Chooser $chooser -Filter $filter -Log $log `
+        -TargetIds $TargetIds -MaxRows $MaxRows
 }
 
 Write-Host 'T320 chooser session resume'

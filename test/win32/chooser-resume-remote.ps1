@@ -81,6 +81,7 @@ $env:GHOZTTY_PIPE_SUFFIX = "-t331$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+. (Join-Path $PSScriptRoot 'lib\ChooserCursor.ps1')  # Step-ChooserCursor / Walk-ChooserCursorToId
 . (Join-Path $PSScriptRoot 'lib\PaneLiveness.ps1')
 . (Join-Path $PSScriptRoot 'lib\FakeRelay.ps1')
 . (Join-Path $PSScriptRoot 'lib\PipeBridge.ps1')
@@ -297,43 +298,18 @@ function Send-ChooserKey($chooser, $filter, $key) {
     return Send-TestKeys -Window $chooser -Target $filter -Key $key
 }
 
-# --- Cursor-log navigation (T602/T620, borrowed from chooser-resume.ps1) -----
-# The displayed roster is SORTED, so an index computed from the agent's own
-# order is NOT the cursor's index space. The app says where the cursor lands
-# after every step, and the walk reads that back instead of assuming an order.
+# --- Cursor-log navigation (T602/T620, shared in lib\ChooserCursor.ps1) ------
+# This file used to hold its own paste of the walk, with a 4000ms step timeout
+# against chooser-resume.ps1's 3000 - two copies that had already drifted, and a
+# third script (orphan-notify.ps1) that never got one and paid for it (T1107).
+# There is one copy now; these keep the positional shape the call sites use.
 function Step-Cursor($chooser, $filter, $log, $key) {
-    $pattern = 'chooser roster: cursor (on session id=([0-9a-fA-F]+)|left the list)'
-    $before = Count-LogLines $log $pattern
-    Send-ChooserKey $chooser $filter $key | Out-Null
-    $waited = 0
-    while ($waited -lt 4000) {
-        $m = @(Select-String -Path $log -Pattern $pattern -ErrorAction SilentlyContinue)
-        if ($m.Count -gt $before) {
-            $last = $m[-1]
-            if ($last.Matches[0].Groups[2].Success) { return $last.Matches[0].Groups[2].Value }
-            return ''
-        }
-        Start-Sleep -Milliseconds 100
-        $waited += 100
-    }
-    return $null
+    return Step-ChooserCursor -Chooser $chooser -Filter $filter -Log $log -Key $key
 }
 
-# Park the cursor on the first displayed row whose id is in $TargetIds: reset to
-# the top (Left leaves the list, Right re-enters at displayed row 0), then
-# Down-scan reading each landing back from the log.
 function Walk-CursorToId($chooser, $filter, $log, [string[]]$TargetIds, [int]$MaxRows) {
-    Step-Cursor $chooser $filter $log 'Left' | Out-Null
-    $cur = Step-Cursor $chooser $filter $log 'Right'
-    for ($i = 0; $i -le $MaxRows; $i++) {
-        if ($null -eq $cur -or $cur -eq '') { return $null }
-        if ($TargetIds -contains $cur) { return $cur }
-        $prev = $cur
-        $cur = Step-Cursor $chooser $filter $log 'Down'
-        # The last row clamps: a Down that lands on the same id is the end.
-        if ($cur -eq $prev) { return $null }
-    }
-    return $null
+    return Walk-ChooserCursorToId -Chooser $chooser -Filter $filter -Log $log `
+        -TargetIds $TargetIds -MaxRows $MaxRows
 }
 
 $TOKEN = 'faketoken-t331'
