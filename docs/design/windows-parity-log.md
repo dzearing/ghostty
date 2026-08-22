@@ -9,6 +9,51 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-22 - **T1094 - the whole acceptance suite has now been run, and
+  every red has an owner.** 242 scripts, forward order, Debug build at
+  `9a764deea`: **211 pass, 30 fail, 1 stall, 7 scripts leaking a live process**.
+  Serial cost **2h 46m 56s** (mean 41.4 s), which replaces T361's 2h 25m
+  extrapolation — that was 13% light, because the first 63 scripts it was drawn
+  from are alphabetically front-loaded with cheap ones. The red rate is the
+  bigger correction: **12.8%, twice the 6%** the sample predicted.
+
+  Thirty tasks filed, one owner per red, stall and leak (T1098–T1127), each
+  with its failing assertion quoted. Two deliberate merges where the SAME
+  assertion string fails across scripts and one fix should close them all — the
+  four `viewer-feedback-*` scripts (T1102, all on `the composer shows an
+  '[Image #1]' chip (holds '')`) and both `split-dim` scripts (T1101, both on an
+  empty measured colour) — with every member script named in its task's title,
+  body and criteria so nothing is untracked, and instructions to split if a
+  member proves different. The seven leaks are T1127, one criteria line each;
+  five of the seven PASS their own assertions, which is exactly why nobody had
+  ever looked at them.
+
+  **Three findings outrank the list.** `upstream/main` does not resolve in this
+  repo at all, so the eight commits the merge-back plan cites are reachable from
+  nothing and a `git gc` may prune them — and step 0's claim printed
+  `UPSTREAM OK (upstream/main a88ad03e6, fetched 16h ago)` on the very turn that
+  found it, so the gate built to catch this cannot go red (T1099, P0). The user
+  watched a system-modal `Unsupported 16-Bit Application` dialog appear on their
+  own desktop mid-sweep: T281's `AGENT VERIFY` launches whatever sits at the
+  installed agent path, `upgrade-staleness.ps1` puts an ASCII sentinel there
+  every run, and the script still scored `ALL PASS (123 assertions)` with the
+  dialog up — which on a real box is the unattended 5am refresh hanging behind a
+  prompt nobody is there to click (T1098). And `profile-latency.ps1` is scored
+  `fail` for correctly refusing a Debug build, so the suite can never report
+  all-green in its normal configuration (T1126).
+
+  The last two are the same defect wearing different clothes, and it is the one
+  worth carrying forward: **the suite cannot see anything outside a script's own
+  assertions.** A modal dialog, a leaked process and a by-design refusal are all
+  invisible to, or misreported by, the verdict contract. The between-script leak
+  sweep was added for precisely this reason and is the only one of the three
+  currently covered; T1098 asks for the dialog sweep beside it, T1126 for a real
+  SKIP verdict.
+
+  Green: floor all four lanes PASS (lib 5 s, none 140 s, win32 199 s, agent
+  377 s); P1/P2/P3 pass inside the sweep itself (12.2 s / 23.2 s / 33.2 s).
+  Summary and per-script logs kept at `temp\suite-runs\fwd1\`.
+
 - 2026-08-22 - **T359 - the acceptance scripts that need an on-demand
   binary now build it themselves.** `remote-test-client` - the only thing here
   that speaks the agent protocol without a GUI - has its own `zig build
