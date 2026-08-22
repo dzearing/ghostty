@@ -57,6 +57,12 @@ if ($ExePath) { $exe = $ExePath }
 
 $env:GHOZTTY_PIPE_SUFFIX = "-fbimg$PID"
 
+# The chip oracle below is the RichEdit's own text, so this suite pins itself to
+# the RichEdit surface (T1102). See lib\ComposerSurface.ps1 for why asking is not
+# enough and the run also PROVES which surface it got.
+. (Join-Path $PSScriptRoot 'lib\ComposerSurface.ps1')
+Set-ComposerSurface 'richedit'
+
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 Add-Type -AssemblyName System.Windows.Forms
@@ -300,6 +306,8 @@ try {
     Assert (Invoke-FeedbackButton $view) 'the revealed nav bar took a click at the feedback button'
     $s = Wait-FeedbackState $errlog $paneId $true
     Assert ($s -and $s.Open) "the pane reports the composer OPEN (state '$($s.Open)')"
+    Assert (Wait-ComposerSurface $errlog 'richedit') `
+        "...on the RichEdit surface this script can drive (got '$(Get-ComposerSurface $errlog)')"
 
     $fb = $null
     for ($t = 0; $t -lt 20; $t++) {
