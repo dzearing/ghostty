@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-22T11:52:45-07:00",
-    "commit":  "6dd174f71",
+    "generated":  "2026-08-22T12:45:22-07:00",
+    "commit":  "d5be4b072",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
@@ -117,7 +117,7 @@
                   "test/win32/ipc-p2.ps1":  "be369b5da1b2bedb360273fa15b9dbb21e59dc70dbd8add8b251643c88c3b707",
                   "test/win32/ipc-p3.ps1":  "91f5cd1bcbd5fee8dcad7bd41f79ee7813d568eaf597fc8a918ba83fe5c9608c",
                   "test/win32/ipc-read-race.ps1":  "ff6f89cab2e92dae0fa13e1ea2f9a89f2579175ddcc2b8b55c53b8b7f330bee6",
-                  "test/win32/ipc-relay.ps1":  "3ac783e6a3527c6fd10836f7ead08c36e6358d991719fa87d1f07cdbe69c3f5b",
+                  "test/win32/ipc-relay.ps1":  "5f51afab95cc71404e236a0358359f410d68d852d187f5f189dd5e99bcabbe10",
                   "test/win32/ipc-remote.ps1":  "02f87b8c3678e65a41fadb65795d3a11c24e41a9de5a85fae2a8a188843ad99c",
                   "test/win32/ipc-send-keys-fidelity.ps1":  "b2a2da476fd6a74cfab82a23075b133345e2c9bbe02624db4f89b12485bc552d",
                   "test/win32/ipc-startup-latency.ps1":  "f9696e3e450043659688926efca6912b1ddeb19113e1be8c2581e20a591196a6",
