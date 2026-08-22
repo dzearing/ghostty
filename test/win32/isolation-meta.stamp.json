@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-22T14:11:12-07:00",
-    "commit":  "a41a0bc45",
+    "generated":  "2026-08-22T14:49:08-07:00",
+    "commit":  "4af6c2f82",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
@@ -43,7 +43,7 @@
                   "test/win32/chooser-link-hover.ps1":  "9de29beaeb0ae0194f458a30bc0bb10e570decc4610dc3784f9e21629ed1e6d5",
                   "test/win32/chooser-menu.ps1":  "39bf0ac434cc2eb9b69f2d1a569be9be09502e2787cdc3d814516958366c9c5b",
                   "test/win32/chooser-open-chord.ps1":  "fbf6f3281efd358cdd41d49c2bf630e95b559861f0776ea3eb93167adeb7c028",
-                  "test/win32/chooser-orphan-badge.ps1":  "c868502b972d857a70f13211556718358387fa0013068975f938f6007d0b86dc",
+                  "test/win32/chooser-orphan-badge.ps1":  "94aea913d64668ad537094bdd2dc030259a005617bfc0f931975d3eab9bea5e7",
                   "test/win32/chooser-restore-all.ps1":  "ced0ad850d422bf42cd4040a41863b5a1a1158d57a2937e485ff60468d716ceb",
                   "test/win32/chooser-restore-all-adopt.ps1":  "d05f84d8d6e52dcd0996ccbe3992b584cb5ba20969b41f3f21943a47361b2241",
                   "test/win32/chooser-restore-all-remote.ps1":  "6190184881ee2a80a0fa0330d2e8a2b310901b695c1e6c417650bddec1d46744",
