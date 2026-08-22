@@ -29,7 +29,7 @@ $tmp = Join-Path $env:TEMP "ghoztty-ipc-t65-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
 # Isolate the IPC endpoint: the app inherits this through CreateProcessW and
 # so does every `& $Exe +...` below.
-$env:GHOZTTY_PIPE_SUFFIX = '-childexitedtest'
+$env:GHOZTTY_PIPE_SUFFIX = "-childexitedtest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

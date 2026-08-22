@@ -56,7 +56,7 @@ $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
-$env:GHOZTTY_PIPE_SUFFIX = '-heronavtest'
+$env:GHOZTTY_PIPE_SUFFIX = "-heronavtest$PID"
 $errlog = Join-Path $env:TEMP 'ghoztty-hero-nav-stderr.log'
 Remove-Item $errlog -Force -ErrorAction SilentlyContinue
 

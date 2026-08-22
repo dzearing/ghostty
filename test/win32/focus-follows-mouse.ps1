@@ -55,7 +55,7 @@ if ($ExePath) { $exe = $ExePath }
 
 # Isolate the IPC endpoint unconditionally - inherited by the app through
 # CreateProcessW and by every `& $exe +...` below.
-$env:GHOZTTY_PIPE_SUFFIX = '-ffmtest'
+$env:GHOZTTY_PIPE_SUFFIX = "-ffmtest$PID"
 $errlog = Join-Path $env:TEMP 'ghoztty-ffm-stderr.log'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')

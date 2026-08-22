@@ -72,7 +72,7 @@ $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 
 # Isolate the IPC endpoint (inherited through CreateProcessW).
-$env:GHOZTTY_PIPE_SUFFIX = '-t335'
+$env:GHOZTTY_PIPE_SUFFIX = "-t335$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 # T652: the "attached is not alive" oracle. Read its header before adding an

@@ -56,7 +56,7 @@ if ($ExePath) { $exe = $ExePath }
 # Isolated endpoint: every oracle here is an IPC probe, and both ends inherit
 # this (the CLI from this shell, the GUI through the harness's CreateProcessW),
 # so they address THIS run's instance and nothing else on the box.
-$env:GHOZTTY_PIPE_SUFFIX = '-hovertest'
+$env:GHOZTTY_PIPE_SUFFIX = "-hovertest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\ChromeGeometry.ps1')

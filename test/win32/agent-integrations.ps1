@@ -73,7 +73,7 @@ if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 # Isolate the IPC endpoint (inherited through CreateProcessW) so a stray
 # instance answering the shared pipe cannot serve this run's requests.
-$env:GHOZTTY_PIPE_SUFFIX = '-agentinteg'
+$env:GHOZTTY_PIPE_SUFFIX = "-agentinteg$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\PaneCapture.ps1')   # Invoke-GhozttyIpc

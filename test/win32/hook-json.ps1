@@ -45,7 +45,7 @@ if ($ExePath) { $exe = $ExePath }
 
 # Isolate the IPC endpoint: an instance answering the shared pipe would let
 # another run's windows into this one.
-$env:GHOZTTY_PIPE_SUFFIX = '-hjtest'
+$env:GHOZTTY_PIPE_SUFFIX = "-hjtest$PID"
 
 # PS 5.1 pipes strings to a native exe in $OutputEncoding, whose default here
 # prepends a UTF-8 BOM. The exe tolerates a BOM on parse input (measured, and
@@ -265,7 +265,10 @@ if (-not $gitBash) {
         'sd=$(cygpath -u "$1"); pane="$2"',
         'chmod +x "$sd/bin/"* 2>/dev/null',
         'export PATH="$sd/bin:$PATH" HOME="$sd/home" TERM_PROGRAM=ghostty',
-        'export GHOZTTY_PANE_ID="$pane" GHOZTTY_PIPE_SUFFIX="-hjtest"',
+        # The suffix is run-unique (T352), so it is spliced from the live
+        # variable rather than repeated as a literal - a second copy of it
+        # here would send the fixture's hook calls to some other run's pipe.
+        ('export GHOZTTY_PANE_ID="$pane" GHOZTTY_PIPE_SUFFIX="' + $env:GHOZTTY_PIPE_SUFFIX + '"'),
         'export JQ_SENTINEL="$sd/out/jq-called"',
         'command -v jq >/dev/null && echo "shadow-jq-on-path" > "$sd/out/shadow.txt"',
         's="$sd/ghoztty-banner.sh"',

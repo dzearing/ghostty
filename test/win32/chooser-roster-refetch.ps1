@@ -47,7 +47,7 @@ $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 
 # Isolate the IPC endpoint (inherited through CreateProcessW).
-$env:GHOZTTY_PIPE_SUFFIX = '-t333'
+$env:GHOZTTY_PIPE_SUFFIX = "-t333$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

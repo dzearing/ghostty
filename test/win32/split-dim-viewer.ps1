@@ -48,7 +48,7 @@ if ($ExePath) { $exe = $ExePath }
 # Always isolate the IPC endpoint: the app inherits this env through
 # CreateProcessW and so does every `& $exe +...` below, so the user's own
 # instance is never queried or disturbed.
-$env:GHOZTTY_PIPE_SUFFIX = '-dimviewtest'
+$env:GHOZTTY_PIPE_SUFFIX = "-dimviewtest$PID"
 $errlog = Join-Path $env:TEMP 'ghoztty-split-dim-viewer-stderr.log'
 
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')

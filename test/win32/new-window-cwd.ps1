@@ -82,7 +82,7 @@ param(
 $ErrorActionPreference = 'Continue'
 # Isolate the IPC endpoint (inherited through CreateProcessW) so a stray
 # instance answering the shared pipe cannot serve this run's +list.
-$env:GHOZTTY_PIPE_SUFFIX = '-nwcwdtest'
+$env:GHOZTTY_PIPE_SUFFIX = "-nwcwdtest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 $script:failures = 0

@@ -56,7 +56,7 @@ if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 # Isolate the IPC endpoint (inherited through CreateProcessW) so a stray
 # instance answering the shared pipe cannot open windows in this run.
-$env:GHOZTTY_PIPE_SUFFIX = '-cfgerrtest'
+$env:GHOZTTY_PIPE_SUFFIX = "-cfgerrtest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

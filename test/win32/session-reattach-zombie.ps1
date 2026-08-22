@@ -252,7 +252,7 @@ New-Item -ItemType Directory -Force $root | Out-Null
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 $savedPipe = $env:GHOZTTY_PIPE_SUFFIX
-$env:GHOZTTY_PIPE_SUFFIX = '-altreattach'
+$env:GHOZTTY_PIPE_SUFFIX = "-altreattach$PID"
 
 # ---- the fixture that lives on the alternate screen -------------------------
 #

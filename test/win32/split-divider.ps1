@@ -99,7 +99,7 @@ if ($ExePath) { $exe = $ExePath }
 
 # Isolate the IPC endpoint unconditionally - inherited by the app through
 # CreateProcessW and by every `& $exe +...` below.
-$env:GHOZTTY_PIPE_SUFFIX = '-dividertest'
+$env:GHOZTTY_PIPE_SUFFIX = "-dividertest$PID"
 $errlog = Join-Path $env:TEMP 'ghoztty-split-divider-stderr.log'
 $conf = Join-Path $env:TEMP 'ghoztty-split-divider-test.conf'
 

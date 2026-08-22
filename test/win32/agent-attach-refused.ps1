@@ -248,7 +248,7 @@ $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 # Isolate the IPC endpoint: every `+list` / `+read` / `+send-keys` below is an
 # oracle, and a user instance answering the shared pipe would answer them about
 # somebody else's windows.
-$env:GHOZTTY_PIPE_SUFFIX = '-attachrefused'
+$env:GHOZTTY_PIPE_SUFFIX = "-attachrefused$PID"
 $env:GHOSTTY_AGENT_SUPPRESS_CAPS = $null
 $env:GHOZTTY_RESTORE_PROBE_UNKNOWN = $null
 

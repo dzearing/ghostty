@@ -55,7 +55,7 @@ if (-not (Test-Path $ClientExe)) { $ClientExe = Join-Path $repo 'zig-out\bin\rem
 # Isolate the app's IPC endpoint (inherited through CreateProcessW). The AGENT
 # pipe has no env override - the debug agent is per-user - which is fine: setup
 # kills the repo's agent, so the app starts a fresh one this run owns.
-$env:GHOZTTY_PIPE_SUFFIX = '-t520'
+$env:GHOZTTY_PIPE_SUFFIX = "-t520$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\PipeBridge.ps1')  # Get-LocalAgentPipeName

@@ -240,7 +240,7 @@ $saved = @{
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 # The app arms use +list/+sessions as oracles; a user instance answering the
 # shared IPC pipe would answer them about somebody else's windows.
-$env:GHOZTTY_PIPE_SUFFIX = '-t167'
+$env:GHOZTTY_PIPE_SUFFIX = "-t167$PID"
 if ($Release) {
     # A release build registers HKCU\Software\Classes\ghoztty at launch, pointed
     # at its own exe - i.e. it would hand the user's `ghoztty://` links to a

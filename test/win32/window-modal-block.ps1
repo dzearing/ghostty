@@ -56,7 +56,7 @@ $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 $com = Join-Path (Split-Path $exe -Parent) 'ghoztty.com'
-$env:GHOZTTY_PIPE_SUFFIX = '-modalblock'
+$env:GHOZTTY_PIPE_SUFFIX = "-modalblock$PID"
 
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')

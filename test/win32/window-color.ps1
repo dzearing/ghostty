@@ -59,7 +59,7 @@ if ($ExePath) { $exe = $ExePath }
 # and both ends inherit this (the CLI from this shell, the GUI through the
 # harness's CreateProcessW), so they address THIS run's instance and nothing
 # else on the box.
-$env:GHOZTTY_PIPE_SUFFIX = '-colortest'
+$env:GHOZTTY_PIPE_SUFFIX = "-colortest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\PaneCapture.ps1')

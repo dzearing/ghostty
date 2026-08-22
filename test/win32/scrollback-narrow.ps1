@@ -70,7 +70,7 @@ $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 
-$env:GHOZTTY_PIPE_SUFFIX = '-sbnarrow'
+$env:GHOZTTY_PIPE_SUFFIX = "-sbnarrow$PID"
 $errlog = Join-Path $env:TEMP 'ghoztty-sbnarrow-stderr.log'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')

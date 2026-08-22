@@ -50,7 +50,7 @@ if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 
 # Isolate the IPC endpoint (inherited through CreateProcessW).
-$env:GHOZTTY_PIPE_SUFFIX = '-wttest'
+$env:GHOZTTY_PIPE_SUFFIX = "-wttest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

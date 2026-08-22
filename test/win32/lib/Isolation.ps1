@@ -34,6 +34,16 @@
 #
 # Both asserts THROW. A script whose isolation has silently stopped working
 # must die where it stands, not degrade back into driving a live terminal.
+#
+# T352: the suffix must be unique to the RUN, not just to the script. The
+# `$PID` below is doing that job, and a hand-rolled `$env:GHOZTTY_PIPE_SUFFIX =
+# '-something'` must carry `$PID` too - `test\win32\isolation-meta.ps1` section
+# C fails the tree otherwise. Why it matters beyond tidiness: `+new-window
+# --target=<name>` is idempotent by design, so a fixed endpoint hands the next
+# run whatever windows a run that died before its cleanup left registered
+# there, and the fixture is FOCUSED instead of built. One run-unique endpoint
+# closes that for every name the script registers, which is why those names
+# were left alone rather than each given a prefix of their own.
 
 # T350: the suffix isolates the APP endpoint and nothing else - the local
 # agent's pipe is build-mode derived with no env override - so a release build

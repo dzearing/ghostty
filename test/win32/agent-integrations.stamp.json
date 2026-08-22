@@ -1,8 +1,8 @@
 {
     "guard":  "agent-integrations",
     "script":  "test/win32/agent-integrations.ps1",
-    "generated":  "2026-08-21T20:38:39-07:00",
-    "commit":  "8340e815a",
+    "generated":  "2026-08-21T22:19:02-07:00",
+    "commit":  "56e310ef0",
     "files":  {
                   "src/apprt/win32/agent_integration_service.zig":  "96462ad4254afc51d65f9c2b3e7f076096b0e9b7a930a9c0ae317cf09ffe2b08",
                   "src/apprt/win32/BannerScriptInstaller.zig":  "e349d9a86275fb68b44211120d5859a92e14dc2ce797f9060a8b5cd701cb923d",
@@ -18,6 +18,6 @@
                   "src/apprt/win32/runtime_probe.zig":  "e9a8927087558063833d30e15d1cbd1b0f3648ead5f24a8616415e3b3efb6254",
                   "src/apprt/win32/RuntimeIntegration.zig":  "4ea491239e8e400dadd99f2d4c8341812b323a0fabee280dd377f8376b3546f3",
                   "src/apprt/win32/SkillComponent.zig":  "0b100dfca6ae0439091bd79254256bee80027f34d99da50ed2a68a6d926e90ca",
-                  "test/win32/agent-integrations.ps1":  "aac6b132c986521cd878190886a813cd1819ce139ab9ba02aee3032460e1d265"
+                  "test/win32/agent-integrations.ps1":  "201c7424c1271d20322417b8f0881665be453f2dd6e9611f3fcf10f105310169"
               }
 }

@@ -242,7 +242,7 @@ $blank = 'about:blank'
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 $savedPipe = $env:GHOZTTY_PIPE_SUFFIX
-$env:GHOZTTY_PIPE_SUFFIX = '-vrestore'
+$env:GHOZTTY_PIPE_SUFFIX = "-vrestore$PID"
 
 Stop-RepoInstances
 New-Item -ItemType Directory -Force $root | Out-Null

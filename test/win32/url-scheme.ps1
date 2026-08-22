@@ -58,7 +58,7 @@ Assert-GhozttyIsolatedBuild -Exe $exe
 
 # Isolate the IPC endpoint (inherited through CreateProcessW -- and, as arm D
 # measures, through the shell's own launch of the registered command).
-$env:GHOZTTY_PIPE_SUFFIX = '-urlscheme'
+$env:GHOZTTY_PIPE_SUFFIX = "-urlscheme$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

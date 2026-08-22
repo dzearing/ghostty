@@ -60,7 +60,7 @@ if ($ExePath) { $exe = $ExePath }
 # Always isolate the IPC endpoint: the app inherits this env through
 # CreateProcessW and so does every `& $exe +...` below, so the user's own
 # instance is never queried or disturbed.
-$env:GHOZTTY_PIPE_SUFFIX = '-kstest'
+$env:GHOZTTY_PIPE_SUFFIX = "-kstest$PID"
 $errlog = Join-Path $env:TEMP 'ghoztty-key-state-stderr.log'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')

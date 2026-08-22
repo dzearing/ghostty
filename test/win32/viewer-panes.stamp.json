@@ -1,10 +1,10 @@
 {
     "guard":  "viewer-panes",
     "script":  "test/win32/viewer-panes.ps1",
-    "generated":  "2026-08-21T20:09:32-07:00",
-    "commit":  "8340e815a",
+    "generated":  "2026-08-21T22:02:41-07:00",
+    "commit":  "56e310ef0",
     "files":  {
                   "test/win32/lib/BrowserLeak.ps1":  "ae41845c0869dc0a37c9104ff6189f07d1e4ede98445bdecbeb3e222f5224826",
-                  "test/win32/viewer-panes.ps1":  "12f0d7748aae24efbb6579ac70ba10d2f8241f2c75eeedcc4c14561889e87e2a"
+                  "test/win32/viewer-panes.ps1":  "a69c6aac3f34a3db6ab5a5063cabdc761e6fb111ade91c1d4a5ca74ad2d7b2d4"
               }
 }

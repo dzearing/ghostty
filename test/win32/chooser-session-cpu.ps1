@@ -59,7 +59,7 @@ $ErrorActionPreference = 'Continue'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 
-$env:GHOZTTY_PIPE_SUFFIX = '-t462'
+$env:GHOZTTY_PIPE_SUFFIX = "-t462$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\TestScore.ps1')

@@ -44,7 +44,7 @@ $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 $errlog = Join-Path $env:TEMP 'ghoztty-palette-close-stderr.log'
-$env:GHOZTTY_PIPE_SUFFIX = '-paletteclose'
+$env:GHOZTTY_PIPE_SUFFIX = "-paletteclose$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

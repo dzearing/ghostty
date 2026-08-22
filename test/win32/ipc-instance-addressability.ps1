@@ -73,9 +73,19 @@ New-Item -ItemType Directory -Force $tmp | Out-Null
 
 $user = $env:USERNAME
 if (-not $user) { $user = 'default' }
-$pipeA = "\\.\pipe\ghoztty-t118a-$user"
-$pipeB = "\\.\pipe\ghoztty-t118b-$user"
-$pipeGhost = "\\.\pipe\ghoztty-t118ghost-$user"
+
+# T352: the two instances' endpoints and the names they register are keyed on
+# $PID, so a run that dies before its cleanup leaves nothing this run can
+# inherit, and two runs on one box never meet.
+$sfxA = "-t118a$PID"
+$sfxB = "-t118b$PID"
+$sfxGhost = "-t118ghost$PID"
+$winA = "t118aw$PID"
+$winB = "t118bw$PID"
+
+$pipeA = "\\.\pipe\ghoztty$sfxA-$user"
+$pipeB = "\\.\pipe\ghoztty$sfxB-$user"
+$pipeGhost = "\\.\pipe\ghoztty$sfxGhost-$user"
 
 # Run a CLI verb against one instance: the suffix picks the endpoint, and the
 # baked var is always cleared here so the HARNESS never accidentally rides the
@@ -199,15 +209,15 @@ New-TestDesktop | Out-Null
 
 try {
     Write-Host 'SETUP: instance A on a private endpoint'
-    $appA = Start-Instance -Suffix '-t118a' -ErrLog (Join-Path $tmp 'a.log')
+    $appA = Start-Instance -Suffix $sfxA -ErrLog (Join-Path $tmp 'a.log')
     if (-not $appA) { throw 'SETUP FAIL: instance A did not start' }
-    $r = Invoke-Cli '-t118a' @('+new-window', '--target=t118aw')
+    $r = Invoke-Cli $sfxA @('+new-window', "--target=$winA")
     Assert ($r.Code -eq 0) 'SETUP: named window in A'
     Start-Sleep -Seconds 3
 
     Write-Host ''
     Write-Host '1. the pane is baked with A''s OWN endpoint'
-    $rc = Invoke-PaneProbe '-t118a' 't118aw' 'baked' @(
+    $rc = Invoke-PaneProbe $sfxA $winA 'baked' @(
         "echo %GHOZTTY_IPC_SOCKET%> `"$tmp\baked.txt`""
     )
     $baked = (Read-ProbeFile 'baked.txt').Trim()
@@ -216,28 +226,28 @@ try {
 
     Write-Host ''
     Write-Host '2. a CLI run inside the pane reaches A with no suffix to help it'
-    $rc = Invoke-PaneProbe '-t118a' 't118aw' 'inpane' @(
+    $rc = Invoke-PaneProbe $sfxA $winA 'inpane' @(
         'set GHOZTTY_PIPE_SUFFIX=',
         "`"$Exe`" +list > `"$tmp\inpane.txt`" 2>&1"
     )
     $inpane = Read-ProbeFile 'inpane.txt'
     Assert ($rc -eq 0) '+list exits 0 inside the pane'
-    Assert ($inpane -match 't118aw') '+list from the pane sees A''s own window'
+    Assert ($inpane -match $winA) '+list from the pane sees A''s own window'
 
     Write-Host ''
     Write-Host '3. NEGATIVE CONTROL: clear the baked var and the same command fails'
-    $rc = Invoke-PaneProbe '-t118a' 't118aw' 'nobake' @(
+    $rc = Invoke-PaneProbe $sfxA $winA 'nobake' @(
         'set GHOZTTY_PIPE_SUFFIX=',
         'set GHOZTTY_IPC_SOCKET=',
         "`"$Exe`" +list > `"$tmp\nobake.txt`" 2>&1"
     )
     $nobake = Read-ProbeFile 'nobake.txt'
     Assert ($rc -ne 0 -and $null -ne $rc) 'without the bake, +list fails (derives -debug)'
-    Assert ($nobake -notmatch 't118aw') 'and it does not see A''s window'
+    Assert ($nobake -notmatch $winA) 'and it does not see A''s window'
 
     Write-Host ''
     Write-Host '4. an explicit override aims the command elsewhere'
-    $rc = Invoke-PaneProbe '-t118a' 't118aw' 'override' @(
+    $rc = Invoke-PaneProbe $sfxA $winA 'override' @(
         'set GHOZTTY_PIPE_SUFFIX=',
         "set GHOZTTY_IPC_SOCKET=$pipeGhost",
         "`"$Exe`" +list > `"$tmp\override.txt`" 2>&1"
@@ -246,16 +256,16 @@ try {
 
     Write-Host ''
     Write-Host '5. the SERVER ignores an inherited endpoint'
-    $countA = Get-WindowCount '-t118a'
-    $appB = Start-Instance -Suffix '-t118b' -InheritedSocket $pipeA `
+    $countA = Get-WindowCount $sfxA
+    $appB = Start-Instance -Suffix $sfxB -InheritedSocket $pipeA `
         -ErrLog (Join-Path $tmp 'b.log') -NoPersistence
     if (-not $appB) { throw 'SETUP FAIL: instance B did not start' }
-    $r = Invoke-Cli '-t118b' @('+new-window', '--target=t118bw')
+    $r = Invoke-Cli $sfxB @('+new-window', "--target=$winB")
     Assert ($r.Code -eq 0) 'B answers on its OWN derived endpoint'
     Start-Sleep -Seconds 3
-    $listA = (Invoke-Cli '-t118a' @('+list')).Text
-    Assert ($listA -notmatch 't118bw') 'and B did not bind (or serve) A''s endpoint'
-    $rc = Invoke-PaneProbe '-t118b' 't118bw' 'bakedb' @(
+    $listA = (Invoke-Cli $sfxA @('+list')).Text
+    Assert ($listA -notmatch $winB) 'and B did not bind (or serve) A''s endpoint'
+    $rc = Invoke-PaneProbe $sfxB $winB 'bakedb' @(
         "echo %GHOZTTY_IPC_SOCKET%> `"$tmp\bakedb.txt`""
     )
     $bakedB = (Read-ProbeFile 'bakedb.txt').Trim()
@@ -266,27 +276,27 @@ try {
     # This is what keeps an acceptance script launched from one of the USER'S
     # panes on the build it was asked to test: it sets a suffix, and the pane it
     # inherited an endpoint from must not win.
-    $rc = Invoke-PaneProbe '-t118a' 't118aw' 'aimed' @(
-        'set GHOZTTY_PIPE_SUFFIX=-t118b',
+    $rc = Invoke-PaneProbe $sfxA $winA 'aimed' @(
+        "set GHOZTTY_PIPE_SUFFIX=$sfxB",
         "`"$Exe`" +list > `"$tmp\aimed.txt`" 2>&1"
     )
     $aimed = Read-ProbeFile 'aimed.txt'
     Assert ($rc -eq 0) 'the suffixed +list runs from inside A''s pane'
-    Assert ($aimed -match 't118bw') 'and it lands on B, the instance it aimed at'
-    Assert ($aimed -notmatch 't118aw') 'not on A, whose endpoint the pane carries'
+    Assert ($aimed -match $winB) 'and it lands on B, the instance it aimed at'
+    Assert ($aimed -notmatch $winA) 'not on A, whose endpoint the pane carries'
 
     Write-Host ''
     Write-Host '6. so does the AlreadyRunning forward'
-    $countA = Get-WindowCount '-t118a'
-    $countB = Get-WindowCount '-t118b'
+    $countA = Get-WindowCount $sfxA
+    $countB = Get-WindowCount $sfxB
     # C collides with B on the pipe name, so its bind fails and it forwards a
     # new-window before exiting. With A's endpoint in its environment, the
     # forward must still go to B.
-    Start-Instance -Suffix '-t118b' -InheritedSocket $pipeA `
+    Start-Instance -Suffix $sfxB -InheritedSocket $pipeA `
         -ErrLog (Join-Path $tmp 'c.log') -NoPersistence -NoWait | Out-Null
     Start-Sleep -Seconds 6
-    Assert ((Get-WindowCount '-t118b') -eq ($countB + 1)) 'C forwarded its window to B'
-    Assert ((Get-WindowCount '-t118a') -eq $countA) 'and A gained nothing'
+    Assert ((Get-WindowCount $sfxB) -eq ($countB + 1)) 'C forwarded its window to B'
+    Assert ((Get-WindowCount $sfxA) -eq $countA) 'and A gained nothing'
 } catch {
     # An escaping exception must SCORE, not print a green summary on its way out.
     Assert $false "unexpected error: $_"

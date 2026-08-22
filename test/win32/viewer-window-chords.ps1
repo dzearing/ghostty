@@ -56,7 +56,7 @@ if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 # Isolate the IPC endpoint (inherited through CreateProcessW): the user's own
 # instance is never queried or disturbed.
-$env:GHOZTTY_PIPE_SUFFIX = '-vwctest'
+$env:GHOZTTY_PIPE_SUFFIX = "-vwctest$PID"
 $errlog = Join-Path $env:TEMP 'ghoztty-viewer-window-chords-stderr.log'
 Remove-Item $errlog -Force -ErrorAction SilentlyContinue
 

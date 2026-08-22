@@ -66,7 +66,7 @@ $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 
-$env:GHOZTTY_PIPE_SUFFIX = '-fbcap'
+$env:GHOZTTY_PIPE_SUFFIX = "-fbcap$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

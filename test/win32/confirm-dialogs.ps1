@@ -49,7 +49,7 @@ if ($ExePath) { $exe = $ExePath }
 # Isolate the IPC endpoint (inherited through CreateProcessW) even though this
 # script drives only the GUI: an instance answering the shared pipe would let
 # another run's +new-window land in this window.
-$env:GHOZTTY_PIPE_SUFFIX = '-confirmtest'
+$env:GHOZTTY_PIPE_SUFFIX = "-confirmtest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

@@ -44,7 +44,7 @@ if ($ExePath) { $exe = $ExePath }
 $errlog = Join-Path $env:TEMP 'ghoztty-command-registry-stderr.log'
 # Isolate the IPC endpoint (inherited through CreateProcessW): Tab-Count must
 # count THIS instance's tabs, not whatever answers the shared pipe.
-$env:GHOZTTY_PIPE_SUFFIX = '-cmdregtest'
+$env:GHOZTTY_PIPE_SUFFIX = "-cmdregtest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

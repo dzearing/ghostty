@@ -58,7 +58,7 @@ if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 
 # Isolate the IPC endpoint (inherited through CreateProcessW): an instance
 # answering the shared pipe would let another run's windows into this one.
-$env:GHOZTTY_PIPE_SUFFIX = '-t746'
+$env:GHOZTTY_PIPE_SUFFIX = "-t746$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\TestScore.ps1')

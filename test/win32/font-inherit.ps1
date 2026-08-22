@@ -34,7 +34,7 @@ if ($ExePath) { $exe = $ExePath }
 # Isolate the IPC endpoint unconditionally: the app inherits this through
 # CreateProcessW and so does every `& $exe +...` below, so the user's own
 # instance is never queried or disturbed.
-$env:GHOZTTY_PIPE_SUFFIX = '-fontinherittest'
+$env:GHOZTTY_PIPE_SUFFIX = "-fontinherittest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

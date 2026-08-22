@@ -581,7 +581,7 @@ $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 # Isolate the IPC endpoint: every `+list` / `+read` / `+send-keys` below is an
 # oracle, and a user instance answering the shared pipe would answer them about
 # somebody else's windows.
-$env:GHOZTTY_PIPE_SUFFIX = '-relnotify'
+$env:GHOZTTY_PIPE_SUFFIX = "-relnotify$PID"
 
 Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive

@@ -55,7 +55,7 @@ Remove-Item $errlog -ErrorAction SilentlyContinue
 # Isolate the IPC endpoint unconditionally: the app inherits this through
 # CreateProcessW and so does every `& $Exe +...` below, so a run can never
 # drive whatever instance happens to own the shared pipe.
-$env:GHOZTTY_PIPE_SUFFIX = '-clippastetest'
+$env:GHOZTTY_PIPE_SUFFIX = "-clippastetest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

@@ -154,7 +154,7 @@ function Manifest-Leaves($w) {
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 $savedPipe = $env:GHOZTTY_PIPE_SUFFIX
-$env:GHOZTTY_PIPE_SUFFIX = '-slpreserve'
+$env:GHOZTTY_PIPE_SUFFIX = "-slpreserve$PID"
 
 Stop-RepoInstances
 New-Item -ItemType Directory -Force $root | Out-Null

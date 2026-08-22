@@ -56,7 +56,7 @@ $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 
 # Isolate the IPC endpoint (inherited through CreateProcessW).
-$env:GHOZTTY_PIPE_SUFFIX = '-t320'
+$env:GHOZTTY_PIPE_SUFFIX = "-t320$PID"
 # The T620 restore-skip seam is set at the RELAUNCH, not before the first
 # launch; clear a leak from a parent shell so the first launch is a real one.
 Remove-Item Env:\GHOZTTY_RESTORE_SKIP -ErrorAction SilentlyContinue

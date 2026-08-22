@@ -58,7 +58,7 @@ Remove-Item $errlog -ErrorAction SilentlyContinue
 
 # Isolate the IPC endpoint unconditionally - inherited by the app through
 # CreateProcessW and by every `& $Exe +...` below.
-$env:GHOZTTY_PIPE_SUFFIX = '-t01test'
+$env:GHOZTTY_PIPE_SUFFIX = "-t01test$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

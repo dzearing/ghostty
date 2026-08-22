@@ -167,7 +167,7 @@ $restored = @('window-1', 'window-2', 'window-3')
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 $savedPipe = $env:GHOZTTY_PIPE_SUFFIX
-$env:GHOZTTY_PIPE_SUFFIX = '-wnrestore'
+$env:GHOZTTY_PIPE_SUFFIX = "-wnrestore$PID"
 
 Stop-RepoInstances
 New-Item -ItemType Directory -Force $root | Out-Null

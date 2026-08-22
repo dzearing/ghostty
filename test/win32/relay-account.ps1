@@ -99,7 +99,7 @@ Add-Type -AssemblyName System.Security
 # Isolate the IPC endpoint (inherited through CreateProcessW by the GUI, and
 # through the environment by every Run-Cli): an instance answering the shared
 # pipe would answer this run's +list about somebody else's windows.
-$env:GHOZTTY_PIPE_SUFFIX = '-relayacct'
+$env:GHOZTTY_PIPE_SUFFIX = "-relayacct$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

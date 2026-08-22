@@ -1,10 +1,10 @@
 {
     "guard":  "tab-tooltip",
     "script":  "test/win32/tab-tooltip.ps1",
-    "generated":  "2026-08-21T20:39:07-07:00",
-    "commit":  "8340e815a",
+    "generated":  "2026-08-21T22:19:48-07:00",
+    "commit":  "56e310ef0",
     "files":  {
                   "src/apprt/win32/tab_tooltip.zig":  "9dbb27927b691d7776b74d10e6cadaf911a7e50c548b1a6f80ceab3752473303",
-                  "test/win32/tab-tooltip.ps1":  "471bd887f47628d2204ada4ffbe4cb8fd62aaac9d3d4148bf8664b264e224416"
+                  "test/win32/tab-tooltip.ps1":  "2c16b672ae68453765b7c6b86419b4e93d783c063e67985a7789e41eead227a7"
               }
 }

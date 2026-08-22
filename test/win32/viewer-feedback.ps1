@@ -65,7 +65,7 @@ if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 
 # Isolate the IPC endpoint (inherited through CreateProcessW).
-$env:GHOZTTY_PIPE_SUFFIX = '-fbtest'
+$env:GHOZTTY_PIPE_SUFFIX = "-fbtest$PID"
 
 # WHICH SURFACE THIS SUITE DRIVES, and why it is pinned (T934).
 #

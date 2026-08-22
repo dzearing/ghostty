@@ -94,7 +94,7 @@ if (-not (Test-Path $AgentExe)) { $AgentExe = Join-Path $repo 'zig-out\bin\ghozt
 # Isolate the IPC endpoint. Section B's CLI calls inherit it from this shell and
 # the GUI inherits it through CreateProcessW, so both ends of every +list /
 # +read / +send-keys are this run's instance and nothing else on the box.
-$env:GHOZTTY_PIPE_SUFFIX = '-hstest'
+$env:GHOZTTY_PIPE_SUFFIX = "-hstest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

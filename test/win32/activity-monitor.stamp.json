@@ -1,10 +1,10 @@
 {
     "guard":  "activity-monitor",
     "script":  "test/win32/activity-monitor.ps1",
-    "generated":  "2026-08-21T20:28:17-07:00",
-    "commit":  "8340e815a",
+    "generated":  "2026-08-21T22:13:08-07:00",
+    "commit":  "56e310ef0",
     "files":  {
                   "src/apprt/win32/ActivityMonitor.zig":  "5cf09fde34443835e65d9a2404dd5ab657fb74dd9b1d12862019996454b7a0d5",
-                  "test/win32/activity-monitor.ps1":  "f7d13354f2bbd54466d990ef958d014505b39d41cfd9ef6f88a2d59fee84a65c"
+                  "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310"
               }
 }

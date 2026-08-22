@@ -46,7 +46,7 @@ if (-not (Test-Path $ClientExe)) { $ClientExe = Join-Path $repo 'zig-out\bin\rem
 
 # Isolate the app's IPC endpoint; the debug agent is per-user (setup kills the
 # repo's agent, so the app starts a fresh one this run owns).
-$env:GHOZTTY_PIPE_SUFFIX = '-t534'
+$env:GHOZTTY_PIPE_SUFFIX = "-t534$PID"
 # The debug-only policy seams: notify after 4s continuously unattached, check
 # every 2s, and (never reached here) re-notify the same episode after 1h.
 $env:GHOZTTY_ORPHAN_NOTIFY_AFTER_MS = '4000'

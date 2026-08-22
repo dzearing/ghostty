@@ -55,7 +55,7 @@ if (-not (Test-Path $Exe)) { $Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 
 # Isolate the IPC endpoint unconditionally - inherited by the app through
 # CreateProcessW, by every `& $Exe +...` below, and by the Start-Job child.
-$env:GHOZTTY_PIPE_SUFFIX = '-focusdefertest'
+$env:GHOZTTY_PIPE_SUFFIX = "-focusdefertest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

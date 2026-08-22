@@ -53,7 +53,7 @@ $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
-$env:GHOZTTY_PIPE_SUFFIX = '-titlefonttest'
+$env:GHOZTTY_PIPE_SUFFIX = "-titlefonttest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

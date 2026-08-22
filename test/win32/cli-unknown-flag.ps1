@@ -47,7 +47,7 @@ Assert-GhozttyIsolatedBuild -Exe $Exe | Out-Null
 # No verb here should ever reach a live instance; isolate the endpoint so
 # even the ones that would dial (them failing later is not what's asserted)
 # cannot touch the user's session.
-$env:GHOZTTY_PIPE_SUFFIX = '-t489flags'
+$env:GHOZTTY_PIPE_SUFFIX = "-t489flags$PID"
 $tmp = Join-Path $env:TEMP "ghoztty-cli-unknown-flag-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
 

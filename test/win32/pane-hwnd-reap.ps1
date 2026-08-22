@@ -46,7 +46,7 @@ $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 
-$env:GHOZTTY_PIPE_SUFFIX = '-panereap'
+$env:GHOZTTY_PIPE_SUFFIX = "-panereap$PID"
 $errlog = Join-Path $env:TEMP 'ghoztty-pane-reap-stderr.log'
 $tmp = Join-Path $env:TEMP "ghoztty-t681-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null

@@ -143,7 +143,7 @@ $saved = @{ lad = $env:LOCALAPPDATA; bin = $env:GHOSTTY_LOCAL_AGENT_BIN; pipe = 
 New-Item -ItemType Directory -Force (Join-Path $root 'state\ghoztty\local-agent-debug') | Out-Null
 $env:LOCALAPPDATA = Join-Path $root 'state'
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
-$env:GHOZTTY_PIPE_SUFFIX = '-tabtip'
+$env:GHOZTTY_PIPE_SUFFIX = "-tabtip$PID"
 
 Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive

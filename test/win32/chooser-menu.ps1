@@ -69,7 +69,7 @@ $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 # Isolate the IPC endpoint (inherited through CreateProcessW): an instance
 # answering the shared pipe would let another run's windows into this one.
-$env:GHOZTTY_PIPE_SUFFIX = '-cmenutest'
+$env:GHOZTTY_PIPE_SUFFIX = "-cmenutest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

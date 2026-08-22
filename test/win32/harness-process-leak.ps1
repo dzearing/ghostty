@@ -99,7 +99,7 @@ Copy-Item -LiteralPath $exe -Destination $bExe -Force
 
 $savedLocal = $env:LOCALAPPDATA
 $savedSuffix = $env:GHOZTTY_PIPE_SUFFIX
-$env:GHOZTTY_PIPE_SUFFIX = '-t199leak'
+$env:GHOZTTY_PIPE_SUFFIX = "-t199leak$PID"
 $env:LOCALAPPDATA = $bLocal
 Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive

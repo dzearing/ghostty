@@ -49,7 +49,7 @@ $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if ($ExePath) { $exe = $ExePath }
 if (-not (Test-Path $exe)) { Write-Host "SETUP FAIL: no exe at $exe"; exit 1 }
 
-$env:GHOZTTY_PIPE_SUFFIX = '-desktopspike'
+$env:GHOZTTY_PIPE_SUFFIX = "-desktopspike$PID"
 
 $script:pass = 0
 $script:fail = 0

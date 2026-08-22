@@ -30,7 +30,7 @@ $tmp = Join-Path $env:TEMP "ghoztty-t148-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
 # Isolate the IPC endpoint (inherited through CreateProcessW) so this run's
 # +verbs reach THIS instance and not whatever answers the shared pipe.
-$env:GHOZTTY_PIPE_SUFFIX = '-t148'
+$env:GHOZTTY_PIPE_SUFFIX = "-t148$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

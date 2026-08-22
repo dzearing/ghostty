@@ -235,7 +235,7 @@ Assert ($badRow.Count -eq 1 -and -not $badRow[0].Declared) `
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 $savedPipe = $env:GHOZTTY_PIPE_SUFFIX
-$env:GHOZTTY_PIPE_SUFFIX = '-t158flag'
+$env:GHOZTTY_PIPE_SUFFIX = "-t158flag$PID"
 
 Stop-RepoInstances
 $tmp = Join-Path $root 'app'

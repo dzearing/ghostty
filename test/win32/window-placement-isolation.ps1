@@ -41,7 +41,7 @@ if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 # Isolate the IPC endpoint (inherited through CreateProcessW) so a launch can
 # never find - or forward to - the user's instance.
-$env:GHOZTTY_PIPE_SUFFIX = '-t267placement'
+$env:GHOZTTY_PIPE_SUFFIX = "-t267placement$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')

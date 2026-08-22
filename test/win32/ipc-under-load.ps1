@@ -30,7 +30,7 @@ if ($newest -and $newest.FullName -ne (Resolve-Path $exe).Path -and
     Write-Host ("WARNING: grading $exe ($((Get-Item $exe).LastWriteTime)) but " +
         "$($newest.FullName) is NEWER ($($newest.LastWriteTime)) -- stale target?") -ForegroundColor Yellow
 }
-$env:GHOZTTY_PIPE_SUFFIX = '-ipcload'
+$env:GHOZTTY_PIPE_SUFFIX = "-ipcload$PID"
 
 $script:pass = 0
 $script:fail = 0

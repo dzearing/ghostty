@@ -378,6 +378,23 @@ and a *reasonless* marker is itself a finding so it cannot become a rubber stamp
 Acceptance: `test\win32\cleanslate-audit.ps1`, whose `-TeethCheck` plants a real
 violator.
 
+**And the endpoint a script isolates onto is unique to the RUN** (T441, T352).
+`Set-GhozttyTestIsolation` is the preferred form and has always appended `$PID`;
+the hand-rolled half of the suite wrote `$env:GHOZTTY_PIPE_SUFFIX = '-vptest'`
+and 131 scripts pinned one endpoint for all time that way. That isolates the
+script from the user's terminal and from its neighbours, but not from its own
+previous run: an instance leaked by a run that died before its cleanup is still
+answering there with its windows and their `--target=` names registered, and
+`+new-window --target=<name>` is idempotent BY DESIGN — it FOCUSES a name it
+finds. The next run then grades last run's screen and passes. Keying the suffix
+on `$PID` closes that for every name the script registers, now and later, at one
+site per script — which is why the `--target=` names themselves were left alone
+rather than each given a run-unique prefix of their own. Exemption: a
+`# isolation: shared - <why>` marker for a script that genuinely needs an
+endpoint a second process names by hand, and a reasonless marker is itself a
+finding. Acceptance: `test\win32\isolation-meta.ps1` section C, with synthetic
+controls A6–A10 and a real-tree teeth check in T352's own validation.
+
 **And an oracle must read the same text wherever it runs** (T526, T531, T883).
 The audits above ask whether a run happened and whether it scored itself
 honestly. This one asks whether what it MEASURED was real. `2>&1` does not merge

@@ -24,6 +24,15 @@
 #                                 script whose verbs live in comments or
 #                                 fixtures only - say what protects it instead)
 #
+# Since T352 the claim also has to be unique to the RUN - section C. A suffix
+# that is a fixed literal isolates this script from the OTHER scripts and from
+# the user's terminal, but not from its own previous run: the instance that run
+# leaked is still answering on that endpoint with its `--target=` names
+# registered, and `+new-window --target=` FOCUSES a name it finds rather than
+# building the fixture again. `$PID` in the suffix is what closes it, and it
+# closes the whole class at one site per script instead of at every name the
+# script registers.
+#
 # This is a PRESENCE check on purpose. An execution-order check would need to
 # actually trace PowerShell, and a text-order check ("first verb line vs first
 # isolation line") was measured flagging ~13 correct scripts that define a
@@ -65,6 +74,55 @@ function Get-IsolationViolation([string]$Path) {
         if ($text -match $claim) { return $null }
     }
     return 'drives the CLI (+verb) with no isolation claim'
+}
+
+# T352: a claim is only worth what it isolates FROM. A hand-rolled suffix that
+# is a fixed string - `'-vptest'` - gives every run of that script the same
+# endpoint, so an instance leaked by a run that died before its cleanup is
+# still answering there, with its windows and its `--target=` names registered.
+# `+new-window --target=X` is idempotent by design, so the next run FOCUSES
+# that stale window instead of building its own fixture, and grades the
+# previous build. Two runs of one script on one box collide the same way.
+#
+# `Set-GhozttyTestIsolation` has always appended `$PID`; the hand-rolled half
+# of the suite (131 scripts as of this task) did not. This is the rule that
+# stops the fixed form coming back.
+#
+# WHAT COUNTS AS RUN-UNIQUE, per assignment:
+#   * the right-hand side mentions $PID
+#   * the right-hand side is a variable or expression, not a literal - the
+#     save/restore pairs (`= $savedPipe`) and the parameterised helpers
+#     (`= $Suffix`) resolve to whatever their caller chose, so the literal
+#     they came from is what gets judged, wherever it is written
+#   * `Set-GhozttyTestIsolation` with no literal assignment anywhere
+#   * `# isolation: shared - <why>` for a script that genuinely needs an
+#     endpoint a second process can name from a literal. The reason is
+#     required, for the same purpose it is required on a cleanslate exemption.
+$script:SuffixAssign = '\$env:GHOZTTY_PIPE_SUFFIX\s*=\s*([^\r\n]+)'
+
+function Get-SuffixUniquenessViolation([string]$Path) {
+    $text = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+    if ([string]::IsNullOrEmpty($text)) { return $null }
+    # The reason has to be ON the marker line: `\s` matches a newline in a
+    # -Raw read, so a `\s*\S` tail would happily accept the next line of code
+    # as the justification and turn the marker into a rubber stamp.
+    if ($text -match '#[^\S\r\n]*isolation:[^\S\r\n]*shared[^\S\r\n]*-[^\S\r\n]*\S') { return $null }
+
+    $fixed = @()
+    foreach ($line in ($text -split "`r?`n")) {
+        # A commented-out assignment documents; it does not aim anything.
+        if ($line -match '^\s*#') { continue }
+        if ($line -notmatch $script:SuffixAssign) { continue }
+        $rhs = $Matches[1].Trim()
+        if ($rhs -match '\$PID') { continue }
+        # Only a bare quoted literal is judged here. Anything else defers to a
+        # value chosen elsewhere, and that site is judged on its own line.
+        if ($rhs -match "^'([^']*)'" -or $rhs -match '^"([^"$]*)"') {
+            $fixed += $Matches[1]
+        }
+    }
+    if ($fixed.Count -eq 0) { return $null }
+    return "pins a FIXED pipe suffix ($($fixed -join ', ')) - a leaked instance from an earlier run answers there"
 }
 
 # ---------------------------------------------------------------------------
@@ -112,6 +170,49 @@ try {
     )
     Assert 'A5 a verb-free script needs no claim' `
         ($null -eq (Get-IsolationViolation $quiet))
+
+    # T352: the run-uniqueness half. The same fixture that satisfies A2 must
+    # FAIL here - a claim that pins one endpoint forever is exactly the shape
+    # this rule exists to catch, and A2 passing on it is why the two checks
+    # are separate rather than one.
+    Assert 'A6 a FIXED hand-rolled suffix is flagged as not run-unique' `
+        ($null -ne (Get-SuffixUniquenessViolation $suffixed))
+
+    $unique = Join-Path $fixDir 'unique.ps1'
+    Set-Content -LiteralPath $unique -Encoding ASCII -Value @(
+        '$env:GHOZTTY_PIPE_SUFFIX = "-fixture$PID"',
+        '& $exe +list --json'
+    )
+    Assert 'A7 a $PID-keyed suffix passes' `
+        ($null -eq (Get-SuffixUniquenessViolation $unique))
+
+    $restore = Join-Path $fixDir 'restore.ps1'
+    Set-Content -LiteralPath $restore -Encoding ASCII -Value @(
+        '$saved = $env:GHOZTTY_PIPE_SUFFIX',
+        '[void](Set-GhozttyTestIsolation -Tag ''fixture'')',
+        '& $exe +list --json',
+        '$env:GHOZTTY_PIPE_SUFFIX = $saved'
+    )
+    Assert 'A8 a save/restore pair is not a pinned suffix' `
+        ($null -eq (Get-SuffixUniquenessViolation $restore))
+
+    $shared = Join-Path $fixDir 'shared.ps1'
+    Set-Content -LiteralPath $shared -Encoding ASCII -Value @(
+        '# isolation: shared - a second process names this endpoint by hand',
+        '$env:GHOZTTY_PIPE_SUFFIX = "-fixture"',
+        '& $exe +list --json'
+    )
+    Assert 'A9 an explicit isolation: shared marker counts' `
+        ($null -eq (Get-SuffixUniquenessViolation $shared))
+
+    $stamp = Join-Path $fixDir 'stamp.ps1'
+    Set-Content -LiteralPath $stamp -Encoding ASCII -Value @(
+        '# isolation: shared -',
+        '$env:GHOZTTY_PIPE_SUFFIX = "-fixture"',
+        '& $exe +list --json'
+    )
+    Assert 'A10 an EMPTY shared reason is still a violation' `
+        ($null -ne (Get-SuffixUniquenessViolation $stamp))
 } finally {
     Remove-Item -Recurse -Force $fixDir -ErrorAction SilentlyContinue
 }
@@ -133,6 +234,18 @@ foreach ($s in $scripts) {
 foreach ($v in $violations) { "  VIOLATION $v" }
 Assert 'B2 every script that drives the CLI claims a private endpoint' `
     ($violations.Count -eq 0) "($($violations.Count) violation(s))"
+
+# ---------------------------------------------------------------------------
+"== C: and that endpoint is unique to the RUN (T352)"
+# ---------------------------------------------------------------------------
+$pinned = @()
+foreach ($s in $scripts) {
+    $why = Get-SuffixUniquenessViolation $s.FullName
+    if ($null -ne $why) { $pinned += "$($s.Name): $why" }
+}
+foreach ($v in $pinned) { "  VIOLATION $v" }
+Assert 'C1 no script pins a fixed pipe suffix' `
+    ($pinned.Count -eq 0) "($($pinned.Count) violation(s))"
 
 # A clean green run stamps the covered files (T783) so scripts\guard-due.ps1
 # can answer "has this scan been run against the test tree as it now stands?".

@@ -294,7 +294,7 @@ function LatencyProbe([string]$pane, [string]$token, [int]$budgetMs) {
 
 if (-not (Test-Path $ExePath)) { Rep "ABORT: exe not found: $ExePath"; exit 1 }
 $exe = $ExePath
-$env:GHOZTTY_PIPE_SUFFIX = '-prof'
+$env:GHOZTTY_PIPE_SUFFIX = "-prof$PID"
 $env:GHOZTTY_PERF = '1'
 $realLocalAppData = $env:LOCALAPPDATA
 $env:LOCALAPPDATA = $fakeLocal

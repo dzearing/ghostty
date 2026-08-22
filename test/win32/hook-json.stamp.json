@@ -1,8 +1,8 @@
 {
     "guard":  "hook-json",
     "script":  "test/win32/hook-json.ps1",
-    "generated":  "2026-08-21T20:48:38-07:00",
-    "commit":  "8340e815a",
+    "generated":  "2026-08-21T22:10:35-07:00",
+    "commit":  "56e310ef0",
     "files":  {
                   "src/apprt/win32/assets/ghoztty/hooks/ghoztty-activity-state.sh":  "8a37b7305be4d2b14e9c12455bee30b155ea46ea93a88f431667257e124a05b5",
                   "src/apprt/win32/assets/ghoztty/hooks/ghoztty-banner.sh":  "ea3178b42df3acbf7f7068c4842cd770f10be23fd5e2935b97e62e9b4e1b47eb",
@@ -14,6 +14,6 @@
                   "src/apprt/win32/assets/ghoztty/upstream/skills/process-feedback/SKILL.md":  "5dde73c815ed6275e2c649b2e7872751c37374310719f27eb1da2ec87075b9ac",
                   "src/apprt/win32/GhosttyAssets.zig":  "0e51de1f7906565498d0c84c618b47136ce6a6f37107cebcd881c99441178fd7",
                   "src/cli/json.zig":  "3e9d5025af34529c2cc57d433306195a1c55b4c582dc385379ce9b6748e0f251",
-                  "test/win32/hook-json.ps1":  "869d04881070c006be3a1b608a8995e58f98fa7ce57085f6ae12bbf37e377257"
+                  "test/win32/hook-json.ps1":  "6ffe9bffa095bdeeb1d524990d3a7e695aa3d185596df39a7aeca44f7ed82119"
               }
 }

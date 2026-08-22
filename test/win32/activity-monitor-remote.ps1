@@ -98,7 +98,7 @@ $agentExe = Join-Path (Split-Path $exe -Parent) 'ghoztty-agent.exe'
 $errlog = Join-Path $env:TEMP 'ghoztty-activity-remote-stderr.log'
 $tmp = Join-Path $env:TEMP "ghoztty-activity-remote-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
-$env:GHOZTTY_PIPE_SUFFIX = '-activityremote'
+$env:GHOZTTY_PIPE_SUFFIX = "-activityremote$PID"
 $env:GHOSTTY_AGENT_LOCK = Join-Path $tmp 'agent.lock'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')

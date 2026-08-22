@@ -42,7 +42,7 @@ if ($ExePath) { $exe = $ExePath }
 
 # Isolate the IPC endpoint unconditionally - inherited by the app through
 # CreateProcessW and by every `& $exe +...` below.
-$env:GHOZTTY_PIPE_SUFFIX = '-wactest'
+$env:GHOZTTY_PIPE_SUFFIX = "-wactest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')

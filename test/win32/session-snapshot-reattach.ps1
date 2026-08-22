@@ -251,7 +251,7 @@ $savedPipe = $env:GHOZTTY_PIPE_SUFFIX
 # Isolate the IPC endpoint: every assertion is read back through +list /
 # +sessions / +read, and an instance answering the shared pipe would answer
 # them about somebody else's windows.
-$env:GHOZTTY_PIPE_SUFFIX = '-snapreattach'
+$env:GHOZTTY_PIPE_SUFFIX = "-snapreattach$PID"
 
 Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive

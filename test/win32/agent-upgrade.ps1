@@ -378,7 +378,7 @@ $env:GHOZTTY_AGENT_HANDOFF_INTERVAL_MS = $null
 # Isolate the IPC endpoint unconditionally: every `+list` / `+read` /
 # `+send-keys` below is an oracle, and an instance answering the shared pipe
 # would answer them about somebody else's windows.
-$env:GHOZTTY_PIPE_SUFFIX = '-agentupg'
+$env:GHOZTTY_PIPE_SUFFIX = "-agentupg$PID"
 
 # T1033: this script launches the app itself (Start-Process, not the test
 # desktop's helper), so it asks the pre-flight question the helper asks: are

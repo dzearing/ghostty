@@ -102,7 +102,7 @@ if ($ExePath) { $exe = $ExePath }
 
 # Isolate the IPC endpoint (inherited through CreateProcessW): an instance
 # answering the shared pipe would let another run's windows into this one.
-$env:GHOZTTY_PIPE_SUFFIX = '-oztest'
+$env:GHOZTTY_PIPE_SUFFIX = "-oztest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

@@ -66,7 +66,7 @@ if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 # Always isolated, not just under -ExePath: the IPC probes below (+list, +read)
 # must reach THIS run's app and nothing else on the box.
-$env:GHOZTTY_PIPE_SUFFIX = '-ctxmenutest'
+$env:GHOZTTY_PIPE_SUFFIX = "-ctxmenutest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

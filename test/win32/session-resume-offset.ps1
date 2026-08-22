@@ -214,7 +214,7 @@ $saved = @{
     supp = $env:GHOSTTY_AGENT_SUPPRESS_CAPS
     seam = $env:GHOZTTY_RESUME_COUNT_BYTES
 }
-$env:GHOZTTY_PIPE_SUFFIX = '-resumeoffset'
+$env:GHOZTTY_PIPE_SUFFIX = "-resumeoffset$PID"
 
 Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive

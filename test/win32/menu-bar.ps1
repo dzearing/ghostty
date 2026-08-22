@@ -71,7 +71,7 @@ if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 # Always isolated: every oracle below is an IPC probe (+list, +read,
 # +send-keys) and must reach THIS run's app, not whatever else is on the box.
-$env:GHOZTTY_PIPE_SUFFIX = '-menubartest'
+$env:GHOZTTY_PIPE_SUFFIX = "-menubartest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

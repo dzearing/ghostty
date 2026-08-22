@@ -209,7 +209,7 @@ window.addEventListener("load", function () {
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 $savedPipe = $env:GHOZTTY_PIPE_SUFFIX
-$env:GHOZTTY_PIPE_SUFFIX = '-vpopup'
+$env:GHOZTTY_PIPE_SUFFIX = "-vpopup$PID"
 
 Stop-RepoInstances
 New-Item -ItemType Directory -Force $root | Out-Null

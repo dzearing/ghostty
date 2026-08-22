@@ -51,7 +51,7 @@ if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 # Isolate the IPC endpoint (inherited through CreateProcessW): a launch that
 # found the user's instance on the shared pipe would forward and exit.
-$env:GHOZTTY_PIPE_SUFFIX = '-restoremaxtest'
+$env:GHOZTTY_PIPE_SUFFIX = "-restoremaxtest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\TestScore.ps1')

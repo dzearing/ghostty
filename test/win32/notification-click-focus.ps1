@@ -59,7 +59,7 @@ if (-not (Test-Path $Exe)) { $Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 
 # Isolate the IPC endpoint before any CLI call - inherited by the app through
 # CreateProcessW and by every `& $Exe +...` below.
-$env:GHOZTTY_PIPE_SUFFIX = '-notifclicktest'
+$env:GHOZTTY_PIPE_SUFFIX = "-notifclicktest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')

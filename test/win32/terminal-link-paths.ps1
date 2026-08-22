@@ -57,7 +57,7 @@ if (-not $Exe) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 
 # Isolate the IPC endpoint: inherited by the app through CreateProcessW and by
 # every `& $Exe +...` below, so this run cannot drive the user's terminal.
-$env:GHOZTTY_PIPE_SUFFIX = '-linkpath'
+$env:GHOZTTY_PIPE_SUFFIX = "-linkpath$PID"
 $errlog = Join-Path $env:TEMP 'ghoztty-linkpath-stderr.log'
 Remove-Item $errlog -ErrorAction SilentlyContinue
 

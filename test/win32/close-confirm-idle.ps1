@@ -78,7 +78,7 @@ if (-not $AgentExe) { $AgentExe = Join-Path (Split-Path $Exe -Parent) 'ghoztty-a
 
 # Isolate the IPC endpoint (inherited through CreateProcessW) so a stray
 # instance on the shared pipe cannot answer our +list.
-$env:GHOZTTY_PIPE_SUFFIX = '-t41'
+$env:GHOZTTY_PIPE_SUFFIX = "-t41$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

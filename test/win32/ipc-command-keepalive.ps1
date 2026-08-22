@@ -57,7 +57,7 @@ $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $tmp = Join-Path $env:TEMP "ghoztty-cmd-keepalive-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
-$env:GHOZTTY_PIPE_SUFFIX = '-cmdkeepalive'
+$env:GHOZTTY_PIPE_SUFFIX = "-cmdkeepalive$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')

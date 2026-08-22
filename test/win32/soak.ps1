@@ -1,6 +1,6 @@
 # Long-context soak harness (T53a/T53b): Claude-Code-like load against the
 # release-staging build, fully IPC-driven (no keyboard injection, safe to
-# run beside real work). Isolated on the '-soak' pipe suffix.
+# run beside real work). Isolated on a run-unique '-soak<pid>' pipe suffix.
 #
 # Load mix (all --shell=cmd panes in one named window):
 #   soak-stream : endless `type` of an 8MB file  -> sustained visible stream
@@ -59,12 +59,12 @@ public class SoakDrv {
 
 if (-not (Test-Path $ExePath)) { Rep "ABORT: exe not found: $ExePath"; exit 1 }
 $exe = $ExePath
-$env:GHOZTTY_PIPE_SUFFIX = '-soak'
+$env:GHOZTTY_PIPE_SUFFIX = "-soak$PID"
 $env:GHOZTTY_PERF = '1'
 $exeItem = Get-Item $exe
 Rep "=== ghoztty soak $stamp"
 Rep "exe: $exe ($(($exeItem).LastWriteTime), $(($exeItem).Length) bytes)"
-Rep "duration: $Minutes min; pipe suffix: -soak"
+Rep "duration: $Minutes min; pipe suffix: $env:GHOZTTY_PIPE_SUFFIX"
 
 # --- Load-generator assets ----------------------------------------------------
 $assetDir = Join-Path $env:TEMP 'ghoztty-soak'
@@ -97,12 +97,12 @@ while ($true) {
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 # T350: -AllowReleaseBuild, said out loud. This harness's SUBJECT is the release
 # build (its whole point is grading what ships), so it is the one caller that
-# legitimately runs an exe whose endpoints are not the -debug ones. The '-soak'
+# legitimately runs an exe whose endpoints are not the -debug ones. The run-unique
 # suffix above keeps its app endpoint off the user's; its kills are path-exact
 # to zig-out-release either way.
 Reset-GhozttyTestState -Exe $exe -SettleMs 500 -AllowReleaseBuild | Out-Null
 
-# Auto-launch flow: +new-window spawns the GUI (detached) when no -soak
+# Auto-launch flow: +new-window spawns the GUI (detached) when no soak
 # instance answers, and names the window.
 & $exe +new-window --target=soak --shell=cmd | Out-Null
 Start-Sleep -Seconds 3

@@ -63,7 +63,7 @@ if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 
 # Isolate the IPC endpoint (inherited through CreateProcessW).
-$env:GHOZTTY_PIPE_SUFFIX = '-fbwebtest'
+$env:GHOZTTY_PIPE_SUFFIX = "-fbwebtest$PID"
 # The DEFAULT surface, stated rather than assumed: this suite is about the web
 # composer, and a stale `richedit` left in the environment by another run would
 # turn every arm below into a confusing failure.

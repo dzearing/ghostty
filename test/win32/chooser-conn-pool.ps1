@@ -59,7 +59,7 @@ $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 $agentExe = Join-Path (Split-Path $Exe -Parent) 'ghoztty-agent.exe'
 
-$env:GHOZTTY_PIPE_SUFFIX = '-t461'
+$env:GHOZTTY_PIPE_SUFFIX = "-t461$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\FakeRelay.ps1')

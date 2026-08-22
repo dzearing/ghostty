@@ -156,7 +156,7 @@ function Get-RepoAgentArgs {
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 $savedPipe = $env:GHOZTTY_PIPE_SUFFIX
-$env:GHOZTTY_PIPE_SUFFIX = '-lateagent'
+$env:GHOZTTY_PIPE_SUFFIX = "-lateagent$PID"
 
 Stop-RepoInstances
 New-Item -ItemType Directory -Force $root | Out-Null

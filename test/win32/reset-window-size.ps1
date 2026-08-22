@@ -42,7 +42,7 @@ if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 # Isolate the IPC endpoint: the app inherits this through CreateProcessW, so
 # the user's own instance is never queried or disturbed.
-$env:GHOZTTY_PIPE_SUFFIX = '-resetsizetest'
+$env:GHOZTTY_PIPE_SUFFIX = "-resetsizetest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

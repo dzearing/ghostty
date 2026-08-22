@@ -89,7 +89,7 @@ if ($ExePath) { $exe = $ExePath }
 # Always isolated, not just under -ExePath: the fixtures below are built with
 # +split/+send-keys, and both ends inherit this (the CLI from this shell, the
 # GUI through the harness's CreateProcessW).
-$env:GHOZTTY_PIPE_SUFFIX = '-herotest'
+$env:GHOZTTY_PIPE_SUFFIX = "-herotest$PID"
 $errlog = Join-Path $env:TEMP 'ghoztty-hero-mode-stderr.log'
 Remove-Item $errlog -ErrorAction SilentlyContinue
 

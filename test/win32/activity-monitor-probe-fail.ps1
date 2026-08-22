@@ -55,7 +55,7 @@ $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if (-not (Test-Path $exe)) { $exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 if ($ExePath) { $exe = $ExePath }
 $errlog = Join-Path $env:TEMP 'ghoztty-activity-probefail-stderr.log'
-$env:GHOZTTY_PIPE_SUFFIX = '-activityprobefail'
+$env:GHOZTTY_PIPE_SUFFIX = "-activityprobefail$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

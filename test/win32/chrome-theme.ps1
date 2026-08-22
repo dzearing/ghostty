@@ -141,7 +141,7 @@ if ($ExePath) { $exe = $ExePath }
 $errlog = Join-Path $env:TEMP 'ghoztty-chrome-theme-stderr.log'
 $isDebugBuild = $null   # resolved from `+version` once the helpers are defined
 Remove-Item $errlog -ErrorAction SilentlyContinue
-$env:GHOZTTY_PIPE_SUFFIX = '-chromethemetest'
+$env:GHOZTTY_PIPE_SUFFIX = "-chromethemetest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 # `+version`'s build mode, which section A's expectation flips on. TestDesktop

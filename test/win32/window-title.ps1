@@ -48,7 +48,7 @@ $errlog = Join-Path $env:TEMP 'ghoztty-window-title-stderr.log'
 Remove-Item $errlog -ErrorAction SilentlyContinue
 # Isolate the IPC endpoint (inherited through CreateProcessW), so every
 # +list / +rename below is answered by THIS instance and never the user's.
-$env:GHOZTTY_PIPE_SUFFIX = '-windowtitletest'
+$env:GHOZTTY_PIPE_SUFFIX = "-windowtitletest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

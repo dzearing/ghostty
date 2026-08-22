@@ -37,7 +37,7 @@ if (-not $Exe) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 if (-not (Test-Path $Exe)) { $Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe' }
 
 # Isolate the IPC endpoint before any CLI call.
-$env:GHOZTTY_PIPE_SUFFIX = '-palettejump'
+$env:GHOZTTY_PIPE_SUFFIX = "-palettejump$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')

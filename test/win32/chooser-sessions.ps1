@@ -53,7 +53,7 @@ if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 $agentExe = Join-Path (Split-Path $Exe -Parent) 'ghoztty-agent.exe'
 
 # Isolate the IPC endpoint (inherited through CreateProcessW).
-$env:GHOZTTY_PIPE_SUFFIX = '-t318'
+$env:GHOZTTY_PIPE_SUFFIX = "-t318$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

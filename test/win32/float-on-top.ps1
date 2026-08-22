@@ -40,7 +40,7 @@ if ($ExePath) { $exe = $ExePath }
 
 # Isolate the IPC endpoint (inherited through CreateProcessW) so a real
 # instance on the shared pipe cannot answer for this run.
-$env:GHOZTTY_PIPE_SUFFIX = '-fottest'
+$env:GHOZTTY_PIPE_SUFFIX = "-fottest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 

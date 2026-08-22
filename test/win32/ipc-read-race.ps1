@@ -51,7 +51,7 @@ $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $tmp = Join-Path $env:TEMP "ghoztty-read-race-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
-$env:GHOZTTY_PIPE_SUFFIX = '-readracetest'
+$env:GHOZTTY_PIPE_SUFFIX = "-readracetest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
