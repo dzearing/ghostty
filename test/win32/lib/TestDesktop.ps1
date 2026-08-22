@@ -240,6 +240,10 @@ public class GhozttyTestDesktop {
     [DllImport("user32.dll", SetLastError = true)] static extern bool SetThreadDesktop(IntPtr h);
     [DllImport("user32.dll", SetLastError = true)] static extern bool CloseDesktop(IntPtr h);
     [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+    [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenThread(uint access, bool inherit, uint tid);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern uint SuspendThread(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern int ResumeThread(IntPtr h);
+    const uint THREAD_SUSPEND_RESUME = 0x0002;
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr h);
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -1191,6 +1195,9 @@ public class GhozttyTestDesktop {
                 for (int j = mods.Length - 1; j >= 0; j--)
                     PostMessageW(dst, WM_KEYUP, (IntPtr)mods[j], KeyLParam(mods[j], true));
 
+                // Hold the faked modifiers until the app has actually read
+                // them, rather than for a fixed 80ms - see PumpedTwice (T1104).
+                PumpedTwice(top, 5000);
                 ApplyMods(ks, mods, false);
                 SetKeyboardState(ks);
                 Thread.Sleep(80);
@@ -1206,8 +1213,13 @@ public class GhozttyTestDesktop {
     // BOTH threads merges the input queues, so one SetKeyboardState is
     // visible to Chromium (which classifies the key as an accelerator) and
     // to the app (which resolves the binding). The modifier state is held
-    // through a longer settle than SendChord's: the chord crosses two
-    // process boundaries before anyone reads it.
+    // until the app has drained and then some: the chord crosses two process
+    // boundaries before anyone reads it, and BOTH readers matter. Chromium
+    // classifies the key as an accelerator from the modifier state, and only
+    // then raises the event our UI thread resolves the binding on - so a
+    // modifier released too early loses the chord in one place or the other,
+    // and either way there is nothing to see but a shortcut that did nothing
+    // (T1104).
     public bool SendChordCross(IntPtr appTop, IntPtr target, ushort[] mods, ushort vk, int holdMs) {
         return (bool)Run(delegate() {
             uint apid; uint appTid = GetWindowThreadProcessId(appTop, out apid);
@@ -1236,12 +1248,84 @@ public class GhozttyTestDesktop {
                 for (int j = mods.Length - 1; j >= 0; j--)
                     PostMessageW(target, WM_KEYUP, (IntPtr)mods[j], KeyLParam(mods[j], true));
 
+                // The app pumps TWICE for one chord here (the modifier event,
+                // then the key), with a browser hop in between that this side
+                // cannot observe - hence: wait for a pumping app, then the
+                // same 400ms grace this helper always had.
+                PumpedTwice(appTop, 5000);
                 Thread.Sleep(400);
                 ApplyMods(ks, mods, false);
                 SetKeyboardState(ks);
                 Thread.Sleep(80);
                 return true;
             } finally {
+                if (crossAttached) AttachThreadInput(cur, targetTid, false);
+                AttachThreadInput(cur, appTid, false);
+            }
+        });
+    }
+
+    // T1104: the same chord, delivered to an app that is TOO BUSY to answer
+    // at once. The regression guard for the flake that filed the task.
+    //
+    // A viewer chord is resolved by two readers in turn - Chromium classifies
+    // the key as an accelerator, then our UI thread matches the binding - and
+    // both read the modifier state as they get to it. On a loaded box "as they
+    // get to it" can be a second later, and SendChordCross used to drop the
+    // faked modifiers on a fixed 400ms timer: past that, the chord resolves as
+    // a bare letter and opens nothing. A real finger does not work that way,
+    // which is why this is a harness bug and the shortcut is not broken.
+    //
+    // Modelled here by SUSPENDING the app's UI thread across the keystroke -
+    // Chromium blocks against it, exactly as it does against a busy app - and
+    // holding the modifiers down the whole time, as the user would. The
+    // release waits for the app to drain, so a healthy harness still lands the
+    // chord and a fixed-timer one does not.
+    public bool SendChordCrossStarved(IntPtr appTop, IntPtr target, ushort[] mods, ushort vk, int holdMs, int starveMs) {
+        return (bool)Run(delegate() {
+            uint apid; uint appTid = GetWindowThreadProcessId(appTop, out apid);
+            uint tpid; uint targetTid = GetWindowThreadProcessId(target, out tpid);
+            uint cur = GetCurrentThreadId();
+            IntPtr hThread = OpenThread(THREAD_SUSPEND_RESUME, false, appTid);
+            if (hThread == IntPtr.Zero) { LastError = "OpenThread(app ui thread) failed"; return false; }
+            if (!AttachThreadInput(cur, appTid, true)) { CloseHandle(hThread); LastError = "AttachThreadInput(app) failed"; return false; }
+            bool crossAttached = (targetTid != appTid) && AttachThreadInput(cur, targetTid, true);
+            bool suspended = false;
+            try {
+                SetActiveWindow(appTop);
+                SetFocus(target);
+                Thread.Sleep(60);
+
+                var ks = new byte[256];
+                GetKeyboardState(ks);
+                ApplyMods(ks, mods, true);
+                SetKeyboardState(ks);
+
+                if (SuspendThread(hThread) == 0xFFFFFFFF) { LastError = "SuspendThread(app ui thread) failed"; return false; }
+                suspended = true;
+
+                foreach (ushort m in mods) PostMessageW(target, WM_KEYDOWN, (IntPtr)m, KeyLParam(m, false));
+                PostMessageW(target, WM_KEYDOWN, (IntPtr)vk, KeyLParam(vk, false));
+                Thread.Sleep(holdMs);
+                PostMessageW(target, WM_KEYUP, (IntPtr)vk, KeyLParam(vk, true));
+                for (int j = mods.Length - 1; j >= 0; j--)
+                    PostMessageW(target, WM_KEYUP, (IntPtr)mods[j], KeyLParam(mods[j], true));
+
+                // The app cannot look yet, and the modifiers stay down while
+                // it cannot - that is the whole point of the case.
+                Thread.Sleep(starveMs);
+                ResumeThread(hThread);
+                suspended = false;
+
+                PumpedTwice(appTop, 5000);
+                Thread.Sleep(400);
+                ApplyMods(ks, mods, false);
+                SetKeyboardState(ks);
+                Thread.Sleep(80);
+                return true;
+            } finally {
+                if (suspended) ResumeThread(hThread);
+                CloseHandle(hThread);
                 if (crossAttached) AttachThreadInput(cur, targetTid, false);
                 AttachThreadInput(cur, appTid, false);
             }
@@ -1636,6 +1720,37 @@ public class GhozttyTestDesktop {
             }
             return posted;
         });
+    }
+
+    // Has `h`'s GUI thread caught up with the messages we just posted (T1104)?
+    //
+    // The chord helpers above fake the modifier state with SetKeyboardState,
+    // which is an OUT-OF-BAND poke: real hardware modifiers travel with the
+    // message stream, so a slow reader still sees the state that was in force
+    // when the key went down, while a faked one is simply gone the moment we
+    // clear it. Holding it for a fixed number of milliseconds therefore makes
+    // every modified chord a race against box load - and on a loaded box that
+    // race is lost. It cost viewer-panes.ps1 a red ctrl+t in a 242-script
+    // sweep that was green every other time (T1104), which reads as a broken
+    // keyboard shortcut and is not one.
+    //
+    // So the hold ends when the app has DEMONSTRABLY drained, not on a clock:
+    // two consecutive answered pings, because a single one can be answered in
+    // a gap between the messages we care about. A suspended or busy thread
+    // does not answer at all, and the modifiers stay down meanwhile - which is
+    // exactly what a real finger does.
+    static bool PumpedTwice(IntPtr h, int timeoutMs) {
+        int hits = 0;
+        int started = Environment.TickCount;
+        while (unchecked(Environment.TickCount - started) < timeoutMs) {
+            IntPtr res;
+            // SMTO_ABORTIFHUNG | SMTO_BLOCK
+            if (SendMessageTimeoutW(h, 0x0000, IntPtr.Zero, IntPtr.Zero, 0x0002 | 0x0001, 200, out res) != IntPtr.Zero) {
+                if (++hits >= 2) return true;
+            } else hits = 0;
+            Thread.Sleep(30);
+        }
+        return false;
     }
 
     // Does the window's GUI thread pump a WM_NULL within timeoutMs? The
@@ -2628,6 +2743,34 @@ function Send-TestViewerChord {
     $td = Resolve-TestDesktop $Desktop
     $mods = @($Modifiers | ForEach-Object { ConvertTo-TestVk $_ })
     return $td.SendChordCross($Window, $Target, [uint16[]]$mods, (ConvertTo-TestVk $Key), $HoldMs)
+}
+
+<#
+The same chord, pressed at an app too BUSY to answer at once (T1104).
+
+    Send-TestViewerChordStarved -Window $top -Target $chromiumChild -Modifiers ctrl -Key T
+
+Suspends the app's UI thread across the keystroke - Chromium blocks against it
+exactly as it does against a busy app - while holding the modifiers down the
+whole time, which is what a real finger does. The chord must still land. It is
+the regression guard for the harness bug that dropped faked modifiers on a
+fixed timer and made every modified chord a race against box load.
+
+Keep -StarveMs modest. The app is genuinely frozen for that long.
+#>
+function Send-TestViewerChordStarved {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [Parameter(Mandatory = $true)][IntPtr]$Target,
+        [Parameter(Mandatory = $true)][string]$Key,
+        [string[]]$Modifiers = @(),
+        [int]$HoldMs = 40,
+        [int]$StarveMs = 500,
+        $Desktop
+    )
+    $td = Resolve-TestDesktop $Desktop
+    $mods = @($Modifiers | ForEach-Object { ConvertTo-TestVk $_ })
+    return $td.SendChordCrossStarved($Window, $Target, [uint16[]]$mods, (ConvertTo-TestVk $Key), $HoldMs, $StarveMs)
 }
 
 # Type literal text into a terminal surface (WM_KEYDOWN only - the terminal

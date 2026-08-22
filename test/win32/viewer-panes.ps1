@@ -871,6 +871,80 @@ try {
         }
     }
 
+    # --- 11b2. T1104: a viewer chord pressed at an app that is BUSY ---------
+    # The chord above crosses two processes: Chromium classifies the key from
+    # the modifier state, and only then raises the event our UI thread matches
+    # the binding on. Both read that state as they get to it, and on a loaded
+    # box that can be a second after the keystroke.
+    #
+    # A real finger is still on the ctrl key by then, so the app is fine - but
+    # the HARNESS faked the modifiers with SetKeyboardState and dropped them on
+    # a fixed 400ms timer, which is not how hardware behaves. Past that timer
+    # the chord resolves as a bare 't' and opens nothing. That is what took
+    # `T394 ctrl+t from a viewer added a tab` red exactly once in a 242-script
+    # sweep and left it green on every quiet re-run (T1104): a shortcut that
+    # reads as broken and is not.
+    #
+    # Asserted here the way a user presses it: the app's UI thread is suspended
+    # across the keystroke and the modifiers are held down until it catches up.
+    # Its own fixture, so nothing here perturbs the tab arithmetic the T394
+    # section depends on.
+    #
+    # POSITIVE CONTROL first, on the same pane: the ordinary chord must work,
+    # or a starved chord that does nothing proves nothing (T216).
+    $topsBefore1104 = @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyWindow' | ForEach-Object { $_.Hwnd })
+    Invoke-Verb @('+new-window', '--target=t1104') | Out-Null
+    Assert ($null -ne (Wait-Win 't1104')) 'T1104 window created'
+    $t1104top = [IntPtr]::Zero
+    for ($t = 0; $t -lt 25 -and $t1104top -eq [IntPtr]::Zero; $t++) {
+        foreach ($w in @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyWindow')) {
+            if ($topsBefore1104 -notcontains $w.Hwnd) { $t1104top = [IntPtr][int64]$w.Hwnd }
+        }
+        if ($t1104top -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 200 }
+    }
+    Assert ($t1104top -ne [IntPtr]::Zero) 'T1104 found the new top-level window'
+
+    if ($t1104top -ne [IntPtr]::Zero) {
+        Invoke-Verb @('+split', '--target=t1104', '--name=t1104view', "--view=$blank") | Out-Null
+        Assert ($null -ne (Wait-LeafAnyTab 't1104' 't1104view')) 'T1104 viewer pane created'
+
+        $chrome1104 = [IntPtr]::Zero
+        $host1104 = [IntPtr]::Zero
+        for ($t = 0; $t -lt 50 -and $chrome1104 -eq [IntPtr]::Zero; $t++) {
+            foreach ($h in @(Get-TestChildWindows -Window $t1104top -Class 'GhozttyViewer')) {
+                if (-not $h.Visible) { continue }
+                $kids = @(Get-TestChildWindows -Window ([IntPtr][int64]$h.Hwnd) -Class '*')
+                $widget = @($kids | Where-Object { $_.Class -eq 'Chrome_WidgetWin_1' })
+                if ($widget.Count -ge 1) { $chrome1104 = [IntPtr][int64]$widget[0].Hwnd; $host1104 = [IntPtr][int64]$h.Hwnd }
+            }
+            if ($chrome1104 -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 200 }
+        }
+        Assert ($chrome1104 -ne [IntPtr]::Zero) 'T1104 found the Chromium input child under the viewer host'
+
+        if ($chrome1104 -ne [IntPtr]::Zero) {
+            Focus-TestWindow -Window $t1104top -Child $host1104 | Out-Null
+            Start-Sleep -Milliseconds 400
+            Assert (Send-TestViewerChord -Window $t1104top -Target $chrome1104 -Modifiers ctrl -Key T) 'T1104 CONTROL: ctrl+t injected at the viewer'
+            Assert (Wait-TabCount 't1104' 2) 'T1104 CONTROL: an unhurried ctrl+t from a viewer added a tab'
+
+            # And now the same chord at a busy app. The control's new tab took
+            # the foreground, so walk back to the viewer's tab and re-focus it
+            # before pressing.
+            Focus-TestWindow -Window $t1104top | Out-Null
+            Start-Sleep -Milliseconds 400
+            $s1104 = [IntPtr](Get-TestFocusedWindow -Window $t1104top)
+            Send-TestKeys -Window $t1104top -Target $s1104 -Modifiers ctrl,shift -Key 0xDB | Out-Null
+            Start-Sleep -Milliseconds 600
+            Focus-TestWindow -Window $t1104top -Child $host1104 | Out-Null
+            Start-Sleep -Milliseconds 400
+            Assert (Send-TestViewerChordStarved -Window $t1104top -Target $chrome1104 -Modifiers ctrl -Key T -StarveMs 1200) 'T1104 ctrl+t injected at a viewer whose app is busy'
+            Assert (Wait-TabCount 't1104' 3) 'T1104 ctrl+t opened a tab even though the app was busy when the chord arrived'
+            Assert (-not ($app.Process -and $app.Process.HasExited)) 'T1104 no crash from a chord delivered to a starved UI thread'
+        }
+
+        Invoke-Verb @('+close', '--target=t1104') | Out-Null
+    }
+
     # --- 11c. T396: the three viewer palette entries -------------------------
     # The Mac palette carries "Viewer: Open File in Pane…", "Viewer: Open URL
     # in Pane…" and "Viewer: Open Browser Pane"; before T396 the win32 palette
