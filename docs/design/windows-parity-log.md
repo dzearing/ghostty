@@ -9,6 +9,43 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-21 - **T1079 - a side pane asked for from a script now opens beside
+  that script, even if you clicked another window while it worked.** The other
+  half of the anchoring feature the T1073 merge brought over: the CLI already
+  forwarded `$GHOZTTY_PANE_ID` as `--caller-pane=` on `+split` and `+rearrange`
+  (shared `src/`, so it shipped here the day the merge landed), and the app half
+  was macOS-only. The win32 server's argument parser ignores what it does not
+  recognize ON PURPOSE - that tolerance is the app<->CLI compatibility contract -
+  so the flag was read by nobody and Windows kept resolving the default anchor at
+  HANDLE time, which is whatever window is focused by then.
+
+  The rule now lives in `apprt.ipc.args.callerAnchorPane`, pure and unit tested
+  in both lanes, with liveness passed in as a callback the way the Swift twin
+  takes `isAlive`. `IpcHandlers.callerAnchorPaneView` is the live-registry half
+  and walks the registry ONCE (the lookup that decides `isAlive` hands the pane
+  back), and both `handleSplit` and `handleRearrange` fall to it before
+  `frontWindow`. `apprt.ipc.caller_pane_flag` is now an alias of the constant in
+  `args.zig`, so the spelling the CLI writes and the spelling the server reads
+  cannot drift apart.
+
+  The precedence is the interesting part and it is asserted end to end rather
+  than reasoned about: `test\win32\caller-anchor.ps1` builds two windows, proves
+  window B is the fallback (section B, which is also the fixture the rest is read
+  against), and then asks where each split went - the caller's window for a bare
+  `+split`, B for `--target=`, `--from-focused` and a caller pane that no longer
+  resolves, and a hard error for an explicit `--pane=` naming nothing. That last
+  pair is the whole reason the wire flag is not `--pane=`. `+rearrange` gets both
+  directions too: anchored at the caller it succeeds, and with a stale caller pane
+  it fails against the front window exactly as before. ALL PASS, 27 assertions;
+  `-NegativeControl` inverts the load-bearing claim and the run scores exactly 1
+  FAILURE, so the oracle discriminates rather than passing for free.
+
+  No guard-due row: following the `palette-jump` precedent, the pure rule rides
+  both floor lanes every run, and gating the harness on `IpcHandlers.zig` - which
+  moves for a hundred non-anchoring reasons - would be noise rather than cover.
+  Floor all four lanes PASS, P1-P3 ALL PASS, `docs/claude/cli.md`'s known-gap
+  note is gone. Filed nothing new; the gap this closed was already its own task.
+
 - 2026-08-21 - **T1073 (filed T1079) - the Windows branch is no longer behind
   main; 93 commits came across and the floor is green on the other side.** The
   first hard blocker `ship-readiness.ps1` names is gone: `behind` was 93 and is

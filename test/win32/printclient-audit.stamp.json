@@ -1,8 +1,8 @@
 {
     "guard":  "printclient-audit",
     "script":  "test/win32/printclient-audit.ps1",
-    "generated":  "2026-08-21T12:18:46-07:00",
-    "commit":  "1731fae83",
+    "generated":  "2026-08-21T17:44:02-07:00",
+    "commit":  "5bdde19e2",
     "files":  {
                   "src/apprt/win32/activity_actions.zig":  "9f5cfa4c1238fd023d5c8a1d80790ae21751be5f7389662e2fe1b790fef8ad63",
                   "src/apprt/win32/activity_borrow.zig":  "8be5e4ba3e61feeaf28f2d7027fbadb5607c7e5541562795e984c9dc4a2e43a7",
@@ -77,7 +77,7 @@
                   "src/apprt/win32/ipc_agent_integration.zig":  "df7de6466f6d5036d5725e22d8d3913a03081c0b249931518f4a41c3a9d4cf80",
                   "src/apprt/win32/ipc_capture.zig":  "0de50daf7a4053a6baa55be4c5e020f28b477ebfb61a3ad58e4462192d522ef3",
                   "src/apprt/win32/ipc_hover.zig":  "07bbf74a9a035867d9843abcdf41c7c968b561c5868d6821ea149e613eced8be",
-                  "src/apprt/win32/IpcHandlers.zig":  "a68adbfc7fb06ea97b5872f4acec7f82fd65addf6281c29deec4957bc5bbc79a",
+                  "src/apprt/win32/IpcHandlers.zig":  "d50a0102c05e772f2b058e97ac72101d888aae3223c42cef7ed7916260824b29",
                   "src/apprt/win32/IpcRegistry.zig":  "5ebe2322ff50416cd1b825989ab10e1d4563955f497a445e3e00ea7f4c42fef6",
                   "src/apprt/win32/IpcServer.zig":  "2d07c784b46762ef1205a8113f0fbc68d10ada6b06b907dd90b524204fcc0d56",
                   "src/apprt/win32/job_escape.zig":  "70efff6eb21a668cdd18673b8573d38e2d9c3d26e5426586bfbcfb68a4986647",

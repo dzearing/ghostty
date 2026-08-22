@@ -499,10 +499,12 @@ to focus.
   typo and stays a hard error.
 - One resolution site on the CLI side for both platforms:
   `apprt.ipc.seedCallerPane()` (`src/apprt/ipc.zig`), which inserts the flag
-  ahead of anything from `-e` on. The server side is
-  `IPCServer.callerAnchorPane` (Swift) on macOS. **The win32 server does not
-  consume it yet** (T1079) — it ignores the unknown argument, so a Windows
-  `+split` still anchors at the focused window.
+  ahead of anything from `-e` on. One on each server side too:
+  `IPCServer.callerAnchorPane` (Swift) on macOS, and
+  `apprt.ipc.args.callerAnchorPane` — the pure precedence rule, unit tested in
+  both zig lanes — behind `IpcHandlers.callerAnchorPaneView` on Windows (T1079).
+  Acceptance: `test/win32/caller-anchor.ps1`, which drives two windows and asks
+  where each split went.
 
 ### Instance addressability
 

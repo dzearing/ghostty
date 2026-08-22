@@ -1,8 +1,8 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-08-21T15:38:11-07:00",
-    "commit":  "5930e40bb",
+    "generated":  "2026-08-21T17:44:15-07:00",
+    "commit":  "5bdde19e2",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "e0889402c8e6399bc54df60f8bbaf400486049208cd9e9778729adede34f369d",
                   "test/win32/activity-monitor-dialed.ps1":  "3fdfd164a3565c9b770f09bb7295b4011df7e07646b60ab89210f90f2ba3ca64",
@@ -35,6 +35,7 @@
                   "test/win32/build-fresh-guard.ps1":  "e104706bfed3e0183b462abdf421b820556f5b1cb0552909c9d3c8e939870e65",
                   "test/win32/build-locked-artifact.ps1":  "967e0ef2237614607a527f72ee822cceab2b3f7b8134748a84595816b1947399",
                   "test/win32/build-mode-guard.ps1":  "68da44bcf771002979d272e3999f1d2c1d0f788a1a709d2f0284ee2144c226ce",
+                  "test/win32/caller-anchor.ps1":  "7a2a4f669e603e82e1db80fc2624bdd9556a80888b289266827f4d616083fdd0",
                   "test/win32/caption-bar.ps1":  "ddae2e813475b6dee854d8223a9b04db35bdb1cfc7f28f6a7df090f0101e86be",
                   "test/win32/chooser-close-chord.ps1":  "18ba99af87f048fd286aa345f183bff9b75a08bebb85eaeecb996553932be037",
                   "test/win32/chooser-conn-pool.ps1":  "044471f20f4970bd4fe7f72fa1bdc55d615b5b846dcc7d8a2e485cb2493168f1",

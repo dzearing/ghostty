@@ -739,7 +739,8 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
 
     // Resolve where to split: --pane names the exact surface; --target
     // names a window (or a pane, whose window is used) and splits at its
-    // active surface; neither → the foreground (else most recent) window.
+    // active surface; neither → the pane this command was invoked FROM
+    // (T1079), and failing that the foreground (else most recent) window.
     var window: *Window = undefined;
     var at: *PaneView = undefined;
     if (args.pane) |pane_name| {
@@ -762,6 +763,13 @@ fn handleSplit(ctx: Context, request: Request) Allocator.Error!?[]u8 {
         if (window.tab_count == 0)
             return try errorResponse(ctx.alloc, "target '{s}' has no surface to split", .{target});
         at = window.tab_active_pane[window.active_tab];
+    } else if (callerAnchorPaneView(app, args)) |caller| {
+        // No explicit anchor: split off the pane this command was invoked FROM
+        // rather than whatever window is focused by the time we get here. This
+        // lands on the same two locals the `--pane=` branch above sets, so a
+        // caller-anchored split IS the split an explicit one would be.
+        at = caller;
+        window = caller.parentWindow();
     } else {
         window = frontWindow(app) orelse
             return try errorResponse(ctx.alloc, "no window found for split", .{});
@@ -1041,8 +1049,16 @@ fn handleRearrange(ctx: Context, request: Request) Allocator.Error!?[]u8 {
             .window => |w| w,
             .pane => |pane| pane.parentWindow(),
         };
-    } else frontWindow(app) orelse
-        return try errorResponse(ctx.alloc, "no focused window found", .{});
+    } else if (callerAnchorPaneView(app, args)) |caller|
+        // T1079: "rearrange this window" means the caller's window, not
+        // whichever one the user has clicked into since. Same race as `+split`,
+        // same fix; the layout names panes that live in a particular window, so
+        // the focused-window guess made the command FAIL outright as often as
+        // it moved the wrong one.
+        caller.parentWindow()
+    else
+        frontWindow(app) orelse
+            return try errorResponse(ctx.alloc, "no focused window found", .{});
     if (window.tab_count == 0)
         return try errorResponse(ctx.alloc, "no focused window found", .{});
     const tab = window.active_tab;
@@ -1565,6 +1581,38 @@ fn frontWindow(app: *App) ?*Window {
         if (!window.is_quick_terminal) return window;
     }
     return null;
+}
+
+/// The pane a `+split`/`+rearrange` with no explicit anchor was invoked FROM
+/// (`--caller-pane=`, seeded from `$GHOZTTY_PANE_ID` by `apprt.ipc.seedCallerPane`),
+/// or null to keep the `frontWindow` fallback below it. T1079; the Mac twin is
+/// `IPCServer.callerAnchorPane`.
+///
+/// The precedence rule itself is pure and unit tested (`verb_args.callerAnchorPane`);
+/// this is only the live-registry half of it. Resolving to a WINDOW rather than a
+/// pane counts as unresolved: the caller pane is always a pane id, so a name that
+/// answers with a window is a registry collision, not the caller.
+fn callerAnchorPaneView(app: *App, args: VerbArgs) ?*PaneView {
+    // The lookup that decides `isAlive` also HANDS BACK the pane, so the
+    // registry is walked once rather than once to test and once to use.
+    const Resolver = struct {
+        app: *App,
+        found: ?*PaneView = null,
+
+        fn isAlive(self: *@This(), name: []const u8) bool {
+            const entry = self.app.ipcLookup(name) orelse return false;
+            switch (entry) {
+                .pane => |pane| {
+                    self.found = pane;
+                    return true;
+                },
+                .window => return false,
+            }
+        }
+    };
+    var resolver: Resolver = .{ .app = app };
+    _ = verb_args.callerAnchorPane(args, &resolver, Resolver.isAlive) orelse return null;
+    return resolver.found;
 }
 
 fn handleClose(ctx: Context, request: Request) Allocator.Error!?[]u8 {

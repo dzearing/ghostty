@@ -58,6 +58,10 @@ pub const VerbArgs = struct {
     /// keyboard "New Window"/split action on the focused window so the new
     /// frame inherits its remote host (T68, Mac §WP4 parity).
     from_focused: bool = false,
+    /// `--caller-pane=<id>` (T1079): the pane the command was invoked FROM,
+    /// forwarded from `$GHOZTTY_PANE_ID` by `apprt.ipc.seedCallerPane`. A
+    /// DEFAULT anchor only — see `callerAnchorPane` below for the whole rule.
+    caller_pane: ?[]const u8 = null,
     env: []const EnvVar = &.{},
     /// Trailing `-e` arguments: exec this argv directly, no shell wrap.
     e_args: []const [:0]const u8 = &.{},
@@ -109,6 +113,8 @@ pub fn parseVerbArgs(
             result.state = v;
         } else if (dropPrefix(arg, "--pane=")) |v| {
             result.pane = v;
+        } else if (dropPrefix(arg, caller_pane_flag)) |v| {
+            result.caller_pane = v;
         } else if (dropPrefix(arg, "--lines=")) |v| {
             result.lines = std.fmt.parseInt(i64, v, 10) catch null;
         } else if (dropPrefix(arg, "--layout=")) |v| {
@@ -149,6 +155,53 @@ pub fn parseVerbArgs(
     result.env = env.items;
     result.e_args = e_args.items;
     return result;
+}
+
+/// The flag `apprt.ipc.seedCallerPane` adds to carry `$GHOZTTY_PANE_ID` to the
+/// app (`apprt.ipc.caller_pane_flag` aliases this, so the spelling the CLI
+/// writes and the spelling both servers read cannot drift).
+///
+/// It is deliberately NOT `--pane=`: an explicit `--pane=` that names nothing
+/// is a typo and must stay a hard error, while an implicit caller pane that no
+/// longer resolves (the script's own pane was closed - ordinary) must fall
+/// back to the app's focused window. The server tells the two apart by which
+/// flag carried the name.
+pub const caller_pane_flag = "--caller-pane=";
+
+/// The pane a command with no explicit target should anchor at: the one it was
+/// invoked FROM, or null to keep the server's focused-window fallback.
+///
+/// This is the win32 twin of `IPCServer.callerAnchorPane` (Swift) and it is the
+/// ONE place the win32 server decides, as `apprt.ipc.seedCallerPane` is the ONE
+/// place the CLI produces the flag. It exists because the focused window is
+/// read on the app's side at HANDLE time: the user can switch windows between
+/// the CLI invocation and the app's turn, and an agent's command is
+/// asynchronous with respect to focus even when nobody touches anything.
+///
+/// Four ways to get null, all of them ordinary:
+///
+///   * The caller named an anchor of its own. `--target`, `--pane`, and
+///     `--from-focused` all say where the command should land, and each wins
+///     over the environment's default.
+///   * Nothing was forwarded - a plain non-Ghoztty shell, or a pane baked by
+///     an app/agent that predates the flag.
+///   * The value is empty, which is the same as absent.
+///   * The pane id no longer resolves (`isAlive`). A script outliving its own
+///     pane is normal, so this falls back rather than failing the command -
+///     which is exactly why the CLI sends `--caller-pane=` and not `--pane=`,
+///     where a name that resolves to nothing is a typo and a hard error.
+pub fn callerAnchorPane(
+    args: VerbArgs,
+    context: anytype,
+    comptime isAlive: fn (@TypeOf(context), []const u8) bool,
+) ?[]const u8 {
+    if (args.target != null) return null;
+    if (args.pane != null) return null;
+    if (args.from_focused) return null;
+    const caller = args.caller_pane orelse return null;
+    if (caller.len == 0) return null;
+    if (!isAlive(context, caller)) return null;
+    return caller;
 }
 
 pub fn dropPrefix(arg: []const u8, comptime prefix: []const u8) ?[]const u8 {
@@ -694,6 +747,72 @@ test "parseVerbArgs: full flag set" {
     try testing.expectEqualStrings("x=y", parsed.env[1].value);
     try testing.expectEqualStrings("{\"pane\":\"a\"}", parsed.layout.?);
     try testing.expectEqual(@as(?u32, 4242), parsed.pid);
+}
+
+test "parseVerbArgs: --caller-pane= is captured, not dropped as an unknown flag" {
+    var arena = testArena();
+    defer arena.deinit();
+
+    const parsed = try parseVerbArgs(arena.allocator(), &[_][]const u8{
+        "--direction=right", "--caller-pane=PANE-1",
+    });
+    try testing.expectEqualStrings("PANE-1", parsed.caller_pane.?);
+    // It is NOT --pane=: the two must stay distinguishable, because only one
+    // of them is a hard error when it resolves to nothing.
+    try testing.expect(parsed.pane == null);
+
+    const none = try parseVerbArgs(arena.allocator(), &[_][]const u8{"--direction=right"});
+    try testing.expect(none.caller_pane == null);
+}
+
+/// `isAlive` for the precedence tests: only "PANE-1" names a live pane.
+fn testPaneAlive(_: void, name: []const u8) bool {
+    return std.mem.eql(u8, name, "PANE-1");
+}
+
+test "callerAnchorPane: anchors at the invoking pane when the caller named none" {
+    const args = try parseVerbArgs(testing.allocator, &[_][]const u8{
+        "--direction=right", "--caller-pane=PANE-1",
+    });
+    try testing.expectEqualStrings(
+        "PANE-1",
+        callerAnchorPane(args, {}, testPaneAlive).?,
+    );
+}
+
+test "callerAnchorPane: an anchor the caller named explicitly wins" {
+    // --target, --pane and --from-focused are the caller saying WHERE it wants
+    // the command to land; the caller pane is only the default.
+    const with_target = try parseVerbArgs(testing.allocator, &[_][]const u8{
+        "--target=dev", "--caller-pane=PANE-1",
+    });
+    try testing.expect(callerAnchorPane(with_target, {}, testPaneAlive) == null);
+
+    const with_pane = try parseVerbArgs(testing.allocator, &[_][]const u8{
+        "--pane=logs", "--caller-pane=PANE-1",
+    });
+    try testing.expect(callerAnchorPane(with_pane, {}, testPaneAlive) == null);
+
+    const focused = try parseVerbArgs(testing.allocator, &[_][]const u8{
+        "--from-focused", "--caller-pane=PANE-1",
+    });
+    try testing.expect(callerAnchorPane(focused, {}, testPaneAlive) == null);
+}
+
+test "callerAnchorPane: an absent or empty pane id keeps the focused-window fallback" {
+    const absent = try parseVerbArgs(testing.allocator, &[_][]const u8{"--direction=right"});
+    try testing.expect(callerAnchorPane(absent, {}, testPaneAlive) == null);
+
+    const empty = try parseVerbArgs(testing.allocator, &[_][]const u8{"--caller-pane="});
+    try testing.expect(callerAnchorPane(empty, {}, testPaneAlive) == null);
+}
+
+test "callerAnchorPane: a caller pane that no longer resolves falls back" {
+    // A script outliving its own pane is ordinary, so this is a fallback and
+    // never an error - the difference from an explicit `--pane=` that names
+    // nothing, which stays a hard error in the handler.
+    const gone = try parseVerbArgs(testing.allocator, &[_][]const u8{"--caller-pane=PANE-GONE"});
+    try testing.expect(callerAnchorPane(gone, {}, testPaneAlive) == null);
 }
 
 test "droppedOnExistingTarget: names exactly the flags the caller passed" {

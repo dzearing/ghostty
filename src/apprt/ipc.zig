@@ -121,12 +121,16 @@ pub const pane_env = "GHOZTTY_PANE_ID";
 
 /// The flag `seedCallerPane` adds to carry `$GHOZTTY_PANE_ID` to the app.
 ///
+/// Aliased from `ipc/args.zig`, where the win32 server's parser and its
+/// `callerAnchorPane` rule live: the spelling the CLI WRITES and the spelling
+/// the server READS are then the same constant and cannot drift apart.
+///
 /// It is deliberately NOT `--pane=`: an explicit `--pane=` that names nothing
 /// is a typo and must stay a hard error, while an implicit caller pane that no
 /// longer resolves (the script's own pane was closed — ordinary) must fall
 /// back to the app's focused window. The server tells the two apart by which
 /// flag carried the name.
-pub const caller_pane_flag = "--caller-pane=";
+pub const caller_pane_flag = args.caller_pane_flag;
 
 /// Tell the app which pane a command was invoked FROM, so a command that
 /// anchors at a pane can default to the CALLER's rather than to whatever
