@@ -26,7 +26,21 @@
 #     synchronously at close time. The agent here listens on loopback, so the
 #     same Win32_Process oracle still works.
 #
-# Each section runs the same two cases in ONE window, busy first:
+#   Section D - `confirm-close-surface = always` (T357). The user asked for a
+#     confirmation unconditionally, so the shell's state is not a question we
+#     get to ask: `Surface.shellIsIdle` answers FALSE on that config before it
+#     ever looks at the process table, and an IDLE shell must still confirm.
+#   Section E - a READ-ONLY surface (T357). Same shape, different forced
+#     branch: a pane the user has marked read-only confirms whatever the
+#     process table says.
+#
+# Sections A-C prove a dialog can be ABSENT; D and E prove it is still there
+# where it was never the shell's call. That pairing is the point: until T41
+# every close confirmed, so a regression in the forced branches was invisible,
+# and now the absence of a dialog is a normal outcome - a bug that suppressed
+# `always` or read-only would look exactly like the feature working.
+#
+# Sections A-C run the same two cases in ONE window, busy first:
 #
 #   1. BUSY (`ping -n 100 127.0.0.1` running) + ctrl+w -> the confirm dialog
 #      appears. This is also the POSITIVE CONTROL for case 2: it proves the
@@ -138,6 +152,25 @@ function Get-DescendantPids([int]$Root) {
             $queue.Enqueue([int]$child.ProcessId)
         }
     }
+    return $out
+}
+
+# Every PTY HOLDER process this repo's build has running (T905/T909): the
+# per-session `ghoztty-agent.exe --pty-host` that owns the ConPTY, the shell and
+# its kill-on-close job. It is spawned to ESCAPE the agent's job, so depending on
+# which escape tier won it may not be an agent descendant at all - which is why
+# it is found by command line rather than by walking down from the agent.
+function Get-PtyHolderPids {
+    $out = @()
+    $zigOut = Join-Path $repo 'zig-out'
+    foreach ($p in (Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" -ErrorAction SilentlyContinue)) {
+        if (-not $p.ExecutablePath) { continue }
+        if (-not $p.ExecutablePath.StartsWith($zigOut, 'OrdinalIgnoreCase')) { continue }
+        if ($p.CommandLine -and $p.CommandLine -match '--pty-host') { $out += [int]$p.ProcessId }
+    }
+    # Plain `return`, never `return ,$out`: the comma form wraps an EMPTY array
+    # in a one-element array, so `@(Get-PtyHolderPids)` would count 1 holder
+    # when there are none.
     return $out
 }
 
@@ -405,13 +438,27 @@ function Invoke-RemoteSection([string]$Label) {
         $reported = Get-TargetPaneShellPid 't356rem'
         Assert ($reported -eq 0) "$Label the app reports no local pid for the remote pane (got $reported)"
 
-        # The shell itself, from the OS: the agent's own non-console descendant.
+        # The shell itself, from the OS. Since T905/T909 a session's ConPTY and
+        # shell live in a per-session HOLDER process (`ghoztty-agent.exe
+        # --pty-host`) that deliberately escapes the agent's job - and, on the
+        # shell-parent-hop escape tier, its parent link with it. So the agent's
+        # own descendants are no longer where the shell is, and this section
+        # spent a while reporting "the agent spawned a shell" as a failure over
+        # a session that had one (T1090). Both roots are searched, because the
+        # in-process fallback (`GHOZTTY_AGENT_PTY_HOLDER=0`, or a holder that
+        # would not start) still parents the shell to the agent.
         $shell = 0
         for ($t = 0; $t -lt 40 -and $shell -eq 0; $t++) {
-            foreach ($p in (Get-DescendantPids $agent.Id)) {
-                if ($p.Name -match '^(conhost|openconsole)\.exe$') { continue }
-                $shell = [int]$p.ProcessId
-                break
+            foreach ($root in (@($agent.Id) + @(Get-PtyHolderPids))) {
+                foreach ($p in (Get-DescendantPids $root)) {
+                    if ($p.Name -match '^(conhost|openconsole)\.exe$') { continue }
+                    # A holder reached through the agent is a waypoint, not the
+                    # shell; its own descendants are enumerated by this walk.
+                    if ($p.Name -eq 'ghoztty-agent.exe') { continue }
+                    $shell = [int]$p.ProcessId
+                    break
+                }
+                if ($shell -ne 0) { break }
             }
             if ($shell -eq 0) { Start-Sleep -Milliseconds 250 }
         }
@@ -475,6 +522,164 @@ function Invoke-RemoteSection([string]$Label) {
     }
 }
 
+# ---------------------------------------------------------------------------
+# The FORCED confirmations (T357): the two branches `Surface.shellIsIdle`
+# refuses to answer "idle" for, whatever the process table says.
+#
+# Both sections run an IDLE shell - descendant-free, asserted straight out of
+# Win32_Process exactly as A-C do - because idle is the ONLY state in which the
+# forced branch is the sole reason a dialog can appear. A busy shell confirms
+# anyway and would prove nothing about either branch.
+# ---------------------------------------------------------------------------
+
+# Launch, then assert the pane's shell is up and sitting at its prompt with
+# nothing under it. Returns the GUI handle plus the shell pid, or $null after
+# reporting the setup failure itself.
+function Start-IdleShellWindow([string]$Label, [string[]]$ExtraArgs) {
+    $g = Launch-Gui $ExtraArgs
+    if (-not $g) { Write-Host "SETUP FAIL: $Label GUI did not come up"; $script:fail++; return $null }
+    Assert (-not (Test-TestDesktopLeak -ProcessId $g.Pid)) "$Label window is NOT on the interactive desktop"
+
+    $shell = Get-PaneShellPid
+    if ($shell -le 0) {
+        Write-Host "SETUP FAIL: $Label +list reported no shell pid for the pane"
+        $script:fail++
+        Stop-Process -Id $g.Pid -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+    $proc = Get-CimInstance Win32_Process -Filter "ProcessId=$shell" -ErrorAction SilentlyContinue
+    Assert ($null -ne $proc) "$Label shell pid $shell names a live process"
+
+    # @(): a PS 5.1 function's array return unrolls, so one descendant would
+    # arrive as a bare object whose .Count is $null.
+    $idle = @(Wait-Descendants $shell $false 8000)
+    Assert ($idle.Count -eq 0) "$Label the shell is idle before the close ($($idle.Count) descendants)"
+    if ($idle.Count -ne 0) {
+        Write-Host "SETUP FAIL: $Label shell was never idle: $(($idle | ForEach-Object { $_.Name }) -join ',')"
+        Stop-Process -Id $g.Pid -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+    Start-Sleep -Milliseconds 500
+    $g.Shell = $shell
+    return $g
+}
+
+# One forced-confirm check: fire $Send, expect the dialog, escape it, and
+# require the window to survive. -NegativeControl inverts the verdict, so a
+# negative-control run fails here too.
+function Assert-ForcedConfirm([string]$Name, $Gui, [IntPtr]$Top, [scriptblock]$Send) {
+    & $Send
+    $dlg = Wait-Dialog $Gui.Pid $true 5000
+    if ($NegativeControl) {
+        Write-Host "NEGATIVE CONTROL: asserting the forced close does NOT confirm - this run MUST fail"
+        Assert ($dlg -eq [IntPtr]::Zero) "$Name (inverted)"
+    } else {
+        Assert ($dlg -ne [IntPtr]::Zero) $Name
+    }
+    if ($dlg -ne [IntPtr]::Zero) {
+        Send-TestControlKey -Control $dlg -Key Escape | Out-Null
+        $gone = Wait-Dialog $Gui.Pid $false
+        Assert ($gone -eq [IntPtr]::Zero) "$Name - Escape dismisses it"
+        Assert (Test-TestWindowVisible -Window $Top) "$Name - the window survives the cancelled close"
+    }
+}
+
+# Section D: `confirm-close-surface = always`.
+#
+# The discriminator is section A above rather than a toggle inside this
+# section: nothing in a running app can turn `always` off, and A is the same
+# harness, the same chord and the same idle oracle under the default config -
+# where the idle close does NOT confirm. The pair is the control.
+#
+# Both consumers of the branch are exercised, because they are separate call
+# sites: Ctrl+W is `Surface.close` -> `shellIsIdleNow`, and WM_CLOSE (the
+# title-bar X / Alt+F4 path) is `Window.confirmCloseIfNeeded`, which asks
+# `shellIsIdle` once per pane against one shared snapshot.
+function Invoke-AlwaysSection([string]$Label) {
+    Write-Host ""
+    Write-Host "== $Label =="
+
+    $g = Start-IdleShellWindow $Label @('--session-persistence=false', '--confirm-close-surface=always')
+    if (-not $g) { return }
+    try {
+        Assert-ForcedConfirm "$Label idle shell + confirm-close-surface=always: ctrl+w still confirms" `
+            $g $g.Top { Send-TestKeys -Window $g.Top -Target $g.Surface -Modifiers ctrl -Key W | Out-Null }
+
+        Assert-ForcedConfirm "$Label idle shell + confirm-close-surface=always: the window close still confirms" `
+            $g $g.Top { Send-TestWindowClose -Window $g.Top | Out-Null }
+    } finally {
+        Stop-Process -Id $g.Pid -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
+    }
+}
+
+# Section E: a READ-ONLY surface.
+#
+# Read-only is reachable here only through a binding action (there is no
+# default chord and no CLI verb), so the window is launched with one bound -
+# the same route test\win32\readonly-badge.ps1 uses.
+#
+# The badge (class GhozttyReadonlyBadge) is the independent oracle that the
+# toggle actually landed, and doubles as this section's positive control: it
+# proves chords reach this window, so "no dialog" later cannot be "no
+# keystroke". And unlike `always`, read-only CAN be turned back off - so the
+# section carries its own discriminator, closing the identical pane with the
+# identical chord and requiring the dialog to be gone.
+function Invoke-ReadonlySection([string]$Label) {
+    Write-Host ""
+    Write-Host "== $Label =="
+
+    $g = Start-IdleShellWindow $Label @('--session-persistence=false', '--keybind=ctrl+shift+o=toggle_readonly')
+    if (-not $g) { return }
+    $closed = $false
+    try {
+        $badges = @(Get-TestWindows -ProcessId $g.Pid -Class 'GhozttyReadonlyBadge' | Where-Object Visible)
+        Assert ($badges.Count -eq 0) "$Label no read-only badge before the toggle ($($badges.Count))"
+
+        Send-TestKeys -Window $g.Top -Target $g.Surface -Modifiers ctrl, shift -Key O | Out-Null
+        $badges = @()
+        for ($t = 0; $t -lt 30 -and $badges.Count -ne 1; $t++) {
+            Start-Sleep -Milliseconds 100
+            $badges = @(Get-TestWindows -ProcessId $g.Pid -Class 'GhozttyReadonlyBadge' | Where-Object Visible)
+        }
+        Assert ($badges.Count -eq 1) "$Label the pane is read-only (badge visible: $($badges.Count))"
+        if ($badges.Count -ne 1) { return }
+
+        Assert-ForcedConfirm "$Label idle read-only shell: ctrl+w still confirms" `
+            $g $g.Top { Send-TestKeys -Window $g.Top -Target $g.Surface -Modifiers ctrl -Key W | Out-Null }
+
+        # ------------------------------------------------- the discriminator
+        # Same pane, same chord, read-only turned back OFF: the dialog must be
+        # gone. Without this, a section that confirmed for some unrelated
+        # reason would read as green.
+        Send-TestKeys -Window $g.Top -Target $g.Surface -Modifiers ctrl, shift -Key O | Out-Null
+        $badges = @(Get-TestWindows -ProcessId $g.Pid -Class 'GhozttyReadonlyBadge' | Where-Object Visible)
+        for ($t = 0; $t -lt 30 -and $badges.Count -ne 0; $t++) {
+            Start-Sleep -Milliseconds 100
+            $badges = @(Get-TestWindows -ProcessId $g.Pid -Class 'GhozttyReadonlyBadge' | Where-Object Visible)
+        }
+        Assert ($badges.Count -eq 0) "$Label read-only turned back off (badge gone: $($badges.Count))"
+
+        $left = @(Get-DescendantPids $g.Shell)
+        Assert ($left.Count -eq 0) "$Label the shell is still idle for the control close ($($left.Count))"
+
+        Send-TestKeys -Window $g.Top -Target $g.Surface -Modifiers ctrl -Key W | Out-Null
+        $dlg = Wait-Dialog $g.Pid $true 2500
+        for ($t = 0; $t -lt 40 -and -not $closed; $t++) {
+            Start-Sleep -Milliseconds 100
+            $closed = (-not (Test-TestWindowExists -Window $g.Top)) -or (-not (Test-TestWindowVisible -Window $g.Top))
+        }
+        Assert ($dlg -eq [IntPtr]::Zero) "$Label no longer read-only: the idle close confirms nothing"
+        # No dialog plus an open window would be a swallowed chord, not a
+        # skipped confirmation.
+        Assert $closed "$Label no longer read-only: the pane closed without confirming"
+        if ($dlg -ne [IntPtr]::Zero) { Send-TestControlKey -Control $dlg -Key Escape | Out-Null }
+    } finally {
+        Stop-Process -Id $g.Pid -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 500
+    }
+}
+
 Stop-RepoProcesses @('ghoztty', 'ghoztty-agent')
 Reset-AgentState
 Start-TestForegroundWatch
@@ -488,6 +693,12 @@ try {
     Stop-RepoProcesses @('ghoztty', 'ghoztty-agent')
     Reset-AgentState
     Invoke-RemoteSection 'C/remote'
+    Stop-RepoProcesses @('ghoztty', 'ghoztty-agent')
+    Reset-AgentState
+    Invoke-AlwaysSection 'D/always'
+    Stop-RepoProcesses @('ghoztty')
+    Reset-AgentState
+    Invoke-ReadonlySection 'E/readonly'
 } finally {
     Stop-RepoProcesses @('ghoztty', 'ghoztty-agent')
     $fgSeen = @(Stop-TestForegroundWatch)
