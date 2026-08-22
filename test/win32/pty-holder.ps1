@@ -120,6 +120,39 @@ function Wait-SessionsFile([string]$root, [int]$timeoutSec = 40) {
     return $null
 }
 
+# The shell pid the APP reports for its pane, straight out of `+list --json`.
+#
+# With a holder in the picture this number has travelled the whole way: the
+# holder resolved it from the ConPTY child's HANDLE (`pty_host.zig` ->
+# `pty_child.reportedPid`), handed it to the agent over the control pipe, and
+# the agent published it to the app. A HANDLE reported as a pid survives every
+# other assertion in this file - `sessions.json` still records a holder, the
+# holder is still alive, the shell is still its child - and only shows up when
+# somebody asks what the reported number actually names (T355).
+function Get-PaneShellPid {
+    $json = & $Exe +list --json 2>$null | Out-String
+    if (-not $json) { return 0 }
+    try { $tree = $json | ConvertFrom-Json } catch { return 0 }
+    $root = if ($tree.PSObject.Properties.Name -contains 'data') { $tree.data } else { $tree }
+    foreach ($w in @($root.windows)) {
+        foreach ($t in @($w.tabs)) {
+            $stack = New-Object System.Collections.Stack
+            $stack.Push($t.splits)
+            while ($stack.Count -gt 0) {
+                $n = $stack.Pop()
+                if ($null -eq $n) { continue }
+                if ($n.type -eq 'leaf') {
+                    if ($n.terminal -and [int]$n.terminal.pid -gt 0) { return [int]$n.terminal.pid }
+                } else {
+                    if ($n.right) { $stack.Push($n.right) }
+                    if ($n.left) { $stack.Push($n.left) }
+                }
+            }
+        }
+    }
+    return 0
+}
+
 function Test-PipeConnects([string]$fullPipePath) {
     if (-not $fullPipePath) { return $false }
     # `\\.\pipe\NAME` -> NAME (NamedPipeClientStream takes the bare name).
@@ -229,7 +262,11 @@ try {
     # holder owns the ConPTY and the kill-on-close job over this subtree, which
     # is exactly why the agent's death cannot reach it.
     $holderKids = if ($on.HolderPid -gt 0) { Get-Children $on.HolderPid } else { @() }
-    $shell = @($holderKids | Where-Object { $_.Name -match '^(cmd|powershell|pwsh|conhost)\.exe$' } |
+    # `conhost.exe` is a child of the holder too (the ConPTY's own console host)
+    # and it is NOT the shell - leaving it in this alternation let A8 pass on a
+    # holder that had spawned nothing but a console host, and it is the process
+    # this list happened to return first on 2026-08-22.
+    $shell = @($holderKids | Where-Object { $_.Name -match '^(cmd|powershell|pwsh)\.exe$' } |
         Select-Object -First 1)
     $shellPid = if ($shell.Count -eq 1) { [int]$shell[0].ProcessId } else { 0 }
     Assert 'A8 the session shell is a child of the holder' ($shellPid -gt 0)
@@ -237,6 +274,23 @@ try {
     $agentKids = if ($on.AgentPid -ne 0) { Get-Children $on.AgentPid } else { @() }
     $agentShells = @($agentKids | Where-Object { $_.Name -match '^(cmd|powershell|pwsh)\.exe$' })
     Assert 'A9 the agent itself owns no session shell' ($agentShells.Count -eq 0)
+
+    # The number the user actually sees. A8 found the shell by PARENTAGE; this
+    # asks the app what pid it would print for the same pane, and the two must
+    # be the same process. On Windows the holder starts from a process HANDLE,
+    # whose integer value is not a pid in any process - the failure this pins is
+    # a reported pid that names nothing (T41) or that names the holder rather
+    # than the shell inside it.
+    $reportedPid = Get-PaneShellPid
+    Assert 'A10 +list --json reports a shell pid at all' ($reportedPid -gt 0)
+    $reportedProc = @(Get-CimInstance Win32_Process -Filter "ProcessId=$reportedPid" -ErrorAction SilentlyContinue)
+    Say ("  (reported pane pid $reportedPid; holder $($on.HolderPid); holder children: " +
+        (($holderKids | ForEach-Object { "$($_.Name)/$($_.ProcessId)" }) -join ', ') + ')')
+    Assert 'A10b the reported pid NAMES a live process' ($reportedProc.Count -eq 1)
+    Assert 'A10c the reported pid is a process INSIDE the holder, not the holder itself' (
+        $reportedProc.Count -eq 1 -and
+        $reportedPid -ne $on.HolderPid -and
+        [int]$reportedProc[0].ParentProcessId -eq $on.HolderPid)
 
     # ========================================================================
     Say "== B: kill the AGENT - the shell and its holder live on"

@@ -769,6 +769,32 @@ fn dirExists(path: []const u8) bool {
     return true;
 }
 
+/// The OS process id to report for a spawned child, given the `posix.pid_t` the
+/// spawn handed back.
+///
+/// On POSIX that value already IS the pid. On **Windows** `posix.pid_t` is the
+/// process HANDLE, and a handle's integer value is not a pid in any process:
+/// surfacing it made `+list --json`'s `pid`, `+sessions`' child pid and every
+/// ancestry walk against a session-persistence pane answer with a number that
+/// named nothing at all (T41 — the report read `shell pid 492` for a session
+/// whose shell was not 492, and 492 was a low system pid).
+///
+/// Every arm that publishes a child pid goes through here so the two cannot
+/// drift apart again: the in-process ConPTY child in `spawnFn` below, and the
+/// per-session holder in `pty_host.zig`, which is the Windows DEFAULT and so
+/// the one the user's `+sessions` output actually comes from.
+///
+/// A `GetProcessId` failure reports 0 — a value nothing mistakes for a live
+/// process — and says so in the log.
+pub fn reportedPid(child_pid: posix.pid_t) i64 {
+    if (is_windows) {
+        const id = win_job.GetProcessId(child_pid);
+        if (id == 0) log.warn("GetProcessId failed for spawned child; reporting 0", .{});
+        return @intCast(id);
+    }
+    return @intCast(child_pid);
+}
+
 /// Spawns a real pty-backed child per OPEN. The default shell is `$SHELL` (falling
 /// back to `/bin/sh`), invoked login+interactive (`-lic <command>`) when the OPEN
 /// carries a `command`, else just login+interactive (`-li`) for a plain shell —
@@ -828,17 +854,9 @@ pub const PtySpawner = struct {
         }
 
         const pc = try self.spawnChild(open);
-        // `Result.pid` is the child's OS process id. On POSIX `pc.pid` already is
-        // one; on Windows `posix.pid_t` is the process HANDLE, so ask the OS for
-        // the pid behind it. This used to surface the HANDLE's integer value,
-        // which is not a pid in any process — it made `+list --json`'s `pid`,
-        // `+sessions`' child pid, and every ancestry walk against a
-        // session-persistence pane answer with a number that names nothing (T41).
-        const pid_i64: i64 = if (is_windows) pid: {
-            const id = win_job.GetProcessId(pc.pid);
-            if (id == 0) log.warn("GetProcessId failed for spawned child; reporting 0", .{});
-            break :pid @intCast(id);
-        } else @intCast(pc.pid);
+        // `Result.pid` is the child's OS process id — see `reportedPid`, which is
+        // where the Windows HANDLE→pid conversion lives for every arm.
+        const pid_i64: i64 = reportedPid(pc.pid);
         // The PTY slave path (wp3): `Pty.getProcessInfo` resolves it per-OS
         // (macOS TIOCPTYGNAME / Linux ptsname_r, cached in the pty struct inside
         // the heap-owned PtyChild — stable until terminate) and returns null on
@@ -1594,6 +1612,103 @@ test "PtySpawner: the reported pid is a real process parented by the agent (T98)
     }
     try testing.expect(ppid != null);
     try testing.expectEqual(my_pid, ppid.?);
+}
+
+/// Test-only kernel32 surface for asking the OS, directly, whether a pid names a
+/// live process. Deliberately NOT the `proc.ProcSampler` table walk the T98 test
+/// uses: the sampler and the spawn read the same world through the same helper,
+/// and T355 is about asking an independent question.
+const test_win = if (is_windows) struct {
+    const DWORD = windows.DWORD;
+    const BOOL = windows.BOOL;
+    const HANDLE = windows.HANDLE;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
+    /// `GetExitCodeProcess` reports this while the process is still running.
+    const STILL_ACTIVE: DWORD = 259;
+
+    extern "kernel32" fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *DWORD) callconv(.winapi) BOOL;
+} else struct {};
+
+/// Does `pid` name a process that is alive right now? Asked of the OS with the
+/// cheapest per-platform primitive: `OpenProcess` + `GetExitCodeProcess` on
+/// Windows (an openable handle alone is not proof of life — a dead process
+/// object stays openable while anything still references it), `kill(pid, 0)` on
+/// POSIX.
+fn processIsLive(pid: i64) bool {
+    if (pid <= 0) return false;
+    if (is_windows) {
+        // A pid is a DWORD. A value that does not fit one cannot be a pid, and
+        // that is exactly the shape of a HANDLE reported as one on 64-bit.
+        if (pid > std.math.maxInt(windows.DWORD)) return false;
+        const h = test_win.OpenProcess(
+            test_win.PROCESS_QUERY_LIMITED_INFORMATION,
+            0,
+            @intCast(pid),
+        ) orelse return false;
+        defer windows.CloseHandle(h);
+        var code: windows.DWORD = 0;
+        if (test_win.GetExitCodeProcess(h, &code) == 0) return false;
+        return code == test_win.STILL_ACTIVE;
+    }
+    posix.kill(@intCast(pid), 0) catch return false;
+    return true;
+}
+
+test "reportedPid: a process HANDLE becomes the pid behind it, never the handle's own value (T355)" {
+    if (!is_windows) return error.SkipZigTest; // POSIX `pid_t` already IS the pid
+
+    const self_pid: i64 = @intCast(windows.GetCurrentProcessId());
+
+    // The pseudo handle is the case that CANNOT come out right by accident: its
+    // integer value is 0xFFFF_FFFF_FFFF_FFFF, which is not a pid on any Windows
+    // that has ever shipped. The pre-T41 conversion reported `@intFromPtr` of
+    // the handle, so it fails this line rather than merely being unlucky.
+    const pseudo = windows.GetCurrentProcess();
+    const pseudo_value: i64 = @bitCast(@as(u64, @intFromPtr(pseudo)));
+    try testing.expectEqual(self_pid, reportedPid(pseudo));
+    try testing.expect(reportedPid(pseudo) != pseudo_value);
+
+    // And an ordinary handle, the shape a spawn hands back.
+    const h = test_win.OpenProcess(
+        test_win.PROCESS_QUERY_LIMITED_INFORMATION,
+        0,
+        windows.GetCurrentProcessId(),
+    ) orelse return error.OpenProcessFailed;
+    defer windows.CloseHandle(h);
+    try testing.expectEqual(self_pid, reportedPid(h));
+    try testing.expect(processIsLive(reportedPid(h)));
+}
+
+test "PtySpawner: a real pty child's reported pid names a live process, not its handle (T355)" {
+    const alloc = testing.allocator;
+
+    var state = try PtySpawner.init(alloc);
+    defer state.deinit();
+
+    // Pin the IN-PROCESS ConPTY arm on Windows, where the holder is the default
+    // (T909): the conversion this test is about lives in `spawnFn`, and a
+    // holder-backed spawn reports the holder's shell pid instead. The holder's
+    // own arm goes through the same `reportedPid` (see `pty_host.zig`).
+    if (is_windows) try state.env.put(pty_holder_child.env_var, "0");
+
+    const sp = state.spawner();
+    const res = try sp.spawn(.{
+        .rows = 24,
+        .cols = 80,
+        // As in the roundtrip test above: `cat` is not a given on Windows, so
+        // drive the default interactive shell there.
+        .command = if (is_windows) null else "cat",
+    });
+    defer res.child.terminate();
+
+    try testing.expect(res.pid > 0);
+
+    // The assertion that was missing for years: ask the OS whether this number
+    // means anything. Every earlier check was "non-zero" or "it round-tripped",
+    // and the Windows arm shipped the process HANDLE through all of them.
+    try testing.expect(processIsLive(res.pid));
 }
 
 test "PtyChild: SIGNAL terminates the child via its process group" {

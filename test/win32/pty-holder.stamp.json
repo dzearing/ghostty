@@ -1,11 +1,11 @@
 {
     "guard":  "pty-holder",
     "script":  "test/win32/pty-holder.ps1",
-    "generated":  "2026-08-21T20:10:28-07:00",
-    "commit":  "8340e815a",
+    "generated":  "2026-08-22T00:33:46-07:00",
+    "commit":  "4aa3022fa",
     "files":  {
                   "src/remote/agent/pty_holder_child.zig":  "ebbb06e58599341272c6a3bb868bf499062caada88cf8ca42799ffcfbbf082d1",
                   "src/remote/agent/pty_host_spec.zig":  "c84ff5f96e9c73ea41a28de7e5f758550f00c9c0730e439a5e6ab56e99f3e5b2",
-                  "test/win32/pty-holder.ps1":  "449c33289b9ad5136f16359f85e8f1cd5bcbc7b3ff7cb7725afdce3264795e78"
+                  "test/win32/pty-holder.ps1":  "fb439d3945ab88b58031e421c65aa0e088ea9144bf5637195a1871ae68b84473"
               }
 }

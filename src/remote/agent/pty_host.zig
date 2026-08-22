@@ -104,8 +104,6 @@ const stub = struct {
 const win = struct {
     const windows = std.os.windows;
 
-    extern "kernel32" fn GetProcessId(Process: windows.HANDLE) callconv(.winapi) windows.DWORD;
-
     /// Shared holder state. One mutex/cond pair serializes the pty sink, the
     /// per-owner writer, the frame handler, and the exit poller.
     const State = struct {
@@ -170,7 +168,10 @@ const win = struct {
             .shell = opts.shell,
         });
         const child = pc.child();
-        const shell_pid: u32 = GetProcessId(pc.pid);
+        // One conversion for both Windows arms (T355): a `posix.pid_t` here is
+        // the process HANDLE, and the pid the owner is told must be the shell's
+        // real one — this is the number that reaches `+sessions` and `+list`.
+        const shell_pid: u32 = @intCast(pty_child.reportedPid(pc.pid));
 
         // Route ConPTY output into the replay ring. The zero-length EOF nudge
         // is dropped here; exit is observed by the poller's `tryWait`.

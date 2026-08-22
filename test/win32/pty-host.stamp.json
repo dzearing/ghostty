@@ -1,10 +1,10 @@
 {
     "guard":  "pty-host",
     "script":  "test/win32/pty-host.ps1",
-    "generated":  "2026-08-21T00:22:43-07:00",
-    "commit":  "a905a5363",
+    "generated":  "2026-08-22T00:32:45-07:00",
+    "commit":  "4aa3022fa",
     "files":  {
-                  "src/remote/agent/pty_host.zig":  "16f9993a3ad235e8818b978447ce0948a18324bdabcb8790a2e3514f3ad63f0a",
+                  "src/remote/agent/pty_host.zig":  "214837d7ae8d011aef3793dda0f9fa4ddb3e3178cf8ec27cb6cd7cdbf5c0d5cd",
                   "src/remote/agent/pty_host_proto.zig":  "5ac87489e712361e3dce7b83695385130be5c9fa258ccf94f10e86ac762bbbb2",
                   "src/remote/agent/pty_host_smoke.zig":  "cfbd2273a5a7ef6684feb142097dc000f523648fb436879805b2fc91eef36ad6",
                   "test/win32/pty-host.ps1":  "0f55c91a5950ac27a78bf29b90e3ea613948a586da2ca66dba17a5d8aa220333"
