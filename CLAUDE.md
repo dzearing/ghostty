@@ -81,13 +81,17 @@ What that means in practice:
   detect capability at runtime via the HELLO handshake, and route any breaking
   change through the mandatory update process — full contract in
   `docs/claude/sessions.md`.
-- **Ghoztty is a permanent hard fork of Ghostty, and `origin` is the only
-  remote.** Nothing is ever merged, cherry-picked, or rebased from
-  ghostty-org/ghostty, and nothing is ever pushed anywhere but
-  `github.com/dzearing/ghoztty`. The `upstream` remote was removed on
-  2026-08-22; do not re-add it, do not fetch it by URL, and do not file or
-  accept a task that depends on absorbing upstream. This is settled (D80,
-  reversed by user directive) - it is not a question a future turn may re-open.
+- **Code flows one way: from Ghostty into Ghoztty, never back.** Ghoztty is
+  **never** contributed upstream - no pull request against ghostty-org/ghostty,
+  no branch pushed there, no "upstreaming" of anything. `origin`
+  (`github.com/dzearing/ghoztty`) is the only place anything is ever pushed,
+  and the `upstream` remote is deliberately fetch-only (its push URL is set to
+  a non-repository so `git push upstream` fails outright). Do not re-enable it.
+  Pulling *from* upstream is allowed but is **the user's call, never the
+  loop's**: wait to be told, then land it in **our mac build first** (Ghostty
+  is mac-centric) and funnel it to the **windows port second** - at the first
+  step the windows port is not a consideration. Say "upstream pull"/"upstream
+  sync", not "merge-back", which reads backwards. Full contract: D80.
 - **Everything gets tests**: pure logic → unit tests in the `none` lane;
   behavior → an on-box acceptance script in `test/win32/`. The harness rules in
   `docs/claude/testing.md` are enforced by sweeps and are not optional.
