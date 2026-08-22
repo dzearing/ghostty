@@ -1,0 +1,10 @@
+{
+    "guard":  "test-client",
+    "script":  "test/win32/test-client-build.ps1",
+    "generated":  "2026-08-22T01:33:25-07:00",
+    "commit":  "f59d987c5",
+    "files":  {
+                  "test/win32/lib/TestClient.ps1":  "98b5449096d7103ec31d8eb19b2d0d84985c48fddc88a5871eeb641ec43091f8",
+                  "test/win32/test-client-build.ps1":  "4151eff034e0de3acacf2e176c97702fd757f2c83f863476a115da9dc34e7b2b"
+              }
+}

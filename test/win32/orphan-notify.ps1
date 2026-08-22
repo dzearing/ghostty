@@ -42,7 +42,11 @@ param(
 $ErrorActionPreference = 'Continue'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
-if (-not (Test-Path $ClientExe)) { $ClientExe = Join-Path $repo 'zig-out\bin\remote-test-client.exe' }
+# T359: remote-test-client is an on-demand build target, so a clean tree does
+# not have it. Resolve it here - and build it if it is missing - before any
+# isolation or launch, since this shells out to zig.
+. (Join-Path $PSScriptRoot 'lib\TestClient.ps1')
+$ClientExe = Resolve-RemoteTestClient -ClientExe $ClientExe -Repo $repo
 
 # Isolate the app's IPC endpoint; the debug agent is per-user (setup kills the
 # repo's agent, so the app starts a fresh one this run owns).
@@ -154,8 +158,9 @@ try {
     # --- 1. Attached sessions never notify (negative control) --------------
     Write-Host ''
     Write-Host '1. sessions held by panes stay quiet past the threshold'
-    Assert (Test-Path $ClientExe) 'remote-test-client exists in zig-out (zig build remote-test-client)'
-    if (-not (Test-Path $ClientExe)) { Write-Host 'SETUP FAIL: build remote-test-client first'; exit 1 }
+    $haveClient = ($ClientExe -and (Test-Path $ClientExe))
+    Assert $haveClient "remote-test-client available ($(Get-RemoteTestClientBuildCommand))"
+    if (-not $haveClient) { Write-Host "SETUP FAIL: $(Get-RemoteTestClientBuildCommand)"; exit 1 }
 
     $g = Launch-Gui $errlog @('--session-persistence=true')
     if (-not $g) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }

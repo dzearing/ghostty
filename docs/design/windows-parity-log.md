@@ -9,6 +9,34 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-22 - **T359 - the acceptance scripts that need an on-demand
+  binary now build it themselves.** `remote-test-client` - the only thing here
+  that speaks the agent protocol without a GUI - has its own `zig build
+  remote-test-client` step and is reached by nothing the default install step
+  builds. Six acceptance scripts need it, and every one opened by asserting the
+  file exists - so a tree that had only ever run `zig build -Dapp-runtime=win32`
+  met `FAIL remote-test-client exists`, which reads like the agent failed to
+  build rather than "this binary was never asked for", and two of the six then
+  `exit 1` on the spot - taking their remaining ~30 assertions with them.
+  `test\win32\lib\TestClient.ps1` is the resolve-or-build half of the pre-flight:
+  resolved early (before a script redirects `%LOCALAPPDATA%` or takes its
+  isolated endpoint, since it shells out to zig), Debug so the client matches the
+  `zig-out` around it, and with `ZIG_GLOBAL_CACHE_DIR` derived onto the repo's
+  drive. The build command has one spelling
+  (`Get-RemoteTestClientBuildCommand`) and every precondition message
+  interpolates it, because a precondition that cannot be acted on is half a
+  message. All six consumers are wired, including `agent-relay-session-e2e`,
+  which used to SKIP the whole e2e rather than build a binary that takes seconds.
+  `wp4-e2e` was checked for the same trap and has no consumers at all. Validated
+  by deleting the client: `agent-pipe` and `agent-user-env` both ALL PASS with no
+  manual build. New `test\win32\test-client-build.ps1` (ALL PASS, 21) deletes the
+  real client and makes the helper put it back, and re-derives the consumer list
+  from the tree so a seventh script cannot regress to a bare existence assert.
+  Surprise along the way: `chooser-orphan-badge` fails 4 of 16 on this box - and
+  so does the unmodified HEAD script, run twice as a control - whenever the
+  orphan renders anywhere but the row the chooser already has selected. Filed as
+  T1091.
+
 - 2026-08-21 - **T354 - the site's portable-ZIP link hands you a file again.**
   The landing page offered Windows users a "portable ZIP" that did not download
   one: the link dropped them on the release PAGE, because `win-v1.4.1` - the

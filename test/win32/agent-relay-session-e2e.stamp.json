@@ -1,8 +1,8 @@
 {
     "guard":  "agent-relay-session",
     "script":  "test/win32/agent-relay-session-e2e.ps1",
-    "generated":  "2026-08-21T16:49:43-07:00",
-    "commit":  "aaf6a2c1b",
+    "generated":  "2026-08-22T01:54:51-07:00",
+    "commit":  "f59d987c5",
     "files":  {
                   "src/cli/sessions.zig":  "d06a403598489ecd6102873080a53907a143c2e7b2f240848738ad211e9ae956",
                   "src/remote/agent/link_control.zig":  "fe127515d37ebba9bb9cb77af3565f03c1fcab8809effa1fb50d3cca1be53996",
@@ -10,7 +10,7 @@
                   "src/remote/agent/server.zig":  "11c72de04c3b21d114ae22c8a5a1237d06afe6c1382f2343905eca0718fb1966",
                   "src/remote/agent/session.zig":  "69f89ae926f515aad068cd1287ea90479d1e630d2eab6e9c133351baf259d512",
                   "src/remote/ws_client.zig":  "9d6bf5343afa0c3a934d110e7e0b0a505a867170f1de76bba0ff4f77dccf522b",
-                  "test/win32/agent-relay-session-e2e.ps1":  "5a40c5b4a283cf7ff4da83d212e03d31640bfddc64ac98801f856b32bfcb396f",
+                  "test/win32/agent-relay-session-e2e.ps1":  "4b716067360f927c9ab3d6983514756095b2a89437c4b73a816c67735d2d5c40",
                   "test/win32/lib/FakeAgentRelay.ps1":  "75beb6bffdb603e237860dc7bcbda4cfc41ace110f7f12b13777395244c232c7"
               }
 }

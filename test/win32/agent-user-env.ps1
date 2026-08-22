@@ -39,6 +39,13 @@ param(
 
 $ErrorActionPreference = 'Continue'
 . (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
+
+# T359: remote-test-client is an on-demand build target, so a tree that only
+# ever ran the normal build does not have it. Resolve (and build it if needed)
+# HERE, before %LOCALAPPDATA% is redirected below - this shells out to zig.
+. (Join-Path $PSScriptRoot 'lib\TestClient.ps1')
+$ClientExe = Resolve-RemoteTestClient -ClientExe $ClientExe
+
 $script:failures = 0
 $script:passes = 0
 
@@ -52,7 +59,7 @@ New-Item -ItemType Directory -Force $tmp | Out-Null
 
 "== 0: preconditions"
 Assert "agent exe exists" (Test-Path $AgentExe)
-Assert "remote-test-client exists" (Test-Path $ClientExe)
+Assert "remote-test-client available ($(Get-RemoteTestClientBuildCommand))" ($ClientExe -and (Test-Path $ClientExe))
 if ($script:failures -gt 0) { "$($script:failures) FAILURE(S)"; exit 1 }
 
 # ---------------------------------------------------------------------------

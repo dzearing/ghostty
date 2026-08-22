@@ -1109,6 +1109,25 @@ $GuardTable = @(
             'test\win32\parity-tasks-seat.ps1'
         )
     },
+    # The on-demand test client (T359). `remote-test-client` is built by its own
+    # zig step and by nothing the default build reaches, so six acceptance
+    # scripts produce it themselves through lib\TestClient.ps1. Nothing in the
+    # P1-P3 floor or the zig lanes runs a line of that helper, and its failure
+    # mode is quiet: the client is simply absent again, and the scripts that
+    # need it go back to failing on a precondition that reads like a product
+    # bug. The six consumers are deliberately NOT covered - they move for agent
+    # and session reasons this helper cannot see; section E re-derives the
+    # consumer list from the tree on every run, so a seventh is caught without
+    # a row here.
+    [pscustomobject]@{
+        Name   = 'test-client'
+        Script = 'test\win32\test-client-build.ps1'
+        Stamp  = 'test\win32\test-client-build.stamp.json'
+        Covers = @(
+            'test\win32\lib\TestClient.ps1',
+            'test\win32\test-client-build.ps1'
+        )
+    },
     # The dashboard (T505): its detached server keeps serving whatever code it
     # was started with, so a page or server edit that broke the app stays "up"
     # and is only ever met by the user. Nothing in the P1-P3 floor touches it.

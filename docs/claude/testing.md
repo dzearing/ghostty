@@ -532,6 +532,43 @@ Acceptance: `test\win32\build-fresh-guard.ps1`, which plays both sides in a
 throwaway fixture repo under `$TEMP` and keeps a positive control on the real
 `zig-out` exe.
 
+**And a harness that needs an ON-DEMAND binary builds it itself** (T359).
+`remote-test-client` — the only thing here that speaks the agent protocol
+without a GUI — has its own `zig build remote-test-client` step and is reached
+by nothing the default install step builds. Six acceptance scripts need it, and
+every one used to open by asserting the file exists, so a tree that had only
+ever run `zig build -Dapp-runtime=win32` met `FAIL remote-test-client exists`:
+a precondition that reads like the agent failed to build, and that two of the
+six then `exit 1` on, taking their remaining assertions with them.
+
+`test\win32\lib\TestClient.ps1` is the resolve-or-build half of the pre-flight:
+
+```powershell
+. (Join-Path $PSScriptRoot 'lib\TestClient.ps1')
+$ClientExe = Resolve-RemoteTestClient -ClientExe $ClientExe
+```
+
+- **Resolve EARLY**, next to the `CleanSlate`/`BuildMode` dot-sources, before
+  the script redirects `%LOCALAPPDATA%` or takes its isolated endpoint — this
+  shells out to zig, and a build launched from inside a live fixture is a
+  different experiment than the one the script is running.
+- **Debug, and `ZIG_GLOBAL_CACHE_DIR` derived onto the repo's drive**, so the
+  client matches the `zig-out` around it (T350) and the build cannot hit the
+  cross-drive assert (T243).
+- **A failure still names the command.** `Get-RemoteTestClientBuildCommand` is
+  the single spelling of `zig build remote-test-client -Doptimize=Debug`, and
+  every precondition message interpolates it: a precondition that cannot be
+  acted on is half a message. `-NoBuild` is the hatch for a run that must not
+  shell out.
+- **The default build stays lean.** The prerequisite is declared at the point
+  of use rather than bolted onto the install step — the same shape as the
+  delivery launcher building its own staging release instead of assuming one.
+
+Acceptance: `test\win32\test-client-build.ps1`, whose section D deletes the real
+client and makes the helper put it back, and whose section E re-derives the
+consumer list from the tree so a seventh script cannot regress to a bare
+existence assert.
+
 **And a script that can only run on the INPUT DESKTOP has to SAY so** (T272,
 widened by T276).
 T211–T218 moved the GUI suite onto a background desktop because the user's

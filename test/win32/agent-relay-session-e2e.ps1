@@ -62,8 +62,14 @@ if (-not (Test-Path $Exe)) {
 if (-not (Test-Path $AgentExe)) {
     Write-TestAssertedNothing -Label 'T887 RELAY SESSION E2E' -Reason "agent not found: $AgentExe (build with: zig build -Dapp-runtime=win32 -Doptimize=Debug)"
 }
-if (-not (Test-Path $ClientExe)) {
-    Write-TestAssertedNothing -Label 'T887 RELAY SESSION E2E' -Reason "client not found: $ClientExe (build with: zig build remote-test-client -Doptimize=Debug)"
+# T359: this one is an on-demand build target, so a tree that only ever ran the
+# normal build does not have it - and skipping the whole e2e for a binary we can
+# produce in seconds asserts nothing for no reason. Build it, and only skip if
+# that fails.
+. (Join-Path $PSScriptRoot 'lib\TestClient.ps1')
+$ClientExe = Resolve-RemoteTestClient -ClientExe $ClientExe
+if (-not $ClientExe) {
+    Write-TestAssertedNothing -Label 'T887 RELAY SESSION E2E' -Reason "client not found and could not be built (build with: $(Get-RemoteTestClientBuildCommand))"
 }
 
 # A release zig-out would derive the USER's agent pipe and state dir, so the

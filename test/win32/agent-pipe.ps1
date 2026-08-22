@@ -24,6 +24,12 @@ param(
 # test never wants the caller pane's endpoint.
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 
+# T359: remote-test-client is an on-demand build target, so a tree that only
+# ever ran the normal build does not have it. Resolve (and build it if needed)
+# HERE, before %LOCALAPPDATA% is redirected below - this shells out to zig.
+. (Join-Path $PSScriptRoot 'lib\TestClient.ps1')
+$ClientExe = Resolve-RemoteTestClient -ClientExe $ClientExe
+
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $tmp = Join-Path $env:TEMP "ghoztty-agent-pipe-$PID"
@@ -80,7 +86,12 @@ function Stop-TestProcs {
 
 Stop-TestProcs
 
-"== 0: start a ghoztty-agent in --listen-pipe mode"
+"== 0: preconditions"
+Assert "agent exe exists ($AgentExe)" (Test-Path $AgentExe)
+Assert "remote-test-client available ($(Get-RemoteTestClientBuildCommand))" ($ClientExe -and (Test-Path $ClientExe))
+if ($script:failures -gt 0) { "$($script:failures) FAILURE(S)"; exit 1 }
+
+"== 0b: start a ghoztty-agent in --listen-pipe mode"
 # --force-replace + a redirected heartbeat keep this hermetic: the pipe agent
 # shares the per-user single-instance guard with any relay agent, so force-replace
 # guarantees we win it, and the redirected heartbeat never touches real state.

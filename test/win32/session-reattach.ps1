@@ -80,6 +80,13 @@ $root = Join-Path $env:TEMP "ghoztty-session-reattach-$PID"
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\PipeBridge.ps1')  # Get-LocalAgentPipeName (T411)
 
+# T359: remote-test-client is an on-demand build target (F9d manufactures the
+# orphan session with it), so a clean tree does not have it. Resolve it here -
+# building it if it is missing - rather than 500 lines in, where a rebuild would
+# land in the middle of a live harness agent's run.
+. (Join-Path $PSScriptRoot 'lib\TestClient.ps1')
+$ClientExe = Resolve-RemoteTestClient -ClientExe $ClientExe
+
 # Write-Host, not the pipeline: a helper that both asserts and returns a value
 # would otherwise hand its caller @('  PASS ...', $realValue).
 function Assert($name, $cond) {
@@ -628,7 +635,7 @@ Assert "F9c restore log reports the zero case (0 live sessions unattached)" `
 # with no pane holding it - the exact shape T108 found on the release install
 # (4 live sessions, the layout references 3). `--hold` opens a session, holds
 # it briefly, then DETACHes; a detached session SURVIVES (only CLOSE ends one).
-Assert "F9d remote-test-client exists in zig-out (zig build remote-test-client)" (Test-Path $ClientExe)
+Assert "F9d remote-test-client available ($(Get-RemoteTestClientBuildCommand))" ($ClientExe -and (Test-Path $ClientExe))
 $pipe = "\\.\pipe\$(Get-LocalAgentPipeName)"
 $pc = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
     -ArgumentList "/c `"`"$ClientExe`" --pipe=$pipe --hold=1 > `"$tmp\orphan-client.txt`" 2>&1`""
