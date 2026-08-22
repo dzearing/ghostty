@@ -9,6 +9,27 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-21 - **T354 - the site's portable-ZIP link hands you a file again.**
+  The landing page offered Windows users a "portable ZIP" that did not download
+  one: the link dropped them on the release PAGE, because `win-v1.4.1` - the
+  only Windows release published when that card was written - shipped the MSI
+  alone. `win-v1.34.0` went out today carrying both artifacts, the release-time
+  rewrite (`dist/website/update-windows-links.py`, T39) promoted `win-zip-link`
+  to `.../releases/download/win-v1.34.0/Ghoztty-portable-1.34.0-x64.zip` on
+  gh-pages and in the in-repo mirror, and both live URLs answer 200 - so the
+  task's first check closed on its own, exactly as filed. Its second half is a
+  real edit. A6 in `test\win32\website-windows-download.ps1` *allowed* the
+  tag-page form on the grounds that a release page is never a 404; every
+  release since `win-v1.31.0` publishes the ZIP, so that allowance can no
+  longer protect anything and can only hide the one failure worth catching - a
+  rewrite that ran and did not promote the link. A6 now holds the ZIP to the
+  same bar A2/A3 hold the MSI to: a direct asset URL, tag version and filename
+  version agreeing (A6b), same `win-v` release as the MSI card (A6c), with an
+  explicit else-branch so an href that never matched FAILS rather than
+  comparing two empty strings and passing green. Harness ALL PASS under
+  `-RequireNetwork`; a negative control confirms the old tag-page href is now a
+  failure and a tag/filename mismatch trips A6b.
+
 - 2026-08-21 - **T351 - one way to put the box back to empty, instead of 133
   hand-written ones.** T248 hoisted the pre-fixture reset into
   `test\win32\lib\CleanSlate.ps1` and converted 19 scripts to it. Three weeks

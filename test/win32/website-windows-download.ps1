@@ -12,7 +12,8 @@
 #
 #   A  page shape: the Windows card sits beside the macOS card, its href is a
 #      real win-v<version> asset whose FILENAME carries the same version plus
-#      the arch, the portable ZIP alternative is offered, and the minimum-OS
+#      the arch, the portable ZIP alternative is offered as its own asset URL
+#      on that same release (T354), and the minimum-OS
 #      note is there, and the unsigned/SmartScreen caveat warns the user
 #      before they download rather than after the scary dialog (T349). Also
 #      that the card and the caveat reuse existing CSS classes rather than
@@ -115,12 +116,28 @@ $zipMatches = [regex]::Matches($html, 'id="win-zip-link"[^>]*?href="([^"]+)"')
 AssertEq 'A5 exactly one win-zip-link with an href' 1 $zipMatches.Count
 $zipHref = ''
 if ($zipMatches.Count -eq 1) { $zipHref = $zipMatches[0].Groups[1].Value }
-# The ZIP link is allowed to point at the release PAGE while a published
-# release predates the portable ZIP (win-v1.4.1 shipped the MSI only) -- the
-# release page always lists whatever assets exist, so it is never a 404. What
-# it may NOT do is point at a different release than the MSI card.
-Assert 'A6 zip link targets the same win-v release as the msi' `
-    ($winVersion -ne '' -and $zipHref -match ("win-v" + [regex]::Escape($winVersion) + '(/|$)'))
+# The ZIP link must be the portable-ZIP ASSET of the same win-v release as the
+# MSI card, with the tag version and the filename version agreeing -- the same
+# bar A2/A3 hold the MSI to. It used to be allowed to point at the release
+# PAGE instead, because win-v1.4.1 (MSI only) was the newest published Windows
+# release and a release page is never a 404. Every release since win-v1.31.0
+# publishes the ZIP and the live page has carried the direct asset URL since
+# win-v1.34.0, so as of T354 that allowance can only hide the one thing worth
+# catching: a rewrite that failed to promote the link.
+$zipRe = '^https://github\.com/dzearing/ghoztty/releases/download/win-v(\d+\.\d+\.\d+)/Ghoztty-portable-(\d+\.\d+\.\d+)-x64\.zip$'
+$zipOk = $zipHref -match $zipRe
+Assert 'A6 zip href is a portable-ZIP release asset URL' $zipOk
+if ($zipOk) {
+    # Captured before anything else runs: $Matches belongs to the last -match.
+    $zipTagVersion = $Matches[1]
+    $zipFileVersion = $Matches[2]
+    AssertEq 'A6b zip filename version matches its tag' $zipTagVersion $zipFileVersion
+    AssertEq 'A6c zip link targets the same win-v release as the msi' $winVersion $zipTagVersion
+} else {
+    # Not vacuously green: an href that never matched cannot agree with anything.
+    Assert 'A6b zip filename version matches its tag' $false
+    Assert 'A6c zip link targets the same win-v release as the msi' $false
+}
 Assert 'A7 zip link is offered as the portable alternative' `
     ($html -match 'id="win-zip-link"[^>]*>\s*portable ZIP\s*</a>')
 
