@@ -251,6 +251,26 @@ $GuardTable = @(
             'src\remote\agent\pty_host_spec.zig'
         )
     },
+    # Agent AUTOSTART + the reboot floor (T89h; row added by T1108): the only
+    # harness that executes the HKCU Run value the way winlogon does - raw
+    # CreateProcess on the recorded command line - and then asserts what comes
+    # back. A quoting slip in that value, or a Run-key name that stops matching
+    # the build lineage, is invisible to every lane and to every other script:
+    # they all start the agent themselves. The reboot half rides the same run,
+    # so `session_meta`/`materialize` changing what a restored session looks
+    # like makes it due too. T1108 is the case for the row - the script sat red
+    # from the T1094 sweep with nothing obliged to run it, and it was red
+    # because holders (T909) made its reboot proxy stop being one.
+    [pscustomobject]@{
+        Name   = 'agent-autostart'
+        Script = 'test\win32\agent-autostart.ps1'
+        Stamp  = 'test\win32\agent-autostart.stamp.json'
+        Covers = @(
+            'test\win32\agent-autostart.ps1',
+            'src\apprt\win32\LocalAgent.zig',
+            'src\remote\agent\session_meta.zig'
+        )
+    },
     # Holder RE-ADOPTION (T906): the only harness that measures the number that
     # separates adoption from the relaunch path agent-recovery.ps1 covers - the
     # SHELL PID is unchanged across a manager kill. It also owns the orphan

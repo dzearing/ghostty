@@ -1,0 +1,11 @@
+{
+    "guard":  "agent-autostart",
+    "script":  "test/win32/agent-autostart.ps1",
+    "generated":  "2026-08-22T15:28:00-07:00",
+    "commit":  "3067817a4",
+    "files":  {
+                  "src/apprt/win32/LocalAgent.zig":  "568c21aeed1eca082e7f095f1820b2b1c4a9e324407e3994df75d29260e06f1b",
+                  "src/remote/agent/session_meta.zig":  "e4ed838dea2d904f1c095c50fbb84b9f32c76441c39a0543896e5f092df6624b",
+                  "test/win32/agent-autostart.ps1":  "f72c424b834cfa79caac0a77486e5863d18fe3e95961681c1a111a7e9f26c73e"
+              }
+}

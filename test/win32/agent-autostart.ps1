@@ -9,11 +9,14 @@
 #      lineage-suffixed value `GhozttyAgent-debug` appears and carries the
 #      exact daemon command line (agent exe + --listen-pipe/--port-file/
 #      --sessions-file, all quoted).
-#   B. Reboot proxy: kill the GUI, then the agent (the reboot analog), then
-#      execute the Run-key command VERBATIM via Win32_Process.Create — the
-#      same raw-CreateProcess treatment Windows gives Run entries at sign-in.
-#      The agent must come back and list the pre-kill session as a DEAD
-#      tombstone (alive=false) materialized from sessions.json.
+#   B. Reboot proxy: kill the GUI, then the agent, then every surviving
+#      per-session holder (T1108 — a reboot takes all three; a holder outlives
+#      an agent BY DESIGN, and leaving it up turned this section into a
+#      re-adoption test), then execute the Run-key command VERBATIM via
+#      Win32_Process.Create — the same raw-CreateProcess treatment Windows
+#      gives Run entries at sign-in. The agent must come back and list the
+#      pre-kill session as a DEAD tombstone (alive=false) materialized from
+#      sessions.json.
 #   C. Debug gate: without the force hook a debug GUI writes NO Run value.
 #
 # Hermetic: per-run $env:LOCALAPPDATA + GHOSTTY_LOCAL_AGENT_BIN; only ever
@@ -191,6 +194,28 @@ Stop-Process -Id $oldAgentPid -Force -ErrorAction SilentlyContinue
 Start-Sleep -Milliseconds 800
 Assert "B2 agent dead after the proxy kill" ($null -eq (Get-Process -Id $oldAgentPid -ErrorAction SilentlyContinue))
 
+# T1108: a reboot takes EVERYTHING with it, per-session holders included. Since
+# T909 a session's ConPTY, shell and kill-on-close job live in a separate
+# `--pty-host` holder process that deliberately escapes the agent's job (T905),
+# so the two kills above leave it running with a live shell. That is the whole
+# point of holders - and it is exactly what a reboot is not. Leaving them up
+# made this section measure RE-ADOPTION (T906, covered end to end by
+# `test\win32\holder-adopt.ps1`) instead of the reboot floor it is named for:
+# the restarted agent dialed the surviving holder, picked the same shell back
+# up, and B6 saw a legitimately alive session where the proxy promised a
+# corpse. The agent is already dead, so every repo-path agent process still
+# standing here IS a holder.
+$agentPath = Get-GhozttyAgentPath -Exe $Exe
+function Count-Holders { @(Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
+        Where-Object { $_.ExecutablePath -eq $agentPath }).Count }
+# Counted BEFORE the kill so the section proves it is not vacuous: with holders
+# on there is one here, and a run reporting 0 is the tell that the mechanism
+# under test was switched off (GHOZTTY_AGENT_PTY_HOLDER) rather than exercised.
+$holdersBefore = Count-Holders
+[void](Stop-RepoGhoztty -Exe $Exe -AgentOnly -SettleMs 800)
+Assert "B2b surviving holders died too (a reboot leaves nothing running)" ((Count-Holders) -eq 0)
+"  holders alive after the agent kill, before the reboot proxy finished them: $holdersBefore"
+
 # Execute the Run-key command VERBATIM, the way winlogon/Explorer does at
 # sign-in: a raw command line through CreateProcess (Win32_Process.Create).
 $created = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = $runCmd }
@@ -249,6 +274,16 @@ else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }
 if ($null -ne $savedAutostart) { $env:GHOZTTY_AGENT_AUTOSTART = $savedAutostart }
 else { Remove-Item env:GHOZTTY_AGENT_AUTOSTART -ErrorAction SilentlyContinue }
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+
+# --- stamp (T783; row added by T1108) ---------------------------------------
+# Only from the bottom of a clean run, like every other stamping harness: a run
+# with a red section - or one that died before here - leaves the guard DUE,
+# which is the whole point of it.
+if ($script:failures -eq 0) {
+    $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard agent-autostart -Repo $repo 2>&1 | ForEach-Object { "  $_" }
+}
 
 ""
 if ($script:failures -eq 0) { "ALL PASS" ; exit 0 }
