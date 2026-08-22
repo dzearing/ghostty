@@ -71,6 +71,13 @@ function AssertEq($name, $expected, $actual) {
 . (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
 Register-HarnessGhozttyRoot -Root $root | Out-Null
 
+# T1098: this script is where the stray-modal problem was FOUND. Section E runs
+# the delivery over a deliberately non-PE agent, which is what the Windows loader
+# answers with a system-modal dialog - and on 2026-08-22 the script scored ALL
+# PASS (123 assertions) with that box sitting on the user's desktop. A modal is
+# invisible to every verdict a harness computes, so it has to be looked for.
+. (Join-Path $PSScriptRoot 'lib\ModalSweep.ps1')
+
 # ============================================================================
 "== A: reading and comparing the baked commit (pure)"
 # ============================================================================
@@ -362,6 +369,60 @@ Assert "B13 and it is reachable from HEAD, not some other branch's" `
 # Freshness of a SHIPPED artifact is enforced where the answer matters and the
 # tree is known clean: launch-upgrade's STALE STAGING gate, in section C below.
 
+# --- B14-B21: a file that is not a program is NEVER launched (T1098) ---------
+#
+# The probe's job is to read a binary's identity, and until 2026-08-22 it did
+# that by running it. On a file carrying an `.exe` name that is not a PE image
+# CreateProcess fails with ERROR_BAD_EXE_FORMAT and the Windows loader answers
+# with a SYSTEM-MODAL `Unsupported 16-Bit Application` box - on whatever desktop
+# the caller is on, waiting for a human to click OK. The delivery's own read-back
+# checks (T208, T281) walk exactly that path, and T525's morning refresh walks it
+# unattended at 5am on the user's own desktop.
+#
+# So the gate is a header read, and these arms pin all three halves of it: the
+# verdict, the reason, and - the one that would catch a regression to launching -
+# that answering takes no time at all.
+$peGood = Test-PortableExecutable -Path $Exe
+Assert "B14 a real binary passes the PE check" $peGood.Ok
+AssertEq "B15 with no complaint alongside it" '' $peGood.Why
+
+$fakeExe = Join-Path $root 'not-a-program.exe'
+Set-Content -LiteralPath $fakeExe -Encoding ascii -Value 'PREVIOUS-INSTALL-DO-NOT-TOUCH'
+$peBad = Test-PortableExecutable -Path $fakeExe
+Assert "B16 a text file named .exe fails the PE check" (-not $peBad.Ok)
+Assert "B17 and says it is not a Windows program" ($peBad.Why -match 'not a Windows program')
+
+$peSw = [System.Diagnostics.Stopwatch]::StartNew()
+$fakeInfo = Resolve-GhozttyExeCommit -Exe $fakeExe
+$peSw.Stop()
+AssertEq "B18 the exe probe yields no commit for it" '' $fakeInfo.Commit
+Assert "B19 and flags it as not-a-program rather than as an unread answer" ([bool]$fakeInfo.NotExecutable)
+# The whole point: nothing was started, so nothing can be waiting on a dialog.
+# A launch of a bad image costs seconds even when it does not block.
+Assert "B20 answering it costs no process launch (took $([int]$peSw.ElapsedMilliseconds)ms)" `
+    ($peSw.ElapsedMilliseconds -lt 2000)
+$fakeAgentInfo = Resolve-GhozttyAgentStamp -Exe $fakeExe
+Assert "B21 the agent probe refuses the same file for the same reason" `
+    ((-not $fakeAgentInfo.Stamp) -and [bool]$fakeAgentInfo.NotExecutable)
+
+# A half-copied binary: the MZ is there (it is the first 2 bytes of any download)
+# and everything the loader needs after it is not. This is the delivery accident
+# the gate is actually for, and the one a bare `MZ` test would wave through.
+$truncExe = Join-Path $root 'truncated.exe'
+$mzOnly = New-Object byte[] 128
+$mzOnly[0] = 0x4D; $mzOnly[1] = 0x5A
+[IO.File]::WriteAllBytes($truncExe, $mzOnly)
+$peTrunc = Test-PortableExecutable -Path $truncExe
+Assert "B22 a truncated image (MZ, no PE header) is rejected too" (-not $peTrunc.Ok)
+
+# And the other side of the gate: a `.cmd` is run by cmd.exe as a script and
+# never handed to the loader, so demanding a PE header there would reject
+# something that genuinely runs. B5/B6 above prove it still probes; this names
+# why it is allowed to.
+$muteAgain = Invoke-GhozttyVersionText -Exe $mute
+Assert "B23 a .cmd is still probed rather than rejected as not-a-PE" `
+    (-not [bool]$muteAgain.NotExecutable)
+
 # ============================================================================
 "== C: launch-upgrade.ps1 refuses a stale staging prefix"
 # ============================================================================
@@ -554,6 +615,11 @@ if (-not $haveAgent) {
     Assert "E1 the staged agent reports a stamp ('$stagedStamp')" `
         ($stagedStamp -match '^(dev|\d{8}-[0-9a-f]{7,40})$')
 
+    # T1098: what was on screen before this section, so the sweep at the end can
+    # name what THIS section raised rather than whatever the box already had up.
+    $eModalsBefore = @(Get-StrayModalDialog)
+    $eModalTitlesBefore = @($eModalsBefore | ForEach-Object { "$($_.Handle)" })
+
     # --- E2 the healthy delivery: the swap happens and is PROVEN -------------
     Set-Content -LiteralPath $eInstalledExe -Encoding ascii -Value $sentinel
     Set-Content -LiteralPath $eInstalledAgent -Encoding ascii -Value $sentinel
@@ -575,6 +641,12 @@ if (-not $haveAgent) {
     $eBak = "$eInstalledAgent.bak"
     if (-not (Test-Path -LiteralPath $eBak)) { Set-Content -LiteralPath $eBak -Encoding ascii -Value $sentinel }
     # A stale agent on disk, the way a box that has taken earlier deliveries has.
+    #
+    # T1098: this sentinel is TEXT under an `.exe` name, so it is also a damaged
+    # image - the second thing this arm now tests. Before the PE gate, AGENT
+    # VERIFY launched it, the loader raised `Unsupported 16-Bit Application`, and
+    # the run waited for a human. Keep it non-PE deliberately: it stands in for
+    # both a stale agent and a half-copied one, which is the same accident twice.
     Set-Content -LiteralPath $eInstalledAgent -Encoding ascii -Value $sentinel
     $lock = [IO.File]::Open($eBak, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
     try {
@@ -593,6 +665,15 @@ if (-not $haveAgent) {
     # The app half still landed - that is what makes this a distinct verdict
     # rather than a general "the delivery broke".
     Assert "E14 while the exe half is still reported as fine" ($eLogText -match 'POST-SWAP VERIFY OK')
+    # T1098: and it failed for the RIGHT reason - the file is not a program, read
+    # off its header. "Unreadable" would be the old answer, arrived at by
+    # launching it and waiting.
+    Assert "E14b the failure names it as not a runnable program, not merely unread" `
+        ($eLogText -match 'not a runnable program')
+    # The reason must name what was READ - a header, or the lack of one - and
+    # never an exit code or a timeout, because those can only come from a launch.
+    Assert "E14c and the reason is something read off the file, not a launch result" `
+        ($eLogText -match 'not a Windows program: (no MZ signature|no PE signature|only \d+ bytes|PE header offset)')
 
     # --- E15 -AppOnly: an older agent on disk is the CONTRACT, not a defect --
     # T525's morning refresh deliberately swaps no agent. If this verified
@@ -608,6 +689,81 @@ if (-not $haveAgent) {
     AssertEq "E16 and the run still succeeds over a legitimately older agent" 0 $eApp.Code
     AssertEq "E17 which is still sitting there untouched" $sentinel `
         ((Get-Content -LiteralPath $eInstalledAgent -Raw).Trim())
+
+    # --- E18-E22: the same standard for the APP exe (T1098) ------------------
+    #
+    # The agent is not the only binary read back. POST-SWAP VERIFY launches the
+    # INSTALLED ghoztty.exe, and the delivery can put a damaged file there: a
+    # payload that is itself broken, shipped over the staleness gate with
+    # -AllowStaleStaging (the flag exists for a staging prefix that cannot report
+    # its commit, which is exactly what a damaged one does).
+    #
+    # Before the gate this ended as `POST-SWAP VERIFY UNKNOWN` - a probe that
+    # could not answer, which does NOT fail the delivery - after a launch that
+    # first hung a modal on the desktop. Both halves are wrong: a file with no PE
+    # header cannot be the exe that was staged, so it is a verdict.
+    $fRoot = Join-Path $root 'badexe'
+    $fStaging = Join-Path $fRoot 'staging'
+    $fInstall = Join-Path $fRoot 'install'
+    New-Item -ItemType Directory -Force (Join-Path $fStaging 'bin') | Out-Null
+    New-Item -ItemType Directory -Force $fInstall | Out-Null
+    $fInstalledExe = Join-Path $fInstall 'ghoztty.exe'
+    Copy-Item -LiteralPath $Exe $fInstalledExe -Force
+    # A half-copied download in staging: the name is right, the bytes are not.
+    Set-Content -LiteralPath (Join-Path $fStaging 'bin\ghoztty.exe') -Encoding ascii -Value $sentinel
+    $fLog = Join-Path $fRoot 'ghoztty-upgrade.log'
+    $fSw = [System.Diagnostics.Stopwatch]::StartNew()
+    $fBad = Invoke-InSandboxTemp -TempDir $fRoot -Argv @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $upgrade,
+        '-Staging', $fStaging, '-InstallDir', $fInstall, '-WorkingDirectory', $Repo,
+        '-ExpectedCommit', $exeCommit, '-NoResume', '-NoExtraInstalls', '-DelaySeconds', '0',
+        '-AllowStaleStaging')
+    $fSw.Stop()
+    $fLogText = Get-Content -LiteralPath $fLog -Raw -ErrorAction SilentlyContinue
+    Assert "E18 a damaged exe on disk is caught by POST-SWAP VERIFY" `
+        ($fLogText -match 'POST-SWAP VERIFY FAILED')
+    Assert "E19 named as not a runnable program, from its header" `
+        ($fLogText -match 'POST-SWAP VERIFY FAILED[^\r\n]*not a runnable program')
+    AssertEq "E20 THE POINT: the run is a failure, not an UNKNOWN it can ship past" 1 $fBad.Code
+    Assert "E21 and nothing is propagated onward" ($fLogText -match 'NOT PROPAGATED')
+    # A dialog would hold the run until a human clicks OK; a header read cannot.
+    Assert "E22 and the whole run finished unattended ($([int]$fSw.Elapsed.TotalSeconds)s)" `
+        ($fSw.Elapsed.TotalSeconds -lt 120)
+
+    # --- E23p POSITIVE CONTROL: the sweep can actually see a dialog ----------
+    #
+    # Without this, E23 is a zero that proves nothing - the exact shape
+    # lib\AssertedNothingAudit.ps1 exists to reject, and the shape the ALL PASS
+    # of 2026-08-22 had. So raise a real `#32770` with the loader's own wording,
+    # in another process so it cannot block this one, and make the sweep find it.
+    $mbBody = "Add-Type -AssemblyName System.Windows.Forms; " +
+        "[void][System.Windows.Forms.MessageBox]::Show('ghoztty harness positive control','Unsupported 16-Bit Application')"
+    $mbProc = Start-Process powershell -PassThru -WindowStyle Hidden `
+        -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', $mbBody)
+    $seen = @()
+    foreach ($t in 1..50) {
+        $seen = @(Get-StrayModalDialog | Where-Object { $_.ProcessId -eq $mbProc.Id })
+        if ($seen.Count -gt 0) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    Assert "E23p the modal sweep sees a hard-error dialog when one exists" ($seen.Count -gt 0)
+    if ($seen.Count -gt 0) {
+        Assert "E23q and dismisses it" ((Close-StrayModalDialog -Modals $seen) -eq $seen.Count)
+        $stillThere = @(Get-StrayModalDialog | Where-Object { $_.ProcessId -eq $mbProc.Id })
+        AssertEq "E23r leaving nothing on screen" 0 $stillThere.Count
+    }
+    try { Stop-Process -Id $mbProc.Id -Force -ErrorAction SilentlyContinue } catch { }
+
+    # --- E23: NO stray modal was raised by any of the above ------------------
+    #
+    # The assertion this section did not have. Every arm here runs the delivery
+    # over a file that is text under an .exe name, which is precisely what makes
+    # the Windows loader raise `Unsupported 16-Bit Application`. Scored ALL PASS
+    # with that box on the user's screen on 2026-08-22 - so look for it.
+    $eModalsAfter = @(Get-StrayModalDialog)
+    $eNewModals = @($eModalsAfter | Where-Object { $eModalTitlesBefore -notcontains "$($_.Handle)" })
+    Assert "E23 no Windows error dialog was raised by section E$(if ($eNewModals.Count) { ': ' + ((Format-StrayModalDialog -Modals $eNewModals) -join '; ') })" `
+        ($eNewModals.Count -eq 0)
+    if ($eNewModals.Count -gt 0) { $null = Close-StrayModalDialog -Modals $eNewModals }
 }
 
 # ============================================================================

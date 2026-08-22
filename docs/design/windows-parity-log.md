@@ -9,6 +9,78 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-22 - **T1098 - the upgrade now reads a binary's header instead of
+  asking Windows to run it, so a damaged install fails the delivery instead of
+  parking a modal dialog on the user's desktop.** The user saw it live on
+  2026-08-22 while the T1094 sweep ran `upgrade-staleness.ps1`: a grey
+  `Unsupported 16-Bit Application` box, naming a path inside the test's own
+  sandbox, waiting for somebody to click OK.
+
+  The root cause is one missing precondition. T208 and T281 made the delivery
+  READ ITS BINARIES BACK - launch the installed exe and the installed agent, ask
+  each for its version, compare - and both launches trusted whatever was on
+  disk. When that file carries an `.exe` name and is not a PE image,
+  `CreateProcess` fails with `ERROR_BAD_EXE_FORMAT` and the Windows loader
+  answers with a **system-modal dialog rather than an error code**. So the check
+  built to catch a damaged delivery is the thing that hangs on one, and it hangs
+  in the worst place: T525's morning refresh runs unattended at 5am in the
+  user's own session.
+
+  The fix is four bytes of evidence instead of a process. `Test-PortableExecutable`
+  (`scripts\delivery-version.ps1`) reads `MZ`, follows `e_lfanew` and checks for
+  `PE\0\0`, and `Invoke-GhozttyVersionText` refuses to launch anything with an
+  image extension that fails it - so **both** read-backs, plus every other caller
+  of the probe (`deliver-windows-build.ps1`, `launch-upgrade.ps1`), are covered
+  by one gate. It is also better evidence than a launch: a file with no PE header
+  cannot in principle be the binary that was staged, so `not-a-PE` is a VERDICT
+  and now says so. `POST-SWAP VERIFY` used to end `UNKNOWN` on it - a probe that
+  could not answer, which does not fail a delivery - and now ends `FAILED … not a
+  runnable program`, exit 1, `NOT PROPAGATED`. The same for a damaged payload in
+  staging, which must never ship onward.
+
+  Two more launches were on the same path and are closed too: the pre-kill
+  `+sessions` probe is the one launch of the INSTALLED exe that happens before
+  the swap, so it is precisely the one that meets a damaged install - it now
+  checks the header and skips, costing an assert rather than the delivery. And
+  the whole upgrade process sets `SEM_FAILCRITICALERRORS | SEM_NOOPENFILEERRORBOX`
+  once at startup, inherited by every child, so the relaunch and the resume typing
+  are covered by a floor rather than one gate at a time.
+
+  **The harness half is the one worth remembering.** `upgrade-staleness.ps1`
+  provoked that dialog on every run it has ever made, and scored `ALL PASS (123
+  assertions)` each time. A modal is invisible to every verdict a harness
+  computes - it is not a failed assertion and not a nonzero exit - and it is only
+  known about because a human happened to be looking at the screen. So
+  `test\win32\lib\ModalSweep.ps1` enumerates visible `#32770` windows and reports
+  the ones that are either titled like a Windows hard-error box or owned by a
+  `zig-out` process, which is the same path-exact, repo-scoped discipline
+  `lib\CleanSlate.ps1` uses and the reason it can run beside the user's own
+  applications without touching their dialogs. `scripts\suite-run.ps1` sweeps
+  between scripts next to the leak sweep, and a stray modal **overwrites the
+  script's verdict**: a run that hung a dialog on the user's desktop did not pass,
+  whatever its own assertions counted. It is dismissed too, so one modal cannot
+  block the 200 scripts after it.
+
+  Both new gates carry positive controls, because a zero that cannot go red is
+  the failure mode this whole task is about: E23p/q/r raise a real MessageBox
+  titled with the loader's own wording from another process and prove the sweep
+  finds it, closes it, and leaves nothing; suite-run section M drives a fixture
+  script that leaves a dialog up behind its own clean `ALL PASS` and asserts the
+  runner scores it `fail`, names it in the report, counts it, and goes red.
+
+  Green: `upgrade-staleness.ps1` ALL PASS at **144 assertions, up from 123**
+  (B14-B23 the PE gate and its `.cmd` exemption, E14b/E14c the reason is read
+  rather than launched, E18-E22 the app-side verdict, E23 + controls the modal
+  sweep); `suite-run.ps1` ALL PASS 51, up from 45; `upgrade-no-fork.ps1` ALL PASS
+  131; floor all four lanes PASS (lib 52s, none 281s, win32 355s, agent);
+  P1/P2/P3 25/20/16. Six audits the new lib made due re-run and re-stamped
+  (isolation-meta 13, launch-preflight 17, verdict-exit, cleanslate 19,
+  stderr-capture 25, body-complete 40). `fork-identity` stays red for the reason
+  T1134 already owns - the reproduce-from-fork-point baseline decays with every
+  main intake - so committed under `-NoGuardDue` naming it, exactly as the
+  previous turn did; T1135 was filed for it before that was found, and closed as
+  a duplicate the same turn.
+
 - 2026-08-22 - **T1094 - the whole acceptance suite has now been run, and
   every red has an owner.** 242 scripts, forward order, Debug build at
   `9a764deea`: **211 pass, 30 fail, 1 stall, 7 scripts leaking a live process**.

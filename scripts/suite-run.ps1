@@ -126,6 +126,14 @@ function Split-List {
 # number in this report nobody can check by eye, and its first version was a
 # minute wrong.
 . (Join-Path $PSScriptRoot 'lib\Duration.ps1')
+# T1098: the modal sweep, run beside the leak sweep for the same reason - a
+# script can leave something behind that no assertion of its own can see.
+#
+# Resolved against THIS script's own tree, never against -Repo: the runner's
+# acceptance test points -Repo at a throwaway fixture whose test\win32\lib holds
+# only its own stubs, and a dependency of the runner is not something a fixture
+# is expected to supply.
+. (Join-Path $PSScriptRoot '..\test\win32\lib\ModalSweep.ps1')
 
 $IncludeList = Split-List $Include
 $ExcludeList = Split-List $Exclude
@@ -287,6 +295,30 @@ function Invoke-LeakSweep {
     }
     if ($killed -gt 0) { Start-Sleep -Milliseconds 400 }
     return $killed
+}
+
+<#
+Report and dismiss any Windows error dialog a script left standing (T1098).
+
+Same shape as the leak sweep above and for the same reason: what a script leaves
+behind is a finding the script's own verdict cannot contain. A modal is the worse
+of the two - it does not merely poison the scripts after it, it BLOCKS whoever
+raised it until a human clicks OK, on the user's own desktop, during a sweep that
+is meant to be unattended. `upgrade-staleness.ps1` raised one on every run for as
+long as it has existed and scored ALL PASS each time.
+
+Returns the modal records; the caller turns them red and names the script.
+#>
+function Invoke-ModalSweep {
+    param([string]$ZigOut)
+    $modals = @()
+    try { $modals = @(Get-StrayModalDialog -ZigOut $ZigOut) } catch { return @() }
+    if ($modals.Count -gt 0) {
+        # Dismiss before the next script starts: the sweep exists so a stray
+        # modal is reported, not so the rest of the suite runs behind it.
+        try { $null = Close-StrayModalDialog -Modals $modals } catch { }
+    }
+    return @($modals)
 }
 
 # ------------------------------------------------------------------ one script
@@ -527,14 +559,32 @@ foreach ($r in $rows) {
     $leaked = 0
     if (-not $NoSweep) { $leaked = Invoke-LeakSweep -ZigOut $zigOut }
 
+    # T1098: a stray modal is a FAILURE of the script that raised it, not a note
+    # beside its PASS. The verdict is overwritten deliberately - a run that hung
+    # a system-modal dialog on the user's desktop did not pass, whatever its own
+    # assertions counted.
+    $modalLines = @()
+    if (-not $NoSweep) {
+        $modals = @(Invoke-ModalSweep -ZigOut $zigOut)
+        if ($modals.Count -gt 0) { $modalLines = @(Format-StrayModalDialog -Modals $modals) }
+    }
+
+    $verdict = $run.Verdict
+    $line = $run.Line
+    if ($modalLines.Count -gt 0) {
+        $verdict = 'fail'
+        $line = "stray modal dialog raised: $($modalLines -join '; ')"
+    }
+
     $row = [pscustomobject]@{
         Name    = $r.Name
         Class   = $r.Class
-        Verdict = $run.Verdict
-        Line    = $run.Line
+        Verdict = $verdict
+        Line    = $line
         Seconds = $run.Seconds
         Exit    = $run.Exit
         Leaked  = $leaked
+        Modals  = $modalLines.Count
         Log     = (Split-Path $run.Log -Leaf)
         Index   = $i
     }
@@ -572,6 +622,10 @@ if ($results.Count -gt 0) {
 $leaks = @($results | Where-Object { $_.Leaked -gt 0 })
 if ($leaks.Count -gt 0) {
     "  leaked procs : $($leaks.Count) script(s) left a zig-out process running"
+}
+$modalRows = @($results | Where-Object { $_.Modals -gt 0 })
+if ($modalRows.Count -gt 0) {
+    "  stray modals : $($modalRows.Count) script(s) raised a Windows dialog (dismissed, scored as failures)"
 }
 ''
 '  slowest:'

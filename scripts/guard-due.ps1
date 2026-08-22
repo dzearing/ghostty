@@ -385,7 +385,10 @@ $GuardTable = @(
             'scripts\upgrade-ghoztty-windows.ps1',
             'scripts\launch-upgrade.ps1',
             'scripts\delivery-version.ps1',
-            'test\win32\upgrade-staleness.ps1'
+            'test\win32\upgrade-staleness.ps1',
+            # T1098: section E is what raised a system-modal dialog for as long
+            # as it existed, and E23 is the arm that would now catch it.
+            'test\win32\lib\ModalSweep.ps1'
         )
     },
     # The MEASURED half of the delivery (T198), which had a harness but no row
@@ -1159,7 +1162,10 @@ $GuardTable = @(
         Covers = @(
             'scripts\suite-run.ps1',
             'scripts\lib\Duration.ps1',
-            'test\win32\suite-run.ps1'
+            'test\win32\suite-run.ps1',
+            # T1098: the between-script modal sweep is the runner's, and section
+            # M is the only thing that exercises it.
+            'test\win32\lib\ModalSweep.ps1'
         )
     },
     # The palette's "Focus: <pane>" jump entries (T555). The pure derivation

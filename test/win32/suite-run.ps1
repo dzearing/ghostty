@@ -55,6 +55,8 @@ $ErrorActionPreference = 'Stop'
 # that same fixture as its repo root.
 
 . (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
+# Section M asks the same question the runner asks: is a dialog still on screen?
+. (Join-Path $PSScriptRoot 'lib\ModalSweep.ps1')
 
 $Runner = Join-Path $Repo 'scripts\suite-run.ps1'
 
@@ -403,6 +405,59 @@ try {
     foreach ($p in @($leakProc, $ctrlProc, $leak2)) {
         try { & taskkill.exe /T /F /PID $p.Id *> $null } catch { }
     }
+
+    # --- M. stray modal sweep (T1098) --------------------------------------
+    Write-Host ''
+    Write-Host '-- M. stray modal dialogs'
+
+    # The failure this is for: on 2026-08-22 `upgrade-staleness.ps1` raised a
+    # system-modal `Unsupported 16-Bit Application` box on the USER's desktop and
+    # scored ALL PASS (123 assertions). A modal is invisible to every verdict the
+    # runner computes - it is not a failed assertion and not a nonzero exit - and
+    # it BLOCKS whoever raised it until a human clicks OK, in a sweep that is
+    # meant to run unattended.
+    #
+    # The fixture script raises one from a DETACHED process and exits 0 with a
+    # clean ALL PASS, which is exactly the shape that scored green: the dialog
+    # outlives the script that raised it.
+    Set-FixtureScript 'h-modal.ps1' @'
+$body = "Add-Type -AssemblyName System.Windows.Forms; " +
+    "[void][System.Windows.Forms.MessageBox]::Show('suite-run fixture','Unsupported 16-Bit Application')"
+$p = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-Command',$body)
+Set-Content -LiteralPath (Join-Path $env:TEMP 'ghoztty-suite-modal-pid.txt') -Value $p.Id -Encoding ASCII
+Start-Sleep -Seconds 3
+"ALL PASS (1 assertions)"
+exit 0
+'@
+
+    $modalPidFile = Join-Path $env:TEMP 'ghoztty-suite-modal-pid.txt'
+    Remove-Item -LiteralPath $modalPidFile -Force -ErrorAction SilentlyContinue
+    $dirM = Join-Path $Fixture 'runM'
+    $rM = Invoke-Runner @('-Include', 'h-modal.ps1', '-OutDir', $dirM, '-TimeoutSec', '60')
+    $sM = Get-Summary $dirM
+    Check 'M1 a script that leaves a dialog up is scored a FAILURE, not its own ALL PASS' `
+        ((Get-Verdict $sM 'h-modal.ps1') -eq 'fail') (Get-Verdict $sM 'h-modal.ps1')
+    $rowM = @($sM.results | Where-Object { $_.Name -eq 'h-modal.ps1' })
+    Check 'M2 and the report names the dialog' `
+        (($rowM.Count -eq 1) -and ($rowM[0].Line -match 'stray modal dialog')) `
+        $(if ($rowM.Count) { $rowM[0].Line } else { '(no row)' })
+    Check 'M3 the suite verdict goes red over it' ($rM.Exit -ne 0) "exit $($rM.Exit)"
+    Check 'M4 the summary counts it' `
+        (($rowM.Count -eq 1) -and ([int]$rowM[0].Modals -ge 1)) ''
+    # And it is DISMISSED: the sweep exists so the rest of the suite is not run
+    # behind a modal waiting for a human.
+    $modalPid = 0
+    if (Test-Path -LiteralPath $modalPidFile) {
+        try { $modalPid = [int]((Get-Content -LiteralPath $modalPidFile -Raw).Trim()) } catch { $modalPid = 0 }
+    }
+    Check 'M5 the fixture really raised one (positive control)' ($modalPid -gt 0) "pid $modalPid"
+    if ($modalPid -gt 0) {
+        $stillUp = @(Get-StrayModalDialog | Where-Object { $_.ProcessId -eq $modalPid })
+        Check 'M6 and the sweep dismissed it rather than leaving it on screen' ($stillUp.Count -eq 0) `
+            "$($stillUp.Count) still up"
+        try { & taskkill.exe /T /F /PID $modalPid *> $null } catch { }
+    }
+    Remove-Item -LiteralPath $modalPidFile -Force -ErrorAction SilentlyContinue
 
     # --- J. the duration in the report ------------------------------------
     Write-Host ''

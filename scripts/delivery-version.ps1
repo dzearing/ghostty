@@ -175,7 +175,99 @@ function Get-CommitFromAgentStamp {
     return ''
 }
 
-# One BOUNDED version probe. Returns @{ Text; Why } and never throws.
+# Is the file at $Path a Windows program image? @{ Ok; Why } - Why is empty when
+# Ok (tracker T1098).
+#
+# This is a PRECONDITION for launching it, not a nicety. `CreateProcess` on a
+# file that carries an `.exe` name and is not a PE image fails with
+# ERROR_BAD_EXE_FORMAT, and the Windows loader answers that with a SYSTEM-MODAL
+# dialog - `Unsupported 16-Bit Application` - on whatever desktop the caller is
+# on, which on this box is the user's own. The probe below then waits for a human
+# to click OK. Seen live on 2026-08-22 during an acceptance sweep, on the exact
+# path the delivery's own read-back check walks: T281's `AGENT VERIFY` exists
+# BECAUSE a delivery can leave a wrong or damaged agent on disk, and a truncated
+# copy is that same accident.
+#
+# Reading four bytes is also better evidence than a launch: a file with no PE
+# header cannot in principle be the binary that was staged, so there is nothing
+# a `--version` run could add.
+#
+# Checks only what CreateProcess itself needs to find: `MZ`, then a plausible
+# `e_lfanew` at 0x3C pointing at `PE\0\0`. Machine type and bitness are
+# deliberately NOT checked - a wrong-architecture binary is a real (and
+# different) failure that the version read-back reports on its own.
+function Test-PortableExecutable {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $fs = $null
+    try {
+        $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open,
+            [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        if ($fs.Length -lt 64) {
+            return @{ Ok = $false; Why = "not a Windows program: only $($fs.Length) bytes, too short for a PE header" }
+        }
+        $head = New-Object byte[] 64
+        $read = $fs.Read($head, 0, 64)
+        if ($read -lt 64) {
+            return @{ Ok = $false; Why = 'not a Windows program: could not read the first 64 bytes' }
+        }
+        if ($head[0] -ne 0x4D -or $head[1] -ne 0x5A) {
+            return @{ Ok = $false; Why = 'not a Windows program: no MZ signature (the file is not an executable image)' }
+        }
+        $lfanew = [System.BitConverter]::ToInt32($head, 0x3C)
+        if ($lfanew -lt 4 -or ($lfanew + 4) -gt $fs.Length) {
+            return @{ Ok = $false; Why = "not a Windows program: PE header offset $lfanew is outside the file" }
+        }
+        $null = $fs.Seek($lfanew, [System.IO.SeekOrigin]::Begin)
+        $sig = New-Object byte[] 4
+        $read = $fs.Read($sig, 0, 4)
+        if ($read -lt 4 -or $sig[0] -ne 0x50 -or $sig[1] -ne 0x45 -or $sig[2] -ne 0 -or $sig[3] -ne 0) {
+            return @{ Ok = $false; Why = 'not a Windows program: no PE signature (a DOS-era or truncated image)' }
+        }
+        return @{ Ok = $true; Why = '' }
+    } catch {
+        return @{ Ok = $false; Why = "could not read the file to check it is a program: $($_.Exception.Message)" }
+    } finally {
+        if ($fs) { $fs.Dispose() }
+    }
+}
+
+# Belt and braces for the same failure (T1098): tell Windows to RETURN the error
+# rather than raise a message box, for this process and everything it starts.
+# SEM_FAILCRITICALERRORS suppresses the critical-error handler dialog and
+# SEM_NOOPENFILEERRORBOX the file-not-found one; child processes inherit the
+# mode, so `cmd.exe` and whatever it launches are covered too.
+#
+# The PE gate above is the fix; this is what catches the variants nobody has met
+# yet - a corrupt image that passes the header check, a missing DLL, a device
+# that is not ready.
+function Set-GhozttyQuietErrorMode {
+    if (-not ('Ghoztty.NativeErrorMode' -as [type])) {
+        Add-Type -Namespace Ghoztty -Name NativeErrorMode -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern uint SetErrorMode(uint uMode);
+'@ -ErrorAction SilentlyContinue
+    }
+    if (-not ('Ghoztty.NativeErrorMode' -as [type])) { return $null }
+    $SEM_FAILCRITICALERRORS = 0x0001
+    $SEM_NOOPENFILEERRORBOX = 0x8000
+    try {
+        $previous = [Ghoztty.NativeErrorMode]::SetErrorMode($SEM_FAILCRITICALERRORS -bor $SEM_NOOPENFILEERRORBOX)
+        return $previous
+    } catch { return $null }
+}
+
+function Restore-GhozttyErrorMode {
+    param($Previous)
+    if ($null -eq $Previous) { return }
+    if (-not ('Ghoztty.NativeErrorMode' -as [type])) { return }
+    try { $null = [Ghoztty.NativeErrorMode]::SetErrorMode([uint32]$Previous) } catch { }
+}
+
+# One BOUNDED version probe. Returns @{ Text; Why; NotExecutable } and never
+# throws. `NotExecutable` is $true only for the one failure that is a VERDICT
+# rather than a missing answer: the file is there and is not a program (T1098),
+# so no launch was attempted and none could have helped.
 #
 # `-VersionArg` is what the binary is asked: `+version` for ghoztty.exe, but
 # `--version` for ghoztty-agent.exe, which is a different program with its own
@@ -187,7 +279,18 @@ function Invoke-GhozttyVersionText {
         [string]$VersionArg = '+version'
     )
     if (-not (Test-Path -LiteralPath $Exe -PathType Leaf)) {
-        return @{ Text = ''; Why = "exe not found: $Exe" }
+        return @{ Text = ''; Why = "exe not found: $Exe"; NotExecutable = $false }
+    }
+    # Only image extensions are gated. `cmd.exe /c` runs a `.cmd`/`.bat` as a
+    # batch script without ever asking the loader for an image, so demanding a
+    # PE header there would reject something that genuinely runs - and the test
+    # fixtures that stand in for "a program that answers the wrong thing" are
+    # exactly that shape.
+    if ([System.IO.Path]::GetExtension($Exe) -in @('.exe', '.com', '.scr')) {
+        $pe = Test-PortableExecutable -Path $Exe
+        if (-not $pe.Ok) {
+            return @{ Text = ''; Why = $pe.Why; NotExecutable = $true }
+        }
     }
     $out = Join-Path $env:TEMP ("ghoztty-vsnprobe-{0}-{1}.txt" -f $PID, [guid]::NewGuid().ToString('N').Substring(0, 8))
     # Both callers want the identity of the FILE on disk, and nothing else in
@@ -200,6 +303,7 @@ function Invoke-GhozttyVersionText {
     # past, and `+version` still exits 0 carrying its own version.
     $prevIpcTimeout = $env:GHOZTTY_IPC_TIMEOUT_MS
     $env:GHOZTTY_IPC_TIMEOUT_MS = '2000'
+    $prevErrorMode = Set-GhozttyQuietErrorMode
     try {
         $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
             -ArgumentList "/c `"`"$Exe`" $VersionArg > `"$out`" 2>&1`""
@@ -207,15 +311,19 @@ function Invoke-GhozttyVersionText {
         # empty exactly when we most want to report it.
         $null = $p.Handle
         if (-not $p.WaitForExit($TimeoutSec * 1000)) {
+            # /T: the answer is written by a GRANDCHILD (cmd.exe -> the binary),
+            # so killing cmd alone leaves whatever wedged still wedged.
+            & taskkill.exe /T /F /PID $p.Id *> $null
             Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-            return @{ Text = ''; Why = "$VersionArg hung past ${TimeoutSec}s" }
+            return @{ Text = ''; Why = "$VersionArg hung past ${TimeoutSec}s"; NotExecutable = $false }
         }
         $t = if (Test-Path -LiteralPath $out) { Get-Content -LiteralPath $out -Raw } else { '' }
-        if ($t) { return @{ Text = $t; Why = '' } }
-        return @{ Text = ''; Why = "exit=$($p.ExitCode), no output" }
+        if ($t) { return @{ Text = $t; Why = ''; NotExecutable = $false } }
+        return @{ Text = ''; Why = "exit=$($p.ExitCode), no output"; NotExecutable = $false }
     } catch {
-        return @{ Text = ''; Why = "probe threw: $($_.Exception.Message)" }
+        return @{ Text = ''; Why = "probe threw: $($_.Exception.Message)"; NotExecutable = $false }
     } finally {
+        Restore-GhozttyErrorMode -Previous $prevErrorMode
         if ($null -eq $prevIpcTimeout) {
             Remove-Item Env:\GHOZTTY_IPC_TIMEOUT_MS -ErrorAction SilentlyContinue
         } else {
@@ -241,7 +349,12 @@ function Resolve-GhozttyExeCommit {
     $r = Invoke-GhozttyVersionText -Exe $Exe -TimeoutSec $TimeoutSec
     $commit = Get-CommitFromVersionText $r.Text
     $why = if ($commit) { '' } elseif ($r.Why) { $r.Why } else { "no version line in the output of '$Exe +version'" }
-    return @{ Commit = $commit; Why = $why; SignIn = (Get-SignInBakeFromVersionText $r.Text) }
+    return @{
+        Commit        = $commit
+        Why           = $why
+        SignIn        = (Get-SignInBakeFromVersionText $r.Text)
+        NotExecutable = [bool]$r.NotExecutable
+    }
 }
 
 # The build stamp of an agent binary ON DISK: @{ Stamp; Commit; Why } (tracker
@@ -267,7 +380,12 @@ function Resolve-GhozttyAgentStamp {
     $r = Invoke-GhozttyVersionText -Exe $Exe -TimeoutSec $TimeoutSec -VersionArg '--version'
     $stamp = Get-StampFromAgentVersionText $r.Text
     $why = if ($stamp) { '' } elseif ($r.Why) { $r.Why } else { "no 'ghoztty-agent <stamp>' line in the output of '$Exe --version'" }
-    return @{ Stamp = $stamp; Commit = (Get-CommitFromAgentStamp $stamp); Why = $why }
+    return @{
+        Stamp         = $stamp
+        Commit        = (Get-CommitFromAgentStamp $stamp)
+        Why           = $why
+        NotExecutable = [bool]$r.NotExecutable
+    }
 }
 
 # Do two agent stamps name the same build? Exact, case-insensitive, and empty on

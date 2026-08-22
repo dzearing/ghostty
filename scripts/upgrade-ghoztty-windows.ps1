@@ -146,6 +146,19 @@ function Log($m) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $m" | Add-Content 
 . (Join-Path $PSScriptRoot 'loop-session.ps1')
 . (Join-Path $PSScriptRoot 'delivery-version.ps1')
 
+# T1098: no dialog, ever, from anything this run starts.
+#
+# The delivery launches the binaries it ships - the pre-kill session probe, both
+# read-back checks, the relaunch, the resume typing - and every one of those is a
+# CreateProcess on a file another step of the delivery just wrote. When that file
+# is damaged the Windows loader answers with a SYSTEM-MODAL box
+# (`Unsupported 16-Bit Application`) and waits for a human, on the user's own
+# desktop, in a run that is normally unattended at 5am (T525). Set the mode once
+# for the whole process: it is inherited by every child, so it covers the launch
+# sites individually rather than one at a time. The PE gate in
+# delivery-version.ps1 is the actual fix; this is the floor under it.
+$null = Set-GhozttyQuietErrorMode
+
 # Log an Invoke-NativeExact result the way the `& $exe ... 2>&1 | ForEach Log`
 # shape used to (T279): one line per line of output, stdout and stderr alike.
 function Log-NativeResult($tag, $r) {
@@ -338,12 +351,23 @@ Start-Sleep -Seconds $DelaySeconds
 # the assert below had been silently skipping ever since. Parse the payload
 # as a whole (ConvertFrom-GhozttySessionsJson tolerates both shapes).
 $preSessions = @()
-try {
-    # T663: through $oldExe (GUI subsystem) this captured nothing, so the probe
-    # reported 0 sessions on every run and the survive-assert below never fired.
-    $preRaw = (& $cliExe +sessions --json 2>$null) | Out-String
-    if ($LASTEXITCODE -eq 0 -and $preRaw) { $preSessions = Get-GhozttySessionIds $preRaw }
-} catch {}
+# T1098: this is the one launch of the INSTALLED exe that happens before the
+# swap, so it is the one that can meet a damaged install - the very thing this
+# delivery is about to repair. Check the header rather than asking the loader:
+# CreateProcess on a non-image raises a system-modal dialog and waits for a
+# human. Skipping the probe costs an assert (SESSIONS-SURVIVE), not the delivery.
+$preCliPe = Test-PortableExecutable -Path $cliExe
+if (-not $preCliPe.Ok) {
+    Log ("pre-kill session probe SKIPPED: $cliExe is not a runnable program ($($preCliPe.Why)). " +
+        'The installed binary is damaged; this delivery replaces it.')
+} else {
+    try {
+        # T663: through $oldExe (GUI subsystem) this captured nothing, so the probe
+        # reported 0 sessions on every run and the survive-assert below never fired.
+        $preRaw = (& $cliExe +sessions --json 2>$null) | Out-String
+        if ($LASTEXITCODE -eq 0 -and $preRaw) { $preSessions = Get-GhozttySessionIds $preRaw }
+    } catch {}
+}
 Log "pre-kill agent sessions: $($preSessions.Count) ($($preSessions -join ', '))"
 
 # Kill only release GUI instances (running from the install dir). Debug/test
@@ -491,7 +515,14 @@ if ($preSessions.Count -gt 0) {
 $installedInfo = Resolve-GhozttyExeCommit -Exe $oldExe
 $script:installedCommit = $installedInfo.Commit
 $want = if ($expected) { $expected } else { $stagedInfo.Commit }
-if (-not $installedInfo.Commit) {
+if ($installedInfo.NotExecutable) {
+    # T1098: "the file on disk is not a program" is a VERDICT, not a probe that
+    # failed to answer - whatever is at the install path, it is certainly not
+    # this delivery's exe. UNKNOWN would let the run continue and propagate.
+    $script:deliveryFailure = "POST-SWAP VERIFY FAILED: $oldExe is not a runnable program ($($installedInfo.Why))"
+    Log ("POST-SWAP VERIFY FAILED: $oldExe is not a runnable program ($($installedInfo.Why)); wanted '$want'. " +
+        'Nothing was launched to find that out. This run is NOT a successful delivery.')
+} elseif (-not $installedInfo.Commit) {
     Log "POST-SWAP VERIFY UNKNOWN: could not read the installed exe's commit ($($installedInfo.Why)); wanted '$want'"
 } elseif (Test-CommitsMatch $installedInfo.Commit $want) {
     Log "POST-SWAP VERIFY OK: $oldExe now reports '$($installedInfo.Commit)'"
@@ -528,13 +559,30 @@ if ($AppOnly) {
     $stagedAgent = Resolve-GhozttyAgentStamp -Exe $newAgent
     $script:stagedAgentStamp = $stagedAgent.Stamp
     $installedAgent = Resolve-GhozttyAgentStamp -Exe $oldAgent
-    if (-not $stagedAgent.Stamp) {
+    if ($stagedAgent.NotExecutable) {
+        # T1098, staging side: a staged agent that is not a PE image is a broken
+        # payload, not an unanswerable question - shipping it onward is the one
+        # thing this check must never allow.
+        if (-not $script:deliveryFailure) {
+            $script:deliveryFailure = "AGENT VERIFY FAILED: the STAGED agent is not a runnable program ($($stagedAgent.Why))"
+        }
+        Log ("AGENT VERIFY FAILED: the STAGED agent $newAgent is not a runnable program ($($stagedAgent.Why)). " +
+            'The payload this delivery would install is damaged. This run is NOT a successful delivery.')
+    } elseif (-not $stagedAgent.Stamp) {
         Log ("AGENT VERIFY UNKNOWN: the STAGED agent would not report a stamp ($($stagedAgent.Why)); " +
             'there is no number to compare the installed one against')
     } elseif (Test-AgentStampsMatch $installedAgent.Stamp $stagedAgent.Stamp) {
         Log "AGENT VERIFY OK: $oldAgent now reports '$($installedAgent.Stamp)'"
     } else {
-        $got = if ($installedAgent.Stamp) { "'$($installedAgent.Stamp)'" } else { "nothing readable ($($installedAgent.Why))" }
+        $got = if ($installedAgent.Stamp) {
+            "'$($installedAgent.Stamp)'"
+        } elseif ($installedAgent.NotExecutable) {
+            # T1098: say the shape of the failure, not just that it was silent -
+            # a file that is not a program was never launched to find out.
+            "no stamp - it is not a runnable program ($($installedAgent.Why))"
+        } else {
+            "nothing readable ($($installedAgent.Why))"
+        }
         # Never clobber an earlier verdict: the exe's failure is the one the
         # delivery is named for, and both lines are in the log either way.
         if (-not $script:deliveryFailure) {
