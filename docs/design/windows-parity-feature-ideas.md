@@ -144,3 +144,14 @@ as the digest that showed them.
 - Zoom just this pane, and remember it (per-pane font size, persisted)
 - Stay responsive when a pane floods (decoupled render rate under output floods)
 - Tell me when a saved session's program has died (dead-session marker in the chooser)
+
+## 2026-08-22
+
+- Make Ghoztty the terminal Windows opens by default (default terminal host registration)
+- "Open Ghoztty here" in the Explorer right-click menu
+- Bring this session to the machine I am sitting at (session roaming over the relay)
+- Find in the viewer pane (Ctrl+F for rendered docs, diffs and pages)
+- A password prompt that does not look frozen (masked-input indicator)
+- One key hides every piece of chrome (presentation mode)
+- Mute a chatty pane (per-pane bell/notification control)
+- Tab-completion for the ghoztty command itself (pwsh completer with live pane ids)
