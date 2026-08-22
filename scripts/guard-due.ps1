@@ -565,6 +565,26 @@ $GuardTable = @(
             'dist\windows-installer\build-portable-zip.sh'
         )
     },
+    # The site's Windows downloads (T353). Both halves of the release's website
+    # update -- the rewrite script and the gh-pages publish script it runs
+    # inside -- only ever execute during a real release, and the publish
+    # script's retry loop does not execute even then unless a concurrent
+    # appcast push beats it. Section G runs both for real against local bare
+    # repos with that collision staged, so an edit here can be caught on this
+    # box; nothing else in the tree looks at either file. Stamped by any run
+    # with zero failures: sections E and F need the network and cover neither
+    # script, so gating the stamp on their skips would make this row a wedge on
+    # an offline box (the T898 lesson).
+    [pscustomobject]@{
+        Name   = 'website-windows-links'
+        Script = 'test\win32\website-windows-download.ps1'
+        Stamp  = 'test\win32\website-windows-links.stamp.json'
+        Covers = @(
+            'dist\website\publish-windows-links.sh',
+            'dist\website\update-windows-links.py',
+            'test\win32\website-windows-download.ps1'
+        )
+    },
     # Single-instance launch (T1022): the only harness that proves a second
     # launch of one build JOINS the app already running while a second LINEAGE
     # still starts its own. Both arms need two real GUI launches racing for one

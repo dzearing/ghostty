@@ -198,7 +198,13 @@ if (-not $dockerUp) {
     $printed = (docker run --rm -v "${repoUnix}:/repo" -w /repo msitools-local `
             bash dist/windows-installer/build-msi.sh --print-file-version --build-num 7 |
         Select-Object -Last 1).Trim()
-    $expect = "{0}.{1}.{2}.7" -f [int](Get-Date -Format yy), [int](Get-Date -Format MM), [int](Get-Date -Format dd)
+    # The container's `date` is UTC, and so is a CI runner's -- the host's
+    # local date only agrees with it for part of the day. Comparing the two
+    # made this assertion fail every evening after 17:00 PDT against a version
+    # string that was perfectly correct (measured 2026-08-21 23:12 local:
+    # expected 26.8.21.7, got 26.8.22.7).
+    $utc = (Get-Date).ToUniversalTime()
+    $expect = "{0}.{1}.{2}.7" -f [int]$utc.ToString('yy'), [int]$utc.Month, [int]$utc.Day
     AssertEq "B1 FILEVERSION single source" $expect $printed
 }
 

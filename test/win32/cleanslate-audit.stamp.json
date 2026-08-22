@@ -1,8 +1,8 @@
 {
     "guard":  "cleanslate",
     "script":  "test/win32/cleanslate-audit.ps1",
-    "generated":  "2026-08-21T21:59:16-07:00",
-    "commit":  "56e310ef0",
+    "generated":  "2026-08-21T23:11:30-07:00",
+    "commit":  "90429f489",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
@@ -192,7 +192,7 @@
                   "test/win32/rearrange-session-drop.ps1":  "6518414ea072bf9c8a31da3b073363ea3cd07bef2ffddca9d4df42c0cb81a13c",
                   "test/win32/relaunch-guard.ps1":  "784140b66081be866d4cae5cb2858ef00c9979cdce73dc6f0e4fd5a95aa1628f",
                   "test/win32/relay-account.ps1":  "8dee3165d569d5069208dee6975b251d6bb3444434e4993e5d4bda207e80250f",
-                  "test/win32/release-artifacts.ps1":  "d2f61e55484ebe94aa6235b615bb52f9c6bf39515c7a0574ba06b95be8cab835",
+                  "test/win32/release-artifacts.ps1":  "e7e4706e02c7977a4e91cc3969d5dc21095d4ab2756d59f3bf649b6d1691f37f",
                   "test/win32/release-parity.ps1":  "58774aa921db12266c09e382a9d3908036bb01f4c5b09c7b2dda00bba7f42715",
                   "test/win32/remote-inherit.ps1":  "50b2a9d36a10d0e677963fbb7d155e3dbc45261111214c1ab8b6454f025e24da",
                   "test/win32/remote-pill.ps1":  "f104889463c957ed92a60240036e7a4823ebf343ffbe33433710b550f77c15f6",
@@ -261,7 +261,7 @@
                   "test/win32/viewer-window-chords.ps1":  "f8a4613094f1ff5449211e6c3bddee67c8ee3ed3050f95b02e61717744fba7eb",
                   "test/win32/viewer-worktree.ps1":  "b58c40302cdc8cd34690887d581cd2763eef490c3e9387145884a313caee01fd",
                   "test/win32/viewer-worktree-port.ps1":  "74df2c3c92ef08ce58bed2f4ad1912b9f72058f4990c42b84b6039a2fc4a2cea",
-                  "test/win32/website-windows-download.ps1":  "329c26ab8b13e69d458483a30454907da3e56db9a5ab19c3ef3f043e555598ee",
+                  "test/win32/website-windows-download.ps1":  "571c823e063efbec905d1fc6944e168669754f23f2e42382588a7c1574a1dfa8",
                   "test/win32/wheel-scroll.ps1":  "88785d4f8d74189bf464946842d582a54c638728c792e8fa807e6dcafdaec9d1",
                   "test/win32/window-active.ps1":  "9151aa942d89c9db56f8fe9531b66c67285d311d17d50d8c43b8bec7b1b778df",
                   "test/win32/window-color.ps1":  "3b8c5d85c60fad07747da53240ffaf56f75d255d993461163774c30644010fac",

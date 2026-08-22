@@ -205,33 +205,15 @@ jobs:
         if: env.PUBLISH == 'true'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # The body of this step is dist/website/publish-windows-links.sh, and
+        # it lives there for one reason (T353): the clone-rewrite-commit-push
+        # is only half the job, and the other half -- the rebase-retry that
+        # answers release.yml's concurrent appcast push -- does not execute on
+        # a normal release at all. Inline in YAML, the first time it ran would
+        # have been the first time a release depended on it. As a script it is
+        # run for real, with a collision staged on purpose, by section G of
+        # test\win32\website-windows-download.ps1.
         run: |
-          REPO_URL="https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          git clone --branch gh-pages --single-branch "$REPO_URL" /tmp/gh-pages
-          python3 dist/website/update-windows-links.py /tmp/gh-pages/index.html "$VERSION"
-
-          cd /tmp/gh-pages
-          if git diff --quiet -- index.html; then
-            echo "website already current for win-v$VERSION"
-            exit 0
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add index.html
-          git commit -m "Update website Windows download to win-v${VERSION}"
-
-          # release.yml pushes appcast.xml to this same branch on this same tag
-          # push, so a plain push loses a coin flip roughly half the time.
-          # Rebase and retry rather than failing a release over it.
-          for attempt in 1 2 3 4 5; do
-            if git push origin gh-pages; then
-              echo "website updated (attempt $attempt)"
-              exit 0
-            fi
-            echo "push rejected (attempt $attempt) -- rebasing onto origin/gh-pages"
-            git pull --rebase origin gh-pages
-            sleep $(( attempt * 3 ))
-          done
-          echo "::error::could not push the website update after 5 attempts"
-          exit 1
+          dist/website/publish-windows-links.sh \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "$VERSION" /tmp/gh-pages

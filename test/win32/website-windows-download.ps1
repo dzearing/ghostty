@@ -32,6 +32,10 @@
 #   E  live: the URLs on the page answer 200. Needs network; SKIPs without.
 #   F  drift: the in-repo mirror matches the deployed gh-pages page. It has
 #      silently drifted twice.
+#   G  the gh-pages publish script, RUN, against bare repos on disk -- with a
+#      rival push staged so its rejected-push retry actually executes (T353).
+#      That loop is dead code on a normal release, so until this section the
+#      first execution of it would have been a release depending on it.
 #
 # Read-only apart from a temp dir. Never launches the app, never publishes.
 #
@@ -62,11 +66,12 @@ function Skip($name, $why) {
 $indexPath = Join-Path $Repo 'relay\deploy\ghpages\index.html'
 $cssPath   = Join-Path $Repo 'relay\deploy\ghpages\landing\styles.css'
 $pyPath    = Join-Path $Repo 'dist\website\update-windows-links.py'
+$pubPath   = Join-Path $Repo 'dist\website\publish-windows-links.sh'
 $wfPath    = Join-Path $Repo '.github\workflows\release-windows.yml'
 $macWfPath = Join-Path $Repo '.github\workflows\release.yml'
 $sharedSh  = Join-Path $Repo 'dist\windows-installer\build-release-artifacts.sh'
 
-foreach ($p in @($indexPath, $cssPath, $pyPath, $wfPath, $macWfPath, $sharedSh)) {
+foreach ($p in @($indexPath, $cssPath, $pyPath, $pubPath, $wfPath, $macWfPath, $sharedSh)) {
     if (-not (Test-Path -LiteralPath $p)) {
         "FATAL: missing $p"
         "1 FAILURE(S)"
@@ -80,6 +85,7 @@ $py     = Get-Content -LiteralPath $pyPath -Raw
 $wf     = Get-Content -LiteralPath $wfPath -Raw
 $macWf  = Get-Content -LiteralPath $macWfPath -Raw
 $shared = Get-Content -LiteralPath $sharedSh -Raw
+$pub    = Get-Content -LiteralPath $pubPath -Raw
 
 "=== A. page shape ==="
 
@@ -251,8 +257,10 @@ if (-not $interp) {
 
 "=== D. release wiring ==="
 
-Assert 'D1 workflow calls the rewrite script' `
-    ($wf -match 'dist/website/update-windows-links\.py')
+Assert 'D1 workflow updates the site through the publish script' `
+    ($wf -match 'dist/website/publish-windows-links\.sh')
+Assert 'D1b the publish script is what calls the rewrite script' `
+    ($pub -match 'update-windows-links\.py')
 Assert 'D2 the website step is gated on PUBLISH' `
     ($wf -match "(?s)Update website Windows download links.*?if:\s*env\.PUBLISH == 'true'")
 # Ordering matters: links must never precede the assets they point at.
@@ -261,11 +269,20 @@ $iWeb     = $wf.IndexOf('Update website Windows download links')
 Assert 'D3 the website step runs after the publish step' `
     ($iPublish -ge 0 -and $iWeb -gt $iPublish)
 Assert 'D4 windows gh-pages push retries on rejection' `
-    ($wf -match '(?s)Update website Windows download links.*?git pull --rebase origin gh-pages')
+    ($pub -match 'git pull --rebase origin gh-pages')
 Assert 'D5 mac appcast push retries on rejection too' `
     ($macWf -match 'git pull --rebase origin gh-pages')
 Assert 'D6 both writers target the gh-pages branch' `
-    (($wf -match 'clone --branch gh-pages') -and ($macWf -match 'clone --branch gh-pages'))
+    (($pub -match 'clone --branch gh-pages') -and ($macWf -match 'clone --branch gh-pages'))
+# The workflow invokes the script directly (not `bash script`), so a file that
+# lost its executable bit is a release that dies at the last step. git's index
+# mode is the one that travels to the runner; the working-tree bit on this box
+# is not.
+$pubMode = ''
+Push-Location $Repo
+try { $pubMode = (& git ls-files -s -- 'dist/website/publish-windows-links.sh' 2>$null) } finally { Pop-Location }
+Assert 'D6b the publish script is executable in the index (100755)' `
+    ("$pubMode" -match '^100755\s')
 
 # T577. The workflow was correct for two weeks and had still never run once,
 # because a workflow runs from the tree of the ref that triggered it and the
@@ -352,6 +369,239 @@ if (-not $haveLive) {
             }
         }
     }
+}
+
+"=== G. the publish script, run for real against a staged collision ==="
+
+# T353. Everything above is text-matching. This section RUNS
+# dist/website/publish-windows-links.sh end to end against bare repos on
+# disk -- and, on purpose, makes its push lose the race the way release.yml's
+# concurrent appcast push makes it lose one during a real release. That retry
+# loop is dead code on a normal run, so before this section the first
+# execution of it would have been the first release that needed it, with a
+# broken download page as the way anyone found out.
+#
+# The collision is staged with a pre-push hook planted through GIT_TEMPLATE_DIR
+# (the fresh clone the script makes picks it up): on the first push, a rival
+# clone commits appcast.xml and pushes it first, so our push is rejected
+# non-fast-forward exactly as a real appcast push would reject it.
+
+function Get-BashPath {
+    foreach ($p in @('C:\Program Files\Git\bin\bash.exe', 'C:\Program Files (x86)\Git\bin\bash.exe')) {
+        if (Test-Path -LiteralPath $p) { return $p }
+    }
+    $git = Get-Command git.exe -ErrorAction SilentlyContinue
+    if ($git) {
+        $cand = Join-Path (Split-Path (Split-Path $git.Source -Parent) -Parent) 'bin\bash.exe'
+        if (Test-Path -LiteralPath $cand) { return $cand }
+    }
+    return $null
+}
+function ConvertTo-MsysPath([string]$Path) {
+    $p = $Path -replace '\\', '/'
+    if ($p -match '^([A-Za-z]):(.*)$') { return '/' + $Matches[1].ToLower() + $Matches[2] }
+    return $p
+}
+# The script calls `python3`, which is what ubuntu-latest has and what this box
+# does not (the Store alias prints an ad and exits non-zero). A one-line shim on
+# PATH lets the UNMODIFIED script run here -- so what is exercised is the exact
+# command line CI runs, not a special-cased one.
+function New-Python3Shim([string]$WorkDir, [string]$Interp) {
+    $exe = (Get-Command $Interp -ErrorAction SilentlyContinue)
+    if (-not $exe) { return $null }
+    $shimDir = Join-Path $WorkDir 'shim'
+    New-Item -ItemType Directory -Path $shimDir -Force | Out-Null
+    $body = "#!/bin/sh`nexec `"" + (ConvertTo-MsysPath $exe.Source) + "`" `"`$@`"`n"
+    [IO.File]::WriteAllText((Join-Path $shimDir 'python3'), $body, (New-Object Text.UTF8Encoding $false))
+    return $shimDir
+}
+
+$bash = Get-BashPath
+if (-not $bash) {
+    Skip 'G1-G12 publish script behavior' 'no Git Bash on this box'
+} elseif (-not $interp) {
+    Skip 'G1-G12 publish script behavior' 'no python 3 interpreter on PATH'
+} else {
+    $g = Join-Path $env:TEMP ('ghoztty-t353-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Path $g -Force | Out-Null
+    $savedPath = $env:PATH
+    try {
+        $gu       = ConvertTo-MsysPath $g
+        $originW  = Join-Path $g 'origin.git'
+        $brokenW  = Join-Path $g 'origin-broken.git'
+        $shimDir  = New-Python3Shim $g $interp
+        if ($shimDir) { $env:PATH = "$shimDir;$savedPath" }
+
+        # -- fixture: a bare gh-pages with the real page on it, a second bare
+        #    one whose page is missing the anchor, and a rival clone to push
+        #    the colliding commit from.
+        $setup = @'
+#!/bin/sh
+set -e
+W="$1"; SRC_INDEX="$2"
+export GIT_AUTHOR_NAME=harness GIT_AUTHOR_EMAIL=harness@example.invalid
+export GIT_COMMITTER_NAME=harness GIT_COMMITTER_EMAIL=harness@example.invalid
+cd "$W"
+git init -q --bare origin.git
+git init -q --bare origin-broken.git
+git init -q seed
+cd seed
+git checkout -q -b gh-pages
+cp "$SRC_INDEX" index.html
+printf '<rss>appcast base</rss>\n' > appcast.xml
+git add index.html appcast.xml
+git commit -qm "base"
+git remote add origin "$W/origin.git"
+git push -q origin gh-pages
+sed 's/id="win-msi-link"/id="win-msi-link-renamed"/' index.html > broken.html
+mv broken.html index.html
+git add index.html
+git commit -qm "page with no windows anchor"
+git remote add broken "$W/origin-broken.git"
+git push -q broken gh-pages
+cd "$W"
+git clone -q --branch gh-pages --single-branch "$W/origin.git" rival
+echo SETUP-OK
+'@
+        $hook = @'
+#!/bin/sh
+# The concurrent appcast push, staged. Fires once unless RIVAL_ALWAYS=1.
+if [ "${RIVAL_ALWAYS:-0}" != "1" ]; then
+    [ -e "$RIVAL_MARKER" ] && exit 0
+    : > "$RIVAL_MARKER"
+fi
+{
+    # The rival has to be CURRENT to win the race -- a rejected rival push is
+    # no collision at all, and it would leave our push succeeding on attempt 1
+    # while the assertions below read as a broken retry.
+    git -C "$RIVAL" fetch -q origin gh-pages
+    git -C "$RIVAL" reset -q --hard FETCH_HEAD
+    printf '<rss>appcast %s</rss>\n' "$(date +%s)-$$" > "$RIVAL/appcast.xml"
+    git -C "$RIVAL" add appcast.xml
+    git -C "$RIVAL" -c user.name=rival -c user.email=rival@example.invalid \
+        commit -qm "appcast push racing the website update"
+    git -C "$RIVAL" push origin gh-pages
+} >> "$RIVAL_LOG" 2>&1
+echo "hook rc=$? at $(date +%s)" >> "$RIVAL_LOG"
+# Always 0: this hook stages a race, it does not veto the push. A rival that
+# could not push must let our push SUCCEED, so a broken fixture reads as
+# "the retry was never exercised" rather than as a passing retry test.
+exit 0
+'@
+        $setupPath = Join-Path $g 'setup.sh'
+        [IO.File]::WriteAllText($setupPath, ($setup -replace "`r`n", "`n"), (New-Object Text.UTF8Encoding $false))
+        $tmplHooks = Join-Path $g 'tmpl\hooks'
+        New-Item -ItemType Directory -Path $tmplHooks -Force | Out-Null
+        [IO.File]::WriteAllText((Join-Path $tmplHooks 'pre-push'), ($hook -replace "`r`n", "`n"), (New-Object Text.UTF8Encoding $false))
+
+        $setupOut = & $bash (ConvertTo-MsysPath $setupPath) "$gu" (ConvertTo-MsysPath $indexPath) 2>&1
+        if ("$setupOut" -notmatch 'SETUP-OK') {
+            Assert "G0 fixture repos built ($setupOut)" $false
+        } else {
+            $pubU = ConvertTo-MsysPath $pubPath
+            # git.exe reads these out of the environment, and MSYS does not
+            # path-convert environment variables the way it converts argv --
+            # so they are drive-letter paths with forward slashes, which both
+            # bash and native git resolve.
+            $gw = $g -replace '\\', '/'
+            $rivalLog = Join-Path $g 'rival.log'
+            $env:WEBSITE_PUSH_BACKOFF = '0'   # the loop's sleep, not its logic
+            $env:RIVAL = "$gw/rival"
+            $env:RIVAL_MARKER = "$gw/collided.once"
+            $env:RIVAL_LOG = "$gw/rival.log"
+
+            function Invoke-Publish($originPath, $version, $clone) {
+                $out = & $bash $pubU $originPath $version "$gu/$clone" 2>&1
+                return [pscustomobject]@{ Out = ("$out"); Code = $LASTEXITCODE }
+            }
+            function GhPages($repo, $file) {
+                $t = & git -C $repo show "gh-pages:$file" 2>$null
+                return ($t -join "`n")
+            }
+            function CommitCount($repo) {
+                return [int](& git -C $repo rev-list --count gh-pages 2>$null)
+            }
+
+            # -- G1: the ordinary path. Clone, rewrite, commit, push, first try.
+            $r1 = Invoke-Publish "$gu/origin.git" '9.9.9' 'clone1'
+            AssertEq 'G1 publish exits 0 on an uncontended push' 0 $r1.Code
+            Assert 'G1b it says which attempt succeeded' ($r1.Out -match 'website updated \(attempt 1\)')
+            $page1 = GhPages $originW 'index.html'
+            Assert 'G2 gh-pages now offers win-v9.9.9' ($page1 -match 'win-v9\.9\.9')
+            Assert 'G2b and the macOS download is untouched' ($page1 -match 'arm64\.dmg')
+            $countAfter1 = CommitCount $originW
+
+            # -- G3: same version again. A republish must not pile empty
+            #    commits onto the branch.
+            $r2 = Invoke-Publish "$gu/origin.git" '9.9.9' 'clone2'
+            AssertEq 'G3 a second run for the same version exits 0' 0 $r2.Code
+            Assert 'G3b and says the site is already current' ($r2.Out -match 'already current')
+            AssertEq 'G3c and pushed nothing' $countAfter1 (CommitCount $originW)
+
+            # -- G4: THE POINT OF THIS SECTION. A rival push lands between our
+            #    clone and our push; the retry must rebase and win.
+            $env:GIT_TEMPLATE_DIR = "$gw/tmpl"
+            $r3 = Invoke-Publish "$gu/origin.git" '9.9.10' 'clone3'
+            Remove-Item Env:\GIT_TEMPLATE_DIR -ErrorAction SilentlyContinue
+            AssertEq 'G4 publish still exits 0 when its push is rejected' 0 $r3.Code
+            Assert 'G4b the rejection was real (attempt 1 lost)' `
+                ($r3.Out -match 'push rejected \(attempt 1\)')
+            Assert 'G4c the rebase-retry then landed it' `
+                ($r3.Out -match 'website updated \(attempt 2\)')
+            $page2 = GhPages $originW 'index.html'
+            Assert 'G5 gh-pages carries the new version after the retry' `
+                ($page2 -match 'win-v9\.9\.10')
+            # The half a force-push would have destroyed: the concurrent
+            # writer's file must survive, which is why this is a rebase.
+            Assert 'G5b and the rival appcast push survived the retry' `
+                ((GhPages $originW 'appcast.xml') -match 'appcast \d')
+
+            # -- G6: retries are bounded. Losing every race must fail loudly
+            #    rather than spin, and must leave the branch as it was.
+            $env:GIT_TEMPLATE_DIR = "$gw/tmpl"
+            $env:RIVAL_ALWAYS = '1'
+            $env:WEBSITE_PUSH_ATTEMPTS = '2'
+            $r4 = Invoke-Publish "$gu/origin.git" '9.9.11' 'clone4'
+            Remove-Item Env:\GIT_TEMPLATE_DIR -ErrorAction SilentlyContinue
+            Remove-Item Env:\RIVAL_ALWAYS -ErrorAction SilentlyContinue
+            Remove-Item Env:\WEBSITE_PUSH_ATTEMPTS -ErrorAction SilentlyContinue
+            Assert 'G6 losing every race fails' ($r4.Code -ne 0)
+            Assert 'G6b and says so as a workflow error' `
+                ($r4.Out -match 'could not push the website update after 2 attempts')
+            Assert 'G6c and the page was left at the last version that landed' `
+                ((GhPages $originW 'index.html') -match 'win-v9\.9\.10')
+
+            # -- G7: a page the rewrite cannot retarget must fail the step,
+            #    not report success over an unchanged site (T214/T303 shape).
+            $r5 = Invoke-Publish "$gu/origin-broken.git" '9.9.9' 'clone5'
+            Assert 'G7 a page with no windows anchor fails the publish' ($r5.Code -ne 0)
+            Assert 'G7b and nothing was committed to that branch' `
+                ((CommitCount $brokenW) -eq 2)
+
+            # -- G8: called wrong is a usage error, not a mystery.
+            $out6 = & $bash $pubU 2>&1
+            $code6 = $LASTEXITCODE
+            AssertEq 'G8 no arguments exits 2' 2 $code6
+            Assert 'G8b and prints usage' ("$out6" -match 'usage: publish-windows-links\.sh')
+        }
+    } finally {
+        $env:PATH = $savedPath
+        foreach ($v in @('WEBSITE_PUSH_BACKOFF', 'WEBSITE_PUSH_ATTEMPTS', 'RIVAL', 'RIVAL_MARKER',
+                         'RIVAL_ALWAYS', 'RIVAL_LOG', 'GIT_TEMPLATE_DIR')) {
+            Remove-Item ("Env:\" + $v) -ErrorAction SilentlyContinue
+        }
+        Remove-Item -LiteralPath $g -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# A clean green run stamps the files this harness covers (T783), so an edit to
+# the publish script or the rewrite script reads as DUE until someone runs this
+# again. Sections E and F need the network and SKIP without it; they cover
+# neither script, so a skip there must not withhold the stamp -- the T898
+# lesson about a bar that can never be met on this box.
+if ($script:failures -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
+        update -Guard website-windows-links -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
 }
 
 ""
