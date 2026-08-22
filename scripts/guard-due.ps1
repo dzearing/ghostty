@@ -130,7 +130,12 @@ $GuardTable = @(
         Covers = @(
             'test\win32\upstream-remote.ps1',
             'scripts\upstream-remote.ps1',
-            '.gitattributes'
+            '.gitattributes',
+            # T1099: the plan doc IS the input - `check` derives the sha list
+            # from it, so a re-cut stage introduces a sha nothing has anchored
+            # yet, and the harness is what notices. Without this row the plan
+            # could name a new merge point and the gate would stay green over it.
+            'docs\design\windows-parity-merge-back-plan.md'
         )
     },
     # The other half of Stage 0 (T956): the fork-identity overlay. Same argument

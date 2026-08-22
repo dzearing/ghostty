@@ -273,6 +273,14 @@ switch ($Action) {
         # fetch needs GitHub, and a loop that cannot claim because the network
         # is down is a worse failure than a stale upstream ref. Fetches at most
         # once a day.
+        #
+        # T1099: `ensure` also ANCHORS each plan sha with a local tag, and the
+        # line printed below is now the full verdict rather than "upstream/main
+        # resolved". It used to be the weaker one, which is why this block could
+        # print UPSTREAM OK on the very turn whose acceptance run scored five
+        # failures against this repo. It can print UPSTREAM PROBLEM now; it still
+        # exits 0, because the teeth belong in test\win32\upstream-remote.ps1
+        # (via guard-due), not in a claim that must never wedge.
         $upstreamScript = Join-Path $PSScriptRoot 'upstream-remote.ps1'
         if (Test-Path -LiteralPath $upstreamScript) {
             $upOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $upstreamScript ensure -Repo $Repo 2>&1 | Out-String

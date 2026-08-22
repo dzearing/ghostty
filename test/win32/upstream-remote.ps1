@@ -53,6 +53,10 @@ function Say($m) { Write-Host $m }
 
 $UpstreamUrl = 'https://github.com/ghostty-org/ghostty.git'
 $EnsureScript = Join-Path $Repo 'scripts\upstream-remote.ps1'
+# Must match $AnchorPrefix in scripts\upstream-remote.ps1 (T1099). Spelled out
+# here rather than imported so this script asserts against the ref names a human
+# would type, not against whatever the script under test happens to define.
+$AnchorPrefix = 'upstream-anchor/'
 
 # Every git call here reports through its exit code. SilentlyContinue is
 # function-scoped so a git that writes to stderr - a missing remote and an
@@ -116,18 +120,38 @@ Assert 'A4 the plan cites the staged merge points at all' ($planShas.Count -ge 6
 
 $unresolved = @()
 $unreachable = @()
+$unanchored = @()
 foreach ($s in $planShas) {
     $t = Invoke-GitIn $Repo @('cat-file', '-t', $s)
     if ($t.Code -ne 0 -or $t.Text -ne 'commit') { $unresolved += $s; continue }
     if (-not (Test-GitOk $Repo @('merge-base', '--is-ancestor', $s, 'upstream/main'))) { $unreachable += $s }
+    # T1099: the tag is the anchor that actually keeps the object alive. Compare
+    # the OBJECT, not the tag's existence - a tag left over from a re-cut plan
+    # would otherwise read as an anchor for a sha it no longer points at.
+    $tagged = Invoke-GitIn $Repo @('rev-parse', '--verify', '--quiet', "refs/tags/$AnchorPrefix$s^{commit}")
+    $target = Invoke-GitIn $Repo @('rev-parse', '--verify', '--quiet', "$s^{commit}")
+    if ($tagged.Code -ne 0 -or $tagged.Text -ne $target.Text) { $unanchored += $s }
 }
 Assert 'A5 every sha the plan cites resolves to a commit' ($unresolved.Count -eq 0) "(missing: $($unresolved -join ', '))"
 Assert 'A6 every one is an ancestor of upstream/main, so the ref keeps it alive' ($unreachable.Count -eq 0) "(dangling: $($unreachable -join ', '))"
+# A6 is the WEAK anchor and A6b is the durable one. A remote-tracking ref
+# disappears the moment somebody runs `git remote remove upstream` - which
+# happened on 2026-08-22 and left every sha below reachable from nothing for an
+# hour and a half (T1099).
+Assert 'A6b ...and every one is anchored by a local tag, which no remote operation can prune' ($unanchored.Count -eq 0) "(unanchored: $($unanchored -join ', '))"
 
 $checkOut = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $EnsureScript check -Repo $Repo)
 $checkCode = $LASTEXITCODE
 Assert 'A7 `upstream-remote.ps1 check` scores this repo green' ($checkCode -eq 0) "(exit $checkCode)"
 Assert 'A8 ...and says so in one readable line' (@($checkOut | Where-Object { $_ -match '^UPSTREAM OK' }).Count -eq 1) "(got: $($checkOut -join ' / '))"
+
+# The line the LOOP prints every turn is `ensure`'s, not `check`'s, and until
+# T1099 it answered a weaker question: upstream/main resolving, with the plan
+# shas never asked about at all. A9 is the assertion that the two verdicts are
+# now the same verdict.
+$ensureOut = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $EnsureScript ensure -Repo $Repo -NoFetch)
+Assert 'A9 the claim`s own line (`ensure`) agrees with `check` on this repo' (@($ensureOut | Where-Object { $_ -match '^UPSTREAM OK' }).Count -eq 1) "(got: $($ensureOut -join ' / '))"
+Assert 'A10 ...and reports the anchor count, so the gate names what it checked' (@($ensureOut | Where-Object { $_ -match 'anchored by tag' }).Count -ge 1) "(got: $($ensureOut -join ' / '))"
 
 # ---------------------------------------------------------------------------
 Say ''
@@ -282,6 +306,70 @@ Assert 'D3 git itself reports merge=union for every declared path' ($notUnion.Co
 # does not parse, which is worse than the conflict it avoided.
 $unsafe = @($unionPaths | Where-Object { $_ -match '\.(zig|swift|json|zon|yml|yaml|toml|c|h|m|rc)$' })
 Assert 'D4 no structured-syntax file is under a union driver' ($unsafe.Count -eq 0) "(unsafe: $($unsafe -join ', '))"
+
+# ---------------------------------------------------------------------------
+Say ''
+Say 'E. the anchor survives the remote being removed (T1099)'
+# ---------------------------------------------------------------------------
+# The failure this section exists for is not hypothetical: on 2026-08-22 a turn
+# ran `git remote remove upstream` by hand, which deleted refs/remotes/upstream/*
+# and left all eight plan shas reachable from nothing. Re-adding the remote did
+# not bring the ref back. Everything here runs in a throwaway repo with its own
+# plan doc, so the assertion is about the MECHANISM and does not depend on the
+# live repo happening to be healthy.
+
+$anchorRepo = Join-Path $sandbox 'anchor'
+New-Item -ItemType Directory -Force -Path $anchorRepo | Out-Null
+[void](Invoke-GitIn $anchorRepo @('init', '-q', '.'))
+$planShasFixture = @()
+foreach ($i in 1..3) {
+    Set-Content -LiteralPath (Join-Path $anchorRepo "f$i.txt") -Value "v$i" -Encoding UTF8
+    [void](Invoke-GitCommit $anchorRepo @('add', "f$i.txt"))
+    [void](Invoke-GitCommit $anchorRepo @('commit', '-qm', "stage $i"))
+    $planShasFixture += (Invoke-GitIn $anchorRepo @('rev-parse', '--short=9', 'HEAD')).Text
+}
+# The plan doc is where the sha list comes from, in the fixture exactly as in
+# the real repo - so this also covers the extraction, not just the anchoring.
+$fixturePlanDir = Join-Path $anchorRepo 'docs\design'
+New-Item -ItemType Directory -Force -Path $fixturePlanDir | Out-Null
+$planLines = @('# fixture plan', '')
+foreach ($s in $planShasFixture) { $planLines += "- stage at ``$s``" }
+Set-Content -LiteralPath (Join-Path $fixturePlanDir 'windows-parity-merge-back-plan.md') -Value $planLines -Encoding UTF8
+
+$e0 = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $EnsureScript check -Repo $anchorRepo)
+Assert 'E1 `check` calls an un-anchored plan sha out by name' (@($e0 | Where-Object { $_ -match 'is not anchored' }).Count -ge 1) "(got: $($e0 -join ' / '))"
+
+[void](& powershell -NoProfile -ExecutionPolicy Bypass -File $EnsureScript ensure -Repo $anchorRepo -NoFetch)
+$tagsAfter = @((Invoke-GitIn $anchorRepo @('tag', '-l', "$AnchorPrefix*")).Lines | Where-Object { $_ })
+Assert 'E2 `ensure` anchors every plan sha with a tag' ($tagsAfter.Count -eq $planShasFixture.Count) "(got $($tagsAfter.Count) of $($planShasFixture.Count): $($tagsAfter -join ', '))"
+
+# THE POINT OF THE SECTION: rip the remote out, the way 2026-08-22 did.
+[void](Invoke-GitIn $anchorRepo @('remote', 'remove', 'upstream'))
+Assert 'setup: the remote really is gone' (-not (Test-GitOk $anchorRepo @('remote', 'get-url', 'upstream')))
+$stillAnchored = @()
+foreach ($s in $planShasFixture) {
+    $tagged = Invoke-GitIn $anchorRepo @('rev-parse', '--verify', '--quiet', "refs/tags/$AnchorPrefix$s^{commit}")
+    if ($tagged.Code -eq 0 -and $tagged.Text) { $stillAnchored += $s }
+}
+Assert 'E3 every sha is STILL anchored with the remote removed' ($stillAnchored.Count -eq $planShasFixture.Count) "(kept: $($stillAnchored.Count) of $($planShasFixture.Count))"
+
+# `git gc --prune=now` is the operation the whole task is about. An anchored
+# object must survive it; that is what "anchor" means.
+[void](Invoke-GitIn $anchorRepo @('reflog', 'expire', '--expire=now', '--all'))
+[void](Invoke-GitIn $anchorRepo @('gc', '--prune=now', '--quiet'))
+$survived = @()
+foreach ($s in $planShasFixture) {
+    $t = Invoke-GitIn $anchorRepo @('cat-file', '-t', $s)
+    if ($t.Code -eq 0 -and $t.Text -eq 'commit') { $survived += $s }
+}
+Assert 'E4 ...and survives `git gc --prune=now` with every reflog expired' ($survived.Count -eq $planShasFixture.Count) "(survived: $($survived.Count) of $($planShasFixture.Count))"
+
+# The verdict must still be able to go RED for the sha question alone. A plan
+# citing a sha this repo has never seen is the cheapest way to ask that.
+Add-Content -LiteralPath (Join-Path $fixturePlanDir 'windows-parity-merge-back-plan.md') -Value '- stage at `0123456789abcdef0123456789abcdef01234567`'
+$e5 = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $EnsureScript ensure -Repo $anchorRepo -NoFetch)
+Assert 'E5 `ensure` prints UPSTREAM PROBLEM for a sha the plan cites and the repo lacks' (@($e5 | Where-Object { $_ -match '^UPSTREAM PROBLEM' }).Count -eq 1) "(got: $($e5 -join ' / '))"
+Assert 'E6 ...and still exits 0, so a bad verdict cannot wedge the claim' ($LASTEXITCODE -eq 0) "(exit $LASTEXITCODE)"
 
 if ($NegativeControl) {
     Say ''

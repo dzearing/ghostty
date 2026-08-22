@@ -1,8 +1,8 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-08-22T03:39:25-07:00",
-    "commit":  "053eb41da",
+    "generated":  "2026-08-22T07:40:10-07:00",
+    "commit":  "a57a441fb",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
@@ -247,7 +247,7 @@
                   "test/win32/upgrade-no-fork.ps1":  "76264704b07c6d8267edda9d19349210a5462999cc8321b7c6b4d1f5e09df56c",
                   "test/win32/upgrade-resume-readiness.ps1":  "9df12a1d37c47dddc89f67af6056dd1c850a055e8b11b119ba272f24922e61f8",
                   "test/win32/upgrade-staleness.ps1":  "465efa7795749c2b09a05f818543aee50af87708b86e6edd0506be7827315eab",
-                  "test/win32/upstream-remote.ps1":  "acb9b3e1db6c42e393c27fea8b01c1470a201a7fdd706249062a6b37415f7489",
+                  "test/win32/upstream-remote.ps1":  "bddf3e1b1b2765c9304cbf09aff560170ebdcf65695c6530fe1cf1543bc5a21a",
                   "test/win32/url-scheme.ps1":  "a1d5fdb9e20011bced3c5989e8eaed5a0a079e346bb8e14f462c92dadef34b48",
                   "test/win32/verdict-exit-audit.ps1":  "02f5dc6471e5790a9609eeb47a5cb4b3810c8d480ec19626b89bc716bb025d8d",
                   "test/win32/viewer-composer.ps1":  "a6ee294b66489b65bad593890320052fe11c6677643cff68d4596719fb3e292f",

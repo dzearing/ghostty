@@ -1,11 +1,12 @@
 {
     "guard":  "upstream-remote",
     "script":  "test/win32/upstream-remote.ps1",
-    "generated":  "2026-08-20T11:44:26-07:00",
-    "commit":  "9b6d55abd",
+    "generated":  "2026-08-22T07:36:56-07:00",
+    "commit":  "a57a441fb",
     "files":  {
                   ".gitattributes":  "183cb88ce3f447a2ad7ddd13ec981a5a3ef0044f4a99696b38f565ca30d404bb",
-                  "scripts/upstream-remote.ps1":  "bbab63644bb9f31225dbefe5d4b08f42f4507f8fee732ce248ae6f2a3f08a3f3",
-                  "test/win32/upstream-remote.ps1":  "acb9b3e1db6c42e393c27fea8b01c1470a201a7fdd706249062a6b37415f7489"
+                  "docs/design/windows-parity-merge-back-plan.md":  "b1376ec6a0458c667d8b591cd9ac5128440129cae5ffa8dc4e29e28e5fd73530",
+                  "scripts/upstream-remote.ps1":  "f2efb217a3de93970cb6832be730a3f9121977313db669a7d2c781a11a6f623d",
+                  "test/win32/upstream-remote.ps1":  "bddf3e1b1b2765c9304cbf09aff560170ebdcf65695c6530fe1cf1543bc5a21a"
               }
 }

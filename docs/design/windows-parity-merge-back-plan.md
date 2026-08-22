@@ -36,6 +36,27 @@ daily process and does not need a plan.
 - **Changed only here:** 1973 files - no conflict possible
 - **Changed only upstream:** 616 files - arrive clean
 
+### What keeps these shas alive
+
+Every sha this doc pins in backticks is anchored by a local lightweight tag,
+`refs/tags/upstream-anchor/<sha>`, written by
+`scripts\upstream-remote.ps1 ensure` (which `go-loop-exec.ps1 claim` runs every
+turn) and asserted by `test\win32\upstream-remote.ps1` section A6b.
+
+The anchor used to be `refs/remotes/upstream/main` alone, and that is not
+durable. On 2026-08-22 a turn ran `git remote remove upstream` by hand; the
+tracking ref went with it, re-adding the remote twelve minutes later did not
+bring it back, and for the next hour and a half every sha below was reachable
+from nothing and a `git gc` was entitled to drop it (T1099). A tag is a ref this
+repo owns: no remote operation prunes it, it survives the remote being removed
+outright, and because it is lightweight neither `git push` nor `push.followTags`
+can leak it into `origin`.
+
+**Re-cutting a stage means re-running `ensure`.** The sha list is read out of
+this file, so a new pin is un-anchored until the script sees it - which is why
+this doc is in the `upstream-remote` guard's coverage list and editing it makes
+that harness due.
+
 ## The fact that decides the sequence: upstream is on Zig 0.16.0
 
 Upstream commit **`e8525c0fd` "Update to Zig 0.16.0"** (authored 2026-05-07,
