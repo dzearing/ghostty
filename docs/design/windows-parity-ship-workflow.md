@@ -11,13 +11,18 @@ referenced from `go.md`, which is the file every turn actually reads.
 
 ## Which merge this is
 
-Two different merges get called "merge back". They are independent and this doc
-covers only the first.
+Three different merges used to share the name "merge back", and two of them got
+mistaken for the third on 2026-08-22 (T1097). They are named apart now. This doc
+covers the **cutover**, the first row:
 
-| | What it is | Where it is planned |
-|---|---|---|
-| **Branch → fork main** | `users/dzearing/windows-amd64` into `origin/main` (dzearing/ghoztty) | **this doc** |
-| **Upstream → fork** | `ghostty-org/ghostty` `main` into this repo | `windows-parity-merge-back-plan.md` |
+| | The operation | Direction | Where it is planned |
+|---|---|---|---|
+| **Cutover** | `users/dzearing/windows-amd64` → `main` on dzearing/ghoztty | our branch becomes the trunk | **this doc**, gated by `scripts\ship-readiness.ps1` |
+| **Upstream pull** | ghostty-org/ghostty `main` → this fork | code flows INTO us, on the user's call only | `windows-parity-upstream-pull-plan.md`, policy in D80 |
+| **Upstreaming** | this fork → ghostty-org/ghostty | **never happens** | D80. No PR, no pushed branch; the `upstream` remote is fetch-only by construction |
+
+Never write the bare phrase "merge back" again — say "cutover", "upstream pull",
+or "upstreaming", and name the direction in the same sentence.
 
 `origin/main` is not a dead trunk. The Mac seat has been merging feature
 branches into it all along — `users/dzearing/pane-resize-fixed-edges`,

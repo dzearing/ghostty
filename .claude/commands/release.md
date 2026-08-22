@@ -102,7 +102,7 @@ git push origin main --tags
 
 That starts the macOS half: `release.yml` builds, signs, notarizes, and publishes `Ghoztty-X.Y.Z-arm64.dmg` to the `vX.Y.Z` release.
 
-**Until the Windows branch merges back, the Windows half needs its own tag** (T577). Push it too, at the head of the Windows branch:
+**Until the cutover (this branch onto `main` in dzearing/ghoztty), the Windows half needs its own tag** (T577). Push it too, at the head of the Windows branch:
 
 ```bash
 git push origin users/dzearing/windows-amd64        # the tag must point at a pushed commit
@@ -110,7 +110,7 @@ git tag -a win-vX.Y.Z -m "Ghoztty for Windows vX.Y.Z" users/dzearing/windows-amd
 git push origin win-vX.Y.Z
 ```
 
-A GitHub workflow runs from the tree of the ref that triggered it, and `main` has no Windows frontend at all — no `src/apprt/win32`, no `dist/windows-installer`, and an apprt enum of gtk/none/embedded, so `-Dapp-runtime=win32` is not a valid option there. A `vX.Y.Z` tag cut from main therefore cannot build a Windows terminal no matter which branch the workflow file sits on. `release-windows.yml` triggers on **both** `v*` and `win-v*` for exactly that reason: today the `win-v` tag is what fires it, and at merge-back the `vX.Y.Z` tag starts firing it on its own with nothing to rewire. Between now and then, **a release that skips the second tag ships macOS only**, silently — which is how Windows came to be offered a build from 2026-07-19 while macOS shipped v1.31.0.
+A GitHub workflow runs from the tree of the ref that triggered it, and `main` has no Windows frontend at all — no `src/apprt/win32`, no `dist/windows-installer`, and an apprt enum of gtk/none/embedded, so `-Dapp-runtime=win32` is not a valid option there. A `vX.Y.Z` tag cut from main therefore cannot build a Windows terminal no matter which branch the workflow file sits on. `release-windows.yml` triggers on **both** `v*` and `win-v*` for exactly that reason: today the `win-v` tag is what fires it, and at the cutover (this branch merged onto `main` in dzearing/ghoztty) the `vX.Y.Z` tag starts firing it on its own with nothing to rewire. Between now and then, **a release that skips the second tag ships macOS only**, silently — which is how Windows came to be offered a build from 2026-07-19 while macOS shipped v1.31.0.
 
 Either trigger publishes `Ghoztty-X.Y.Z-x64.msi` + `Ghoztty-portable-X.Y.Z-x64.zip` to a `win-vX.Y.Z` release (`--latest=false`, so the Mac latest/Sparkle flow is untouched). The separate release tag is a contract with shipped binaries: installed Windows builds find updates by scanning the releases list for the newest `win-v` tag (`src/apprt/win32/update_check.zig`).
 

@@ -45,7 +45,7 @@ scripts/githooks/* text eol=lf
 *.otf binary
 
 #--------------------------------------------------------------------
-# Merge drivers (T957, Stage 0 of docs/design/windows-parity-merge-back-plan.md)
+# Merge drivers (T957, Stage 0 of docs/design/windows-parity-upstream-pull-plan.md)
 #--------------------------------------------------------------------
 # `union` is git's built-in append-both-sides driver: it needs no local config,
 # so unlike core.hooksPath it travels with the repo to every clone and every

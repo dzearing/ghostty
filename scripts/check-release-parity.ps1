@@ -1,6 +1,6 @@
 # Does the newest macOS release have its Windows half? (T579)
 #
-# Until merge-back a full release is TWO tag pushes: vX.Y.Z on main for macOS
+# Until the cutover a full release is TWO tag pushes: vX.Y.Z on main for macOS
 # and win-vX.Y.Z on the Windows branch (T577 explains why one tag cannot do
 # both). Skipping the second push produces no error anywhere: every download
 # link keeps answering 200, it just hands people an old build -- that is how

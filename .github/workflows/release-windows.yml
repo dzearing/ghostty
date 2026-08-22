@@ -14,7 +14,7 @@ on:
     #           release is cut as its OWN tag on the Windows branch, which is
     #           the only ref whose tree can build one.
     #
-    #   v*      is the one that takes over at merge-back, unchanged. Once the
+    #   v*      is the one that takes over at the cutover, unchanged. Once the
     #           Windows branch is in main, a vX.Y.Z tag carries the win32
     #           source and this workflow fires from it -- "every release ships
     #           Windows too" without anyone rewiring anything. It is
@@ -46,10 +46,10 @@ name: Release (Windows)
 # version a release carries, so one release produces both platforms'
 # artifacts at the same version -- Ghoztty-<version>-x64.msi and
 # Ghoztty-portable-<version>-x64.zip alongside Ghoztty-<version>-arm64.dmg.
-# Until merge-back that is two tag pushes rather than one, for the reason
+# Until the cutover that is two tag pushes rather than one, for the reason
 # spelled out on the triggers above; the version number is what ties them.
 #
-# workflow_dispatch is listed but is INERT until merge-back: GitHub only
+# workflow_dispatch is listed but is INERT until the cutover: GitHub only
 # offers manual dispatch for workflows on the default branch, and this file
 # is not on main. Cutting a win-v tag is the way to run it today.
 #

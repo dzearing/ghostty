@@ -1,10 +1,10 @@
 {
     "guard":  "divergence-inventory",
     "script":  "test/win32/divergence-inventory.ps1",
-    "generated":  "2026-08-20T23:06:34-07:00",
-    "commit":  "f6ec7c789",
+    "generated":  "2026-08-22T08:06:59-07:00",
+    "commit":  "5ab9970e9",
     "files":  {
-                  "scripts/divergence-inventory.ps1":  "f3580dea057b6e48b455a8a00eabe55b629dc49443ec9dec1288c329d941b258",
-                  "test/win32/divergence-inventory.ps1":  "2581d40c471d94b437e2dbb6016da2e93a2e25f94c1bd2959d9b09854bf8b514"
+                  "scripts/divergence-inventory.ps1":  "33644498b65edc0f88a83a64f97686c6223c9a0fe91b4bf08c20cb48820d8dd5",
+                  "test/win32/divergence-inventory.ps1":  "829edd00d4ed65595adf6d9a837414af1f212b18f4cbfff9f4ce4568e43b7c09"
               }
 }

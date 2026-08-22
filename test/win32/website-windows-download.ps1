@@ -311,7 +311,7 @@ $tagBlock = ''
 if ($wf -match '(?s)on:\s*\r?\n\s*push:\s*\r?\n(.*?)\r?\n\s*workflow_dispatch:') { $tagBlock = $Matches[1] }
 Assert 'D7 workflow triggers on a tag the windows branch can carry (win-v*)' `
     ($tagBlock -match '(?m)^\s*-\s*"win-v\*"\s*$')
-Assert 'D8 workflow still triggers on v* for after the merge-back' `
+Assert 'D8 workflow still triggers on v* for after the cutover' `
     ($tagBlock -match '(?m)^\s*-\s*"v\*"\s*$')
 # A win-v tag must parse to a bare X.Y.Z or the version regex rejects it and
 # the release dies on a version that was never malformed.

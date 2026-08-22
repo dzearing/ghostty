@@ -117,7 +117,7 @@ $GuardTable = @(
             'docs\design\windows-parity-ship-workflow.md'
         )
     },
-    # Stage 0 of the merge-back (T957): the upstream remote and the union merge
+    # Stage 0 of the upstream pull (T957): the upstream remote and the union merge
     # drivers. Neither is exercised by any lane - the remote is git config and
     # the drivers only fire inside a merge - so nothing else would notice a
     # `.gitattributes` edit that stops matching, or an `ensure` that quietly
@@ -135,7 +135,7 @@ $GuardTable = @(
             # from it, so a re-cut stage introduces a sha nothing has anchored
             # yet, and the harness is what notices. Without this row the plan
             # could name a new merge point and the gate would stay green over it.
-            'docs\design\windows-parity-merge-back-plan.md'
+            'docs\design\windows-parity-upstream-pull-plan.md'
         )
     },
     # The other half of Stage 0 (T956): the fork-identity overlay. Same argument
@@ -703,7 +703,7 @@ $GuardTable = @(
             'test\win32\share-machine.ps1'
         )
     },
-    # The divergence inventory (T516) is merge-back planning's input: a set
+    # The divergence inventory (T516) is upstream-pull planning's input: a set
     # computation that drifts wrong sends a future merge hunting conflicts in
     # the wrong files, and nothing in the P1-P3 floor runs its harness.
     [pscustomobject]@{
@@ -1442,6 +1442,29 @@ $GuardTable = @(
             'CLAUDE.md',
             'docs\claude\*.md',
             'test\win32\docs-routing.ps1'
+        )
+    },
+    # The merge-terminology lint (T1097): "merge back" named three unrelated
+    # operations - the cutover to `main`, an upstream pull FROM ghostty-org, and
+    # upstreaming TO it (which never happens) - and reading one as another cost
+    # a full round trip with the user twice in one day, plus a task filed on the
+    # misreading. CLAUDE.md bans the bare phrase; this row is what keeps the ban
+    # from decaying into a comment nobody checks. The net is wide on purpose:
+    # the phrase can reappear in ANY doc, script or task file, so an edit to the
+    # three disambiguating docs, to the tracker's live prose, or to the lint
+    # itself must re-prove the tree. Static scan over tracked text, about a
+    # second.
+    [pscustomobject]@{
+        Name   = 'merge-terminology'
+        Script = 'test\win32\merge-terminology.ps1'
+        Stamp  = 'test\win32\merge-terminology.stamp.json'
+        Covers = @(
+            'CLAUDE.md',
+            'go.md',
+            'docs\design\windows-parity-ship-workflow.md',
+            'docs\design\windows-parity-upstream-pull-plan.md',
+            'scripts\ship-readiness.ps1',
+            'test\win32\merge-terminology.ps1'
         )
     },
     # The chooser's SELECTION TREATMENT (T828): the pixels a user reported as "a

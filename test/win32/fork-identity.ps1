@@ -1,4 +1,4 @@
-# T956 acceptance - Stage 0 of the merge-back plan: the fork-identity overlay.
+# T956 acceptance - Stage 0 of the upstream pull plan: the fork-identity overlay.
 #
 #   powershell -NoProfile -File test\win32\fork-identity.ps1
 #
@@ -62,7 +62,7 @@ function Skip($name, $why) { Write-Host "  SKIP $name - $why" -ForegroundColor Y
 function Say($m) { Write-Host $m }
 
 $Overlay = Join-Path $Repo 'scripts\fork-identity.ps1'
-$PlanRelative = 'docs\design\windows-parity-merge-back-plan.md'
+$PlanRelative = 'docs\design\windows-parity-upstream-pull-plan.md'
 $ForkPoint = '063ac3ecc'
 
 # The number of the 52 U-files that the overlay reproduces byte-for-byte from

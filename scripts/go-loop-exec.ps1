@@ -268,7 +268,7 @@ switch ($Action) {
         # T957: keep the `upstream` remote wired up. Same argument as the commit
         # guard above and the same remedy: a remote is LOCAL config, so it cannot
         # arrive by `git pull` and a fresh clone has none - and without it every
-        # sha docs\design\windows-parity-merge-back-plan.md pins is reachable
+        # sha docs\design\windows-parity-upstream-pull-plan.md pins is reachable
         # from no ref at all, which makes them `git gc` bait. Never fatal: a
         # fetch needs GitHub, and a loop that cannot claim because the network
         # is down is a worse failure than a stale upstream ref. Fetches at most

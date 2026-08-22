@@ -81,7 +81,7 @@ Concretely, in order, with no stops in between:
      - **Reflection** — a genuine step back: how the work has been going,
        common themes across recent tasks and decisions, what keeps recurring.
        Are tools missing? Skills missing? Is the UX clean? Which gaps still
-       stand between here and **merging back into main**? Think out of the
+       stand between here and the **cutover to `main`**? Think out of the
        box; propose process changes, not just code changes.
      - **Decisions** — anything filed for the user's call, and any directives
        from recently resolved ones that should steer the day.
@@ -98,7 +98,8 @@ Concretely, in order, with no stops in between:
      M1-closed / M1-total, never done/all-time. **New tasks default OUT of
      M1** — promotion is a deliberate triage act, with the same bar as a P0/
      P1 call: user-facing, or blocking a user-facing task, or blocking the
-     merge-back goal. Never remove a task from M1 to make the number move —
+     cutover goal (this branch -> `main`). Never remove a task from M1 to make
+     the number move —
      scope-cuts are `skipped(reason)`, visible as closures, not silent
      demotions.
    - **Sweep new-since-yesterday tasks** (git: task files added since the

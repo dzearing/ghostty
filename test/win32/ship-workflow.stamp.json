@@ -1,12 +1,12 @@
 {
     "guard":  "ship-workflow",
     "script":  "test/win32/ship-workflow.ps1",
-    "generated":  "2026-08-21T13:53:47-07:00",
-    "commit":  "687ed987e",
+    "generated":  "2026-08-22T08:13:21-07:00",
+    "commit":  "5ab9970e9",
     "files":  {
-                  "docs/design/windows-parity-ship-workflow.md":  "1664a1a2889d1c4ef8d9b6319e8c500c1fe632397a1f2ceff5ad638228235d98",
-                  "scripts/ship-feature.ps1":  "cbe8ce36fcab0b55e3bfdc6d82f41dfcd3e4ed0f5ad17b410e26102c330380b4",
-                  "scripts/ship-readiness.ps1":  "0750a4cf52f9f3eed25168596cd3fc0f7a40b26a8685dc4599eecff222e9dbc3",
+                  "docs/design/windows-parity-ship-workflow.md":  "f7289e5a320ad543ee36ece4ddef741e958f78ba942eed49547f9db26784e0c6",
+                  "scripts/ship-feature.ps1":  "5fcde228d19c43b887fe4ae42202a1c84c0f7e0a464fbe3caec600c39796663e",
+                  "scripts/ship-readiness.ps1":  "caa9866296a2ee39ba4aadcc6dd5154edc8311ad340652ac9224b5dae6e6c359",
                   "test/win32/ship-workflow.ps1":  "8e3a1a7cdc228cd8b9add1b7fc07e95e325f9f346067d119acc8b91ffa9dd818"
               }
 }

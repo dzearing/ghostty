@@ -5,7 +5,7 @@
   incantations.
 
 .DESCRIPTION
-  T1058. User directive, 2026-08-21: after the branch is merged back, "continue
+  T1058. User directive, 2026-08-21: after the cutover onto the fork's `main`, "continue
   work from there or build individual worktrees for new features and make prs."
 
   Once the trunk is `main`, a turn no longer commits where it stands. It forks a

@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
   Keep a permanent `upstream` remote (ghostty-org/ghostty) wired up and fetched,
-  so every sha the merge-back plan cites stays resolvable.
+  so every sha the upstream pull plan cites stays resolvable.
 
 .DESCRIPTION
-  T957, Stage 0 of docs\design\windows-parity-merge-back-plan.md.
+  T957, Stage 0 of docs\design\windows-parity-upstream-pull-plan.md.
 
   The plan pins six staged merge points plus the fork point by sha. Before this
   script those objects were in the store for one reason only: `divergence-
@@ -30,7 +30,7 @@
            remote itself still gets added, because that part needs no network.
   check    Report without touching the network or writing a ref, and exit 1 if
            anything is wrong: remote present, URL canonical, upstream/main
-           resolvable, and every sha cited in the merge-back plan resolvable AND
+           resolvable, and every sha cited in the upstream pull plan resolvable AND
            anchored by a local tag. This is the assertion the plan depends on.
   list     Print what is known, always exit 0.
 
@@ -84,7 +84,7 @@ if (-not $Repo) { $Repo = Split-Path -Parent $PSScriptRoot }
 # The plan doc is the source of the sha list on purpose: a hard-coded list here
 # would go stale the moment a stage is re-cut, and then `check` would be green
 # about shas nobody is merging.
-$PlanRelative = 'docs\design\windows-parity-merge-back-plan.md'
+$PlanRelative = 'docs\design\windows-parity-upstream-pull-plan.md'
 
 # The durable anchor namespace (T1099). One lightweight tag per plan sha, under
 # a prefix nothing else uses, so `git tag -l "$AnchorPrefix*"` is exactly the set
@@ -246,7 +246,7 @@ function Get-Problems {
         if (-not $r.Resolves) { $problems += "merge-plan sha $($r.Sha) does not resolve" }
         elseif (-not $r.Anchored) { $problems += "merge-plan sha $($r.Sha) is not anchored by a tag (gc bait)" }
     }
-    if (@($Shas).Count -eq 0) { $problems += "the merge-back plan cites no shas (is $PlanRelative missing?)" }
+    if (@($Shas).Count -eq 0) { $problems += "the upstream pull plan cites no shas (is $PlanRelative missing?)" }
     return @($problems)
 }
 

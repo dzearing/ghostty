@@ -3,7 +3,7 @@
   Mechanical divergence inventory against upstream ghostty (T516).
 
 .DESCRIPTION
-  Merge-back planning needs a list, not a guess: which files did THIS fork
+  Upstream-pull planning needs a list, not a guess: which files did THIS fork
   change since the fork point, which did upstream change in the same span,
   and - the actual merge risk - which did both sides touch. This script
   computes all three sets mechanically and writes a committed report so the

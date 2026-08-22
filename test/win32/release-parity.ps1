@@ -1,6 +1,6 @@
 # A release cannot silently ship macOS-only (T579).
 #
-# Until merge-back a full release is two tag pushes (v* on main, win-v* on the
+# Until the cutover a full release is two tag pushes (v* on main, win-v* on the
 # Windows branch), and forgetting the second one produces no error anywhere --
 # the site's links keep answering 200 with an old build. That is how the
 # Windows channel sat three weeks stale (T38) and then shipped v1.32.0/v1.33.0

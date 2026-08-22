@@ -1,11 +1,11 @@
 {
     "guard":  "website-windows-links",
     "script":  "test/win32/website-windows-download.ps1",
-    "generated":  "2026-08-21T23:24:51-07:00",
-    "commit":  "f69e3d079",
+    "generated":  "2026-08-22T08:07:15-07:00",
+    "commit":  "5ab9970e9",
     "files":  {
                   "dist/website/publish-windows-links.sh":  "41e424f4e850c82993b759d82c45b3556d8264b4fb95707d9672f8e4a74f97e4",
                   "dist/website/update-windows-links.py":  "03573c2f74effb040242d4bd588b7b6a8d770267c98664a02392e6efa763615c",
-                  "test/win32/website-windows-download.ps1":  "7e2a27ed847fddf32eac13797a877e3c9de1957eeab3a81712ec40f3efd6e9cb"
+                  "test/win32/website-windows-download.ps1":  "778bbda3b03b1f80193b2d8723ab1afbc6809f43a269e9cdd2c120011d3245d7"
               }
 }

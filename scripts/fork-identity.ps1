@@ -4,7 +4,7 @@
   tree taken from upstream, and verify that no upstream identity survives.
 
 .DESCRIPTION
-  T956, Stage 0 item 2 of docs\design\windows-parity-merge-back-plan.md.
+  T956, Stage 0 item 2 of docs\design\windows-parity-upstream-pull-plan.md.
 
   T879 measured the 131-file merge risk set and found that 52 of those files
   carry a fork delta of 10 lines or fewer, and that the delta in that class is
@@ -257,7 +257,7 @@ $script:ScopeCache = @{}
 # `scripts/` at all (`git ls-tree -d 063ac3ecc` lists neither), and
 # `test\win32\` is this seat's harness - so no file under them ever arrives
 # from upstream, while all three legitimately QUOTE the upstream identity: the
-# merge-back plan documents the rename, and this script states it. A check that
+# upstream pull plan documents the rename, and this script states it. A check that
 # reports its own rule table is noise, and noise is how a verifier stops being
 # read.
 $script:GlobalExclude = @('docs/**', 'scripts/**', 'test/win32/**')

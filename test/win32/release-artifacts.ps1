@@ -72,10 +72,10 @@ $ps1 = Get-Content -LiteralPath $ps1Path -Raw
 # ============================================================================
 
 # A1-A2: the Windows triggers are the macOS triggers PLUS win-v* (T577).
-# Until merge-back a Windows release is cut as its own win-v tag on the
-# Windows branch (main's tree cannot build one); at merge-back the shared v*
+# Until the cutover a Windows release is cut as its own win-v tag on the
+# Windows branch (main's tree cannot build one); at the cutover the shared v*
 # pattern takes over with nothing rewired. A dropped v* is how "every release
-# ships Windows" quietly breaks at merge-back; a dropped win-v* breaks it
+# ships Windows" quietly breaks at the cutover; a dropped win-v* breaks it
 # today. A stricter macOS-side pattern is the same disease in the other
 # direction, hence per-pattern containment rather than string equality.
 function Get-TagPatterns($yaml) {

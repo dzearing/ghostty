@@ -1,4 +1,4 @@
-# Merge-back plan: taking upstream Ghostty into this fork
+# Upstream pull plan: taking upstream Ghostty into this fork
 
 Written 2026-08-18 for **T879**, from the data in
 [`windows-parity-divergence.md`](windows-parity-divergence.md) (T516). Every
@@ -7,20 +7,27 @@ are named so the plan can be re-derived when the inventory is regenerated.
 
 ## Which merge this is
 
-Two different merges get called "merge back" and they are not the same job:
+Three different merges used to share the name "merge back", which cost a day of
+crossed wires on 2026-08-22 (T1097). They are named apart now, and this doc is
+the second one:
 
-| | What it is | Where it is tracked |
-|---|---|---|
-| **Branch -> fork main** | `users/dzearing/windows-amd64` (1244 ahead) into `origin/main` (81 ahead of us) | the daily **main intake** in `go.md` step 0.6, one task per incoming commit |
-| **Upstream -> fork** (this doc) | `ghostty-org/ghostty` `main` into this repo | nothing until now; 764 upstream commits are unmapped to any task |
+| | The operation | Direction | Where it is tracked |
+|---|---|---|---|
+| **Cutover** | `users/dzearing/windows-amd64` -> `main` on dzearing/ghoztty | one trunk carrying mac and windows | `windows-parity-ship-workflow.md`, gated by `scripts\ship-readiness.ps1`; daily **main intake** in `go.md` step 0.6 keeps the lag small |
+| **Upstream pull** (this doc) | ghostty-org/ghostty `main` -> this fork | code flows INTO us | this plan; the user calls for one, the loop never starts one on its own (D80) |
+| **Upstreaming** | this fork -> ghostty-org/ghostty | **never happens** | D80. No pull request, no pushed branch; the `upstream` remote is fetch-only by construction |
 
-They are independent: `origin/main` forked from upstream at the **same** commit
-we did (`git merge-base origin/main ad6e72ddc` = `063ac3ecc`) and has never
-merged upstream since. So the fork's `main` carries no upstream work we would
-inherit for free, and this plan applies whichever branch does the merge first.
+Never write the bare phrase again: say "cutover", "upstream pull", or
+"upstreaming", and state the direction in the same sentence.
 
-**This doc covers the second row only.** The first row already has a working
-daily process and does not need a plan.
+The first two are independent: `origin/main` forked from upstream at the
+**same** commit we did (`git merge-base origin/main ad6e72ddc` = `063ac3ecc`)
+and has never pulled upstream since. So the fork's `main` carries no upstream
+work we would inherit for free, and this plan applies whichever branch takes
+the upstream pull first.
+
+**This doc covers the middle row only.** The cutover has its own doc, and the
+daily main intake already keeps it fed.
 
 ## The state of the divergence
 

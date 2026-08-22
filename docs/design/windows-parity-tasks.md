@@ -1684,7 +1684,7 @@ Status values: `todo` / `in-progress` / `done` / `blocked(<on what>)` /
 - `windows-parity-divergence.md` — the mechanical divergence inventory vs
   upstream ghostty (T516): fork point, the changed-both merge risk set with
   per-file commit counts, and the two single-side lists. Regenerate with
-  `scripts\divergence-inventory.ps1` before any merge-back planning; do not
+  `scripts\divergence-inventory.ps1` before any upstream-pull planning; do not
   hand-edit it.
 - `windows-parity-spec.md` — architecture decisions (pinned). Read its
   "Architecture decisions" section before implementing any IPC task.

@@ -3,7 +3,7 @@
   Acceptance test for scripts\divergence-inventory.ps1 (T516).
 
 .DESCRIPTION
-  The inventory is the input to merge-back planning, so a wrong list sends a
+  The inventory is the input to upstream-pull planning, so a wrong list sends a
   future merge hunting conflicts in the wrong files. Every arm here runs
   against a synthetic repo this test builds itself - a base commit, a "fork"
   branch and an "upstreamref" branch with a known overlap - so the expected

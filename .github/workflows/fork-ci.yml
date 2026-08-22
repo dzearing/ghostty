@@ -162,7 +162,8 @@ jobs:
       # proving the release path means using the release's toolchain setup,
       # not this job's own idea of one. Pinned by sha per this file's style;
       # the release workflow floats on @v2, which is close enough to one
-      # definition until merge-back consolidates them.
+      # definition until the cutover (this branch -> dzearing/ghoztty main)
+      # consolidates them.
       - name: Setup Zig
         if: steps.detect.outputs.present == 'true'
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
@@ -181,7 +182,7 @@ jobs:
         run: |
           dist/windows-installer/build-release-artifacts.sh --semver 0.0.0
 
-  # T579. Until merge-back a full release is two tag pushes (v* on main for
+  # T579. Until the cutover a full release is two tag pushes (v* on main for
   # macOS, win-v* on the Windows branch), and forgetting the second one
   # produces no error anywhere -- every link keeps answering 200 with an old
   # build, which is how the Windows channel sat three weeks stale (T38) and

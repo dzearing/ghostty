@@ -1,4 +1,4 @@
-# T957 acceptance - Stage 0 of the merge-back plan: the upstream remote stays
+# T957 acceptance - Stage 0 of the upstream pull plan: the upstream remote stays
 # wired up, and the append-only files merge by UNION instead of conflicting.
 #
 #   powershell -NoProfile -File test\win32\upstream-remote.ps1
@@ -12,7 +12,7 @@
 #
 # WHY IT EXISTS
 #
-# docs\design\windows-parity-merge-back-plan.md pins six staged merge points and
+# docs\design\windows-parity-upstream-pull-plan.md pins six staged merge points and
 # a fork point by sha. Until T957 those objects were reachable from NOTHING: an
 # earlier `divergence-inventory.ps1` had fetched them by sha into no ref, so a
 # `git gc` was free to drop them and the plan would still READ correctly with
@@ -106,8 +106,8 @@ Assert 'A3 upstream/main resolves (the ref that keeps the objects alive)' ($head
 if ($head.Code -eq 0) { Say "    upstream/main = $($head.Text)" }
 
 # The sha list comes out of the plan doc, not out of this script.
-$planPath = Join-Path $Repo 'docs\design\windows-parity-merge-back-plan.md'
-Assert 'setup: the merge-back plan is where it is expected' (Test-Path -LiteralPath $planPath)
+$planPath = Join-Path $Repo 'docs\design\windows-parity-upstream-pull-plan.md'
+Assert 'setup: the upstream pull plan is where it is expected' (Test-Path -LiteralPath $planPath)
 $planShas = @()
 if (Test-Path -LiteralPath $planPath) {
     $planText = Get-Content -LiteralPath $planPath -Raw
@@ -334,7 +334,7 @@ $fixturePlanDir = Join-Path $anchorRepo 'docs\design'
 New-Item -ItemType Directory -Force -Path $fixturePlanDir | Out-Null
 $planLines = @('# fixture plan', '')
 foreach ($s in $planShasFixture) { $planLines += "- stage at ``$s``" }
-Set-Content -LiteralPath (Join-Path $fixturePlanDir 'windows-parity-merge-back-plan.md') -Value $planLines -Encoding UTF8
+Set-Content -LiteralPath (Join-Path $fixturePlanDir 'windows-parity-upstream-pull-plan.md') -Value $planLines -Encoding UTF8
 
 $e0 = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $EnsureScript check -Repo $anchorRepo)
 Assert 'E1 `check` calls an un-anchored plan sha out by name' (@($e0 | Where-Object { $_ -match 'is not anchored' }).Count -ge 1) "(got: $($e0 -join ' / '))"
@@ -366,7 +366,7 @@ Assert 'E4 ...and survives `git gc --prune=now` with every reflog expired' ($sur
 
 # The verdict must still be able to go RED for the sha question alone. A plan
 # citing a sha this repo has never seen is the cheapest way to ask that.
-Add-Content -LiteralPath (Join-Path $fixturePlanDir 'windows-parity-merge-back-plan.md') -Value '- stage at `0123456789abcdef0123456789abcdef01234567`'
+Add-Content -LiteralPath (Join-Path $fixturePlanDir 'windows-parity-upstream-pull-plan.md') -Value '- stage at `0123456789abcdef0123456789abcdef01234567`'
 $e5 = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $EnsureScript ensure -Repo $anchorRepo -NoFetch)
 Assert 'E5 `ensure` prints UPSTREAM PROBLEM for a sha the plan cites and the repo lacks' (@($e5 | Where-Object { $_ -match '^UPSTREAM PROBLEM' }).Count -eq 1) "(got: $($e5 -join ' / '))"
 Assert 'E6 ...and still exits 0, so a bad verdict cannot wedge the claim' ($LASTEXITCODE -eq 0) "(exit $LASTEXITCODE)"

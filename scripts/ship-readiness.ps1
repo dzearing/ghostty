@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-  Answer, mechanically, whether this branch is ready to be merged back to the
+  Answer, mechanically, whether this branch is ready to be cut over onto the
   fork's `main` - and name every criterion that is not yet satisfied.
 
 .DESCRIPTION
@@ -15,14 +15,18 @@
   go/no-go is a check somebody can re-run rather than a judgement call somebody
   has to defend.
 
-  WHICH MERGE THIS IS. Two different merges get called "merge back" and they
-  are not the same job (docs\design\windows-parity-merge-back-plan.md opens with
-  the same table):
+  WHICH MERGE THIS IS. Three different merges used to share the name "merge
+  back" and they are not the same job (T1097; the same table opens
+  docs\design\windows-parity-ship-workflow.md and
+  docs\design\windows-parity-upstream-pull-plan.md):
 
-    branch -> fork main    `users/dzearing/windows-amd64` into `origin/main`.
-                           THIS script. Has never happened.
-    upstream -> fork       `ghostty-org/ghostty` into this repo. Planned in
-                           windows-parity-merge-back-plan.md, not gated here.
+    cutover        `users/dzearing/windows-amd64` -> `main` on dzearing/ghoztty.
+                   THIS script gates it. Has never happened.
+    upstream pull  ghostty-org/ghostty -> this fork. Planned in
+                   windows-parity-upstream-pull-plan.md, on the user's call
+                   only (D80), not gated here.
+    upstreaming    this fork -> ghostty-org/ghostty. Never happens; the
+                   `upstream` remote is fetch-only by construction (D80).
 
   THE CRITERIA, and why each one is a gate rather than a nice-to-have:
 
