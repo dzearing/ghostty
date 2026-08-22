@@ -1,11 +1,11 @@
 {
     "guard":  "restore-late-agent",
     "script":  "test/win32/restore-late-agent.ps1",
-    "generated":  "2026-08-19T17:28:19-07:00",
-    "commit":  "16765630f",
+    "generated":  "2026-08-21T20:39:30-07:00",
+    "commit":  "8340e815a",
     "files":  {
                   "src/apprt/win32/LocalAgent.zig":  "568c21aeed1eca082e7f095f1820b2b1c4a9e324407e3994df75d29260e06f1b",
                   "src/apprt/win32/restore_retry.zig":  "c5c212390938893831ae32751909c471cbc09607b72880fb45a0d8a329e48789",
-                  "test/win32/restore-late-agent.ps1":  "567598e0350cf7864afe28c042bd9ece7b6a14dfbd00083cd17b4d6e523e20ff"
+                  "test/win32/restore-late-agent.ps1":  "46f79ff62a0091a259b8e2751b96d127fd8fe6e4d821c0d37b3a41b44e1b22bd"
               }
 }

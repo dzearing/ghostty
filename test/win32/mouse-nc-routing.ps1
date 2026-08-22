@@ -39,6 +39,11 @@
 # never takes the user's foreground. Only touches ghoztty processes running
 # from this repo's zig-out.
 param([string]$ExePath, [switch]$NegativeControl)
+
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
@@ -182,9 +187,9 @@ try {
     Write-Host "1 FAILURE(S) - $($_.Exception.Message)"
     $exitCode = 1
 } finally {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.ExecutablePath -eq $exe } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    # T351: the shared, path-exact kill (lib\CleanSlate.ps1). -AppOnly: this
+    # script never starts an agent, so there is none of ours to take down.
+    [void](Stop-RepoGhoztty -Exe $exe -AppOnly -SettleMs 0)
     Remove-TestDesktop
 }
 exit $exitCode

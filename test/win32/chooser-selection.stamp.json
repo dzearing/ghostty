@@ -1,14 +1,14 @@
 {
     "guard":  "chooser-selection",
     "script":  "test/win32/chooser-selection.ps1",
-    "generated":  "2026-08-21T00:47:52-07:00",
-    "commit":  "a905a5363",
+    "generated":  "2026-08-21T20:46:23-07:00",
+    "commit":  "8340e815a",
     "files":  {
                   "src/apprt/win32/chooser_rows.zig":  "22429346bc431d82a1c5091e240962f613f385c829b257ed80d2532192971fff",
                   "src/apprt/win32/chooser_sessions.zig":  "de267bf5e49cea23f0e9e304b718a9169038b159bf185318923b522a2fd48b66",
                   "src/apprt/win32/list_selection.zig":  "b7f5720b1a405deacf48309f6b34439b7148e73a19a876ef9c7f38faf5308913",
                   "src/apprt/win32/MachineChooser.zig":  "a99ac18abe19fbd23d17fc86d6b74ed297030f62dc04f3c56be4a21d69aa8f25",
                   "src/apprt/win32/SessionRoster.zig":  "2b44fdbee15514c64f285cfa5eb69d1eeee39ff880c94cc22e15946ee4b4e28b",
-                  "test/win32/chooser-selection.ps1":  "4e138abf4c0187cd89e0d1a01788c87d63b0ed99076c7543e98290e49e0c4b49"
+                  "test/win32/chooser-selection.ps1":  "5edbca4f09e9188af8c9ecab8605944f12d23fcef89933d3368049ebaf6c6574"
               }
 }

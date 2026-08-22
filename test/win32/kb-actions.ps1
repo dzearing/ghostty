@@ -32,6 +32,11 @@ param(
     [switch]$Interactive
 )
 
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
 $ErrorActionPreference = 'Continue'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
@@ -49,13 +54,6 @@ $script:fail = 0
 function Assert([bool]$cond, [string]$label) {
     if ($cond) { $script:pass++; Write-Host "PASS  $label" }
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
-}
-
-function Stop-RepoGhoztty {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out\*') -or $_.ExecutablePath -eq $Exe } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 800
 }
 
 # ctrl+shift+r, retried: the chord can land while the window is still
@@ -76,7 +74,7 @@ function Get-Dialog {
 # --- Setup: fresh debug instance on the test desktop -------------------------
 # --session-persistence=false: a restored layout manifest would carry a
 # previous run's window title into the assertions below (batch-2 lesson).
-Stop-RepoGhoztty
+[void](Stop-RepoGhoztty -Exe $Exe -AppOnly -SettleMs 800)
 Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive
 $app = $null
@@ -263,7 +261,7 @@ Assert (Select-String -Path $errlog -Pattern 'injected WM_CHAR in win32-input mo
     # below vacuous (the batch-3 lesson).
     $script:launched = @(Get-TestLaunchedPids)
     Remove-TestDesktop
-    Stop-RepoGhoztty
+    [void](Stop-RepoGhoztty -Exe $Exe -AppOnly -SettleMs 800)
 }
 
 $fgSeen = @(Stop-TestForegroundWatch)

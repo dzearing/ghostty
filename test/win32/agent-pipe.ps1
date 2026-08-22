@@ -19,6 +19,11 @@ param(
     [string]$ClientExe = 'D:\git\ghoztty\zig-out\bin\remote-test-client.exe'
 )
 
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $tmp = Join-Path $env:TEMP "ghoztty-agent-pipe-$PID"
@@ -64,9 +69,10 @@ function Get-Out($outfile) {
 }
 
 function Stop-TestProcs {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
-        Where-Object { $_.CommandLine -like '*zig-out*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    # T351: the shared, path-exact kill (lib\CleanSlate.ps1). -AgentOnly because
+    # the subject here is the AGENT: the app is left where it is. The remote test
+    # client below is this script's own litter, so it stays local.
+    [void](Stop-RepoGhoztty -Exe $Exe -AgentOnly -SettleMs 0)
     Get-CimInstance Win32_Process -Filter "Name='remote-test-client.exe'" |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 500

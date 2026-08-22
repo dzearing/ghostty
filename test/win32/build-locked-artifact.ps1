@@ -38,6 +38,11 @@ param(
     [string]$Repo = 'D:\git\ghoztty'
 )
 
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
 $ErrorActionPreference = 'Continue'
 Set-StrictMode -Off
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
@@ -79,10 +84,9 @@ function Test-StampIn($path, $stamp) {
 # Only ever repo-lineage agents: an installed Ghoztty runs its agent from
 # %LOCALAPPDATA%\Programs and owns the user's live sessions.
 function Stop-RepoAgents {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
-        Where-Object { $_.ExecutablePath -eq $AgentExe } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 800
+    # T351: the shared, path-exact kill (lib\CleanSlate.ps1), which derives the
+    # agent as $Exe's required sibling - the same file $AgentExe names.
+    [void](Stop-RepoGhoztty -Exe $Exe -AgentOnly -SettleMs 800)
 }
 
 # A long-lived repo-lineage agent, fully hermetic: its own pipe, its own

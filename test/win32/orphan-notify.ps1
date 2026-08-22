@@ -34,6 +34,11 @@ param(
     [string]$ClientExe = 'D:\git\ghoztty\zig-out\bin\remote-test-client.exe'
 )
 
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
 $ErrorActionPreference = 'Continue'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
@@ -60,7 +65,13 @@ function Assert($cond, $name) {
 }
 
 function Stop-RepoProcesses([string[]]$Names) {
-    foreach ($name in $Names) {
+    # T351: the ghoztty halves go through the one shared, path-exact kill
+    # (lib\CleanSlate.ps1) - every private copy answered "does the agent go too"
+    # alone. Anything else in $Names is this script's own litter, so it stays local.
+    if ($Names -contains 'ghoztty') {
+        [void](Stop-RepoGhoztty -Exe $Exe -AppOnly:(-not ($Names -contains 'ghoztty-agent')) -SettleMs 0)
+    }
+    foreach ($name in ($Names | Where-Object { $_ -notin @('ghoztty', 'ghoztty-agent') })) {
         Get-CimInstance Win32_Process -Filter "Name='$name.exe'" | ForEach-Object {
             if ($_.ExecutablePath -and $_.ExecutablePath.StartsWith((Join-Path $repo 'zig-out'), 'OrdinalIgnoreCase')) {
                 try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {}

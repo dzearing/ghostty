@@ -50,6 +50,7 @@ if (-not (Test-Path $AgentExe)) {
 }
 
 function Stop-TestAgents {
+    # cleanslate-exempt: this run's t546-marked agents only, not every repo agent
     Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
         Where-Object { $_.CommandLine -like '*t546*' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }

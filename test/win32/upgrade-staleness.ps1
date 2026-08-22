@@ -684,6 +684,7 @@ if (-not $haveAgent) {
     # Teardown: the relaunched app, its private local agent, and the decoy.
     if ($gProc) { Stop-Process -Id $gAppPid -Force -ErrorAction SilentlyContinue }
     if (-not $decoy.HasExited) { Stop-Process -Id $decoy.Id -Force -ErrorAction SilentlyContinue }
+    # cleanslate-exempt: this arm's staged copy under $gRoot, not the repo zig-out
     Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe' OR Name='ghoztty-agent.exe'" |
         Where-Object { ($_.ExecutablePath -like "$gRoot*") -or ($_.CommandLine -like "*$gRoot*") } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }

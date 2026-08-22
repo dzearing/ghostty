@@ -34,6 +34,11 @@ param(
     [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe'
 )
 
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
 $ErrorActionPreference = 'Continue'
 . (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 
@@ -82,9 +87,10 @@ function Test-Alive([int]$procId) {
     return $null -ne (Get-Process -Id $procId -ErrorAction SilentlyContinue)
 }
 function Stop-TestProcs {
-    foreach ($p in (Get-TestApps)) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
-    foreach ($p in (Get-TestAgentProcs)) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 800
+    # T351: one shared, path-exact kill (lib\CleanSlate.ps1) instead of a private
+    # copy. It matches the same two exact images the Get-Test* enumerations above
+    # do - $Exe and its required sibling agent.
+    [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 800)
 }
 
 function Wait-NewAgent($excludePids, $timeoutSec = 40) {

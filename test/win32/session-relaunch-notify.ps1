@@ -80,6 +80,11 @@ param(
     [switch]$Interactive
 )
 
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $script:passes = 0
@@ -129,11 +134,9 @@ $BAN_B = "T422banB$MARK_B"
 $WIN_TITLE = "T422title$MARK_A"
 
 function Stop-TestProcs {
-    foreach ($n in @('ghoztty.exe', 'ghoztty-agent.exe')) {
-        Get-CimInstance Win32_Process -Filter "Name='$n'" |
-            Where-Object { $_.CommandLine -like '*zig-out*' } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    }
+    # T351: one shared, path-exact kill (lib\CleanSlate.ps1) for the app and its
+    # sibling agent. The marker-ping shells below are this script's own litter.
+    [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 0)
     Stop-MarkerPings
     Start-Sleep -Milliseconds 700
 }
@@ -155,18 +158,18 @@ function Stop-TestProcs {
 # which owns their real sessions - out of it.
 function Stop-AgentAndHolders($agentPid) {
     if ($agentPid) { Stop-Process -Id $agentPid -Force -ErrorAction SilentlyContinue }
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
-        Where-Object { $_.CommandLine -like '*zig-out*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 900
+    # T351: the shared, path-exact kill (lib\CleanSlate.ps1). Holders are the same
+    # image at the same path, so -AgentOnly takes the manager and its holders
+    # together - which is the point - and leaves the app alone.
+    [void](Stop-RepoGhoztty -Exe $Exe -AgentOnly -SettleMs 900)
     return @(Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
         Where-Object { $_.CommandLine -like '*zig-out*' }).Count
 }
 function Stop-AppOnly {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.CommandLine -like '*zig-out*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 900
+    # T351: one shared, path-exact kill (lib\CleanSlate.ps1) instead of a private
+    # copy - the filter this replaced also matched a detached instance running from
+    # zig-out-release (T53b), and every copy answered "does the agent go too" alone.
+    [void](Stop-RepoGhoztty -Exe $Exe -AppOnly -SettleMs 900)
 }
 # THE oracle for "did the recorded command run?": count live pings carrying this
 # run's unique -n value.

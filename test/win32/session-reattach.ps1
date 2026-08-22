@@ -67,6 +67,11 @@ param(
     [switch]$Interactive
 )
 
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $script:passes = 0
@@ -85,21 +90,23 @@ function Say($m) { Write-Host $m }
 
 # Kill ONLY zig-out ghoztty/agent processes (never the user's release build).
 function Stop-TestProcs {
-    foreach ($n in @('ghoztty.exe', 'ghoztty-agent.exe', 'remote-test-client.exe')) {
-        Get-CimInstance Win32_Process -Filter "Name='$n'" |
-            Where-Object { $_.CommandLine -like '*zig-out*' } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    }
+    # T351: one shared, path-exact kill (lib\CleanSlate.ps1) for the app and its
+    # sibling agent - the private copies each filtered differently. The extra
+    # process below is this script's own litter, so it stays local.
+    [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 0)
+    Get-CimInstance Win32_Process -Filter "Name='remote-test-client.exe'" |
+        Where-Object { $_.CommandLine -like '*zig-out*' } |
+        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Milliseconds 700
 }
 
 # Kill ONLY the zig-out ghoztty APP (leave ghoztty-agent alive so its PTYs
 # survive - the crash/upgrade re-attach scenario the restore half tests).
 function Stop-AppOnly {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.CommandLine -like '*zig-out*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 900
+    # T351: one shared, path-exact kill (lib\CleanSlate.ps1) instead of a private
+    # copy - the filter this replaced also matched a detached instance running from
+    # zig-out-release (T53b), and every copy answered "does the agent go too" alone.
+    [void](Stop-RepoGhoztty -Exe $Exe -AppOnly -SettleMs 900)
 }
 
 # Run a zig-out ghoztty +command with a hard timeout; stdout+stderr -> $out.

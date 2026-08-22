@@ -41,6 +41,11 @@ param(
     [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe',
     [switch]$Interactive
 )
+
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 $ErrorActionPreference = 'Continue'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
@@ -66,12 +71,10 @@ $dirB = Join-Path $root "tipB$($PID % 997)"
 New-Item -ItemType Directory -Force $dirA, $dirB | Out-Null
 
 function Kill-RepoInstances {
-    foreach ($n in @('ghoztty.exe', 'ghoztty-agent.exe')) {
-        Get-CimInstance Win32_Process -Filter "Name='$n'" |
-            Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out*') } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    }
-    Start-Sleep -Milliseconds 600
+    # T351: one shared, path-exact kill (lib\CleanSlate.ps1) instead of a private
+    # copy - the filter this replaced also matched a detached instance running from
+    # zig-out-release (T53b), and every copy answered "does the agent go too" alone.
+    [void](Stop-RepoGhoztty -Exe $exe -SettleMs 600)
 }
 
 function Run-CliArgs($argv, $out, $timeoutSec = 15) {
@@ -211,10 +214,10 @@ try {
         # pane must answer with where the shell actually is (dirB).
         # -------------------------------------------------------------------
         Start-Sleep -Seconds 3   # let the session-layout manifest debounce out
-        Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-            Where-Object { $_.ExecutablePath -eq $exe } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-        Start-Sleep -Seconds 2
+        # T351: the shared, path-exact kill (lib\CleanSlate.ps1). -AppOnly is
+        # load-bearing here: section C is about the AGENT keeping the shell alive
+        # across the app restart, so the agent must not go with it.
+        [void](Stop-RepoGhoztty -Exe $exe -AppOnly -SettleMs 2000)
 
         $errlog2 = Join-Path $root 'app2-stderr.log'
         # persistence: on (default) - this is the RESTORE launch section C is about.

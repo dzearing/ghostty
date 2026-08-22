@@ -9,6 +9,57 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-21 - **T351 - one way to put the box back to empty, instead of 133
+  hand-written ones.** T248 hoisted the pre-fixture reset into
+  `test\win32\lib\CleanSlate.ps1` and converted 19 scripts to it. Three weeks
+  later the survey found not the ~29 stragglers the task was filed for but
+  **133**, under six names (`Kill-RepoInstances`, `Stop-TestProcs`,
+  `Stop-RepoInstances`, `Stop-DebugGhoztty`, `Stop-AppOnly`,
+  `Stop-RepoProcesses`), four filters and eight settle times - and four scripts
+  had redefined `Stop-RepoGhoztty` ITSELF, so the private body won inside those
+  processes and the shared one was never called.
+
+  130 are converted. Every one now calls the single path-exact kill, which also
+  refuses outright an exe that is not under the repo - the guarantee no copy had,
+  because they all filtered and none of them refused. Two divergences died with
+  them: `$_.CommandLine -like '*zig-out*'`, which also matched a detached
+  instance running from `zig-out-release` (T53b), and the app-only copies that
+  left the agent holding a PTY so a previous run's pane survived and
+  `+new-window --target=` FOCUSED it instead of running this run's fixture.
+  `Stop-RepoGhoztty` grew `-AgentOnly` for the one shape it could not express
+  (`agent-pipe.ps1` restarts the agent under a live app), and the two switches
+  now refuse each other rather than quietly killing nothing.
+
+  Each script's own litter stays local, which is the line the sweep drew: relay
+  stubs, `remote-test-client`, marker-ping shells and fake agents are that
+  script's business, the app and its sibling agent are everybody's. Eight kills
+  are deliberately different - a run marker, a state root, `ghoztty-agent%`
+  because the image under test is `ghoztty-agent.exe.bak` - and each now carries
+  a `# cleanslate-exempt: <reason>` the audit reads.
+
+  The audit is the part that makes this the last time. `test\win32\cleanslate-audit.ps1`
+  (analyzer in `lib\CleanSlateAudit.ps1`) sweeps all 264 harness scripts for a
+  `Get-CimInstance Win32_Process` naming ghoztty whose pipeline reaches
+  `Stop-Process`, ignores enumerations, requires a REASON on every exemption (an
+  empty marker is itself a finding, so "exempt" cannot become a rubber stamp),
+  and separately fails a script that calls the shared kill without dot-sourcing
+  it or that redefines its name. `-TeethCheck` synthesizes a violator to prove
+  the red path exists. It is in `guard-due.ps1` over `test\win32\*.ps1`, so a new
+  private copy is due-and-red rather than a discovery three weeks later.
+
+  Validation: floor all four lanes PASS; P1/P2/P3 25/20/16; target-staleness ALL
+  PASS; the **46** guards the sweep made due all re-run and re-stamped - 45 green
+  first time and the 46th, `hook-json`, red on an UNRELATED vendored-asset drift
+  (main had updated the shipped `skills/ghoztty/SKILL.md` for the caller-anchor
+  default; re-vendored as T1083, then ALL PASS). 143 modified scripts parse. And
+  16 converted scripts that no guard covers were run TWICE consecutively, which is
+  where staleness bites: 14 clean both times, `split-dim` 2-red identically at
+  HEAD before the sweep touched it (pre-existing, T1084), and one unreproduced
+  `session-open` A9 red that passed five later runs including four back-to-back
+  (T1085). Filed T1081 (the reset half - most scripts still never clear the debug
+  restore state, which is the original T248 defect) and T1082 (40+ private copies
+  of the ENUMERATION the kill was built on).
+
 - 2026-08-21 - **T1079 - a side pane asked for from a script now opens beside
   that script, even if you clicked another window while it worked.** The other
   half of the anchoring feature the T1073 merge brought over: the CLI already

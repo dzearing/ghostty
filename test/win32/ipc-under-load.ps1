@@ -163,6 +163,7 @@ $swClose = [System.Diagnostics.Stopwatch]::StartNew()
 $swClose.Stop()
 Assert ($swClose.ElapsedMilliseconds -lt 10000) "+close of the storm window returns in $($swClose.ElapsedMilliseconds)ms < 10s"
 Start-Sleep -Seconds 1
+# cleanslate-exempt: spares the CLI invocations, which the shared kill would take
 Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
     Where-Object { $_.ExecutablePath -eq $exe -and $_.CommandLine -notmatch '\+' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }

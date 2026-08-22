@@ -1,11 +1,11 @@
 {
     "guard":  "orphan-notify",
     "script":  "test/win32/orphan-notify.ps1",
-    "generated":  "2026-08-16T03:48:23-07:00",
-    "commit":  "646e690be",
+    "generated":  "2026-08-21T20:26:21-07:00",
+    "commit":  "8340e815a",
     "files":  {
                   "src/apprt/win32/orphan_notify.zig":  "f6318aae186b5750286309fedef655d818e4e19c520112cccbbf6db2698ad952",
                   "src/apprt/win32/tray_notify.zig":  "24b48b805f9d2deb886b4271f70c2aad336073d0256e5c855fd7c8f4dc3f8b50",
-                  "test/win32/orphan-notify.ps1":  "06c2623f5661e53a0de09d9661bc0c9973e44ae4b4126332c0bc8a6070cb8c5b"
+                  "test/win32/orphan-notify.ps1":  "1a57c033cc2a6d7c0ccded5ecb18a518a6f44d01a91bef35412562f2d099cc64"
               }
 }

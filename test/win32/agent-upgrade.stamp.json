@@ -1,11 +1,11 @@
 {
     "guard":  "agent-upgrade",
     "script":  "test/win32/agent-upgrade.ps1",
-    "generated":  "2026-08-21T10:33:01-07:00",
-    "commit":  "ea429c401",
+    "generated":  "2026-08-21T20:13:20-07:00",
+    "commit":  "8340e815a",
     "files":  {
                   "src/apprt/win32/agent_upgrade.zig":  "20c614d5a708c29dfed3a4c7ad01699cf2e13af4ca57946b492bf5e56cc4f424",
                   "src/apprt/win32/LocalAgent.zig":  "568c21aeed1eca082e7f095f1820b2b1c4a9e324407e3994df75d29260e06f1b",
-                  "test/win32/agent-upgrade.ps1":  "09b7dd527d7beff399cc792474ce5676842e07bba25ef0b6b984a2a5562629c2"
+                  "test/win32/agent-upgrade.ps1":  "04a6729ca99db2eb208ad737c34f3a628b7f53d5892f2c416e128552829e2a43"
               }
 }

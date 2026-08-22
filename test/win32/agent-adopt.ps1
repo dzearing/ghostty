@@ -56,6 +56,11 @@ if (-not (Test-Path $AgentExe)) {
 }
 
 function Stop-TestProcs {
+    # T351: deliberately NOT the shared Stop-RepoGhoztty. This script's subject is
+    # a FAKE agent - a renamed powershell.exe under a `ghoztty-t549*` directory,
+    # plus the real one launched with a `t549` listen-pipe - so what has to die is
+    # picked out by those run markers, not by the exe path the shared kill matches.
+    # cleanslate-exempt: picks this run's FAKE agents out by their t549 markers
     Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
         Where-Object { ($_.CommandLine -like '*t549*') -or ($_.ExecutablePath -like '*ghoztty-t549*') } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }

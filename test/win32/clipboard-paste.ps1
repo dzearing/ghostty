@@ -41,6 +41,11 @@ param(
     [switch]$Interactive
 )
 
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
 $ErrorActionPreference = 'Continue'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
@@ -145,13 +150,6 @@ function Stop-Probe {
     Start-Sleep -Milliseconds 800
 }
 
-function Stop-RepoGhoztty {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out\*') -or $_.ExecutablePath -eq $Exe } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 800
-}
-
 function Get-AnyLeaf($node) {
     if ($node.type -eq 'leaf') { return $node.terminal }
     return (Get-AnyLeaf $node.left)
@@ -161,7 +159,7 @@ function Get-AnyLeaf($node) {
 # --session-persistence=false so a restore cannot hand back a previous run's
 # window (the T131 lesson), and so the surviving agent cannot replay a layout
 # manifest over what this run asserts (the batch-2 lesson).
-Stop-RepoGhoztty
+[void](Stop-RepoGhoztty -Exe $Exe -AppOnly -SettleMs 800)
 Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive
 $app = $null
@@ -326,7 +324,7 @@ Assert (-not ($app.Process -and $app.Process.HasExited)) 'no crash at end of run
     $script:launched = @(Get-TestLaunchedPids)
     Set-TextClipboard '' | Out-Null
     Remove-TestDesktop
-    Stop-RepoGhoztty
+    [void](Stop-RepoGhoztty -Exe $Exe -AppOnly -SettleMs 800)
     Remove-Item $probe -ErrorAction SilentlyContinue
 }
 

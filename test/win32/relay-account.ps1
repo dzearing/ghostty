@@ -89,6 +89,11 @@ param(
     [switch]$Interactive
 )
 
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
 $ErrorActionPreference = 'Continue'
 Add-Type -AssemblyName System.Security
 # Isolate the IPC endpoint (inherited through CreateProcessW by the GUI, and
@@ -177,12 +182,10 @@ function Run-Cli($argsLine, $outfile, $timeoutSec = 20) {
 }
 
 function Stop-TestProcs {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.CommandLine -like '*zig-out*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
-        Where-Object { $_.CommandLine -like '*zig-out*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    # T351: one shared, path-exact kill (lib\CleanSlate.ps1) for the app and its
+    # sibling agent - the private copies each filtered differently. The extra
+    # process below is this script's own litter, so it stays local.
+    [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 0)
     Get-CimInstance Win32_Process -Filter "Name='ghoztty-relay-acct-e2e.exe'" |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
     Start-Sleep -Seconds 1

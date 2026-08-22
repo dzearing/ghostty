@@ -89,18 +89,28 @@ function Stop-RepoGhoztty {
     Path-exact, and refuses outright to touch an exe that does not live under
     the repo - so a mistyped -Exe can never reach the user's install.
     Returns the number of processes stopped.
+
+    -AgentOnly is the mirror of -AppOnly and exists for the scripts whose
+    subject is the agent alone (T351: `agent-pipe.ps1` restarts the agent under
+    a live app). Passing both is a contradiction, so it throws rather than
+    quietly killing nothing.
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Exe,
         [switch]$AppOnly,
+        [switch]$AgentOnly,
         [int]$SettleMs = 800
     )
 
     if (-not (Test-UnderRepo $Exe)) {
         throw "Stop-RepoGhoztty refuses '$Exe': not under the repo ($script:CleanSlateRepo). Acceptance scripts never touch an installed Ghoztty."
     }
+    if ($AppOnly -and $AgentOnly) {
+        throw "Stop-RepoGhoztty: -AppOnly and -AgentOnly are mutually exclusive."
+    }
 
-    $targets = @($Exe)
+    $targets = @()
+    if (-not $AgentOnly) { $targets += $Exe }
     if (-not $AppOnly) { $targets += (Get-GhozttyAgentPath -Exe $Exe) }
 
     $killed = 0

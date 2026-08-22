@@ -53,6 +53,11 @@ param(
     [int]$Cycles = 3
 )
 
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $root = Join-Path $env:TEMP "ghoztty-session-persist-$PID"
@@ -112,12 +117,10 @@ function App-Pids {
         ForEach-Object { $_.ProcessId })
 }
 function Stop-TestProcs {
-    foreach ($n in @('ghoztty.exe', 'ghoztty-agent.exe')) {
-        Get-CimInstance Win32_Process -Filter "Name='$n'" |
-            Where-Object { $_.CommandLine -like '*zig-out*' } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    }
-    Start-Sleep -Milliseconds 700
+    # T351: one shared, path-exact kill (lib\CleanSlate.ps1) instead of a private
+    # copy - the filter this replaced also matched a detached instance running from
+    # zig-out-release (T53b), and every copy answered "does the agent go too" alone.
+    [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 700)
 }
 # The crash under test: taskkill /f of the GUI only (agent keeps every ConPTY).
 function Crash-App {

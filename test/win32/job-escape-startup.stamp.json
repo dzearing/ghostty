@@ -1,12 +1,12 @@
 {
     "guard":  "job-escape-startup",
     "script":  "test/win32/job-escape-startup.ps1",
-    "generated":  "2026-08-21T00:22:40-07:00",
-    "commit":  "a905a5363",
+    "generated":  "2026-08-21T20:06:50-07:00",
+    "commit":  "8340e815a",
     "files":  {
                   "src/apprt/win32/job_escape.zig":  "70efff6eb21a668cdd18673b8573d38e2d9c3d26e5426586bfbcfb68a4986647",
                   "src/apprt/win32/job_object.zig":  "cc0f28320c8d9e4b0d40e402a49e7de4c57b16bfe50fc7ec5e33121175ec342d",
                   "src/apprt/win32/job_spawn.zig":  "b0c0163a6a79f3408e188c2d1af509855f0e5fe9428f14ad1d623be404ac754f",
-                  "test/win32/job-escape-startup.ps1":  "6901369f66191a98d98cbd44bcd190fe3783bcb9c8d8ad6aefa5fe6c34815d1f"
+                  "test/win32/job-escape-startup.ps1":  "7606d07132d3ff0958a650b0b16ba231e40f738dc8b4c25fefecce22432a4d85"
               }
 }

@@ -38,6 +38,11 @@ param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe'
 )
 
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $script:passes = 0
@@ -86,10 +91,10 @@ function Stop-TestApps {
     foreach ($p in $apps) {
         Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
     }
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
-        Where-Object { $_.CommandLine -like '*zig-out*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 600
+    # T351: the agent half goes through the shared, path-exact kill
+    # (lib\CleanSlate.ps1). The app half above stays local because it filters on
+    # THIS run's command line, which the shared kill deliberately does not.
+    [void](Stop-RepoGhoztty -Exe $Exe -AgentOnly -SettleMs 600)
 }
 
 # Start the app under test, detached, and wait until it answers its own IPC.

@@ -48,6 +48,11 @@ param(
     [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe'
 )
 
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $root = Join-Path $env:TEMP "ghoztty-gui-launch-command-$PID"
@@ -62,12 +67,10 @@ function AssertEq($name, $expected, $actual) {
 
 # Kill ONLY zig-out ghoztty/agent processes (never the user's release build).
 function Stop-TestProcs {
-    foreach ($n in @('ghoztty.exe', 'ghoztty-agent.exe')) {
-        Get-CimInstance Win32_Process -Filter "Name='$n'" |
-            Where-Object { $_.CommandLine -like '*zig-out*' } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    }
-    Start-Sleep -Milliseconds 900
+    # T351: one shared, path-exact kill (lib\CleanSlate.ps1) instead of a private
+    # copy - the filter this replaced also matched a detached instance running from
+    # zig-out-release (T53b), and every copy answered "does the agent go too" alone.
+    [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 900)
 }
 function Count-TestProcs($name) {
     return @(Get-CimInstance Win32_Process -Filter "Name='$name'" |
@@ -77,10 +80,11 @@ function Count-TestProcs($name) {
 # shape section D needs, since the agent is what keeps the sessions alive for
 # the next launch to re-attach to.
 function Stop-TestApp {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.CommandLine -like '*zig-out*' } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 900
+    # T351: the shared, path-exact kill (lib\CleanSlate.ps1). -AppOnly is the
+    # point of this helper - the agent (and its PTYs) stay up - and exact-exe is
+    # what the private copy's '*zig-out*' filter got wrong: that also matched a
+    # detached instance running from zig-out-release (T53b).
+    [void](Stop-RepoGhoztty -Exe $Exe -AppOnly -SettleMs 900)
 }
 
 function Run-Cli($argsLine, $out, $timeoutSec = 20) {

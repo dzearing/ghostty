@@ -571,6 +571,8 @@ $upgradeLog = Join-Path $tempDir 'ghoztty-upgrade.log'
 # Matched on `local-agent-debug` in the command line, so the user's RELEASE
 # agent (`local-agent`, holding their real panes) is never a candidate.
 function Stop-DebugLineage {
+    # cleanslate-exempt: also takes this run's SANDBOX copy under $root, which the
+    # shared kill (exact-exe on the repo zig-out) cannot see
     Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" -ErrorAction SilentlyContinue |
         Where-Object {
             $_.ExecutablePath -and (
@@ -578,6 +580,8 @@ function Stop-DebugLineage {
                 $_.ExecutablePath.StartsWith($root, [StringComparison]::OrdinalIgnoreCase))
         } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    # cleanslate-exempt: matched on the debug STATE dir, so the user's release
+    # agent - same image name, holding their real panes - is never a candidate
     Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" -ErrorAction SilentlyContinue |
         Where-Object { $_.CommandLine -and $_.CommandLine -like '*local-agent-debug*' } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
@@ -587,6 +591,7 @@ function Stop-DebugLineage {
 # Only ever touch processes running out of the sandbox.
 function Stop-SandboxProcs {
     foreach ($n in @('ghoztty.exe', 'ghoztty-agent.exe')) {
+        # cleanslate-exempt: the sandbox copy under $root only - never the repo build
         Get-CimInstance Win32_Process -Filter "Name='$n'" -ErrorAction SilentlyContinue |
             Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($root, [StringComparison]::OrdinalIgnoreCase) } |
             ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }

@@ -402,6 +402,7 @@ Complete-TestBody  # T1039: the run reached the end of its body
     # image file - after the script had exited and its $root was deleted. Matched
     # on THIS RUN'S root, never on the image name: the user's agent runs the same
     # image name and, in the release lineage, the same image path.
+    # cleanslate-exempt: matched on THIS RUN's state root, never on the image path
     Get-CimInstance Win32_Process -Filter "Name='ghoztty-agent.exe'" |
         Where-Object { $_.CommandLine -like "*$root*" } |
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }

@@ -41,6 +41,11 @@
 # Only touches ghoztty processes running from this repo's zig-out.
 #   powershell -NoProfile -File test\win32\terminal-link-paths.ps1
 param([string]$Exe, [switch]$NegativeControl, [switch]$Interactive)
+
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 if (-not $Exe) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
@@ -61,13 +66,6 @@ $script:fail = 0
 function Assert([bool]$cond, [string]$label) {
     if ($cond) { $script:pass++; Write-Host "PASS  $label" }
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
-}
-
-function Stop-RepoGhoztty {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out\*') -or $_.ExecutablePath -eq $Exe } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 800
 }
 
 function Get-ActiveSurface {
@@ -199,7 +197,7 @@ function Get-Column0DoubleClickSelections {
     return , @($seen | Select-Object -Unique)
 }
 
-Stop-RepoGhoztty
+[void](Stop-RepoGhoztty -Exe $Exe -AppOnly -SettleMs 800)
 Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive
 $app = $null
@@ -321,7 +319,7 @@ try {
 } finally {
     if ($app -and $app.Pid) { Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue }
     Remove-TestDesktop
-    Stop-RepoGhoztty
+    [void](Stop-RepoGhoztty -Exe $Exe -AppOnly -SettleMs 800)
 }
 
 $fgSeen = @(Stop-TestForegroundWatch)

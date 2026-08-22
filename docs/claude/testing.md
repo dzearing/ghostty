@@ -3,9 +3,9 @@
 > Progressive-disclosure doc routed from `/CLAUDE.md`. Load this before
 > writing or running ANY test — unit lanes, `test/win32/` acceptance scripts,
 > or scripts that drive the GUI. The audit rules in here (exit-code, skip,
-> verdict, asserted-nothing, body-completion, foreground/desktop, persistence
-> declaration, liveness, PS 5.1 argv fidelity) are enforced by sweeps that fail
-> the suite.
+> verdict, asserted-nothing, body-completion, one-shared-kill,
+> foreground/desktop, persistence declaration, liveness, PS 5.1 argv fidelity)
+> are enforced by sweeps that fail the suite.
 
 ### Test lanes and acceptance scripts
 
@@ -353,6 +353,30 @@ Acceptance: `test\win32\body-complete-audit.ps1` (the scorer on the wire as real
 processes, the stamp gate against a throwaway repo, the analyzer against
 fixtures both directions, the suite sweep), whose `-TeethCheck` plants a real
 violator so the sweep keeps its teeth.
+
+**And there is exactly ONE way to put the box back to empty** (T248, T351). A
+script never writes its own kill of the app under test or its sibling agent:
+`Stop-RepoGhoztty` in `test\win32\lib\CleanSlate.ps1` is it, with `-AppOnly` /
+`-AgentOnly` for the two narrower scopes and `Reset-GhozttyTestState` on top when
+the debug restore state must go too. It matches the EXACT ExecutablePath of the
+exe under test and refuses outright an exe that is not under the repo — the
+guarantee no private copy ever had, because they all filtered and none of them
+refused. This rule has been paid for twice: T248 hoisted the reset and converted
+19 scripts, and three weeks later **133** scripts carried a private copy again
+under six different names, four of them redefining `Stop-RepoGhoztty` itself so
+the private body won inside that process. Two divergences were live in them —
+`$_.CommandLine -like '*zig-out*'`, which also kills a detached instance running
+from `zig-out-release` (T53b), and app-only copies that left the agent holding a
+PTY, so a previous run's pane survived and `+new-window --target=` FOCUSED it
+instead of running this run's fixture. Litter that is genuinely one script's own
+(a relay stub, a fake agent, marker-ping shells) stays local; the app and its
+agent are everybody's. Sweep: `test\win32\lib\CleanSlateAudit.ps1`, reporting
+`private-kill` and `empty-exemption` at zero over every harness script, plus a
+caller that never dot-sources the library and a script that redefines the shared
+name. Exemption: the same stated-intent `# cleanslate-exempt: <reason>` marker,
+and a *reasonless* marker is itself a finding so it cannot become a rubber stamp.
+Acceptance: `test\win32\cleanslate-audit.ps1`, whose `-TeethCheck` plants a real
+violator.
 
 **And an oracle must read the same text wherever it runs** (T526, T531, T883).
 The audits above ask whether a run happened and whether it scored itself

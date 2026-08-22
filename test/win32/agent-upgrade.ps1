@@ -138,12 +138,18 @@ $script:TestProcRoot = Join-Path $env:TEMP 'ghoztty-agent-upgrade-'
 . (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
 Register-HarnessGhozttyRoot -Root $root | Out-Null
 function Stop-TestProcs {
+    # T351: deliberately NOT the shared Stop-RepoGhoztty, which matches on the
+    # exact image NAME of $Exe and its sibling. This script also runs agents from
+    # a per-run staging root under a renamed image, and both are invisible to an
+    # exact-name filter - see the next paragraph.
+    #
     # `ghoztty-agent%`, not `ghoztty-agent.exe`: arm M runs its agent from
     # `ghoztty-agent.exe.bak` (the image name a real delivery leaves the RUNNING
     # agent with), and Win32_Process.Name is the image name recorded at
     # creation - so an exact-name filter would walk straight past the one
     # process that arm is about and leak it into the next run.
     foreach ($n in @('ghoztty.exe', 'ghoztty-agent%')) {
+        # cleanslate-exempt: LIKE, because the image under test is ghoztty-agent.exe.bak
         Get-CimInstance Win32_Process -Filter "Name LIKE '$n'" |
             Where-Object {
                 $_.CommandLine -like '*zig-out*' -or

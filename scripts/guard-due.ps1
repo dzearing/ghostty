@@ -1330,6 +1330,23 @@ $GuardTable = @(
             'test\win32\lib\*.ps1'
         )
     },
+    # One shared kill for the app under test and its sibling agent (T351). T248
+    # hoisted it and converted 19 scripts; three weeks later 133 scripts carried
+    # a private copy again, four of them redefining the shared NAME so the copy
+    # won inside the process. A sweep alone has already been tried, and the
+    # regrowth is what a sweep alone buys. Same wide net as the audits above,
+    # for the same reason: the property is about the corpus, so any new or
+    # edited acceptance script must re-prove it. Static text over source, about
+    # a second.
+    [pscustomobject]@{
+        Name   = 'cleanslate'
+        Script = 'test\win32\cleanslate-audit.ps1'
+        Stamp  = 'test\win32\cleanslate-audit.stamp.json'
+        Covers = @(
+            'test\win32\*.ps1',
+            'test\win32\lib\*.ps1'
+        )
+    },
     # The host-dependent capture meta-check (T883): a merged stream formatted
     # through Out-String reads differently in every host - decorated and
     # wrapped where one can format, blank where none can - so a stderr-text

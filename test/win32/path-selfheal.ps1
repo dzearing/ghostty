@@ -22,6 +22,11 @@
 # shells during the run must keep working); the original value + kind are
 # restored in a finally block. Only touches ghoztty processes running from
 # this repo's zig-out.
+
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 $ErrorActionPreference = 'Stop'
 # T675: suppress the app's startup job self-escape - this harness tracks the
 # pids it launches, and a pane-launched app would otherwise hand its work to
@@ -67,10 +72,10 @@ function Set-UserPathRaw([string]$value, $kind) {
 }
 
 function Kill-RepoInstances {
-    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
-        Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out*') } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    Start-Sleep -Milliseconds 500
+    # T351: one shared, path-exact kill (lib\CleanSlate.ps1) instead of a private
+    # copy - the filter this replaced also matched a detached instance running from
+    # zig-out-release (T53b), and every copy answered "does the agent go too" alone.
+    [void](Stop-RepoGhoztty -Exe $exe -AppOnly -SettleMs 500)
 }
 
 # Launch the GUI, give the self-heal thread time to run, kill it. Returns

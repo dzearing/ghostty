@@ -44,6 +44,11 @@
 #
 # Only touches ghoztty processes running from this repo's zig-out.
 param([string]$ExePath, [switch]$Interactive)
+
+# T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
+# of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
+# test never wants the caller pane's endpoint.
+. (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
@@ -69,12 +74,10 @@ function Assert([bool]$cond, [string]$label) {
 # then reads last run's pixels and every assertion passes without the build
 # under test having drawn anything.
 function Kill-RepoInstances {
-    foreach ($name in @('ghoztty.exe', 'ghoztty-agent.exe')) {
-        Get-CimInstance Win32_Process -Filter "Name='$name'" |
-            Where-Object { $_.ExecutablePath -like (Join-Path $repo 'zig-out*') } |
-            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    }
-    Start-Sleep -Milliseconds 800
+    # T351: one shared, path-exact kill (lib\CleanSlate.ps1) instead of a private
+    # copy - the filter this replaced also matched a detached instance running from
+    # zig-out-release (T53b), and every copy answered "does the agent go too" alone.
+    [void](Stop-RepoGhoztty -Exe $exe -SettleMs 800)
 }
 
 # --- WCAG contrast, the same math the Zig side asserts on ----------------
