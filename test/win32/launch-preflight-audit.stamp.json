@@ -1,8 +1,8 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-08-22T15:28:43-07:00",
-    "commit":  "3067817a4",
+    "generated":  "2026-08-22T16:31:37-07:00",
+    "commit":  "6cada034a",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
@@ -168,7 +168,7 @@
                   "test/win32/local-split-no-command-rerun.ps1":  "ee277b6308cdb172e153fe92d0624732f8b64743418134ce466da5534138fae2",
                   "test/win32/log-append.ps1":  "035c556759b4a332b9198de4dbca91ccfd2f3cd21a9cc7ad1ef3d2e95576b62a",
                   "test/win32/machine-chooser.ps1":  "c69e331b19e83e300b5f0c22860220ea1d2de144d587db1ee4ae4e797ce6b79e",
-                  "test/win32/menu-bar.ps1":  "ad54dc2e5325862324a53099c4a5ae360da8987a38d65e25281cc3d3b9c8a36a",
+                  "test/win32/menu-bar.ps1":  "787a69dc27ed58f7134e046beb04ee2c7dafea6252e081e7f86ec7fe77a9c2c4",
                   "test/win32/merge-terminology.ps1":  "c6e28d4f5dac63e423b492c7e854a11ae24e754ddf56587a8dd6cbeeb5efa6eb",
                   "test/win32/morning-refresh.ps1":  "4af22c6e66fb4a9dc95140dc46176890ab28ff0d1a8d3482608b04b61627a6c3",
                   "test/win32/mouse-nc-routing.ps1":  "0e9c09958e46b3444898c47fdcadfbd1c509854b6c07e5bb8c5086abd2f80969",

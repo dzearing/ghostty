@@ -246,6 +246,29 @@ function Focused-Pane-Name {
 }
 function Tab-Count { @((List-Json).data.windows[0].tabs).Count }
 
+# Wait until the window reports $target tabs, up to $ms. Returns the last count
+# read AND how long it took, so an assertion can report the timing rather than
+# just the verdict.
+#
+# Opening a tab is ASYNCHRONOUS: the click only posts a message, the app then
+# spawns a shell, and the pane reaches `+list` some time after that. A fixed
+# sleep is therefore not an oracle for it - it is a bet on how loaded the box
+# is. Section A used to sleep 900ms and read the count once, and in the T1094
+# sweep (242 scripts, box busy) that bet lost: it scored `tabs 1 -> 1` against
+# a tab that did arrive, and section D then failed its two-tab rows off the
+# tab that was not there yet - three FAILs out of one late tab (T1110).
+# Everything here that waits for a tab waits for the COUNT.
+function Wait-TabCount([int]$target, [int]$ms = 8000) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $n = Tab-Count
+    while ($n -lt $target -and $sw.ElapsedMilliseconds -lt $ms) {
+        Start-Sleep -Milliseconds 150
+        $n = Tab-Count
+    }
+    $sw.Stop()
+    [pscustomobject]@{ Count = $n; Ms = [int]$sw.ElapsedMilliseconds }
+}
+
 # How many terminal children are VISIBLE (the Zoom Split oracle: zooming HIDES
 # the other panes).
 function Visible-Panes([IntPtr]$top) {
@@ -608,6 +631,8 @@ $m = Wait-Menu $g.Pid 1200
 Assert ($m -eq [IntPtr]::Zero) 'A(T260): the strip has no menu button on a caption window'
 if ($m -ne [IntPtr]::Zero) { Close-Menu $g }
 Assert ((Tab-Count) -eq $tabsAtStripRight) 'A(T260): ...and clicking there opens no tab either'
+# Same drag band, same modal loop to clear (see the T1110 note below).
+[void](Invoke-TestMessage -Window $g.Top -Message 0x001F)  # WM_CANCELMODE
 
 # It is a button, not "the strip": the bare strip between the "+" and the
 # strip's right end is dead space, and the "+" is its own hit box.
@@ -620,13 +645,39 @@ Assert ($m -eq [IntPtr]::Zero) 'A: clicking bare strip does NOT open the menu'
 if ($m -ne [IntPtr]::Zero) { Close-Menu $g }
 Assert ((Tab-Count) -eq $tabsBefore) 'A: ...and does not open a tab either (it is dead space)'
 
+# Both probes above are NON-CLIENT clicks, and saying so out loud is the point
+# (T1110). `Get-TestMouseRoute` answers HTCAPTION (2) at the strip's right end
+# and at the dead space, against HTCLIENT (1) at the "+": bare strip in the
+# merged chrome row is the window's DRAG band, which is correct and is why
+# neither click opens anything. Asserting the codes turns two claims of "then
+# nothing happened" - which a click that was never delivered satisfies just as
+# well - into claims about a click that demonstrably reached the window.
+$crA = Get-TestWindowRect -Window $g.Top -Client
+$routeDead = Get-TestMouseRoute -Window $g.Top -X ($crA.Left + $geo.DeadX) -Y ($crA.Top + $geo.StripY)
+$routePlus = Get-TestMouseRoute -Window $g.Top -X ($crA.Left + $geo.PlusX) -Y ($crA.Top + $geo.PlusY)
+Assert ($routeDead.Code -eq 2) "A: bare strip is the window's drag band, so those clicks went non-client (HTCAPTION, got $($routeDead.Code))"
+Assert ($routePlus.Code -eq 1) "A: the ""+"" is client area, so its click is a real button press (HTCLIENT, got $($routePlus.Code))"
+
+# ...and because they were non-client HTCAPTION, DefWindowProc may have entered
+# its modal SC_MOVE loop on them - a loop that pumps its own messages and eats
+# whatever is queued behind it, including the "+" click below. A real user ends
+# that loop by lifting a real button; a POSTED WM_NCLBUTTONUP does not reliably
+# do it. So end it here, explicitly, before the one click in this section whose
+# whole point is that it lands. This is the T1094 sweep's three FAILs: no tab
+# opened, and section D then read Close Tab and tab cycling as grayed - which is
+# the RIGHT answer for the one tab that was really there.
+[void](Invoke-TestMessage -Window $g.Top -Message 0x001F)  # WM_CANCELMODE
+
 Click-Client $g.Top $geo.PlusX $geo.PlusY
 Start-Sleep -Milliseconds 900
 $m = Wait-Menu $g.Pid 300
 Assert ($m -eq [IntPtr]::Zero) 'A: the "+" button did not open the menu'
 if ($m -ne [IntPtr]::Zero) { Close-Menu $g }
-$tabsAfterPlus = Tab-Count
-Assert ($tabsAfterPlus -eq $tabsBefore + 1) "A: the rect after the last tab is the + (tabs $tabsBefore -> $tabsAfterPlus)"
+# Waited for, not slept at (T1110). The 900ms above is the "did a menu open
+# instead?" window and stays fixed, because a menu that has not appeared by
+# then is the pass; the TAB is the asynchronous outcome and gets a poll.
+$plus = Wait-TabCount ($tabsBefore + 1)
+Assert ($plus.Count -eq $tabsBefore + 1) "A: the rect after the last tab is the + (tabs $tabsBefore -> $($plus.Count), $($plus.Ms)ms)"
 
 # --- A(pixels): the glyph is painted --------------------------------------
 # Everything else here is hit-testing; this is the only assertion that the
@@ -754,7 +805,13 @@ if ($null -ne $tree) {
     Assert ((Row-Flags $tree "&Window/&Zoom Split") -eq ':grayed') 'D: Zoom Split is grayed in a single-pane tab'
     Assert ((Row-Flags $tree "&Window/&Select Split/Select Split &Left") -eq ':grayed') 'D: Select Split rows are grayed in a single-pane tab'
     Assert ((Row-Flags $tree "&Window/&Resize Split/Move Divider &Up") -eq ':grayed') 'D: Move Divider rows are grayed in a single-pane tab'
-    # Run 1 opened a second tab in section A, so the tab rows are live.
+    # Run 1 opened a second tab in section A, so the tab rows are live - and
+    # that PREMISE is asserted here rather than assumed (T1110). With one tab,
+    # Close Tab and tab cycling being grayed is CORRECT behaviour, so the two
+    # rows below would score a right answer as a defect and point the blame at
+    # the menu's state logic instead of at the missing tab.
+    $tabsForD = Tab-Count
+    Assert ($tabsForD -eq 2) "D: the two-tab premise holds ($tabsForD tabs open)"
     Assert ((Row-Flags $tree "&File/Close Ta&b") -eq '') 'D: Close Tab is enabled with two tabs'
     Assert ((Row-Flags $tree "&Window/Previous &Tab") -eq '') 'D: tab cycling is enabled with two tabs'
     # E(off): the Exit row only advertises session keeping when it is on.
@@ -784,9 +841,8 @@ Send-MenuKey $g.Top 'F'  # File submenu
 Start-Sleep -Milliseconds 300
 Send-MenuKey $g.Top 'T'  # New Tab
 Assert (Test-MenuGone $g.Pid 2500) 'C: choosing New Tab closes the menu'
-$grew = $false
-for ($t = 0; $t -lt 20; $t++) { Start-Sleep -Milliseconds 250; if ((Tab-Count) -gt $before) { $grew = $true; break } }
-Assert $grew "C: File>New Tab opened a tab ($before -> $(Tab-Count))"
+$grew = Wait-TabCount ($before + 1)
+Assert ($grew.Count -gt $before) "C: File>New Tab opened a tab ($before -> $($grew.Count), $($grew.Ms)ms)"
 
 # --- C: View>Terminal Read-only round-trips through the check state --------
 [void](Click-MenuHost $g.Top)
@@ -1101,7 +1157,15 @@ Stop-Process -Id $g.Pid -Force -ErrorAction SilentlyContinue
 
 } finally {
     Remove-TestDesktop
-    Kill-RepoInstances
+    # The AGENT goes too, and only here (T1110). `Kill-RepoInstances` is
+    # -AppOnly on purpose BETWEEN runs - run 2 launches with
+    # `--session-persistence=true`, which starts the repo's debug local agent,
+    # and killing it under a live app mid-script is not what any section is
+    # measuring. But at the END there is nothing left to serve: the agent
+    # simply stays running, holding this run's session, and the T1094 sweep
+    # counted it as this script's `[leaked 1]`. Path-exact, so it can only ever
+    # reach zig-out's agent and never the one the user's install is running.
+    [void](Stop-RepoGhoztty -Exe $exe -SettleMs 500)
 }
 
 $fgSeen = @(Stop-TestForegroundWatch)

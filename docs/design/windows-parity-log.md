@@ -9,6 +9,22 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-08-22: T1110 - the menu was right about Close Tab all along; the click that was supposed to open the second tab never arrived. Filed from the 242-script sweep as a P1 user-facing defect - `menu-bar.ps1` scoring `3 FAILED / 75 passed`, with Close Tab and tab cycling greyed out "with two tabs open". There was never a second tab. Re-running the script alone was ALL PASS on the first attempt, before a line of it was read.
+
+  The task file asked for attribution before repair, so: the `+` rect was not the problem (the sweep printed the same geometry as a green run, `plus@378 tabsRight@351`, and a probe shows the rect never moves - 40 samples over 14 s, `plus=[358..399]` throughout), and the tab was not merely slow (the sweep's own section C read `1 -> 2` later in the same run). The click itself was lost. Measured mechanism: the two probes that click bare strip immediately before the `+` are NON-CLIENT clicks - `Get-TestMouseRoute` answers HTCAPTION (2) at both the strip's right end and the dead space, against HTCLIENT (1) at the `+`. Bare strip in the merged chrome row IS the window's drag band, which is correct; but `Send-TestMouse` therefore posts `WM_NCLBUTTONDOWN`, and DefWindowProc answers that with its modal SC_MOVE loop, which pumps its own messages and eats what is queued behind it. A real user ends that loop by lifting a real button; a posted `WM_NCLBUTTONUP` does not reliably do it.
+
+  What made it read as a menu defect is that both preceding assertions only claim *nothing happened* - which a click that was never delivered satisfies perfectly. So the section passed twice vacuously, failed on the one assertion that needs a click to land, and section D then scored Close Tab and tab cycling as broken when grayed is the right answer for the one tab that was really there.
+
+  Four changes, all in the harness, none in the product. The section clears the modal mode (`WM_CANCELMODE`) after each drag-band probe, so the `+` click cannot be eaten. It asserts the two hit codes, so "then nothing happened" stops being a claim a lost click can satisfy. `Wait-TabCount` replaces a fixed 900 ms sleep and a single count - opening a tab is asynchronous and a sleep is a bet on box load, not an oracle - and it reports the timing (`tabs 1 -> 2, 78ms`). And section D asserts its two-tab PREMISE instead of inheriting it, so the menu rows can never again be judged against a window that has one tab.
+
+  The `[leaked 1]` was the second half and a separate fault: run 2 launches with `--session-persistence=true`, which starts the repo's debug local agent, and every teardown in the file is `Kill-RepoInstances`, which is `-AppOnly` on purpose. Correct between runs, wrong at the end - the agent simply stayed running. The final `finally` now stops the agent too, path-exact so it can only ever reach zig-out's.
+
+  Filed T1141 for the general half: `Send-TestMouse`'s click path knows the hit code already, and any of the 141 scripts that clicks a caption, a drag band or a resize edge and then clicks something else can lose the second click. The losing script almost always reports the consequence rather than the lost click, which is exactly how this one filed a defect against a correct menu.
+
+  This is the EIGHTH sweep-filed task in a row whose root cause is the harness rather than the feature (T1102-T1105, T1107, T1106, T1108, now T1110) - evidence into T1137, and the cleanest case for it yet: the task file had already reasoned its way to the right suspicion in prose ("assertion A is the tell for the other two"), so what was missing is not insight, it is the 90-second run.
+
+  Green: `menu-bar.ps1` ALL PASS (81 assertions) three times, and a `Win32_Process` sweep for anything running out of `zig-out` finds 0 afterwards. Floor all four lanes PASS; P1/P2/P3 25/20/16. The five audit harnesses the test edit made due re-run and re-stamped (isolation-meta, launch-preflight, verdict-exit, cleanslate, stderr-capture), and body-complete re-checked ALL PASS (40). `fork-identity` stays red for T1134's reason and nothing to do with this turn, so committed under `-NoGuardDue` naming T1134.
+
 - 2026-08-22 - **T1098 - the upgrade now reads a binary's header instead of
   asking Windows to run it, so a damaged install fails the delivery instead of
   parking a modal dialog on the user's desktop.** The user saw it live on
