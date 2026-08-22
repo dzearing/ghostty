@@ -493,6 +493,54 @@ been asked. Acceptance: `test\win32\guard-due.ps1`, whose sections D and E
 measure the two forces against each other (the same staleness must fail
 `validate` and must not fail `claim`).
 
+**And the SUITE itself is one command now** (T361). The stamp above is per
+harness; nothing could ever run the whole of `test\win32\` — 241 top-level
+scripts, 136 of which drive a GUI — so a change to a shared harness library
+(`lib\TestDesktop.ps1`, `lib\ChromeGeometry.ps1`, `lib\CleanSlate.ps1`) was
+validated against the handful a turn happened to think of, and the rest were
+found broken by whichever later turn opened one. T267's own Validation asked for
+"the GUI suite twice back to back, and then in reverse order" and could not be
+discharged, because there was no runner and nobody had measured what a pass
+costs.
+
+```powershell
+powershell -NoProfile -File scripts\suite-run.ps1 list          # what is in the suite
+powershell -NoProfile -File scripts\suite-run.ps1 -Set gui      # run them all
+powershell -NoProfile -File scripts\suite-run.ps1 -Set gui -Order reverse
+powershell -NoProfile -File scripts\suite-run.ps1 compare -Runs a\summary.json,b\summary.json
+```
+
+Each script is its own `powershell -File` child with its stdout and stderr in a
+per-script log, scored by the verdict contract above — `pass` / `fail` /
+`nothing` (exit 2) / `stall` (killed at `-TimeoutSec`) / `error` (an odd exit
+code, or exit 0 with no verdict line, which is the T221 shape and must never
+launder as green). Four properties are the ones that matter in practice:
+
+- **It survives being killed.** Every row is written to `summary.json` the
+  moment its script ends, so a sweep stopped at script 90 keeps 90 rows, and
+  `-Resume <summary.json>` picks up from there. A suite this long is going to be
+  interrupted; the design assumes it.
+- **One hang costs one script.** The child is killed at the timeout, scored
+  `stall`, and the sweep carries on.
+- **It sweeps leaks between scripts** — anything still running out of the repo's
+  `zig-out`, path-exact and repo-scoped the way `lib\CleanSlate.ps1` is — and
+  reports which script leaked. A leaked instance poisons every script after it,
+  and the one that leaks is rarely the one that then fails.
+- **`compare` is what discharges an order-independence claim.** Forward,
+  forward, reverse, then compare the three summaries: a script whose verdict
+  moves is reading state a neighbour left behind.
+
+**It is serial, and that is a measured decision, not an omission.** Every script
+here resolves the app as `<repo>\zig-outin\ghoztty.exe` — 91 of them compute
+that path internally and ignore any `-Exe` a caller passes — and `CleanSlate`
+kills the app under test by exact ExecutablePath. Two workers out of one
+`zig-out` therefore kill each other's app mid-assertion, with no error either
+can attribute, and they share `%LOCALAPPDATA%\ghoztty\*` besides. Parallelism
+needs a per-worker exe copy and a per-worker `LOCALAPPDATA`, which needs every
+script to honor an injected exe path first — a suite-wide change with its own
+task. Until then the honest number is the serial one, and the runner prints it.
+Acceptance: `test\win32\suite-run.ps1`.
+
 **And a harness that ran against a STALE EXE proves nothing either** (T1028).
 The stamp above answers "has this harness been run against the code as it now
 stands?" — and until now the run itself never checked. Every `test\win32` script

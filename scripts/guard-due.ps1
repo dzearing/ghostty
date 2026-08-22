@@ -1143,6 +1143,20 @@ $GuardTable = @(
             'test\win32\task-dashboard.ps1'
         )
     },
+    # The acceptance-suite runner (T361). It is the one tool whose subject is
+    # the other 241 scripts, so a regression in it does not fail loudly - it
+    # mis-scores a sweep, and a wall of green is exactly what nobody re-reads.
+    # Nothing in the P1-P3 floor touches it.
+    [pscustomobject]@{
+        Name   = 'suite-run'
+        Script = 'test\win32\suite-run.ps1'
+        Stamp  = 'test\win32\suite-run.stamp.json'
+        Covers = @(
+            'scripts\suite-run.ps1',
+            'scripts\lib\Duration.ps1',
+            'test\win32\suite-run.ps1'
+        )
+    },
     # The palette's "Focus: <pane>" jump entries (T555). The pure derivation
     # rides the none lane; this row ties the HARNESS to its own family only -
     # Surface.zig/IpcHandlers.zig move for a hundred non-palette reasons and
