@@ -1309,6 +1309,28 @@ $GuardTable = @(
             'test\win32\lib\ChooserCursor.ps1'
         )
     },
+    # The chooser's ORPHAN MARK (T520/T1106): the "not in any window" count and,
+    # in its third section, the mark going AWAY when the row is resumed. Nothing
+    # else asserts either half - the two resume rows above prove the resume and
+    # never look at the mark, and the mark's oracle is a log line no floor lane
+    # reads. The row exists because this harness sat `4 FAILURE(S)` in the
+    # 242-script sweep with no guard obliging anyone to run it, and the failure
+    # read as a broken attach when it was the harness walking the roster blind.
+    # Coverage is the roster that both computes the count and hosts the cursor
+    # (SessionRoster.zig), the pure row model behind what renders
+    # (chooser_sessions.zig), the shared walk, and the harness itself.
+    # MachineChooser.zig is left out for the reason the resume rows state.
+    [pscustomobject]@{
+        Name   = 'chooser-orphan-badge'
+        Script = 'test\win32\chooser-orphan-badge.ps1'
+        Stamp  = 'test\win32\chooser-orphan-badge.stamp.json'
+        Covers = @(
+            'src\apprt\win32\SessionRoster.zig',
+            'src\apprt\win32\chooser_sessions.zig',
+            'test\win32\chooser-orphan-badge.ps1',
+            'test\win32\lib\ChooserCursor.ps1'
+        )
+    },
     # The chooser's ACCOUNT ROW (T316): the sign-in flow and the four
     # compositions the row takes (signed in / signing in / signed out /
     # unconfigured). No other harness drives it - the P1-P3 floor opens no

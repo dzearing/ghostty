@@ -12,9 +12,13 @@
 #   2. OPEN a session directly against the agent (remote-test-client --hold,
 #      the T411/T108 shape: the client detaches and the session stays alive
 #      with no pane) - reopening the chooser counts exactly that one.
-#   3. Resume the marked row from the roster (Right/Down/Return, the T320
-#      path); reopening the chooser shows the count back at zero - the mark
-#      clears the moment a window holds the session.
+#   3. Resume the marked row from the roster (the T320 path); reopening the
+#      chooser shows the count back at zero - the mark clears the moment a
+#      window holds the session. The cursor is walked to the marked row by the
+#      app's own "chooser roster: cursor on session id=..." log through
+#      lib\ChooserCursor.ps1, never by counting Downs off `+sessions --json`
+#      (T1106): the roster is sorted, so that count is the wrong index space,
+#      and Right does nothing at all while the roster is still being fetched.
 #
 # WHY A LOG LINE IS THE ORACLE. The roster is owner-drawn on the dialog's own
 # surface - there is no HWND to read a badge back from - so the count is said
@@ -63,6 +67,7 @@ $env:GHOZTTY_PIPE_SUFFIX = "-t520$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\PipeBridge.ps1')  # Get-LocalAgentPipeName
+. (Join-Path $PSScriptRoot 'lib\ChooserCursor.ps1')  # Walk-ChooserCursorToId (T602/T620)
 
 $script:pass = 0
 $script:fail = 0
@@ -173,6 +178,34 @@ function Send-ChooserKey($chooser, $filter, $key) {
     return Send-TestKeys -Window $chooser -Target $filter -Key $key
 }
 
+# Resuming from the chooser is ASYNCHRONOUS: the app opens a window, dials the
+# agent, and only then does the ATTACH land and the mark clear. Sleeping a
+# fixed two seconds at that makes the assertion a race against box load, which
+# is half of why section 3 scored red in the 242-script sweep (T1106/T1107). So
+# poll for the transition and say how long it took: a genuinely broken attach
+# still fails at the timeout, a merely slow one is a number instead of a red.
+function Wait-Attached([string]$id, [int]$timeoutMs = 20000) {
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $row = @()
+    while ($sw.ElapsedMilliseconds -lt $timeoutMs) {
+        $row = @(Get-Sessions | Where-Object { $_.id -eq $id })
+        if ($row.Count -eq 1 -and $row[0].attached) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    $sw.Stop()
+    return @{ Row = $row; ElapsedMs = [int]$sw.ElapsedMilliseconds }
+}
+
+function Wait-WindowGone($window, [int]$timeoutMs = 6000) {
+    $waited = 0
+    while ($waited -lt $timeoutMs) {
+        if (-not (Test-TestWindowExists -Window $window)) { return $true }
+        Start-Sleep -Milliseconds 200
+        $waited += 200
+    }
+    return $false
+}
+
 Write-Host 'T520 chooser orphan mark ("not in any window")'
 Stop-RepoProcesses @('ghoztty', 'ghoztty-agent', 'remote-test-client')
 Reset-AgentState
@@ -235,29 +268,34 @@ try {
     # --- 3. Resuming the marked row clears its mark ------------------------
     Write-Host ''
     Write-Host '3. resuming the marked session takes its mark away'
+    # Walk by the app's own cursor log, not by an index counted off
+    # `+sessions --json` (T602/T620, shared in lib\ChooserCursor.ps1). The
+    # displayed roster is SORTED since T602, so the agent's order is not the
+    # cursor's index space; and Right no-ops entirely while the roster is still
+    # being fetched, after which Return resumes NOTHING and falls through to the
+    # machine row's default action - a window opens on no session at all. A
+    # blind Right/Down/Return cannot tell that apart from a broken resume, and
+    # did not: that is the whole of T1106's reported "resume does not attach".
     $rendered = @(Get-RenderedSessions)
-    $targetIdx = -1
-    for ($i = 0; $i -lt $rendered.Count; $i++) {
-        if ($rendered[$i].id -eq $loose[0].id) { $targetIdx = $i; break }
-    }
-    Assert ($targetIdx -ge 0) "the marked row is rendered to resume (index $targetIdx of $($rendered.Count))"
-    if ($targetIdx -lt 0) { Write-Host 'SETUP FAIL: orphan not in rendered list'; exit 1 }
+    $landed = Walk-ChooserCursorToId -Chooser $chooser -Filter $filter -Log $errlog `
+        -TargetIds @($loose[0].id) -MaxRows ([Math]::Max(4, $rendered.Count + 2))
+    Assert ($landed -eq $loose[0].id) "the roster cursor parks on the marked row ($landed of $($rendered.Count) rendered)"
+    if ($landed -ne $loose[0].id) { Write-Host 'SETUP FAIL: cursor never reached the marked row'; exit 1 }
 
-    Send-ChooserKey $chooser $filter 'Right' | Out-Null
-    for ($i = 0; $i -lt $targetIdx; $i++) { Send-ChooserKey $chooser $filter 'Down' | Out-Null }
-    Start-Sleep -Milliseconds 400
     Send-ChooserKey $chooser $filter 'Return' | Out-Null
     $attach = Wait-LogLine $errlog 'resume session: attaching local session id=' 6000
     Assert ($null -ne $attach) 'Return resumes the marked row'
     $resumedId = ''
     if ($attach -and $attach -match 'id=([0-9a-fA-F]+)') { $resumedId = $Matches[1] }
     Assert ($resumedId -eq $loose[0].id) "the resumed session is the marked one ($resumedId vs $($loose[0].id))"
-    Start-Sleep -Seconds 2
-    Assert (-not (Test-TestWindowExists -Window $chooser)) 'the chooser dismissed onto the resumed window'
+    Assert (Wait-WindowGone $chooser) 'the chooser dismissed onto the resumed window'
 
     # The agent's own view agrees: the orphan now has a viewer.
-    $row = @(Get-Sessions | Where-Object { $_.id -eq $loose[0].id })
+    $attached = Wait-Attached $loose[0].id
+    $row = $attached.Row
+    Write-Host "     (attach landed after $($attached.ElapsedMs) ms)"
     Assert ($row.Count -eq 1 -and $row[0].attached) 'the agent reports the resumed session ATTACHED'
+    Assert ($row.Count -eq 1 -and $null -eq $row[0].unattached_since) 'the attach reset unattached_since to null'
 
     # Reopen: a fresh adopt recounts against the live window set, and the
     # resumed session now has a window, so the count is back at zero - a NEW
@@ -268,6 +306,13 @@ try {
 } finally {
     Stop-RepoProcesses @('ghoztty', 'ghoztty-agent', 'remote-test-client')
     Remove-TestDesktop
+}
+
+# A clean green run stamps the covered files (T783); a red run leaves the
+# stamp alone on purpose - red must stay due.
+if ($script:fail -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard chooser-orphan-badge -Repo $repo 2>&1 | ForEach-Object { "  $_" }
 }
 
 Write-Host ''
