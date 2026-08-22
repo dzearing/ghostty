@@ -90,8 +90,14 @@ What that means in practice:
   Pulling *from* upstream is allowed but is **the user's call, never the
   loop's**: wait to be told, then land it in **our mac build first** (Ghostty
   is mac-centric) and funnel it to the **windows port second** - at the first
-  step the windows port is not a consideration. Say "upstream pull"/"upstream
-  sync", not "merge-back", which reads backwards. Full contract: D80.
+  step the windows port is not a consideration. Full contract: D80.
+- **"Merge back" means three different things here — never write it bare.**
+  (1) The **cutover**: this branch → `main` on dzearing/ghoztty, so one trunk
+  carries mac and windows and the PR pipeline builds both. That is the goal —
+  `scripts\ship-readiness.ps1` is its gate and T1074 executes it. (2) An
+  **upstream pull**: ghostty-org → this fork, per the rule above. (3)
+  **Upstreaming**: this fork → ghostty-org, which never happens. Say which one
+  you mean; the bare phrase has already caused two wrong turns (T1097).
 - **Everything gets tests**: pure logic → unit tests in the `none` lane;
   behavior → an on-box acceptance script in `test/win32/`. The harness rules in
   `docs/claude/testing.md` are enforced by sweeps and are not optional.
