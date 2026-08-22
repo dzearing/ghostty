@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-22T10:13:10-07:00",
-    "commit":  "f59891a61",
+    "generated":  "2026-08-22T10:46:52-07:00",
+    "commit":  "68dfa081e",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
@@ -232,7 +232,7 @@
                   "test/win32/viewer-feedback-utf16.ps1":  "e691ef37cc1c04ca9c691e92660d7323e28ab0f94fa715fb345eb5b234c89fba",
                   "test/win32/viewer-html.ps1":  "da63fa5c0af6cb62ef6852187d873d89cc860d22e1f55435cc85c59c4e98769d",
                   "test/win32/viewer-panes.ps1":  "a69c6aac3f34a3db6ab5a5063cabdc761e6fb111ade91c1d4a5ca74ad2d7b2d4",
-                  "test/win32/viewer-popup.ps1":  "515b8b8e2ee30bf815455819b61e3f5eba1f7860233ba9875cd4662e8915aa23",
+                  "test/win32/viewer-popup.ps1":  "207d22eddae6f4326f1c25a3d64e1e745b705bf53651526519b596318b8de890",
                   "test/win32/viewer-restore.ps1":  "ccca2d3b05ca78901733377666281e357f64b36a57b729f2c54af0252239afb0",
                   "test/win32/viewer-window-chords.ps1":  "f8a4613094f1ff5449211e6c3bddee67c8ee3ed3050f95b02e61717744fba7eb",
                   "test/win32/viewer-worktree.ps1":  "b58c40302cdc8cd34690887d581cd2763eef490c3e9387145884a313caee01fd",

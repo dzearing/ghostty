@@ -117,14 +117,34 @@ function Get-WinLeaves($w) {
 }
 
 # The one window that was not already open. `$script:knownTargets` is snapshotted
-# AFTER the opener comes up, which is what keeps the app's own startup window out
-# of the answer -- a launch opens `window-1` with a shell in it, and a naive
-# "the window that is not the opener" picks THAT and reports the popup as a
-# terminal running cmd.exe.
+# BEFORE the opener is created, which keeps the app's own startup window out of
+# the answer -- a launch opens `window-1` with a shell in it, and a naive "the
+# window that is not the opener" picks THAT and reports the popup as a terminal
+# running cmd.exe. The opener itself is excluded by NAME instead, which is
+# available without waiting for anything because this script gives it one
+# (`--target=opener`).
+#
+# The ordering is load-bearing and was wrong until 2026-08-22 (T1103). The
+# snapshot used to be taken after waiting for the opener's pane to show up in
+# `+list`, and the opener's page calls `window.open()` on load -- so on a loaded
+# box the popup was ALREADY registered by then and got captured into the "known"
+# set. `Get-PopupWin` could then never find it again: B and C failed on a feature
+# that was working (D found the same popup by its HWND title, at the size it had
+# asked for), and E's "the popup is gone" passed vacuously because it had never
+# been findable. A snapshot taken before the opener exists cannot race the popup,
+# because the popup cannot exist before its opener does.
 $script:knownTargets = @()
+# The popup's target, remembered the first time it is seen. Section E asserts
+# that THIS window went away, rather than "no unknown window is present" -- which
+# is true for free when the popup was never found.
+$script:popupTarget = $null
 function Get-PopupWin {
     foreach ($w in Get-Windows) {
-        if ($script:knownTargets -notcontains [string]$w.target) { return $w }
+        $t = [string]$w.target
+        if ($script:knownTargets -contains $t) { continue }
+        if ($t -eq 'opener') { continue }
+        if (-not $script:popupTarget) { $script:popupTarget = $t }
+        return $w
     }
     return $null
 }
@@ -243,17 +263,23 @@ try {
 
     # ---- A: the opener, and nothing else ------------------------------------
     Say '== A: the opener window'
+
+    # Everything open BEFORE the opener: the app's own startup window. Taken
+    # here, not after the opener comes up, so the popup cannot land inside it
+    # (T1103). Anything past this set that is not the opener is the popup.
+    $script:knownTargets = @(@(Get-Windows) | ForEach-Object { [string]$_.target })
+    Say "   known windows: $($script:knownTargets -join ', ')"
+    Assert ($script:knownTargets -notcontains 'opener') `
+        'no window is holding the opener name before the opener is created'
+
     $r = Invoke-Verb @('+new-window', '--target=opener', "--view=$ppUrl")
     Assert ($r.Code -eq 0) "+new-window --view=<opener page> exits 0 (got $($r.Code))"
 
     $up = Wait-For { (@(Get-WinLeaves (@(Get-Windows) | Where-Object { $_.target -eq 'opener' })[0])).Count -eq 1 } 30
     Assert $up 'the opener window came up with one pane'
 
-    # Everything open BEFORE the popup: the app's own startup window and the
-    # opener. Anything past this set is the popup and nothing else.
-    $script:knownTargets = @(@(Get-Windows) | ForEach-Object { [string]$_.target })
-    Assert ($script:knownTargets -contains 'opener') 'the opener is registered under its target name'
-    Say "   known windows: $($script:knownTargets -join ', ')"
+    Assert ((@(Get-Windows) | ForEach-Object { [string]$_.target }) -contains 'opener') `
+        'the opener is registered under its target name'
 
     # ---- B: the popup became a window of its own ----------------------------
     Say '== B: the popup is adopted'
@@ -308,8 +334,14 @@ try {
     # ---- E: window.close() closes it, and only it ---------------------------
     Say '== E: window.close()'
     Set-Content -Path $ppGate -Value 'close' -Encoding ascii
-    $gone = Wait-For { $null -eq (Get-PopupWin) } 40
-    Assert $gone 'window.close() from the opener closed the popup window'
+    # Named, not "no unknown window is present" (T1103): the loose form is true
+    # for free on a run where the popup was never findable, which is exactly the
+    # run this assertion needs to fail on.
+    $closedTarget = $script:popupTarget
+    $gone = $null -ne $closedTarget -and (Wait-For {
+        $null -eq (@(Get-Windows) | Where-Object { [string]$_.target -eq $closedTarget })
+    } 40)
+    Assert $gone "window.close() from the opener closed the popup window (target '$closedTarget')"
 
     $openerStill = @(Get-Windows) | Where-Object { $_.target -eq 'opener' }
     Assert ($null -ne $openerStill) 'the opener window is still open (the close took only the popup)'
