@@ -52,6 +52,16 @@
   a suite-wide change, filed as its own task rather than smuggled in here.
   Until then the honest number is the serial one, and this prints it.
 
+  A RED ROW IS RE-RUN ONCE, ALONE, BEFORE THE RUN ENDS (T1137). "The feature is
+  broken" and "the test is broken" produce the same red row, and the sweep of
+  2026-08-22 had eight consecutive tasks filed at P1 as user-facing outages that
+  were all harness defects - several of them ALL PASS on the first re-run. So the
+  runner re-runs every non-pass script on its own at the end and records what the
+  second run said (`Alone` / `Reproduced` in summary.json, and a `[alone: ...]`
+  note in the not-green table). Green alone = harness or isolation; red both
+  times = a product-defect candidate. `-NoConfirm` skips it; `confirm -Resume
+  <run>` fills the same fields into a summary that already exists.
+
   ORDER INDEPENDENCE is the property T267 could not check: run the suite
   forward, forward again, and reverse, then
 
@@ -67,10 +77,11 @@
   powershell -NoProfile -File scripts\suite-run.ps1 -Set gui -Order reverse
   powershell -NoProfile -File scripts\suite-run.ps1 -Resume temp\suite-runs\20260822-021500\summary.json
   powershell -NoProfile -File scripts\suite-run.ps1 compare -Runs run1\summary.json,run2\summary.json
+  powershell -NoProfile -File scripts\suite-run.ps1 confirm -Resume temp\suite-runswd1
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('run', 'list', 'compare')]
+    [ValidateSet('run', 'list', 'compare', 'confirm')]
     [string]$Action = 'run',
 
     # Which scripts. gui = drives a window (mentions New-TestDesktop),
@@ -122,6 +133,17 @@ param(
     # scripts. Off by default because one leaked instance poisons every script
     # after it - see the leak column in the table.
     [switch]$NoSweep,
+
+    # Do not re-run the non-pass scripts once more on their own at the end of
+    # the run (T1137). On by default: without that second run, a red row cannot
+    # be told from a flaky or order-poisoned one, and eight consecutive P1
+    # "the feature is broken" tasks were filed off rows that were green the
+    # moment anyone re-ran them.
+    #
+    # NOT named -Confirm: that is a PowerShell common parameter name, and a
+    # script that defines its own collides with every caller's muscle memory
+    # about what it means.
+    [switch]$NoConfirm,
 
     [switch]$DryRun,
     [string]$Repo
@@ -184,7 +206,12 @@ ipc_timeout.zig applies to its env var.
 function Get-ScriptTimeout {
     param([string]$Text)
     if (-not $Text) { return 0 }
-    $m = [regex]::Match($Text, '(?m)^[ \t]*#[ \t]*suite-timeout-sec[ \t]*:[ \t]*(\d+)[ \t]*$')
+    # \r? before the anchor: `$` in .NET multiline matches before the \n, and a
+    # CRLF file leaves the \r inside the line - so a declaration in a CRLF script
+    # silently did not exist at all. soak.ps1 became CRLF in ce943e238 and went
+    # straight back to being killed at 600s and scored `stall`, which is the
+    # exact defect T1125 fixed.
+    $m = [regex]::Match($Text, '(?m)^[ \t]*#[ \t]*suite-timeout-sec[ \t]*:[ \t]*(\d+)[ \t]*\r?$')
     if (-not $m.Success) { return 0 }
     $v = 0
     if (-not [int]::TryParse($m.Groups[1].Value, [ref]$v)) { return 0 }
@@ -403,10 +430,15 @@ function Invoke-SuiteScript {
         [object]$Script,
         [string]$LogDir,
         [int]$TimeoutSeconds,
-        [string]$StdinFile
+        [string]$StdinFile,
+        # Appended to the log's base name. The confirm pass re-runs a script
+        # that already has a log in this directory, and overwriting the sweep's
+        # log with the re-run's would destroy the very evidence the two runs are
+        # being compared on.
+        [string]$LogSuffix = ''
     )
 
-    $log = Join-Path $LogDir ($Script.Name -replace '\.ps1$', '')
+    $log = Join-Path $LogDir (($Script.Name -replace '\.ps1$', '') + $LogSuffix)
     $outFile = "$log.log"
     $errFile = "$log.err"
 
@@ -467,6 +499,60 @@ function Invoke-SuiteScript {
     }
 }
 
+<#
+One script, scored, with the two between-script sweeps applied to its verdict.
+
+Factored out of the run loop so the CONFIRM pass below re-runs a script through
+exactly the same scoring the sweep used. A second run scored by a different code
+path would answer a different question than the first one did, which is the
+whole failure this pass exists to prevent.
+#>
+function Invoke-ScoredScript {
+    param(
+        [object]$Script,
+        [string]$LogDir,
+        [int]$TimeoutSeconds,
+        [string]$StdinFile,
+        [string]$ZigOut,
+        [bool]$Sweep,
+        [string]$LogSuffix = ''
+    )
+
+    $run = Invoke-SuiteScript -Script $Script -LogDir $LogDir -TimeoutSeconds $TimeoutSeconds `
+        -StdinFile $StdinFile -LogSuffix $LogSuffix
+
+    $leaked = 0
+    if ($Sweep) { $leaked = Invoke-LeakSweep -ZigOut $ZigOut }
+
+    # T1098: a stray modal is a FAILURE of the script that raised it, not a note
+    # beside its PASS. The verdict is overwritten deliberately - a run that hung
+    # a system-modal dialog on the user's desktop did not pass, whatever its own
+    # assertions counted.
+    $modalLines = @()
+    if ($Sweep) {
+        $modals = @(Invoke-ModalSweep -ZigOut $ZigOut)
+        if ($modals.Count -gt 0) { $modalLines = @(Format-StrayModalDialog -Modals $modals) }
+    }
+
+    $verdict = $run.Verdict
+    $line = $run.Line
+    if ($modalLines.Count -gt 0) {
+        $verdict = 'fail'
+        $line = "stray modal dialog raised: $($modalLines -join '; ')"
+    }
+
+    return [pscustomobject]@{
+        Verdict = $verdict
+        Line    = $line
+        Seconds = $run.Seconds
+        Exit    = $run.Exit
+        Leaked  = $leaked
+        Modals  = $modalLines.Count
+        Log     = $run.Log
+        Timeout = $run.Timeout
+    }
+}
+
 # -------------------------------------------------------------------- reporting
 
 $VerdictTag = @{
@@ -485,6 +571,36 @@ function Write-ResultLine {
     $msg = ('[{0,3}/{1}] {2} {3,7}  {4,-42} {5}{6}' -f `
             $Index, $Total, $tag, (Format-Duration $Row.Seconds), $Row.Name, $Row.Line, $leak)
     Write-Host $msg -ForegroundColor $color
+}
+
+<#
+The table somebody reads before filing tasks (T1137).
+
+Each non-pass row carries what the CONFIRM pass found when it re-ran that script
+on its own, because that is the line that decides how the row gets written up:
+`green alone` is a harness or isolation defect and is not a user-facing outage,
+`reproduced` is a product-defect candidate, and `not re-run` says nobody asked -
+which is a third thing and must not read as the first.
+#>
+function Write-NotGreenTable {
+    param([object[]]$Rows)
+    $red = @(@($Rows) | Where-Object { $_.Verdict -ne 'pass' })
+    if ($red.Count -eq 0) { return }
+    ''
+    '  not green:'
+    foreach ($x in $red) {
+        $alone = '  [alone: not re-run]'
+        if ($x.Reproduced -eq 'no') { $alone = "  [alone: PASS - NOT reproduced -> harness/isolation, not the product]" }
+        elseif ($x.Reproduced -eq 'yes') { $alone = "  [alone: $($x.Alone) - reproduced]" }
+        elseif ($x.Alone -eq 'unknown') { $alone = "  [alone: $($x.AloneLine)]" }
+        '    {0,-8} {1,-42} {2}{3}' -f $x.Verdict, $x.Name, $x.Line, $alone
+    }
+    $conf = @($red | Where-Object { $_.Reproduced })
+    if ($conf.Count -gt 0) {
+        $yes = @($conf | Where-Object { $_.Reproduced -eq 'yes' }).Count
+        ''
+        "  reproduced alone: $yes of $($conf.Count) re-run ($($conf.Count - $yes) green on the re-run - file those as harness defects, not as features that are broken)"
+    }
 }
 
 function Save-Summary {
@@ -508,12 +624,120 @@ function Save-Summary {
     Move-Item -LiteralPath $tmp -Destination $Path -Force
 }
 
+<#
+A summary row read back from JSON, with the confirm-pass fields present.
+
+ConvertFrom-Json hands back a PSCustomObject with exactly the properties that
+were written, and PS 5.1 THROWS when you assign one that is not there - so a
+resumed row, or any row from a summary written before the confirm pass existed,
+cannot simply be filled in. Rebuild it with the three fields present and empty.
+#>
+function ConvertTo-SummaryRow {
+    param([object]$Row)
+    $o = [pscustomobject]@{}
+    foreach ($p in $Row.PSObject.Properties) {
+        Add-Member -InputObject $o -NotePropertyName $p.Name -NotePropertyValue $p.Value
+    }
+    foreach ($f in @('Alone', 'AloneLine', 'Reproduced')) {
+        if (-not $o.PSObject.Properties[$f]) {
+            Add-Member -InputObject $o -NotePropertyName $f -NotePropertyValue ''
+        }
+    }
+    return $o
+}
+
 function Import-Summary {
     param([string]$PathOrDir)
     $p = $PathOrDir
     if (Test-Path -LiteralPath $p -PathType Container) { $p = Join-Path $p 'summary.json' }
     if (-not (Test-Path -LiteralPath $p)) { throw "no summary at '$PathOrDir'" }
     return (Get-Content -LiteralPath $p -Raw | ConvertFrom-Json)
+}
+
+<#
+Re-run every non-pass script once more, on its own, and record what the second
+run said (T1137).
+
+WHY THIS IS PART OF THE RUN AND NOT SOMETHING A HUMAN REMEMBERS. A red row in a
+sweep has two very different causes and reads identically: the product is broken,
+or the HARNESS is - a stale control, a race, a leaked process from the script
+before it, a desktop that cannot take the foreground. Eight consecutive tasks
+filed off the 2026-08-22 sweep (T1102-T1105, T1106-T1108, T1110) were priced P1
+as user-facing outages and every one of them was the harness; several were ALL
+PASS on the first re-run, before a line of code had been read. A turn each.
+
+The discriminator is cheap and it is mechanical, so the runner does it: a script
+that is red in the sweep and GREEN on its own is an isolation or timing defect in
+the test, and a script red both times is a candidate product defect. Neither
+verdict is proof on its own - what the pass buys is that the person writing the
+task starts from two data points instead of one, and the expensive mistake
+(a harness repair filed and queued as a user-facing regression) needs someone to
+ignore a printed line rather than merely not to think of the question.
+
+The re-run is scored through the same Invoke-ScoredScript as the sweep, and its
+log is kept beside the first one as `<name>.alone.log`, so the two runs of a
+disagreeing script can be diffed rather than argued about.
+#>
+function Invoke-ConfirmPass {
+    param(
+        [object[]]$Rows,
+        [object[]]$Scripts,
+        [string]$LogDir,
+        [string]$StdinFile,
+        [string]$ZigOut,
+        [bool]$Sweep,
+        [int]$DefaultTimeout,
+        [int]$MaxTimeout
+    )
+
+    $Rows = @($Rows)
+    # A row that already carries an answer is not re-run: a resumed sweep
+    # carries rows that were confirmed on the run before it, and re-running them
+    # would spend the suite's most expensive minutes re-deriving a verdict that
+    # is already in the file.
+    $red = @($Rows | Where-Object { ($_.Verdict -ne 'pass') -and (-not $_.Reproduced) })
+    if ($red.Count -eq 0) { return $Rows }
+
+    $byName = @{}
+    foreach ($s in @($Scripts)) { $byName[$s.Name] = $s }
+
+    # Write-Host, not bare strings: everything a PowerShell function writes to
+    # the pipeline is part of what it RETURNS, so a progress line here lands in
+    # the caller's results array as a phantom row with no name.
+    Write-Host ''
+    Write-Host "---- confirm pass: re-running $($red.Count) non-pass script(s) alone -------------"
+    Write-Host ''
+
+    $n = 0
+    foreach ($row in $red) {
+        $n++
+        $script = $byName[$row.Name]
+        if (-not $script) {
+            # Nothing to re-run it from - a summary row whose script is no
+            # longer in the selection. Say so rather than leaving a blank that
+            # reads like "did not reproduce".
+            $row.Alone = 'unknown'
+            $row.AloneLine = 'script not in this run''s selection'
+            $row.Reproduced = ''
+            continue
+        }
+
+        $cap = Resolve-ScriptTimeout -Declared $script.Declared -Default $DefaultTimeout -Max $MaxTimeout
+        $again = Invoke-ScoredScript -Script $script -LogDir $LogDir -TimeoutSeconds $cap `
+            -StdinFile $StdinFile -ZigOut $ZigOut -Sweep $Sweep -LogSuffix '.alone'
+
+        $row.Alone = $again.Verdict
+        $row.AloneLine = $again.Line
+        $row.Reproduced = $(if ($again.Verdict -eq 'pass') { 'no' } else { 'yes' })
+
+        $tag = $(if ($row.Reproduced -eq 'yes') { 'REPRODUCED' } else { 'GREEN ALONE' })
+        $color = $(if ($row.Reproduced -eq 'yes') { 'Red' } else { 'Yellow' })
+        Write-Host ('[{0,3}/{1}] {2,-11} {3,7}  {4,-42} {5}' -f `
+                $n, $red.Count, $tag, (Format-Duration $again.Seconds), $row.Name, $again.Line) `
+            -ForegroundColor $color
+    }
+
+    return $Rows
 }
 
 # ============================================================== action: list
@@ -577,6 +801,81 @@ if ($Action -eq 'compare') {
     exit 1
 }
 
+# =========================================================== action: confirm
+
+<#
+Re-run the non-pass scripts of a summary that ALREADY EXISTS, and write the
+answer back into it.
+
+This is the retrospective half of the confirm pass: a sweep that finished before
+the pass existed (or was run with -NoConfirm, or was killed before it got there)
+leaves a summary.json full of red rows and no second data point. Pointing this at
+it fills in the same three fields, in place, so the tasks filed from that sweep
+can be re-priced from evidence rather than from the memory of whoever ran it.
+
+    powershell -NoProfile -File scripts\suite-run.ps1 confirm -Resume temp\suite-runs\fwd1
+    powershell -NoProfile -File scripts\suite-run.ps1 confirm -Resume <dir> -Include 'menu-bar.ps1,soak.ps1'
+#>
+if ($Action -eq 'confirm') {
+    $src = $Resume
+    if (-not $src -and $RunsList.Count -eq 1) { $src = $RunsList[0] }
+    if (-not $src) { throw "confirm needs -Resume pointing at a run's summary.json (or its directory)." }
+
+    $summary = Import-Summary $src
+    $summaryFile = $src
+    if (Test-Path -LiteralPath $summaryFile -PathType Container) { $summaryFile = Join-Path $summaryFile 'summary.json' }
+    $outDirC = Split-Path $summaryFile -Parent
+
+    # Rows come back from ConvertFrom-Json without the fields the pass writes
+    # (a summary predating it has no Alone/Reproduced at all), and PS 5.1 cannot
+    # assign a property that is not there. Rebuild each row with them present.
+    $rowsC = @()
+    foreach ($x in @($summary.results)) { $rowsC += (ConvertTo-SummaryRow -Row $x) }
+
+    $all = @(Get-SuiteScript -Root $TestRoot -SetName 'all' -Inc @())
+    $selected = @($rowsC | Where-Object { $_.Verdict -ne 'pass' })
+    if ($IncludeList) {
+        $selected = @($selected | Where-Object { $n = $_.Name; @($IncludeList | Where-Object { $n -like $_ }).Count -gt 0 })
+    }
+    $selected = @(Remove-ExcludedScript -Rows $selected -Patterns $ExcludeList)
+
+    "confirm: $($selected.Count) non-pass row(s) of $($rowsC.Count) in $summaryFile"
+    if ($selected.Count -eq 0) { ''; 'nothing to re-run.'; exit 0 }
+
+    $stdinFileC = Join-Path $outDirC 'stdin.empty'
+    Set-Content -LiteralPath $stdinFileC -Value '' -Encoding ASCII
+    $zigOutC = Join-Path $Repo 'zig-out'
+
+    if ($DryRun) {
+        foreach ($x in $selected) { '  would re-run {0,-42} (was {1})' -f $x.Name, $x.Verdict }
+        exit 0
+    }
+
+    $null = Invoke-ConfirmPass -Rows $selected -Scripts $all -LogDir $outDirC `
+        -StdinFile $stdinFileC -ZigOut $zigOutC -Sweep (-not $NoSweep) `
+        -DefaultTimeout $TimeoutSec -MaxTimeout $MaxTimeoutSec
+
+    # $selected holds the SAME objects as $rowsC (PS 5.1 filters by reference),
+    # so the fields the pass wrote are already in the rows about to be saved.
+    $metaC = [pscustomobject]@{
+        Started = $summary.started; Set = $summary.set; Order = $summary.order
+        TimeoutSec = $summary.timeout; MaxTimeoutSec = $summary.maxTimeout; Repo = $summary.repo
+    }
+    Save-Summary -Path $summaryFile -Meta $metaC -Rows $rowsC
+
+    Write-NotGreenTable -Rows $rowsC
+    ''
+    "  summary: $summaryFile"
+    ''
+    $stillRed = @($selected | Where-Object { $_.Reproduced -eq 'yes' }).Count
+    if ($stillRed -eq 0) {
+        Write-Host "CONFIRM: none of $($selected.Count) reproduced alone - every one is a harness or isolation defect" -ForegroundColor Yellow
+        exit 0
+    }
+    Write-Host "CONFIRM: $stillRed of $($selected.Count) reproduced alone" -ForegroundColor Red
+    exit 1
+}
+
 # =============================================================== action: run
 
 # @() at every step - see the note in the list action above.
@@ -589,7 +888,10 @@ if ($rows.Count -eq 0) { throw "no scripts selected (-Set $Set, -Include $Includ
 $done = @{}
 if ($Resume) {
     $prev = Import-Summary $Resume
-    foreach ($r in $prev.results) { $done[$r.Name] = $r }
+    # Normalised on the way in: a resumed row goes straight into $results and
+    # then into the confirm pass, which cannot fill in a property JSON did not
+    # carry (see ConvertTo-SummaryRow).
+    foreach ($r in $prev.results) { $done[$r.Name] = (ConvertTo-SummaryRow -Row $r) }
     if (-not $OutDir) {
         $p = $Resume
         if (Test-Path -LiteralPath $p -PathType Container) { $OutDir = $p }
@@ -650,39 +952,25 @@ foreach ($r in $rows) {
     }
 
     $cap = Resolve-ScriptTimeout -Declared $r.Declared -Default $TimeoutSec -Max $MaxTimeoutSec
-    $run = Invoke-SuiteScript -Script $r -LogDir $OutDir -TimeoutSeconds $cap -StdinFile $stdinFile
-
-    $leaked = 0
-    if (-not $NoSweep) { $leaked = Invoke-LeakSweep -ZigOut $zigOut }
-
-    # T1098: a stray modal is a FAILURE of the script that raised it, not a note
-    # beside its PASS. The verdict is overwritten deliberately - a run that hung
-    # a system-modal dialog on the user's desktop did not pass, whatever its own
-    # assertions counted.
-    $modalLines = @()
-    if (-not $NoSweep) {
-        $modals = @(Invoke-ModalSweep -ZigOut $zigOut)
-        if ($modals.Count -gt 0) { $modalLines = @(Format-StrayModalDialog -Modals $modals) }
-    }
-
-    $verdict = $run.Verdict
-    $line = $run.Line
-    if ($modalLines.Count -gt 0) {
-        $verdict = 'fail'
-        $line = "stray modal dialog raised: $($modalLines -join '; ')"
-    }
+    $run = Invoke-ScoredScript -Script $r -LogDir $OutDir -TimeoutSeconds $cap -StdinFile $stdinFile `
+        -ZigOut $zigOut -Sweep (-not $NoSweep)
 
     $row = [pscustomobject]@{
         Name    = $r.Name
         Class   = $r.Class
-        Verdict = $verdict
-        Line    = $line
+        Verdict = $run.Verdict
+        Line    = $run.Line
         Seconds = $run.Seconds
         Exit    = $run.Exit
-        Leaked  = $leaked
-        Modals  = $modalLines.Count
+        Leaked  = $run.Leaked
+        Modals  = $run.Modals
         Log     = (Split-Path $run.Log -Leaf)
         Index   = $i
+        # Filled in by the confirm pass below. '' means nobody re-ran it, which
+        # is NOT the same as "it did not reproduce" and must never read as it.
+        Alone      = ''
+        AloneLine  = ''
+        Reproduced = ''
         # The cap this row was measured against, and whether the script asked
         # for it. A `stall` is only readable next to the number it hit - and the
         # number is read back from the call that enforced it, not recomputed
@@ -700,6 +988,13 @@ foreach ($r in $rows) {
 
 $suiteSw.Stop()
 Save-Summary -Path $summaryPath -Meta $meta -Rows $results
+
+if (-not $NoConfirm) {
+    $results = @(Invoke-ConfirmPass -Rows $results -Scripts $rows -LogDir $OutDir `
+            -StdinFile $stdinFile -ZigOut $zigOut -Sweep (-not $NoSweep) `
+            -DefaultTimeout $TimeoutSec -MaxTimeout $MaxTimeoutSec)
+    Save-Summary -Path $summaryPath -Meta $meta -Rows $results
+}
 
 $byKind = @{}
 foreach ($k in @('pass', 'fail', 'stall', 'nothing', 'error')) {
@@ -734,13 +1029,7 @@ if ($modalRows.Count -gt 0) {
 foreach ($x in @($results | Sort-Object Seconds -Descending | Select-Object -First 8)) {
     '    {0,8}  {1}' -f (Format-Duration $x.Seconds), $x.Name
 }
-if ($red -gt 0) {
-    ''
-    '  not green:'
-    foreach ($x in @($results | Where-Object { $_.Verdict -ne 'pass' })) {
-        '    {0,-8} {1,-42} {2}' -f $x.Verdict, $x.Name, $x.Line
-    }
-}
+if ($red -gt 0) { Write-NotGreenTable -Rows $results }
 ''
 "  summary: $summaryPath"
 ''

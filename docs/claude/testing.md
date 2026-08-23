@@ -541,6 +541,78 @@ script to honor an injected exe path first — a suite-wide change with its own
 task. Until then the honest number is the serial one, and the runner prints it.
 Acceptance: `test\win32\suite-run.ps1`.
 
+**A red script is RE-RUN ALONE before it becomes a task** (T1137). "The feature
+is broken" and "the test is broken" produce exactly the same red row, and the
+sweep of 2026-08-22 filed thirty-one tasks off its red rows without anyone
+telling the two apart. The first EIGHT of those to be worked — T1102, T1103,
+T1104, T1105, T1106, T1107, T1108, T1110 — were all the harness. Every one had
+been priced P1 and written up as a user-facing outage ("Ctrl+T from a viewer pane
+no longer opens a tab", "the menu bar disables Close Tab with two tabs open"),
+and several were `ALL PASS` on the first re-run, before a line of product code
+had been read. A turn each.
+
+So the runner does it, and the answer is in the row rather than in someone's
+memory of the run:
+
+```powershell
+powershell -NoProfile -File scripts\suite-run.ps1                       # confirms as it goes
+powershell -NoProfile -File scripts\suite-run.ps1 confirm -Resume <run>  # an older summary
+```
+
+- **Every non-pass script is re-run once, on its own, at the end of the run.**
+  Only the reds — a pass is never re-run, so the pass costs the reds' time and
+  nothing else. The second run is scored by the same code as the first, and its
+  log is kept beside it as `<name>.alone.log`, so two disagreeing runs can be
+  diffed rather than argued about.
+- **What it decides.** Green alone = an isolation, timing or harness defect,
+  which is NOT a user-facing outage and must not be titled or priced as one. Red
+  both times = a product-defect candidate, and it keeps its priority. Neither is
+  proof; what the pass buys is that the person filing starts from two data points
+  instead of one.
+- **"Not re-run" is a third answer and never reads as the first.** A row nobody
+  confirmed carries an empty `Reproduced`, and the table says `[alone: not
+  re-run]` — the one thing a summary must never do is let "we did not ask"
+  look like "it did not reproduce".
+- **`confirm -Resume <run>` is the retrospective half**, filling the same fields
+  into a summary written before the pass existed. That is how a queue of tasks
+  already filed off an old sweep is re-priced from evidence.
+- **A resumed sweep does not re-confirm what already has an answer**, so the
+  pass is idempotent across the interruptions a multi-hour sweep collects.
+
+Acceptance: section P of `test\win32\suite-run.ps1` (a fixture script that is red
+once and green after, one that is red however often it runs).
+
+**A window under test is identified by the NAME the test gave it, never by "the
+one that was not there a moment ago"** (T1103). `viewer-popup.ps1` snapshotted
+the set of windows to ignore AFTER the page under test had already had the chance
+to open its popup, so the popup was inside the ignore set and the script could
+never find it again — filed, at P1, as "a viewer page's `window.open()` popup is
+never adopted". The feature worked; the same run's later sections found that
+popup by its title and closed it.
+
+The rule, in the order to reach for it:
+
+1. **Name it and ask for it by name.** Every window this suite opens is opened
+   with `--target=<name>`, and that name is how it is found again — through
+   `+list`, through `Wait-Win`, through its caption. A name the test chose cannot
+   be raced by anything the app does on load.
+2. **Where a handle really is needed, snapshot BEFORE the call that creates it**
+   and diff after — never after an action that could itself have created one.
+   The distinction is the whole defect: a set difference is a fine way to find a
+   window whose creation you caused and bracketed, and a coin flip otherwise.
+3. **Never let the set of things to ignore be gathered late.** An ignore list
+   built after the fact hides the very object under test, and the failure it
+   produces is "the feature never happened", which is indistinguishable from the
+   feature never happening.
+
+Swept 2026-08-23 (T1137): six scripts identify a top-level window by set
+difference — `close-confirm-idle.ps1`, `hero-nav.ps1`, `overlay-zorder.ps1`, and
+`viewer-panes.ps1` in three places — and all six snapshot before the call that
+creates the window, so none is the shape above. Pane-name diffs
+(`host-settings.ps1`, `remote-inherit.ps1`, `local-split-no-command-rerun.ps1`,
+`chooser-resume-remote.ps1`) bracket a `+split` the script itself issues, which
+is rule 2 rather than the defect.
+
 **And a harness that ran against a STALE EXE proves nothing either** (T1028).
 The stamp above answers "has this harness been run against the code as it now
 stands?" — and until now the run itself never checked. Every `test\win32` script

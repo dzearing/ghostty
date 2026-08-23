@@ -36,6 +36,9 @@
        bounds every declaration for a deliberately quick pass.
     O. The line the report quotes is the last thing the script said on STDOUT,
        not the stderr that is folded in after it.
+    P. The confirm pass - every non-pass script is re-run once on its own, and
+       what the second run said is recorded on the row. A red row that is green
+       alone is a harness defect, not a broken feature (T1137).
 
   Prints a single ALL PASS / N FAILURE(S) line, like every other script here.
 
@@ -321,7 +324,16 @@ try {
     $afterB = Get-InvocationCount 'b-pass.ps1'
     $afterC = Get-InvocationCount 'c-fail.ps1'
     Check 'F1 a recorded script is NOT run again' ($afterB -eq $beforeB) "$beforeB -> $afterB"
-    Check 'F2 the unrecorded one IS run' ($afterC -eq $beforeC + 1) "$beforeC -> $afterC"
+    # TWICE: once in the sweep, and once more by the confirm pass, which re-runs
+    # a red row alone to tell a broken feature from a broken test (T1137). The
+    # resumed row beside it is red too and is NOT re-run - it already carries
+    # that answer from the run being resumed.
+    Check 'F2 the unrecorded one IS run' ($afterC -eq $beforeC + 2) "$beforeC -> $afterC"
+    $beforeC2 = Get-InvocationCount 'c-fail.ps1'
+    $null = Invoke-Runner @('-Include', 'b-pass.ps1,c-fail.ps1', '-Resume', (Join-Path $dirF 'summary.json'), '-TimeoutSec', '30')
+    Check 'F5 a row that already has an alone verdict is not re-confirmed' `
+        ((Get-InvocationCount 'c-fail.ps1') -eq $beforeC2) "$beforeC2 -> $(Get-InvocationCount 'c-fail.ps1')"
+
     $sF = Get-Summary $dirF
     Check 'F3 the resumed summary carries both rows' (@($sF.results).Count -eq 2) "$(@($sF.results).Count) rows"
     Check 'F4 the resumed run keeps the earlier verdict' ((Get-Verdict $sF 'b-pass.ps1') -eq 'pass') (Get-Verdict $sF 'b-pass.ps1')
@@ -558,6 +570,20 @@ exit 0
     $soakCap = $(if ($soakOk) { [int]$Matches[1] } else { 0 })
     Check 'N12 soak.ps1 declares a cap longer than its own 30-minute default' `
         ($soakOk -and ($soakCap -gt 1800)) "declared $soakCap"
+    # A CRLF script declares its cap just as well as an LF one. `$` in .NET
+    # multiline matches BEFORE the \n and leaves the \r inside the line, so a
+    # pattern anchored with [ \t]*$ reads nothing at all out of a CRLF file -
+    # which is what happened to soak.ps1 the day it was rewritten with CRLF
+    # endings, putting it straight back to a 600s kill and a `stall` verdict.
+    $crlfPath = Join-Path $FixTests 'p-crlf.ps1'
+    $crlfBody = "# suite-timeout-sec: 77`r`n'ALL PASS (1 assertions)'`r`nexit 0`r`n"
+    [System.IO.File]::WriteAllText($crlfPath, $crlfBody)
+    $crlfList = & powershell -NoProfile -ExecutionPolicy Bypass -File $Runner `
+        list -Repo $Fixture -Include 'p-crlf.ps1' | Out-String
+    Check 'N14 a CRLF script declaration is read too' `
+        ($crlfList -match 'p-crlf\.ps1\s+\(declares 77s\)') $crlfList
+    Remove-Item -LiteralPath $crlfPath -Force -ErrorAction SilentlyContinue
+
     # Not Invoke-Runner: that one binds -Repo to the throwaway fixture, and the
     # claim here is about the real test\win32. Stdout only - merging stderr in
     # would make the captured text depend on the host's buffer width (T883).
@@ -612,6 +638,116 @@ exit 9
     Check 'O4 a script that spoke only on stderr is still quoted' `
         (($rowO2.Count -eq 1) -and ($rowO2[0].Line -match 'only stderr ever spoke')) `
         $(if ($rowO2.Count) { $rowO2[0].Line } else { '(no row)' })
+
+    # --- P. the confirm pass (T1137) ---------------------------------------
+    Write-Host ''
+    Write-Host '-- P. a red script is re-run alone before the run ends'
+
+    # The discriminator this pass exists for: a script that is red once and
+    # green the moment it runs again is a harness or isolation defect, and the
+    # sweep of 2026-08-22 had eight of those filed as P1 user-facing outages.
+    # The fixture makes the two cases mechanical - one script flips on its
+    # second invocation, one stays red however often it runs.
+    # Invocation counting is the measurement here, and every section above has
+    # been appending to the same log.
+    Set-Content -LiteralPath $RunLog -Value '' -Encoding ASCII
+    Remove-Item -LiteralPath (Join-Path $Fixture 'flake.marker') -Force -ErrorAction SilentlyContinue
+    $flakeMarker = Join-Path $Fixture 'flake.marker'
+    Set-FixtureScript 'p-flaky.ps1' @"
+if (Test-Path -LiteralPath '$flakeMarker') { 'ALL PASS (1 assertions)'; exit 0 }
+Set-Content -LiteralPath '$flakeMarker' -Value 'x'
+'  FAIL only the first time'
+'1 FAILURE(S) (0 passed)'
+exit 1
+"@
+    Set-FixtureScript 'p-solid.ps1' @'
+"  FAIL every single time"
+"2 FAILURE(S) (1 passed)"
+exit 1
+'@
+
+    $dirP = Join-Path $Fixture 'runP'
+    $rP = Invoke-Runner @('-Include', 'p-flaky.ps1,p-solid.ps1,b-pass.ps1', '-OutDir', $dirP, '-TimeoutSec', '60')
+    $sP = Get-Summary $dirP
+    $flaky = @($sP.results | Where-Object { $_.Name -eq 'p-flaky.ps1' })
+    $solid = @($sP.results | Where-Object { $_.Name -eq 'p-solid.ps1' })
+    $green = @($sP.results | Where-Object { $_.Name -eq 'b-pass.ps1' })
+
+    Check 'P1 the first run verdict is kept as it was' `
+        (($flaky.Count -eq 1) -and ($flaky[0].Verdict -eq 'fail')) `
+        $(if ($flaky.Count) { $flaky[0].Verdict } else { '(no row)' })
+    Check 'P2 a script green on the re-run is marked NOT reproduced' `
+        (($flaky.Count -eq 1) -and ($flaky[0].Alone -eq 'pass') -and ($flaky[0].Reproduced -eq 'no')) `
+        $(if ($flaky.Count) { "alone=$($flaky[0].Alone) reproduced=$($flaky[0].Reproduced)" } else { '(no row)' })
+    Check 'P3 a script red both times is marked reproduced' `
+        (($solid.Count -eq 1) -and ($solid[0].Alone -eq 'fail') -and ($solid[0].Reproduced -eq 'yes')) `
+        $(if ($solid.Count) { "alone=$($solid[0].Alone) reproduced=$($solid[0].Reproduced)" } else { '(no row)' })
+    # Measured by counting real invocations, not by reading the runner's report:
+    # a pass that re-ran everything would double a 2h46m sweep.
+    Check 'P4 only the non-pass scripts are re-run' `
+        ((Get-InvocationCount 'p-solid.ps1') -eq 2 -and (Get-InvocationCount 'b-pass.ps1') -eq 1) `
+        "solid=$(Get-InvocationCount 'p-solid.ps1') pass=$(Get-InvocationCount 'b-pass.ps1')"
+    Check 'P5 a passing row carries no alone verdict at all' `
+        (($green.Count -eq 1) -and ($green[0].Verdict -eq 'pass') -and (-not $green[0].Reproduced)) `
+        $(if ($green.Count) { "reproduced=$($green[0].Reproduced)" } else { '(no row)' })
+    # The line somebody reads before writing the task up.
+    Check 'P6 the table says the green-alone one is not the product' `
+        ($rP.Text -match 'p-flaky\.ps1.*NOT reproduced') $rP.Text
+    Check 'P7 and counts how many of the reds reproduced' `
+        ($rP.Text -match 'reproduced alone: 1 of 2') $rP.Text
+    # Two runs of a disagreeing script are only useful if BOTH logs survive:
+    # writing the re-run over the sweep log destroys the evidence being compared.
+    Check 'P8 the re-run log is kept beside the first one' `
+        ((Test-Path -LiteralPath (Join-Path $dirP 'p-flaky.log')) -and `
+         (Test-Path -LiteralPath (Join-Path $dirP 'p-flaky.alone.log'))) ''
+    # The run's own exit code is still the FIRST pass's verdict: a flake that
+    # goes green on the re-run is still a red suite, it is just a red suite for
+    # a different reason.
+    Check 'P9 the run still exits nonzero' ($rP.Exit -eq 1) "exit $($rP.Exit)"
+
+    # -NoConfirm: no second run, and - the part that matters - no field that
+    # could be mistaken for "it did not reproduce".
+    Remove-Item -LiteralPath $flakeMarker -Force -ErrorAction SilentlyContinue
+    Set-Content -LiteralPath $RunLog -Value '' -Encoding ASCII
+    $dirQ = Join-Path $Fixture 'runQ'
+    $rQ = Invoke-Runner @('-Include', 'p-flaky.ps1,p-solid.ps1', '-OutDir', $dirQ, '-TimeoutSec', '60', '-NoConfirm')
+    $sQ = Get-Summary $dirQ
+    $flakyQ = @($sQ.results | Where-Object { $_.Name -eq 'p-flaky.ps1' })
+    Check 'P10 -NoConfirm re-runs nothing' `
+        ((Get-InvocationCount 'p-flaky.ps1') -eq 1) "invocations=$(Get-InvocationCount 'p-flaky.ps1')"
+    Check 'P11 and leaves the alone verdict empty, not no' `
+        (($flakyQ.Count -eq 1) -and (-not $flakyQ[0].Reproduced)) `
+        $(if ($flakyQ.Count) { "reproduced=$($flakyQ[0].Reproduced)" } else { '(no row)' })
+    Check 'P12 which the table reports as not re-run' `
+        ($rQ.Text -match 'p-flaky\.ps1.*alone: not re-run') $rQ.Text
+
+    # The retrospective half: a summary that already exists gets the same three
+    # fields filled in, in place. This is how a sweep that predates the pass is
+    # re-priced from evidence instead of from memory.
+    $rC = Invoke-Runner @('confirm', '-Resume', $dirQ)
+    $sC = Get-Summary $dirQ
+    $flakyC = @($sC.results | Where-Object { $_.Name -eq 'p-flaky.ps1' })
+    $solidC = @($sC.results | Where-Object { $_.Name -eq 'p-solid.ps1' })
+    Check 'P13 confirm fills in the flaky row of an existing summary' `
+        (($flakyC.Count -eq 1) -and ($flakyC[0].Reproduced -eq 'no')) `
+        $(if ($flakyC.Count) { "reproduced=$($flakyC[0].Reproduced)" } else { '(no row)' })
+    Check 'P14 and the reproducing one' `
+        (($solidC.Count -eq 1) -and ($solidC[0].Reproduced -eq 'yes')) `
+        $(if ($solidC.Count) { "reproduced=$($solidC[0].Reproduced)" } else { '(no row)' })
+    Check 'P15 the original verdicts are not overwritten' `
+        (($flakyC.Count -eq 1) -and ($flakyC[0].Verdict -eq 'fail')) `
+        $(if ($flakyC.Count) { $flakyC[0].Verdict } else { '(no row)' })
+    Check 'P16 confirm exits 1 while something still reproduces' ($rC.Exit -eq 1) "exit $($rC.Exit)"
+
+    # Nothing reproduced -> exit 0, and it says so in those words: that verdict
+    # is the one that re-prices a queue of tasks, so it may not be silent.
+    $dirR = Join-Path $Fixture 'runR'
+    Remove-Item -LiteralPath $flakeMarker -Force -ErrorAction SilentlyContinue
+    $null = Invoke-Runner @('-Include', 'p-flaky.ps1', '-OutDir', $dirR, '-TimeoutSec', '60', '-NoConfirm')
+    $rC2 = Invoke-Runner @('confirm', '-Resume', $dirR)
+    Check 'P17 confirm exits 0 when none of them reproduce' ($rC2.Exit -eq 0) "exit $($rC2.Exit)"
+    Check 'P18 and names them as harness defects' `
+        ($rC2.Text -match 'none of 1 reproduced alone') $rC2.Text
 
     # --- J. the duration in the report ------------------------------------
     Write-Host ''
