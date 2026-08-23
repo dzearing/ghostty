@@ -389,6 +389,12 @@ drag_start_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
 drag_nodes: [MAX_DRAG_NODES]split_resize.Node = undefined,
 drag_node_len: usize = 0,
 
+/// The keyboard's equivalent of that snapshot (T1129). `resize_split` has no
+/// key-up to end a gesture on, so the gesture ends itself: it remembers the
+/// ratios its last plan wrote and starts over as soon as the tree stops
+/// matching them. See `split_resize.KeyboardGesture`.
+kbd_resize: split_resize.KeyboardGesture = .{},
+
 /// The split node whose divider grab band the pointer is currently over
 /// (T233). Design system §5: hover is a COLOR change, not only a cursor
 /// change — a cursor tells nobody who is looking at the divider, and shows
@@ -3533,11 +3539,22 @@ fn startDividerDrag(self: *Window, handle: SplitTree(PaneView).Node.Handle, layo
 /// Returns how many nodes were captured, or 0 when the tree does not fit —
 /// which the drag reads as "no compensation", never as an error.
 fn snapshotDragNodes(self: *Window) usize {
+    return self.snapshotNodes(&self.drag_nodes);
+}
+
+/// Flatten the active tab's tree into `out` for `split_resize.plan`. Returns
+/// how many nodes were captured, or 0 when the tree does not fit — which every
+/// caller reads as "no compensation", never as an error.
+///
+/// Kept separate from the drag's own buffer so the keyboard path (T1129) can
+/// solve against a scratch snapshot without disturbing the pre-drag one a live
+/// mouse drag is still replaying against.
+fn snapshotNodes(self: *Window, out: []split_resize.Node) usize {
     if (self.tab_count == 0) return 0;
     const tree = self.tab_trees[self.active_tab];
-    if (tree.nodes.len == 0 or tree.nodes.len > self.drag_nodes.len) return 0;
+    if (tree.nodes.len == 0 or tree.nodes.len > out.len) return 0;
     for (tree.nodes, 0..) |node, i| {
-        self.drag_nodes[i] = switch (node) {
+        out[i] = switch (node) {
             .leaf => .leaf,
             .split => |s| .{ .split = .{
                 // Exhaustive on purpose: a new SplitTree layout variant has to
@@ -3968,9 +3985,16 @@ pub fn swapSplit(self: *Window, goto_target: apprt.action.GotoSplit) void {
 }
 
 /// Resize the nearest split in the given direction by the given pixel amount.
+///
+/// T1129: this is a divider drag arriving by keyboard, so it goes through the
+/// SAME solver a mouse drag does — the divider moves by `rs.amount` pixels
+/// inside its own region and every OTHER boundary in the tab holds its
+/// absolute position. It used to hand `SplitTree.resize` a ratio delta, which
+/// rescales the moved node's whole subtree: in three columns, ctrl+win+arrow
+/// slid divider 2 along under divider 1 — exactly the defect T533 fixed for
+/// the mouse and exactly what main's 77d21cb48 fixed on the Mac side.
 pub fn resizeSplit(self: *Window, rs: apprt.action.ResizeSplit) void {
     if (self.tab_count == 0) return;
-    const alloc = self.app.core_app.alloc;
     const tab = self.active_tab;
     const tree = &self.tab_trees[tab];
 
@@ -3982,22 +4006,64 @@ pub fn resizeSplit(self: *Window, rs: apprt.action.ResizeSplit) void {
         .up, .down => .vertical,
     };
 
-    const rect = self.surfaceRect();
-    const dimension: f32 = switch (layout) {
-        .horizontal => @floatFromInt(@max(rect.right - rect.left, 1)),
-        .vertical => @floatFromInt(@max(rect.bottom - rect.top, 1)),
+    // The split this gesture moves: the nearest ancestor of the focused pane
+    // whose divider lies on this axis. Same node `SplitTree.resize` picked.
+    const target = tree.nearestSplit(layout, handle) orelse return;
+    const ratio: f32 = switch (tree.nodes[target.idx()]) {
+        .leaf => return,
+        .split => |sp| @floatCast(sp.ratio),
     };
-    const sign: f32 = switch (rs.direction) {
-        .left, .up => -1.0,
-        .right, .down => 1.0,
-    };
-    const delta: f16 = @floatCast(sign * @as(f32, @floatFromInt(rs.amount)) / dimension);
 
-    const new_tree = tree.resize(alloc, handle, layout, delta) catch return;
-    var old_tree = self.tab_trees[tab];
-    old_tree.deinit();
-    self.tab_trees[tab] = new_tree;
+    // The node's OWN region, never the surface (T495): a nested split's ratio
+    // is relative to its sub-rectangle, so a step measured against the whole
+    // window would move a nested divider by the wrong distance.
+    const region = self.splitRegionRect(target) orelse return;
+    const start, const end = switch (layout) {
+        .horizontal => .{ region.left, region.right },
+        .vertical => .{ region.top, region.bottom },
+    };
+    const sign: i32 = switch (rs.direction) {
+        .left, .up => -1,
+        .right, .down => 1,
+    };
+    // A held key is ONE gesture: every press re-solves from the tree as it was
+    // when the run began, so eighty presses out and back land on the pixels
+    // they started on instead of drifting an f16's worth each time.
+    var nodes: [MAX_DRAG_NODES]split_resize.Node = undefined;
+    const n = self.snapshotNodes(&nodes);
+    var adjustments: [split_resize.MAX_ADJUSTMENTS]split_resize.Adjust = undefined;
+    const count = if (n > 0) self.kbd_resize.step(
+        nodes[0..n],
+        @intCast(tab),
+        @intFromEnum(target),
+        start,
+        end,
+        self.scale,
+        sign * @as(i32, rs.amount),
+        &adjustments,
+    ) else 0;
+
+    if (count == 0) {
+        // No gesture (a tree too big to snapshot): move this one divider by
+        // itself, which is still right for a single split and is what this did
+        // before the gesture existed.
+        const solo = split_resize.nudgeRatio(
+            start,
+            end,
+            ratio,
+            self.scale,
+            sign * @as(i32, rs.amount),
+        );
+        tree.resizeInPlace(target, @floatCast(solo));
+    } else for (adjustments[0..count]) |a| {
+        tree.resizeInPlace(@enumFromInt(a.handle), @floatCast(a.ratio));
+    }
+
     self.layoutSplits();
+    // T110: a divider moved by keyboard is as much a layout change as one
+    // moved by the mouse (which persists at drag end), so it has to survive a
+    // restore too.
+    self.app.markLayoutDirty();
 }
 
 /// Equalize all splits in the active tab.

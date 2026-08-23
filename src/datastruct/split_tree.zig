@@ -981,14 +981,7 @@ pub fn SplitTree(comptime V: type) type {
             errdefer result.deinit();
 
             // Find our nearest parent split node matching the layout.
-            const parent_handle = switch (self.findParentSplit(
-                layout,
-                from,
-                .root,
-            )) {
-                .deadend, .backtrack => return result,
-                .result => |v| v,
-            };
+            const parent_handle = self.nearestSplit(layout, from) orelse return result;
 
             // Get our spatial layout, because we need the dimensions of this
             // split with regards to the entire grid.
@@ -1016,6 +1009,26 @@ pub fn SplitTree(comptime V: type) type {
                 @min(@max(full_ratio + ratio, 0), 1),
             );
             return result;
+        }
+
+        /// The nearest ancestor of `from` whose split runs along `layout`, or
+        /// null when there is none — the split whose divider a `resize_split`
+        /// in that layout's direction moves.
+        ///
+        /// Public because a frontend may want that node without `resize`'s
+        /// ratio delta: the win32 app re-solves the same move with its own
+        /// fixed-edge planner, so that a divider nudged by the keyboard lands
+        /// exactly where the same divider dragged by the mouse would.
+        pub fn nearestSplit(
+            self: *const Self,
+            layout: Split.Layout,
+            from: Node.Handle,
+        ) ?Node.Handle {
+            if (self.isEmpty()) return null;
+            return switch (self.findParentSplit(layout, from, .root)) {
+                .deadend, .backtrack => null,
+                .result => |v| v,
+            };
         }
 
         fn findParentSplit(
@@ -2305,6 +2318,56 @@ test "SplitTree: resize" {
             \\
         );
     }
+}
+
+test "SplitTree: nearestSplit picks the ancestor whose divider is on that axis" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A | (B / C): a horizontal root over a vertical nested split. From C,
+    // a vertical resize must find the nested split and a horizontal one must
+    // walk past it to the root — which is the node the win32 keyboard path
+    // then solves against its OWN region (T1129).
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var v3: TestTree.View = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+
+    var ab = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer ab.deinit();
+    const b_handle = at: {
+        var it = ab.iterator();
+        break :at while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "B")) break entry.handle;
+        } else return error.NotFound;
+    };
+    var tree = try ab.split(alloc, b_handle, .down, 0.5, &t3);
+    defer tree.deinit();
+
+    const c_handle = at: {
+        var it = tree.iterator();
+        break :at while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "C")) break entry.handle;
+        } else return error.NotFound;
+    };
+
+    const vertical = tree.nearestSplit(.vertical, c_handle) orelse
+        return error.NotFound;
+    try testing.expectEqual(TestTree.Split.Layout.vertical, tree.nodes[vertical.idx()].split.layout);
+
+    const horizontal = tree.nearestSplit(.horizontal, c_handle) orelse
+        return error.NotFound;
+    try testing.expectEqual(TestTree.Node.Handle.root, horizontal);
+
+    // An empty tree has no split to find, and neither does a lone leaf.
+    const empty: TestTree = .empty;
+    try testing.expectEqual(@as(?TestTree.Node.Handle, null), empty.nearestSplit(.horizontal, .root));
+    try testing.expectEqual(@as(?TestTree.Node.Handle, null), t1.nearestSplit(.horizontal, .root));
 }
 
 test "SplitTree: clone empty tree" {

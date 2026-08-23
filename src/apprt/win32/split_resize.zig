@@ -235,6 +235,198 @@ pub fn plan(
     return w.len;
 }
 
+/// The ratio that shifts a split's divider by `delta` physical pixels inside
+/// its own `region_start`..`region_end` range — the KEYBOARD half of a drag
+/// (T1129).
+///
+/// `resize_split` is the same gesture as a divider drag arriving by another
+/// input, so it has to land in the same place, which means it has to be
+/// expressed the same way: an absolute position for `plan` to solve, never a
+/// delta applied to a ratio. A ratio delta is what `SplitTree.resize` does, and
+/// it rescales the moved node's whole subtree — so before this existed,
+/// ctrl+win+arrow slid the neighbouring dividers that the very same divider
+/// dragged with the mouse held still.
+///
+/// The clamp is `dragRatio`'s, for the same reason: one gesture, one floor.
+///
+/// Unlike a drag, a keyboard step is solved against the tree as it STANDS —
+/// there is no gesture to snapshot, since each press is its own action — so
+/// this round-trips ratio -> pixels -> ratio once per press and the rounding
+/// has to be centered rather than merely small. `split_geometry.axis`
+/// truncates, so aiming at the target pixel's leading edge loses a fraction of
+/// a pixel EVERY press, always in the same direction: nudge a divider eight
+/// steps right and eight steps back and it lands measurably left of where it
+/// started. Aiming half a pixel high is the same correction `holdRatio` makes,
+/// for the same reason.
+pub fn nudgeRatio(
+    region_start: i32,
+    region_end: i32,
+    ratio: f32,
+    scale: f32,
+    delta: i32,
+) f32 {
+    const a = split_geometry.axis(region_start, region_end, ratio, scale);
+    return holdRatio(a.split_pos + delta, .{ .start = region_start, .end = region_end });
+}
+
+/// How many nodes a keyboard gesture can hold on to. Same bound the drag's
+/// own snapshot uses in `Window.zig`; a tree past it simply gets no gesture,
+/// which costs a single divider's drift and never a wrong resize.
+pub const MAX_GESTURE_NODES: usize = 128;
+
+/// A RUN of keyboard divider steps, treated as one gesture (T1129).
+///
+/// `resize_split` arrives one press at a time, but a held key is a single
+/// movement and has to behave like one. Solving each press against the tree
+/// the previous press just wrote round-trips an `f16` ratio through pixels
+/// every time, and that rounding does not cancel: measured over eighty presses
+/// out and back, a held boundary ended 40px from where it started, and the
+/// dragged one did not return to its origin either. The mouse has never had
+/// that problem because it re-solves the whole drag from a snapshot taken when
+/// the divider was grabbed — so the keyboard keeps the same snapshot and
+/// replays its ACCUMULATED offset against it.
+///
+/// The gesture ends by itself the moment anything else touches the layout:
+/// `expect` records the ratios the last plan wrote, and a tree that no longer
+/// matches them (an equalize, a mouse drag, a pane closing, a restore) starts
+/// a fresh one. Nothing has to remember to call an `end` method, which is the
+/// point — there is no key-up to hang one on.
+pub const KeyboardGesture = struct {
+    /// The tree as it was when the gesture began.
+    nodes: [MAX_GESTURE_NODES]Node = undefined,
+    /// The ratios the last plan wrote, per node — the fingerprint that says
+    /// whether this gesture still owns the layout.
+    expect: [MAX_GESTURE_NODES]f16 = undefined,
+    len: usize = 0,
+    /// Caller-defined scope (the win32 app passes the tab index): two tabs can
+    /// hold identically shaped trees, and a gesture must not carry across.
+    context: u32 = 0,
+    target: u16 = 0,
+    region_start: i32 = 0,
+    region_end: i32 = 0,
+    /// Pixels travelled since the gesture began, summed over its presses.
+    offset: i32 = 0,
+
+    /// Whether `tree` is still the tree this gesture was solving.
+    fn owns(
+        self: *const KeyboardGesture,
+        tree: []const Node,
+        context: u32,
+        target: u16,
+        region_start: i32,
+        region_end: i32,
+    ) bool {
+        if (self.len == 0 or self.len != tree.len) return false;
+        if (self.context != context or self.target != target) return false;
+        if (self.region_start != region_start or self.region_end != region_end) return false;
+        for (tree, self.nodes[0..self.len], self.expect[0..self.len]) |now, was, want| {
+            switch (now) {
+                .leaf => if (was != .leaf) return false,
+                .split => |a| switch (was) {
+                    .leaf => return false,
+                    .split => |b| {
+                        // Shape first: a tree rebuilt to the same node count is
+                        // a different tree even when the ratios line up.
+                        if (a.layout != b.layout or a.left != b.left or a.right != b.right) return false;
+                        if (@as(f16, @floatCast(a.ratio)) != want) return false;
+                    },
+                },
+            }
+        }
+        return true;
+    }
+
+    /// Plan one keyboard step, beginning a gesture or continuing the one in
+    /// flight. `tree` is the layout as it stands; `out` receives the same
+    /// adjustments a drag would produce. Returns how many were written — 0
+    /// means no plan (a tree too big to snapshot, or a target that is not a
+    /// split on this axis), and the caller moves that one divider alone.
+    pub fn step(
+        self: *KeyboardGesture,
+        tree: []const Node,
+        context: u32,
+        target: u16,
+        region_start: i32,
+        region_end: i32,
+        scale: f32,
+        delta: i32,
+        out: []Adjust,
+    ) usize {
+        if (!self.owns(tree, context, target, region_start, region_end)) {
+            self.len = 0;
+            if (tree.len == 0 or tree.len > self.nodes.len) return 0;
+            if (target >= tree.len or tree[target] == .leaf) return 0;
+            @memcpy(self.nodes[0..tree.len], tree);
+            self.len = tree.len;
+            self.context = context;
+            self.target = target;
+            self.region_start = region_start;
+            self.region_end = region_end;
+            self.offset = 0;
+            self.markUnmoved();
+        }
+
+        self.offset += delta;
+        const base = switch (self.nodes[target]) {
+            .leaf => return 0,
+            .split => |sp| sp.ratio,
+        };
+        const ratio = nudgeRatio(region_start, region_end, base, scale, self.offset);
+        var n = plan(self.nodes[0..self.len], target, region_start, region_end, ratio, scale, out);
+
+        // `plan` prunes any subtree whose axis range did not move — measured
+        // against the SNAPSHOT, which is what makes a drag cheap. Replaying a
+        // gesture, that prune leaves behind whatever an EARLIER press of the
+        // same run wrote there: come back to the position you started at and
+        // the divider a previous press had squeezed against its clamp would
+        // simply stay squeezed. So anything this run moved and this press does
+        // not mention is put back where the snapshot had it.
+        n = self.restoreUnplanned(out, n);
+
+        // Fingerprint the layout this plan produces, so the next press can
+        // tell "still my gesture" from "somebody else moved something".
+        self.markUnmoved();
+        for (out[0..n]) |a| {
+            if (a.handle < self.len) self.expect[a.handle] = @floatCast(a.ratio);
+        }
+        return n;
+    }
+
+    /// Set the fingerprint to the snapshot itself — "this gesture has moved
+    /// nothing yet".
+    fn markUnmoved(self: *KeyboardGesture) void {
+        for (self.nodes[0..self.len], 0..) |node, i| {
+            self.expect[i] = switch (node) {
+                .leaf => 0,
+                .split => |sp| @floatCast(sp.ratio),
+            };
+        }
+    }
+
+    /// Append an adjustment back to the snapshot ratio for every node this
+    /// gesture has moved that `out[0..n]` does not already cover. Returns the
+    /// new length; a full buffer truncates, exactly as `plan` does.
+    fn restoreUnplanned(self: *const KeyboardGesture, out: []Adjust, n: usize) usize {
+        var len = n;
+        for (self.nodes[0..self.len], 0..) |node, i| {
+            const snapshot: f16 = switch (node) {
+                .leaf => continue,
+                .split => |sp| @floatCast(sp.ratio),
+            };
+            if (self.expect[i] == snapshot) continue;
+            const handle: u16 = @intCast(i);
+            const planned = for (out[0..n]) |a| {
+                if (a.handle == handle) break true;
+            } else false;
+            if (planned) continue;
+            if (len >= out.len) break;
+            out[len] = .{ .handle = handle, .ratio = snapshot };
+            len += 1;
+        }
+        return len;
+    }
+};
+
 /// Where a split's divider sits on `layout`'s axis, given a tree and the axis
 /// range the ROOT occupies. Perpendicular splits pass their range through to
 /// both children untouched, which is what makes this the same one-dimensional
@@ -659,4 +851,223 @@ test "a cyclic node slice terminates" {
     var out: [64]Adjust = undefined;
     const n = plan(&nodes, 0, 0, 1000, 0.4, 1.0, &out);
     try testing.expect(n <= out.len);
+}
+
+// -- T1129: the keyboard is the same gesture ---------------------------------
+
+/// One `resize_split` press through the whole product path: hand the tree as
+/// it stands to the gesture, then apply what it plans — exactly what
+/// `Window.resizeSplit` does. Returns the plan length.
+fn keyboardStep(
+    g: *KeyboardGesture,
+    nodes: []Node,
+    target: u16,
+    region_start: i32,
+    region_end: i32,
+    scale: f32,
+    delta: i32,
+    out: []Adjust,
+) usize {
+    const n = g.step(nodes, 0, target, region_start, region_end, scale, delta, out);
+    apply(nodes, out[0..n]);
+    return n;
+}
+
+test "nudgeRatio moves the divider by the requested pixels, in its own region" {
+    for (SCALES) |scale| {
+        const w: i32 = 1600;
+        // The nested split's region is the right two thirds, not the surface:
+        // a step measured against the whole window would move it by the wrong
+        // distance, which is the T495 rule this inherits.
+        const root = split_geometry.axis(0, w, 1.0 / 3.0, scale);
+        const before = split_geometry.axis(root.band_hi, w, 0.5, scale).split_pos;
+
+        const r = nudgeRatio(root.band_hi, w, 0.5, scale, 40);
+        const after = split_geometry.axis(root.band_hi, w, r, scale).split_pos;
+        try expectHeld(before + 40, after);
+
+        const back = nudgeRatio(root.band_hi, w, r, scale, -40);
+        try expectHeld(before, split_geometry.axis(root.band_hi, w, back, scale).split_pos);
+    }
+}
+
+test "nudgeRatio clamps at the same floor a dragged divider does" {
+    const w: i32 = 1000;
+    // A step far past the edge cannot squeeze a pane below the [0.1, 0.9]
+    // band; it lands ON the band, the way a drag pushed to the limit does.
+    try testing.expectEqual(
+        split_geometry.MAX_RATIO,
+        nudgeRatio(0, w, 0.5, 1.0, 10_000),
+    );
+    try testing.expectEqual(
+        split_geometry.MIN_RATIO,
+        nudgeRatio(0, w, 0.5, 1.0, -10_000),
+    );
+}
+
+test "keyboard: moving divider 1 leaves divider 2 on its pixel" {
+    // THE T1129 defect. `SplitTree.resize` fed the nearest matching split a
+    // ratio delta, which rescales its whole subtree — so ctrl+win+right slid
+    // divider 2 along under divider 1, while a MOUSE drag of that same
+    // divider held it still since T533. One gesture, two answers.
+    for (SCALES) |scale| {
+        const w: i32 = 3110;
+        var nodes = threeColumns(1.0 / 3.0, 0.5);
+        const d2_before = dividerPos(&nodes, 2, 0, 0, w, .horizontal, scale).?;
+        const d1_before = dividerPos(&nodes, 0, 0, 0, w, .horizontal, scale).?;
+
+        // Sixty steps of the 10px `DIVIDER_STEP` — a held key, not a tap.
+        // The count is the point: each press is solved against the tree as it
+        // stands, so an error that accumulated would show up here as tens of
+        // pixels rather than the one the f16 ratio is worth.
+        var g: KeyboardGesture = .{};
+        var out: [64]Adjust = undefined;
+        for (0..60) |_| {
+            _ = keyboardStep(&g, &nodes, 0, 0, w, scale, 10, &out);
+        }
+
+        const d1_after = dividerPos(&nodes, 0, 0, 0, w, .horizontal, scale).?;
+        // Control: the divider the user asked for really did travel. Without
+        // it the hold below would pass on a build that ignores the key.
+        try testing.expect(d1_after - d1_before >= 590);
+        try expectHeld(d2_before, dividerPos(&nodes, 2, 0, 0, w, .horizontal, scale).?);
+    }
+}
+
+test "keyboard: the uncompensated answer is the control" {
+    // What the old path produced, so the test above fails the moment the plan
+    // stops being applied: divider 2 slides by half of divider 1's travel.
+    const w: i32 = 3110;
+    var nodes = threeColumns(1.0 / 3.0, 0.5);
+    const d2_before = dividerPos(&nodes, 2, 0, 0, w, .horizontal, 1.0).?;
+
+    var out: [64]Adjust = undefined;
+    for (0..10) |_| {
+        const ratio = nodes[0].split.ratio;
+        const r = nudgeRatio(0, w, ratio, 1.0, 10);
+        _ = plan(&nodes, 0, 0, w, r, 1.0, &out);
+        apply(&nodes, out[0..1]); // dragged node only
+    }
+    const slid = dividerPos(&nodes, 2, 0, 0, w, .horizontal, 1.0).? - d2_before;
+    try testing.expect(slid >= 40);
+}
+
+test "keyboard: a run out and back lands on the pixels it started on" {
+    // Reversibility is what a user checks by nudging a divider and undoing it
+    // by hand. Because the whole run is replayed against ONE snapshot, the
+    // offset returning to zero reproduces the original tree EXACTLY — this is
+    // an equality, not a tolerance, and it is the assertion that fails if the
+    // gesture ever silently restarts mid-run.
+    for (SCALES) |scale| {
+        const w: i32 = 1600;
+        var nodes = threeColumns(0.5, 0.5);
+        const d1 = dividerPos(&nodes, 0, 0, 0, w, .horizontal, scale).?;
+        const d2 = dividerPos(&nodes, 2, 0, 0, w, .horizontal, scale).?;
+
+        var g: KeyboardGesture = .{};
+        var out: [64]Adjust = undefined;
+        for (0..40) |_| _ = keyboardStep(&g, &nodes, 0, 0, w, scale, 10, &out);
+        for (0..40) |_| _ = keyboardStep(&g, &nodes, 0, 0, w, scale, -10, &out);
+
+        try testing.expectEqual(d1, dividerPos(&nodes, 0, 0, 0, w, .horizontal, scale).?);
+        try testing.expectEqual(d2, dividerPos(&nodes, 2, 0, 0, w, .horizontal, scale).?);
+    }
+}
+
+test "keyboard: solving each press against the previous one is the control" {
+    // What a gesture-less keyboard path produces, and why the equality above
+    // is worth asserting: the same eighty presses, each solved against the
+    // tree the last one wrote, walk the held boundary tens of pixels away.
+    const w: i32 = 1600;
+    var nodes = threeColumns(0.5, 0.5);
+    const d2 = dividerPos(&nodes, 2, 0, 0, w, .horizontal, 1.0).?;
+
+    var out: [64]Adjust = undefined;
+    for (0..80) |i| {
+        const delta: i32 = if (i < 40) 10 else -10;
+        const ratio = nodes[0].split.ratio;
+        const r = nudgeRatio(0, w, ratio, 1.0, delta);
+        const n = plan(&nodes, 0, 0, w, r, 1.0, &out);
+        apply(&nodes, out[0..n]);
+    }
+    try testing.expect(@abs(dividerPos(&nodes, 2, 0, 0, w, .horizontal, 1.0).? - d2) > 10);
+}
+
+test "keyboard: the gesture ends when anything else moves the layout" {
+    // There is no key-up to end it on, so the fingerprint has to. Each of
+    // these is a thing that really happens between two presses of a held key:
+    // an equalize, a different tab, a window resize.
+    const w: i32 = 1600;
+    var out: [64]Adjust = undefined;
+
+    {
+        var nodes = threeColumns(0.5, 0.5);
+        var g: KeyboardGesture = .{};
+        _ = keyboardStep(&g, &nodes, 0, 0, w, 1.0, 10, &out);
+        try testing.expectEqual(@as(i32, 10), g.offset);
+
+        // Somebody else re-ratios the tree (equalize, a mouse drag, a restore).
+        nodes[0].split.ratio = 0.25;
+        _ = keyboardStep(&g, &nodes, 0, 0, w, 1.0, 10, &out);
+        try testing.expectEqual(@as(i32, 10), g.offset); // a NEW run, not a continuation
+        try testing.expectEqual(@as(f32, 0.25), g.nodes[0].split.ratio);
+    }
+
+    {
+        var nodes = threeColumns(0.5, 0.5);
+        var g: KeyboardGesture = .{};
+        _ = keyboardStep(&g, &nodes, 0, 0, w, 1.0, 10, &out);
+        // Another tab, identically shaped: the context is what tells them apart.
+        _ = g.step(&nodes, 1, 0, 0, w, 1.0, 10, &out);
+        try testing.expectEqual(@as(i32, 10), g.offset);
+        try testing.expectEqual(@as(u32, 1), g.context);
+    }
+
+    {
+        var nodes = threeColumns(0.5, 0.5);
+        var g: KeyboardGesture = .{};
+        _ = keyboardStep(&g, &nodes, 0, 0, w, 1.0, 10, &out);
+        // The window was resized under the held key, so the pixels the offset
+        // was measured in are not the same pixels any more.
+        _ = keyboardStep(&g, &nodes, 0, 0, w + 200, 1.0, 10, &out);
+        try testing.expectEqual(@as(i32, 10), g.offset);
+        try testing.expectEqual(@as(i32, w + 200), g.region_end);
+    }
+
+    {
+        // A tree bigger than the snapshot buffer gets no gesture at all, and
+        // says so with a zero-length plan rather than resizing something else.
+        var big: [MAX_GESTURE_NODES + 2]Node = undefined;
+        for (&big) |*n| n.* = .leaf;
+        big[0] = .{ .split = .{ .layout = .horizontal, .ratio = 0.5, .left = 1, .right = 2 } };
+        var g: KeyboardGesture = .{};
+        try testing.expectEqual(@as(usize, 0), g.step(&big, 0, 0, 0, w, 1.0, 10, &out));
+
+        // And a target that is not a split is not a divider to move.
+        var nodes = threeColumns(0.5, 0.5);
+        try testing.expectEqual(@as(usize, 0), g.step(&nodes, 0, 1, 0, w, 1.0, 10, &out));
+    }
+}
+
+test "keyboard: a perpendicular divider is not disturbed" {
+    // `split(h) -> [p1, split(v) -> [p2, p3]]`: a horizontal step changes the
+    // width the vertical split lives in, and must leave its own boundary — a
+    // position on the OTHER axis — exactly where it was. A grid must not
+    // shear when a column boundary moves by keyboard either.
+    const w: i32 = 1600;
+    const h: i32 = 900;
+    var nodes = [_]Node{
+        .{ .split = .{ .layout = .horizontal, .ratio = 0.5, .left = 1, .right = 2 } },
+        .leaf,
+        .{ .split = .{ .layout = .vertical, .ratio = 0.4, .left = 3, .right = 4 } },
+        .leaf,
+        .leaf,
+    };
+    const before = dividerPos(&nodes, 2, 0, 0, h, .vertical, 1.0).?;
+
+    var g: KeyboardGesture = .{};
+    var out: [64]Adjust = undefined;
+    for (0..6) |_| _ = keyboardStep(&g, &nodes, 0, 0, w, 1.0, 10, &out);
+
+    try testing.expectEqual(before, dividerPos(&nodes, 2, 0, 0, h, .vertical, 1.0).?);
 }

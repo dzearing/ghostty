@@ -944,7 +944,18 @@ foreach ($axis in @('down', 'right')) {
 # ~10% of the window width instead of the distance the pointer traveled.
 # ---------------------------------------------------------------------------
 Kill-RepoInstances
-$a495 = Start-OnTestDesktop -Exe $exe -Arguments $common
+# T1129 binds the divider actions onto plain ctrl+shift+alt chords for this
+# run. The SHIPPING chords are super-modified (ctrl+win+arrow to move a
+# divider, super+alt+arrow to change focus) and a posted WM_KEYDOWN carrying a
+# faked VK_LWIN does not resolve them off the input desktop, while every
+# non-super chord in this harness does - measured 2026-08-23, and filed as
+# T1149 because whether that is the harness or the product is a separate
+# question from the divider semantics under test here. The action reached is
+# identical either way: this run is about what `resize_split` DOES.
+$kb = @('--keybind=ctrl+shift+alt+right=resize_split:right,10',
+    '--keybind=ctrl+shift+alt+left=resize_split:left,10',
+    '--keybind=ctrl+shift+alt+up=goto_split:left')
+$a495 = Start-OnTestDesktop -Exe $exe -Arguments ($common + $kb)
 Start-Sleep -Seconds 3
 if ($a495.Process -and $a495.Process.HasExited) {
     Write-Host 'SKIP T495: GUI did not come up'
@@ -1046,6 +1057,76 @@ if ($a495.Process -and $a495.Process.HasExited) {
                 "T533 control: first divider tracked the -120px drag (wanted ~$btarget2, got $($b2.FirstX))"
             Assert ([math]::Abs($b2.X - $b0.X) -le 6) `
                 "T533: second divider still held after dragging back ($($b0.X) -> $($b2.X))"
+
+            # ---------------------------------------------------------------
+            # T1129: the KEYBOARD is the same gesture as the drag.
+            #
+            # `resize_split` (Move Divider / ctrl+win+arrow) used to go through
+            # SplitTree.resize, which applies a ratio DELTA to the nearest
+            # matching split - so it carried both defects the mouse path had
+            # already had fixed: a nested divider teleported (T495's shape,
+            # because the delta is measured against the whole grid while the
+            # ratio is relative to the node's own region) and moving divider 1
+            # slid divider 2 along with it (T533's shape). Same solver now.
+            #
+            # Oracle: pane rects again, and each half leads with a control so
+            # a build that ignores the key cannot pass by doing nothing.
+            # ---------------------------------------------------------------
+            $panesK = @(Get-Panes $t495 | Sort-Object Left | ForEach-Object { [IntPtr]$_.Hwnd })
+            $step = 10   # commands.DIVIDER_STEP, in pixels
+
+            # (a) The nested divider, from the pane that owns it (focus is on
+            # the rightmost pane: +split focuses what it creates). One press
+            # must move it ONE step right - the teleport went ~170px LEFT.
+            $k0 = Get-SecondDividerX $t495
+            [void](Send-TestKeys -Window $t495 -Target $panesK[2] -Modifiers ctrl, shift, alt -Key right)
+            Start-Sleep -Milliseconds 250
+            $k1 = Get-SecondDividerX $t495
+            Assert ($null -ne $k1 -and ($k1.X - $k0.X) -gt 0) `
+                "T1129 control: a resize_split:right press moved the nested divider at all ($($k0.X) -> $($k1.X))"
+            Assert ($null -ne $k1 -and [math]::Abs(($k1.X - $k0.X) - $step) -le 6) `
+                "T1129: one keyboard step moves the nested divider one step, not a leap (wanted ~$step, got $($k1.X - $k0.X))"
+
+            # (b) Walk focus to the leftmost pane (super+alt+left twice) and
+            # move divider 1 ten steps: divider 2 must hold its absolute x and
+            # the far pane must keep its width, exactly as under a mouse drag.
+            [void](Send-TestKeys -Window $t495 -Target $panesK[2] -Modifiers ctrl, shift, alt -Key up)
+            Start-Sleep -Milliseconds 200
+            [void](Send-TestKeys -Window $t495 -Target $panesK[1] -Modifiers ctrl, shift, alt -Key up)
+            Start-Sleep -Milliseconds 200
+
+            $m0 = Get-SecondDividerX $t495
+            $far0 = (@(Get-Panes $t495 | Sort-Object Left)[2])
+            $farW0 = $far0.Right - $far0.Left
+            for ($i = 0; $i -lt 10; $i++) {
+                [void](Send-TestKeys -Window $t495 -Target $panesK[0] -Modifiers ctrl, shift, alt -Key right)
+            }
+            Start-Sleep -Milliseconds 300
+            $m1 = Get-SecondDividerX $t495
+            $far1 = (@(Get-Panes $t495 | Sort-Object Left)[2])
+            $farW1 = $far1.Right - $far1.Left
+            $want = $m0.FirstX + (10 * $step)
+            Assert ($null -ne $m1 -and [math]::Abs($m1.FirstX - $want) -le 20) `
+                "T1129 control: ten keyboard steps moved the first divider ~$(10 * $step)px (wanted ~$want, got $($m1.FirstX))"
+            Assert ($null -ne $m1 -and [math]::Abs($m1.X - $m0.X) -le 6) `
+                "T1129: the second divider held while the first was moved by keyboard ($($m0.X) -> $($m1.X))"
+            Assert ([math]::Abs($farW1 - $farW0) -le 6) `
+                "T1129: the far pane kept its width under a keyboard move ($farW0 -> $farW1)"
+
+            # (c) And the run is reversible: ten steps back lands where it
+            # began. Each press replays the whole run against the layout as it
+            # was when the run started, so this is the property that fails if
+            # the gesture silently restarts (an f16 ratio re-derived per press
+            # drifts tens of pixels over a held key).
+            for ($i = 0; $i -lt 10; $i++) {
+                [void](Send-TestKeys -Window $t495 -Target $panesK[0] -Modifiers ctrl, shift, alt -Key left)
+            }
+            Start-Sleep -Milliseconds 300
+            $m2 = Get-SecondDividerX $t495
+            Assert ($null -ne $m2 -and [math]::Abs($m2.FirstX - $m0.FirstX) -le 6) `
+                "T1129: ten steps out and ten back returns the first divider to its pixel ($($m0.FirstX) -> $($m2.FirstX))"
+            Assert ($null -ne $m2 -and [math]::Abs($m2.X - $m0.X) -le 6) `
+                "T1129: and the second divider is still where it started ($($m0.X) -> $($m2.X))"
 
             Assert (-not ($a495.Process -and $a495.Process.HasExited)) 'T495: no crash'
         }
