@@ -248,6 +248,13 @@ pub fn decide(running: ?[]const u8, bundled: ?[]const u8, live_sessions: usize) 
 /// nobody cleaned up would suppress the confirmation forever, on a machine whose
 /// agent then never updates again. This expires on its own.
 ///
+/// The file is named for the confirmation it was written for, but since T1120
+/// it means the wider thing the delivery actually needs: an unattended relaunch
+/// is in progress, so the app raises NO prompt of its own. `App` reads it for
+/// the protocol-skew confirmation below, the different-build handoff prompt and
+/// the one-time agent-integration offers; each one would otherwise sit on an
+/// empty desk until the user found it in the morning.
+///
 /// Deferral is deliberately NOT the same as the user pressing "Later": it does
 /// not set `agent_upgrade_declined`, so the check that runs when the last
 /// persistent window closes still fires. By then the marker has expired and

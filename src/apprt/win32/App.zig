@@ -1078,6 +1078,19 @@ fn handoffChoice(
         if (std.mem.eql(u8, mode, "join")) return .join;
     } else |_| {}
 
+    // T1120: the morning delivery relaunches this exe with nobody in front of
+    // it, and it kills only the instances running from the install dir — so a
+    // Desktop-portable or share copy of the SAME lineage keeps the endpoint,
+    // which is precisely the version mismatch this prompt exists for. Asking
+    // there is the worst shape available: this process shows a modal and then
+    // exits, so the terminal the delivery promised to bring back never appears
+    // until somebody clicks. Join instead, which is the non-destructive answer
+    // and the one this whole function already fails toward.
+    if (self.unattendedRefreshActive()) {
+        log.info("launch of a different build during an unattended refresh; joining without asking", .{});
+        return .join;
+    }
+
     const running = internal_os.ipc_client.queryIdentity(alloc) orelse return .join;
     const prompt = (internal_os.ipc_handoff.mismatchPrompt(alloc, id.*, running) catch
         return .join) orelse return .join;
@@ -3806,15 +3819,20 @@ fn agentSessionMix(self: *App) ?AgentSessionMix {
 /// the future, a confirmation is deferred rather than shown.
 ///
 /// Since T1056 a stale build raises no modal at all, so the case this was
-/// written for cannot happen any more. It still guards the PROTOCOL-SKEW
-/// confirmation, which an unattended relaunch can absolutely walk into and
-/// which nobody is there to answer.
+/// written for cannot happen any more. What the marker guards now is EVERY
+/// prompt a relaunch can raise on its own with nobody there to answer it —
+/// T1120 audited them and the list is three: the protocol-skew confirmation
+/// below, the different-build handoff prompt (`handoffChoice`), and the
+/// one-time agent-integration offers (`AgentIntegration`). A prompt that only
+/// a user action can reach is not on it, and neither is the config-error
+/// dialog, which reports the user's own broken file and is the one message
+/// they should find waiting for them.
 ///
 /// Every failure here answers `false`. A marker we could not read, a
 /// `%LOCALAPPDATA%` we could not resolve, a deadline we could not parse — none
 /// of those are evidence that a refresh is running, and "suppress on a guess" is
 /// the direction that fails silently and forever.
-fn unattendedRefreshActive(self: *App) bool {
+pub fn unattendedRefreshActive(self: *App) bool {
     const alloc = self.core_app.alloc;
     const dir = std.process.getEnvVarOwned(alloc, "LOCALAPPDATA") catch return false;
     defer alloc.free(dir);

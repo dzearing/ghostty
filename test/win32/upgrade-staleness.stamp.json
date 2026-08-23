@@ -1,12 +1,12 @@
 {
     "guard":  "upgrade-staleness",
     "script":  "test/win32/upgrade-staleness.ps1",
-    "generated":  "2026-08-22T09:33:59-07:00",
-    "commit":  "b32a0f02a",
+    "generated":  "2026-08-22T20:15:36-07:00",
+    "commit":  "9a6547e89",
     "files":  {
                   "scripts/delivery-version.ps1":  "baa9fa9f6d00ac9d5510bd636bdd9d6157214d7c74408ce07fb12b80957746d0",
                   "scripts/launch-upgrade.ps1":  "d36a9073a97b4e36afd4cf7ef5002079ba23e417bc993aecda12e3dcbdcb8e61",
-                  "scripts/upgrade-ghoztty-windows.ps1":  "8fec04e1f356d75dfc61a6a89f0d0c1b4c0b751813b3cdbb9bb3cbe9d0e4585d",
+                  "scripts/upgrade-ghoztty-windows.ps1":  "2bbd6e4d44fc73b90482140f24e0b0f2abe589c0762bac3d5813ddd5609f1917",
                   "test/win32/lib/ModalSweep.ps1":  "ad1fde46a8704161d73608cf0ebcf58c1a0251d82fbea3967f79281065f91649",
                   "test/win32/upgrade-staleness.ps1":  "0990b6d1563340a7b47c780eacb3a0ec197733e7272c7988fbe0c7ba38ef2fda"
               }

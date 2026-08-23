@@ -1,8 +1,8 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-08-22T19:12:16-07:00",
-    "commit":  "682161bdc",
+    "generated":  "2026-08-22T23:07:58-07:00",
+    "commit":  "9a6547e89",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
@@ -170,7 +170,7 @@
                   "test/win32/machine-chooser.ps1":  "c69e331b19e83e300b5f0c22860220ea1d2de144d587db1ee4ae4e797ce6b79e",
                   "test/win32/menu-bar.ps1":  "787a69dc27ed58f7134e046beb04ee2c7dafea6252e081e7f86ec7fe77a9c2c4",
                   "test/win32/merge-terminology.ps1":  "c6e28d4f5dac63e423b492c7e854a11ae24e754ddf56587a8dd6cbeeb5efa6eb",
-                  "test/win32/morning-refresh.ps1":  "4af22c6e66fb4a9dc95140dc46176890ab28ff0d1a8d3482608b04b61627a6c3",
+                  "test/win32/morning-refresh.ps1":  "e0551f73edda29af9e36294b9d897e1c13cc5c8f237f84c2f69389730aeb72e4",
                   "test/win32/mouse-nc-routing.ps1":  "0e9c09958e46b3444898c47fdcadfbd1c509854b6c07e5bb8c5086abd2f80969",
                   "test/win32/msi-upgrade.ps1":  "596f855376fa9af1f3ed137c55c060c10e872f2c6555b20b774688f0ca28e425",
                   "test/win32/new-window-cwd.ps1":  "0c35d0adaf39cdd7fa733c5e2912f1cb4dce1f7c12f05ed63b90a851acd5c440",

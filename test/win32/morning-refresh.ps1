@@ -280,17 +280,34 @@ Assert "D12c and never claims the app came back" (-not ($dLogText -match 'APP-RE
 # --- the positive control: an ORDINARY delivery still ships the agent --------
 # Without this, D5/D6 would pass just as well against a script that had stopped
 # swapping the agent at all.
-Set-Content -LiteralPath $installedAgent -Encoding ascii -Value $agentSentinel
-Remove-Item -LiteralPath "$installedAgent.bak" -Force -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath $dMarker -Force -ErrorAction SilentlyContinue
-$d13 = Invoke-Upgrade @('-DeferMarkerPath', $dMarker)
-$dLogText = Get-Content -LiteralPath $dLog -Raw -ErrorAction SilentlyContinue
-AssertEq "D13 CONTROL: an ordinary delivery succeeds too" 0 $d13.Code
-Assert "D14 CONTROL: and it DOES swap the agent" ($dLogText -match 'agent exe swapped')
-AssertEq "D15 CONTROL: the installed agent is the staged one" 'NEWER-AGENT-BUILD' `
-    ((Get-Content -LiteralPath $installedAgent -Raw).Trim())
-Assert "D16 CONTROL: and it writes no deferral marker - an attended delivery may ask" `
-    (-not (Test-Path -LiteralPath $dMarker))
+#
+# T1120: the staged agent has to be a REAL PROGRAM on this path. Since T1098 the
+# delivery reads the PE header of what it is about to ship and fails the run
+# outright when it is not one - so the ascii sentinel D1-D12 depend on (their
+# whole assertion is that those bytes SURVIVE an -AppOnly run) made this control
+# exit 1 for a reason that has nothing to do with the agent swap, and the
+# expectation was simply left behind by T1098. The repo's own built agent is the
+# binary to stage: AGENT VERIFY launches the installed one and compares its
+# build stamp against staging's, which only a real agent can answer.
+$realAgent = Join-Path (Split-Path -Parent $Exe) 'ghoztty-agent.exe'
+if (Test-Path -LiteralPath $realAgent) {
+    Copy-Item -LiteralPath $realAgent (Join-Path $dStaging 'bin\ghoztty-agent.exe') -Force
+    Set-Content -LiteralPath $installedAgent -Encoding ascii -Value $agentSentinel
+    Remove-Item -LiteralPath "$installedAgent.bak" -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $dMarker -Force -ErrorAction SilentlyContinue
+    $d13 = Invoke-Upgrade @('-DeferMarkerPath', $dMarker)
+    $dLogText = Get-Content -LiteralPath $dLog -Raw -ErrorAction SilentlyContinue
+    AssertEq "D13 CONTROL: an ordinary delivery succeeds too" 0 $d13.Code
+    Assert "D14 CONTROL: and it DOES swap the agent" ($dLogText -match 'agent exe swapped')
+    AssertEq "D15 CONTROL: the installed agent is the staged one" `
+        (Get-FileHash -LiteralPath $realAgent).Hash `
+        (Get-FileHash -LiteralPath $installedAgent).Hash
+    Assert "D15b CONTROL: and the delivery read it back to prove it" ($dLogText -match 'AGENT VERIFY OK')
+    Assert "D16 CONTROL: and it writes no deferral marker - an attended delivery may ask" `
+        (-not (Test-Path -LiteralPath $dMarker))
+} else {
+    "  SKIP D13-D16 CONTROL: no built agent at $realAgent to stage (zig build agent)"
+}
 
 # ============================================================================
 "== E: the marker contract, from the app's side"
@@ -304,8 +321,57 @@ Assert "E1 the app and the script name the same marker file" `
 Assert "E2 the app defers only a confirmation, never the free idle upgrade" `
     ($eSrc -match 'if \(d\.action != \.confirm_first\) return d;')
 $eApp = Get-Content -LiteralPath (Join-Path $Repo 'src\apprt\win32\App.zig') -Raw
-Assert "E3 both routes to that modal are deferred (staleness and skew)" `
-    (([regex]::Matches($eApp, 'agent_upgrade\.applyDeferral')).Count -ge 2)
+# T1120: this used to demand TWO `applyDeferral` calls, on the theory that the
+# agent-restart modal had two routes - staleness and skew. T1056 removed the
+# first one entirely: a stale BUILD raises no modal at all now, so there is
+# nothing there to defer and a second call could only be decoration. What the
+# contract actually says, and what E3a/E3b check, is that NEITHER route can put
+# that modal on an empty desk: the skew route defers, the staleness route never
+# asks.
+Assert "E3a the one route that can still ask - the protocol skew - is deferred" `
+    ($eApp -match 'const decision = agent_upgrade\.applyDeferral\(\s*raw,\s*raw\.action == \.confirm_first and self\.unattendedRefreshActive\(\),')
+$eStale = ''
+$staleStart = $eApp.IndexOf('pub fn refreshLocalAgentIfStale(')
+$staleEnd = $eApp.IndexOf('fn handleAgentProtocolSkew(')
+if ($staleStart -ge 0 -and $staleEnd -gt $staleStart) {
+    $eStale = $eApp.Substring($staleStart, $staleEnd - $staleStart)
+}
+Assert "E3b and the staleness route raises no modal to defer (T1056)" `
+    ($eStale -and -not ($eStale -match 'ConfirmDialog\.show') -and
+     $eStale -match '\.confirm_first => \{[^@]*refusing')
+
+# T1120 goal 2: the audit, not the patch. Every prompt an UNATTENDED relaunch
+# can raise on its own is guarded by the same marker - and the delivery kills
+# only the instances under the install dir, so the different-build handoff
+# prompt is not hypothetical here: a Desktop-portable copy of the same lineage
+# keeps the endpoint and the fresh app asks about it. That one is the worst
+# shape of all, because the asking process exits after the answer, so the
+# terminal the delivery promised never comes back until somebody clicks.
+Assert "E3c the different-build handoff prompt is suppressed during a refresh" `
+    ($eApp -match '(?s)fn handoffChoice\(.*?unattendedRefreshActive\(\).*?return \.join;.*?ConfirmDialog\.show')
+$eAgentInt = Get-Content -LiteralPath (Join-Path $Repo 'src\apprt\win32\AgentIntegration.zig') -Raw
+foreach ($fn in @('showFirstRunPrompt', 'showMigrationPrompt')) {
+    $start = $eAgentInt.IndexOf("pub fn $fn(")
+    $body = if ($start -ge 0) { $eAgentInt.Substring($start) } else { '' }
+    $dlg = $body.IndexOf('ConfirmDialog.show')
+    $guard = $body.IndexOf('app.unattendedRefreshActive()')
+    # And BEFORE the state write, or the one-time offer is burned on an empty
+    # desk and the user is simply never asked.
+    $burn = $body.IndexOf('writeState(')
+    Assert "E3d the one-time $fn offer waits for an attended launch" `
+        ($guard -ge 0 -and $dlg -gt $guard -and ($burn -lt 0 -or $burn -gt $guard))
+}
+# The control that keeps this from becoming "suppress everything": the config
+# error dialog is deliberately NOT on the list. It reports the user's own
+# broken file, the window still opens behind it, and hiding it during the
+# refresh would mean they only ever learn about it on a manual restart.
+$eCfgStart = $eApp.IndexOf('fn showConfigErrorsIfAny(')
+$eCfgEnd = $eApp.IndexOf('var ipc_pumping', [Math]::Max($eCfgStart, 0))
+$eCfg = if ($eCfgStart -ge 0 -and $eCfgEnd -gt $eCfgStart) {
+    $eApp.Substring($eCfgStart, $eCfgEnd - $eCfgStart)
+} else { '' }
+Assert "E3e CONTROL: the config-error dialog is NOT suppressed" `
+    ($eCfg -match 'ConfirmDialog\.show' -and -not ($eCfg -match 'unattendedRefreshActive'))
 Assert "E4 a deferral is NOT a decline - the next quiet moment still asks" `
     ($eApp -match 'unattendedRefreshActive' -and
      -not ($eApp -match 'unattendedRefreshActive\(\)\s*\)\s*\{[^}]*agent_upgrade_declined = true'))
@@ -345,5 +411,11 @@ foreach ($s in @('morning-refresh.ps1', 'launch-upgrade.ps1', 'upgrade-ghoztty-w
 
 ""
 if (-not $Keep) { Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue }
+
+# --- stamp (T783, row added by T1120) ---------------------------------------
+if ($script:failures -eq 0 -and -not $PureOnly) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
+        update -Guard morning-refresh -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
+}
 if ($script:failures -eq 0) { "ALL PASS" } else { "$($script:failures) FAILURE(S)" }
 exit ($script:failures -gt 0)

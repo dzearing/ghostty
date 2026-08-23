@@ -326,14 +326,14 @@ if ($AppOnly) {
         # U+FEFF in front of it reads as garbage (which is safe - it declines to
         # defer - but silently defeats the whole point). Set-Content in PS 5.1
         # would write one.
-        $body = "$deadline`n# ghoztty app-only delivery; the agent-restart confirmation is deferred until this UTC unix time`n"
+        $body = "$deadline`n# ghoztty unattended delivery; the app raises no prompt of its own until this UTC unix time`n"
         [IO.File]::WriteAllText($DeferMarkerPath, $body, (New-Object Text.UTF8Encoding($false)))
         Log "APP-ONLY: agent-upgrade confirmation deferred until $deadline (+$DeferMinutes min) via $DeferMarkerPath"
     } catch {
         # Not fatal. The cost is a dialog on an unattended box, which is the
         # thing being fixed - but a delivery that refused to ship over it would
         # leave the user on a stale client instead, which is worse.
-        Log "WARNING: APP-ONLY: could not write the deferral marker $DeferMarkerPath ($($_.Exception.Message)); the agent-restart confirmation may appear unattended"
+        Log "WARNING: APP-ONLY: could not write the deferral marker $DeferMarkerPath ($($_.Exception.Message)); a prompt may appear on the unattended relaunch"
     }
 }
 

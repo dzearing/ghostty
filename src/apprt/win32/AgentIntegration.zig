@@ -178,6 +178,14 @@ pub fn showFirstRunPrompt(app: *App, agent_bits: usize) void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
+    // T1120: not during the morning delivery's relaunch. Returning BEFORE the
+    // state write below is the whole point — this is a one-time offer, and
+    // burning it on an empty desk would mean the user is never asked at all.
+    if (app.unattendedRefreshActive()) {
+        log.info("agent setup: unattended refresh in progress; the first-run offer waits for a launch with someone in front of it", .{});
+        return;
+    }
+
     // The palette flow may have answered while the check thread slept.
     if (readState(arena, setup_state_name) != .unanswered) return;
 
@@ -333,6 +341,13 @@ pub fn showMigrationPrompt(app: *App) void {
     var arena_state = std.heap.ArenaAllocator.init(app.core_app.alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
+
+    // T1120: same as the first-run offer — a one-time prompt raised by the
+    // unattended relaunch is one the user never gets to answer.
+    if (app.unattendedRefreshActive()) {
+        log.info("agent setup: unattended refresh in progress; the migration offer waits for a launch with someone in front of it", .{});
+        return;
+    }
 
     if (readState(arena, migration_state_name) != .unanswered) return;
 

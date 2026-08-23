@@ -411,6 +411,32 @@ $GuardTable = @(
             'test\win32\lib\ModalSweep.ps1'
         )
     },
+    # The UNATTENDED half of the delivery (T1120), which had a harness and no row
+    # here either: `morning-refresh.ps1` restarts the user's terminal at 5am with
+    # nobody in front of it, and its contract is that NOTHING it starts can raise
+    # a prompt. That claim is checked only by this harness - not by any lane, not
+    # by P1-P3 - and it went stale in exactly the way a guard exists to catch: an
+    # assertion about the agent-restart modal was left behind by T1056 and sat red
+    # until a full-suite sweep tripped over it. It covers the app-side marker code
+    # as well as the two scripts, because the prompt that must not appear is the
+    # app's.
+    [pscustomobject]@{
+        Name   = 'morning-refresh'
+        Script = 'test\win32\morning-refresh.ps1'
+        Stamp  = 'test\win32\morning-refresh.stamp.json'
+        Covers = @(
+            'scripts\morning-refresh.ps1',
+            'scripts\upgrade-ghoztty-windows.ps1',
+            'src\apprt\win32\agent_upgrade.zig',
+            # The prompts section E enumerates live here. These two churn often
+            # and the harness is hermetic and takes well under a minute, which is
+            # the trade: a cheap run every so often, against a suppression that
+            # can be deleted in a one-line edit nothing else would notice.
+            'src\apprt\win32\App.zig',
+            'src\apprt\win32\AgentIntegration.zig',
+            'test\win32\morning-refresh.ps1'
+        )
+    },
     # The MEASURED half of the delivery (T198), which had a harness but no row
     # here: `deliver-windows-build.ps1` is what proves the Desktop portable, the
     # network share, the loose agent and the portable ZIP actually received the
