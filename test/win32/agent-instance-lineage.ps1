@@ -190,7 +190,19 @@ function Out-Text($f) { if (Test-Path $f) { (Get-Content $f -Raw) -replace "`0",
 # BuildMode doc gives: this script's SUBJECT is that build. What makes it SAFE is
 # asserted below, not assumed - the lineage suffix on every launch, and the
 # bystander checks at the end.
-$buildMode = Assert-GhozttyIsolatedBuild -Exe $Exe -Allow:$Release
+# T1158 tightened that opt-in: a release-lineage run must normally hold all
+# three isolating knobs. This script cannot, and the reason is its subject - it
+# MEASURES what the lineage suffix does, so arm A is deliberately the no-suffix
+# case, and the knobs are set per LAUNCH (Invoke-Agent / Invoke-Cli save and
+# restore them around each arm) rather than process-wide. The compensating
+# control is the bystander pair: the user's own agents are enumerated before
+# (line ~238) and asserted still running at the end (line ~433).
+$buildMode = if ($Release) {
+    Assert-GhozttyIsolatedBuild -Exe $Exe -Allow -UserEndpoints `
+        -Reason 'this script measures the agent lineage itself, so its arms set the knobs per launch, not process-wide; bystander agents are asserted untouched before and after'
+} else {
+    Assert-GhozttyIsolatedBuild -Exe $Exe
+}
 Say "build mode under test: $buildMode"
 
 # T1127: the by-PID cleanup below cannot reach a `--pty-host` holder - the

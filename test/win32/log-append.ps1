@@ -67,7 +67,11 @@ $env:LOCALAPPDATA = $root
 # is the startup banner each one writes on its way through. Per-PID (T680) so a
 # leaked instance from an earlier run can never be the thing that answers.
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
-[void](Set-GhozttyTestIsolation -Tag 'logappend')
+# T1158: -ReleaseSandbox so the agent lineage moves too. This script never
+# starts an agent (its whole workload is `+list`), but the gate below no longer
+# takes that on trust from a release-lineage run - and $root stays the
+# LOCALAPPDATA it already was, so $logPath is unchanged.
+[void](Set-GhozttyTestIsolation -Tag 'logappend' -ReleaseSandbox -SandboxRoot $root)
 # T1033: the build-mode pre-flight, answered explicitly rather than skipped.
 # This script's SUBJECT is a release build - the file sink is compiled out of
 # Debug - and what makes that safe is above: its own LOCALAPPDATA (so the log

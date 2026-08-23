@@ -221,10 +221,37 @@ Assert 'B4 and a readable release build is refused too' `
     ((Get-Throw { Assert-GhozttyIsolatedBuild -Exe $fastNamed }) -match 'REFUSING TO RUN')
 
 # Past the gate, the next thing to complain is the desktop - which is how these
-# two prove the gate let them through rather than that it never ran.
+# prove the gate let them through rather than that it never ran.
+#
+# T1158: -AllowReleaseBuild is no longer a free pass. A release-lineage run has
+# to hold all three isolating knobs, so the pass-through is shown from a
+# sandboxed state - and B5z first shows that the launcher cannot be used to
+# smuggle a PARTLY isolated release run past the tightened gate, which is the
+# state soak.ps1 was in when it seeded the user's agent with pinned sessions.
+$savedB5Suffix = $env:GHOZTTY_PIPE_SUFFIX
+$savedB5Inst = $env:GHOZTTY_AGENT_INSTANCE
+$savedB5Lad = $env:LOCALAPPDATA
+
+$env:GHOZTTY_PIPE_SUFFIX = "-lpa$PID"
+Remove-Item Env:GHOZTTY_AGENT_INSTANCE -ErrorAction SilentlyContinue
+$env:LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData')
+$msgPartial = Get-Throw { Start-OnTestDesktop -Exe $stubApp -AllowReleaseBuild }
+Assert 'B5z -AllowReleaseBuild does not excuse a partly-isolated release run' `
+    ($msgPartial -match 'REFUSING TO RUN') "(got: $msgPartial)"
+Assert 'B5y and the refusal names the knob that is missing' `
+    ($msgPartial -match 'GHOZTTY_AGENT_INSTANCE is unset') "(got: $msgPartial)"
+
+$env:GHOZTTY_AGENT_INSTANCE = "lpa$PID"
+$env:LOCALAPPDATA = Join-Path $stubDir 'sandbox-lad'
 $msgAllow = Get-Throw { Start-OnTestDesktop -Exe $stubApp -AllowReleaseBuild }
-Assert 'B5 -AllowReleaseBuild reaches the gate and passes through' `
+Assert 'B5 -AllowReleaseBuild reaches the gate and passes through once isolated' `
     ($msgAllow -match 'No test desktop') "(got: $msgAllow)"
+
+if ($null -eq $savedB5Suffix) { Remove-Item Env:GHOZTTY_PIPE_SUFFIX -ErrorAction SilentlyContinue }
+else { $env:GHOZTTY_PIPE_SUFFIX = $savedB5Suffix }
+if ($null -eq $savedB5Inst) { Remove-Item Env:GHOZTTY_AGENT_INSTANCE -ErrorAction SilentlyContinue }
+else { $env:GHOZTTY_AGENT_INSTANCE = $savedB5Inst }
+$env:LOCALAPPDATA = $savedB5Lad
 
 $msgAgent = Get-Throw { Start-OnTestDesktop -Exe (Join-Path $stubDir 'ghoztty-agent.exe') }
 Assert 'B6 a non-app launch is not gated on the app''s build mode' `

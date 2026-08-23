@@ -152,6 +152,44 @@ function Get-GhozttyBuildMode {
     return $mode
 }
 
+function Get-GhozttyReleaseSandboxGaps {
+    <#
+    .SYNOPSIS
+    Which of the three isolating knobs a release-lineage run is still missing.
+
+    .DESCRIPTION
+    T1158. The header above says it: "One or two of the three is the dangerous
+    state, not a partial win." This is that sentence made checkable, so the
+    `-Allow` opt-in can VERIFY the claim instead of taking the caller's word.
+
+    Returns an array of human-readable gaps - empty means all three knobs are
+    set, which is the only state in which a release-lineage build may open a
+    window here.
+
+      GHOZTTY_PIPE_SUFFIX     the app's IPC pipe
+      GHOZTTY_AGENT_INSTANCE  the agent's guard mutex, pipe and state dir (T167;
+                              honored in RELEASE builds too)
+      LOCALAPPDATA            every file either of them writes; compared against
+                              the KNOWN FOLDER rather than another env read,
+                              since `[Environment]::GetFolderPath` is immune to
+                              the very override we are trying to detect.
+    #>
+    $gaps = @()
+    if ([string]::IsNullOrWhiteSpace($env:GHOZTTY_PIPE_SUFFIX)) {
+        $gaps += 'GHOZTTY_PIPE_SUFFIX is unset - the app''s IPC pipe is the user''s'
+    }
+    if ([string]::IsNullOrWhiteSpace($env:GHOZTTY_AGENT_INSTANCE)) {
+        $gaps += 'GHOZTTY_AGENT_INSTANCE is unset - sessions this run opens land in the agent that owns the user''s live panes, PINNED, where nothing reaps them'
+    }
+    $realLad = $null
+    try { $realLad = [Environment]::GetFolderPath('LocalApplicationData') } catch { $realLad = $null }
+    if ($realLad -and $env:LOCALAPPDATA -and
+        ($env:LOCALAPPDATA.TrimEnd([char]92) -eq $realLad.TrimEnd([char]92))) {
+        $gaps += "LOCALAPPDATA is still the user's ($realLad) - state files, layout blobs and the session roster are shared"
+    }
+    return @($gaps)
+}
+
 function Assert-GhozttyIsolatedBuild {
     <#
     .SYNOPSIS
@@ -166,7 +204,13 @@ function Assert-GhozttyIsolatedBuild {
     lineage acceptance run under the three isolating knobs above. It is
     deliberately an explicit act: there is no env var that makes a release run
     safe, only one that says "I know, and this script is about that build".
-    Whatever it does next is the script's own responsibility to measure.
+
+    T1158: the opt-in is CHECKED, not trusted. A release-lineage run must hold
+    all three isolating knobs (Get-GhozttyReleaseSandboxGaps names the ones it
+    is missing) - or say, with -UserEndpoints -Reason '<why>', that reaching the
+    user's real endpoints IS the point and it opens no panes. `-Allow` on its
+    own used to return unconditionally, and that unchecked return is what let
+    `soak.ps1` seed the user's agent with pinned sessions nothing could reap.
 
     A mode this file cannot read at all (an exe that does not run, or one too
     old to print the line) is refused for the same reason an unknown mode is:
@@ -175,11 +219,62 @@ function Assert-GhozttyIsolatedBuild {
     #>
     param(
         [Parameter(Mandatory = $true)][string]$Exe,
-        [switch]$Allow
+        [switch]$Allow,
+        [switch]$UserEndpoints,
+        [string]$Reason
     )
 
     if ($Allow -or $env:GHOZTTY_TEST_ALLOW_RELEASE -eq '1') {
-        return (Get-GhozttyBuildMode -Exe $Exe)
+        $mode = Get-GhozttyBuildMode -Exe $Exe
+        # A debug-lineage exe under -Allow needs nothing further: its endpoints
+        # are already not the user's, which is the whole question here.
+        if (Test-GhozttyIsolatedBuildMode -Mode $mode) { return $mode }
+
+        # T1158: the opt-in used to return right here, and that unchecked return
+        # is what shipped the window storm. `soak.ps1` set GHOZTTY_PIPE_SUFFIX,
+        # passed -AllowReleaseBuild, and its panes opened sessions in the agent
+        # that owns the user's live terminal. A pinned session survives the
+        # window close its teardown does - that IS the persistence feature - so
+        # every run left its shells behind, alive and unreapable, and the pile
+        # grew until the 5am refresh restarted the user's terminal into it.
+        #
+        # So -Allow now VERIFIES rather than trusts. The header's sentence -
+        # "one or two of the three is the dangerous state, not a partial win" -
+        # is the rule, and this is where it is enforced.
+        if ($UserEndpoints) {
+            if ([string]::IsNullOrWhiteSpace($Reason)) {
+                throw 'Assert-GhozttyIsolatedBuild: -UserEndpoints requires -Reason "<why this script must reach the user''s endpoints>". An unexplained opt-out is the state T1158 was.'
+            }
+            Write-Host "  [build-mode] release lineage on the USER'S endpoints, declared: $Reason"
+            return $mode
+        }
+
+        $gaps = Get-GhozttyReleaseSandboxGaps
+        if ($gaps.Count -eq 0) { return $mode }
+
+        $list = ($gaps | ForEach-Object { "    - $_" }) -join "`n"
+        throw @"
+Assert-GhozttyIsolatedBuild: REFUSING TO RUN. The exe under test
+    $Exe
+is a '$mode' build and -Allow says that is deliberate - but the run is only
+PARTLY isolated, which is the dangerous state, not a partial win:
+
+$list
+
+Isolating a release-lineage run takes all THREE knobs. The one-liner is:
+
+    . (Join-Path `$PSScriptRoot 'lib\Isolation.ps1')
+    Set-GhozttyTestIsolation -Tag '<script>' -ReleaseSandbox
+
+If this script's SUBJECT really is the user's installed build - an upgrade or
+delivery test that must dial the real endpoints and opens no panes - say so:
+
+    Assert-GhozttyIsolatedBuild -Exe `$Exe -Allow -UserEndpoints -Reason '<why>'
+
+T1158: soak.ps1 held exactly one of the three for weeks. Each run left its
+shells in the user's agent as pinned sessions nothing can reap, and the 5am
+refresh restarted the user's terminal into the accumulated pile.
+"@
     }
 
     $mode = Get-GhozttyBuildMode -Exe $Exe
@@ -200,14 +295,18 @@ local agent's pipe and its state files are the ones the user's INSTALLED Ghoztty
 owns, and this script would open windows in the user's terminal, type into it,
 and then report a pass about a binary nobody here built.
 
-A private GHOZTTY_PIPE_SUFFIX does not fix this: the agent pipe is build-mode
-derived and has no env override.
+A private GHOZTTY_PIPE_SUFFIX does not fix this on its own: it moves the app's
+pipe and nothing else. The agent half needs GHOZTTY_AGENT_INSTANCE (T167,
+honored in release builds too) and the file half needs LOCALAPPDATA - all three
+or none, see Get-GhozttyReleaseSandboxGaps.
 
 Rebuild zig-out the way CLAUDE.md says, and re-run:
     zig build -Dapp-runtime=win32 -Doptimize=Debug
 
 If this script's SUBJECT really is a release build (an upgrade or delivery
 test), say so explicitly: pass -Allow to this assert, or set
-GHOZTTY_TEST_ALLOW_RELEASE=1 for the run.
+GHOZTTY_TEST_ALLOW_RELEASE=1 for the run. Since T1158 that opt-in is CHECKED,
+not taken on trust - a release-lineage run that opens panes must hold all three
+isolating knobs, or declare -UserEndpoints -Reason '<why>'.
 "@
 }

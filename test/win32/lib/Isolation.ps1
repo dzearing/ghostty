@@ -66,12 +66,48 @@ process is the script, so there is nothing to leak and no `finally` to forget.
 function Set-GhozttyTestIsolation {
     param(
         [Parameter(Mandatory = $true)][string]$Tag,
-        [switch]$Quiet
+        [switch]$Quiet,
+        [switch]$ReleaseSandbox,
+        [string]$SandboxRoot
     )
     $suffix = "-$Tag$PID"
     $env:GHOZTTY_PIPE_SUFFIX = $suffix
     $script:GhozttyIsolationTag = $suffix
     if (-not $Quiet) { "  [isolation] GHOZTTY_PIPE_SUFFIX=$suffix" }
+
+    # T1158. The other two thirds, for a script that legitimately drives a
+    # RELEASE-lineage build. The app pipe alone is the state BuildMode.ps1's
+    # header calls "the dangerous state, not a partial win": a release build
+    # under a private suffix still dials the agent that owns the user's live
+    # sessions, so every pane it opens becomes a PINNED session in the user's
+    # real roster - and a pinned live session is immortal by design, because
+    # that is what makes a pane survive closing the window.
+    #
+    # Kept behind a switch rather than made unconditional: the ~50 debug-lineage
+    # scripts already get their agent isolation from the build mode, and moving
+    # their LOCALAPPDATA would move the very `-debug` state dirs their
+    # assertions read.
+    if ($ReleaseSandbox) {
+        # `GHOZTTY_AGENT_INSTANCE` caps at 24 chars (agent_lineage.max_len) and
+        # is REJECTED, not truncated, past that - two sandboxes differing only
+        # past the cap would silently share one lineage. Keep it short and
+        # run-unique: the tag is trimmed, the pid is not.
+        $pidPart = [string]$PID
+        $tagRoom = 24 - ($pidPart.Length + 1)
+        $tagPart = if ($Tag.Length -gt $tagRoom) { $Tag.Substring(0, [Math]::Max(1, $tagRoom)) } else { $Tag }
+        $instance = "$tagPart-$pidPart"
+        $env:GHOZTTY_AGENT_INSTANCE = $instance
+
+        $root = if ($SandboxRoot) { $SandboxRoot } else { Join-Path $env:TEMP "ghoztty-sandbox-$Tag$PID" }
+        New-Item -ItemType Directory -Force (Join-Path $root 'ghoztty') | Out-Null
+        $env:LOCALAPPDATA = $root
+
+        if (-not $Quiet) {
+            "  [isolation] GHOZTTY_AGENT_INSTANCE=$instance"
+            "  [isolation] LOCALAPPDATA=$root"
+        }
+    }
+
     return $suffix
 }
 

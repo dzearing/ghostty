@@ -49,7 +49,8 @@ New-Item -ItemType Directory -Force $outDir | Out-Null
 $report = Join-Path $outDir 'report.txt'
 $csv = Join-Path $outDir 'samples.csv'
 $logSlice = Join-Path $outDir 'log-slice.txt'
-$appLog = Join-Path $env:LOCALAPPDATA 'ghoztty\ghoztty.log'
+# $appLog is derived AFTER the sandbox below moves LOCALAPPDATA - see there.
+$appLog = $null
 
 function Rep($m) { $m | Tee-Object -FilePath $report -Append | Write-Host }
 $script:pass = 0
@@ -69,12 +70,40 @@ public class SoakDrv {
 
 if (-not (Test-Path $ExePath)) { Rep "ABORT: exe not found: $ExePath"; exit 1 }
 $exe = $ExePath
-$env:GHOZTTY_PIPE_SUFFIX = "-soak$PID"
+# T1158 bystander baseline. Read the USER'S session roster while the env is
+# still theirs - $exe is a release build, so with no GHOZTTY_AGENT_INSTANCE set
+# it dials exactly the agent that owns the user's live panes. This is the
+# measurement the fix is judged by, and it is taken by the harness itself so
+# every future run re-proves it instead of trusting the env vars below.
+$userSessionsBefore = @(
+    (& $exe +sessions 2>&1 | ForEach-Object { $_.ToString() }) |
+        Where-Object { $_ -match '^[0-9a-f]{32}' } |
+        ForEach-Object { ($_ -split '\s+')[0] }
+)
+
+# T1158: ALL THREE isolating knobs, not just the app pipe. This harness's
+# subject is a RELEASE build, so its endpoints are the user's by default, and
+# for weeks it held only `GHOZTTY_PIPE_SUFFIX` - the state BuildMode.ps1's own
+# header calls "the dangerous state, not a partial win". The app pipe was
+# private while every pane it opened became a session in the agent that owns the
+# user's live terminal, PINNED. A pinned live session is immortal on purpose
+# (it is what lets a pane outlive its window), so nothing reaped them: two runs
+# left six shells behind, and the 5am refresh restarted the user's terminal into
+# the pile. `-ReleaseSandbox` adds GHOZTTY_AGENT_INSTANCE and a private
+# LOCALAPPDATA, and `Assert-GhozttyIsolatedBuild` below now verifies all three
+# rather than taking `-AllowReleaseBuild` on trust.
+. (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+[void](Set-GhozttyTestIsolation -Tag 'soak' -ReleaseSandbox -SandboxRoot (Join-Path $outDir 'sandbox'))
 $env:GHOZTTY_PERF = '1'
+# Now that LOCALAPPDATA is the sandbox, this is the log THIS run's app writes.
+# It used to be the user's own `ghoztty.log`, so the GHOZTTY_PERF slice below
+# was reading the user's live terminal's telemetry interleaved with the soak's.
+$appLog = Join-Path $env:LOCALAPPDATA 'ghoztty\ghoztty.log'
 $exeItem = Get-Item $exe
 Rep "=== ghoztty soak $stamp"
 Rep "exe: $exe ($(($exeItem).LastWriteTime), $(($exeItem).Length) bytes)"
 Rep "duration: $Minutes min; pipe suffix: $env:GHOZTTY_PIPE_SUFFIX"
+Rep "agent lineage: $env:GHOZTTY_AGENT_INSTANCE; state root: $env:LOCALAPPDATA"
 
 # --- Load-generator assets ----------------------------------------------------
 $assetDir = Join-Path $env:TEMP 'ghoztty-soak'
@@ -272,8 +301,27 @@ if ($procAlive) {
         # between latency probes), so a global stall assertion false-fails.
         # Stall detection comes from Responding, fps-under-load, and the
         # latency probes instead.
-        Rep "renderer telemetry: $($fpsVals.Count) windows, median fps $medianFps, worst frame gap ${maxGap}ms (idle panes inflate this), slow-mutex warns $slowMutex"
-        Assert ($medianFps -ge 20) "median fps under load >= 20 (got $medianFps)"
+        # T1158: the assertion here used to be `median fps >= 20`, and it was
+        # measuring the wrong process. $appLog was the USER'S ghoztty.log -
+        # LOCALAPPDATA was not isolated - so this slice mixed the soak's app
+        # with the terminal the user was actually working in, whose busy frames
+        # floated the median over the bar. With the sandbox in place the slice
+        # is purely this run's app, and the population turns out to be BIMODAL:
+        # the sampler reports per WINDOW, most windows are idle between load
+        # bursts and report fps=1, while the ones actually rendering sit at the
+        # 60 cap. Measured 2026-08-23 over 534 samples: min 1, median 1, p75 31,
+        # p90 60, max 60. A median over that population is not a statement about
+        # rendering under load at all - it is a statement about how many panes
+        # happened to be idle.
+        #
+        # So the claim is made where the load is: the top decile of sampled
+        # windows must sustain at least half the 60 fps cap. That is a real
+        # floor with real margin (p90 measured at the cap), and it goes red for
+        # the thing this assertion exists to catch - a renderer that cannot keep
+        # up ANYWHERE under the soak's load.
+        $p90Fps = $sortedFps[[int]($sortedFps.Count * 0.90)]
+        Rep "renderer telemetry: $($fpsVals.Count) samples, median fps $medianFps, p90 fps $p90Fps, worst frame gap ${maxGap}ms (idle panes inflate both), slow-mutex warns $slowMutex"
+        Assert ($p90Fps -ge 30) "the rendering windows sustain >= 30 fps (p90 $p90Fps)"
     } else {
         Rep "WARN  too few perf log windows ($($fpsVals.Count)) - telemetry assertions skipped"
     }
@@ -314,6 +362,34 @@ if ($procAlive) {
     $proc.Refresh()
     if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
 }
+
+# T1158: the sandbox has an agent of its OWN now, and a `--pty-host` holder per
+# pane that deliberately outlives it (T904/T906 - that is what makes a session
+# survive an agent restart, so it is neither a child of the agent nor in its
+# job). Closing the window reaches none of them, which is the T1127 shape
+# exactly. Stop-RepoGhoztty is path-exact and refuses anything not under the
+# repo, so this can only ever reach zig-out-release's own processes - never the
+# installed agent holding the user's panes.
+[void](Stop-RepoGhoztty -Exe $exe -SettleMs 1500)
+
+# --- T1158: the bystander check ------------------------------------------------
+# The point of the whole sandbox, asserted rather than assumed. Read the user's
+# roster back with the env restored to theirs; a session this run opened must
+# not be in it. Before the sandbox every soak added its panes here as PINNED
+# sessions, which are immortal by design (that is what lets a pane outlive its
+# window), so nothing reaped them and the 5am refresh restarted the user's
+# terminal into the accumulated pile.
+$env:GHOZTTY_AGENT_INSTANCE = $null
+Remove-Item Env:GHOZTTY_AGENT_INSTANCE -ErrorAction SilentlyContinue
+$env:LOCALAPPDATA = [Environment]::GetFolderPath('LocalApplicationData')
+$userSessionsAfter = @(
+    (& $exe +sessions 2>&1 | ForEach-Object { $_.ToString() }) |
+        Where-Object { $_ -match '^[0-9a-f]{32}' } |
+        ForEach-Object { ($_ -split '\s+')[0] }
+)
+$strays = @($userSessionsAfter | Where-Object { $userSessionsBefore -notcontains $_ })
+Rep "bystander: user agent held $($userSessionsBefore.Count) session(s) before, $($userSessionsAfter.Count) after"
+Assert ($strays.Count -eq 0) "no session leaked into the user's agent (strays: $($strays -join ' '))"
 
 Rep ''
 if ($script:fail -eq 0) { Rep "ALL PASS ($script:pass assertions) - report: $report" }

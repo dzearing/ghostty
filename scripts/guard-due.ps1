@@ -1710,6 +1710,26 @@ $GuardTable = @(
             'test\win32\test-desktop-harness.ps1'
         )
     },
+    # The build-mode gate itself (T350, tightened by T1158). BuildMode.ps1 was
+    # only ever covered by the build-fresh row above, whose script grades the
+    # FRESHNESS half - so the gate's own harness, build-mode-guard.ps1, had no
+    # row and an edit to the refusal logic pointed nobody at it. That is not
+    # theoretical: T1158 is a defect in exactly this file, where `-Allow`
+    # returned unconditionally and a release-lineage soak seeded the user's
+    # agent with sessions nothing could reap. Isolation.ps1 rides along because
+    # it is where the three knobs are now set in one call, and the gate's whole
+    # question is whether they were. Non-interactive, launches nothing (release
+    # builds are played by stub exes), a few seconds.
+    [pscustomobject]@{
+        Name   = 'build-mode'
+        Script = 'test\win32\build-mode-guard.ps1'
+        Stamp  = 'test\win32\build-mode-guard.stamp.json'
+        Covers = @(
+            'test\win32\lib\BuildMode.ps1',
+            'test\win32\lib\Isolation.ps1',
+            'test\win32\build-mode-guard.ps1'
+        )
+    },
     # The freshness half of the pre-flight (T1028), and the most self-referential
     # row in this table: lib\BuildFresh.ps1 is what stops a green run STAMPING a
     # row here about an exe that was never built from the code it graded. It sits
