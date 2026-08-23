@@ -88,7 +88,15 @@ pub const Layout = struct {
                 .feedback => true, // placed from the trailing edge below
                 else => false,
             };
-            if (absent) {
+            // A button that does not fit WHOLE is not painted at all (T1130,
+            // D83). The strip used to lay every button out from its own
+            // natural width and let the bar's right edge cut through them: a
+            // 62 DIP pane showed one button, a sliced second, and a trailing
+            // button placed entirely outside the bar. A control the pane
+            // cannot pay for reads as a rendering fault, so the strip ends on
+            // the last whole button instead. Order is priority order, so what
+            // goes first is what is reached for least.
+            if (absent or x + m.target > width - pad) {
                 b.* = .{ .left = x, .top = top, .right = x, .bottom = top };
                 continue;
             }
@@ -107,22 +115,30 @@ pub const Layout = struct {
 
         // Feedback trails: measured in from the band's own right edge, never
         // past the leading cluster. A pane too narrow to hold both squeezes the
-        // FIELD to nothing rather than overlapping two painted controls.
+        // FIELD to nothing rather than overlapping two painted controls — and a
+        // pane too narrow to hold the button INSIDE the bar drops it, rather
+        // than parking it off the edge where it painted nothing and answered
+        // no click.
         if (shown.feedback) {
-            const left = @max(width - pad - m.target, cluster_right + pad);
-            buttons[@intFromEnum(Button.feedback)] = .{
-                .left = left,
-                .top = top,
-                .right = left + m.target,
-                .bottom = top + m.target,
-            };
+            const left = width - pad - m.target;
+            if (left >= cluster_right + pad) {
+                buttons[@intFromEnum(Button.feedback)] = .{
+                    .left = left,
+                    .top = top,
+                    .right = left + m.target,
+                    .bottom = top + m.target,
+                };
+            }
         }
 
         // The field takes what is left, floored so a violently narrow pane
         // yields an empty (never inverted) rect rather than a control painted
         // over the buttons.
-        const field_left = cluster_right + field_gap;
-        const field_limit = if (shown.feedback)
+        // Clamped to the band as well as floored: a bar too narrow to hold
+        // even the leading gap would otherwise put an empty field rect PAST
+        // the bar's right edge, which is still a rect outside the pane.
+        const field_left = @min(cluster_right + field_gap, @max(width, 0));
+        const field_limit = if (buttons[@intFromEnum(Button.feedback)].width() > 0)
             buttons[@intFromEnum(Button.feedback)].left - field_gap
         else
             width - field_gap;
@@ -323,8 +339,76 @@ test "a narrow pane squeezes the field, never overlaps two painted buttons" {
         for ([_]i32{ 10, m.target * 2, m.target * 5 }) |width| {
             const l = Layout.init(scale, width, .{ .contents = true, .feedback = true });
             try testing.expect(l.address.right >= l.address.left);
-            try testing.expect(l.button(.feedback).left - l.button(.home).right >= gap);
+            const fb = l.button(.feedback);
+            const home = l.button(.home);
+            // Either the trailing button was dropped for want of room, or it
+            // clears the last PAINTED leading button by a full gap.
+            if (fb.width() > 0 and home.width() > 0) {
+                try testing.expect(fb.left - home.right >= gap);
+            }
         }
+    }
+}
+
+test "T1130: every painted control stays inside the bar, at every width" {
+    for (scales) |scale| {
+        const m = icon_button.Metrics.init(scale);
+        // From "nothing fits" up past the widest strip, one pixel at a time
+        // through the interesting band: this is the invariant, so it may not
+        // hold only at the widths somebody thought to name.
+        var width: i32 = 0;
+        while (width <= m.target * 8) : (width += 1) {
+            const l = Layout.init(scale, width, .{ .contents = true, .feedback = true });
+            for (l.buttons) |b| {
+                if (b.width() <= 0) continue; // dropped: costs no pixels
+                try testing.expect(b.left >= 0);
+                try testing.expect(b.right <= width);
+            }
+            // The field may collapse to nothing, but never inverts and never
+            // sits outside the band.
+            try testing.expect(l.address.right >= l.address.left);
+            try testing.expect(l.address.left >= 0);
+            try testing.expect(l.address.right <= @max(width, 0));
+        }
+    }
+}
+
+test "T1130: buttons drop from the trailing end, and come back as the pane widens" {
+    const scale: f32 = 1.0;
+    const m = icon_button.Metrics.init(scale);
+    const pad = px(4.0, scale);
+
+    // Wide enough for the whole strip: every leading button is painted.
+    const wide = Layout.init(scale, px(600.0, scale), .{ .contents = true, .feedback = true });
+    for ([_]Button{ .contents, .back, .forward, .reload, .home, .feedback }) |which| {
+        try testing.expect(wide.button(which).width() > 0);
+    }
+
+    // Room for exactly two leading buttons and nothing else: the two that
+    // survive are the two that LEAD, and the strip ends on a whole control.
+    const two = Layout.init(scale, pad + 2 * (m.target + pad), .{ .contents = true, .feedback = true });
+    try testing.expect(two.button(.contents).width() > 0);
+    try testing.expect(two.button(.back).width() > 0);
+    try testing.expectEqual(@as(i32, 0), two.button(.forward).width());
+    try testing.expectEqual(@as(i32, 0), two.button(.reload).width());
+    try testing.expectEqual(@as(i32, 0), two.button(.home).width());
+    try testing.expectEqual(@as(i32, 0), two.button(.feedback).width());
+
+    // A dropped button answers no hit, dead on where it would have been.
+    try testing.expect(two.hitButton(scale, two.button(.home).left, two.button(.home).top) == null);
+
+    // Monotone: widening never takes a button away. (The control for the drop
+    // rule — a rule that dropped on the way UP would be worse than clipping.)
+    var painted_prev: usize = 0;
+    var width: i32 = 0;
+    while (width <= m.target * 8) : (width += 1) {
+        const l = Layout.init(scale, width, .{ .contents = true, .feedback = true });
+        var painted: usize = 0;
+        for (l.buttons) |b| {
+            if (b.width() > 0) painted += 1;
+        }
+        try testing.expect(painted >= painted_prev);
+        painted_prev = painted;
     }
 }
 

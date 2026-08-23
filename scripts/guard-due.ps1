@@ -200,6 +200,24 @@ $GuardTable = @(
             'test\win32\lib\BrowserLeak.ps1'
         )
     },
+    # Narrow viewer panes (T1130): the only thing that measures viewer chrome
+    # against the pane it lives in. The unit lanes assert the pure layout
+    # modules and cannot see a WINDOW placed outside its parent, and the P1-P3
+    # floor never squeezes a pane - which is how a contents card 88px past its
+    # own pane went unnoticed. Covers the two layout modules the containment
+    # depends on as well as the script.
+    [pscustomobject]@{
+        Name   = 'viewer-narrow-pane'
+        Script = 'test\win32\viewer-narrow-pane.ps1'
+        Stamp  = 'test\win32\viewer-narrow-pane.stamp.json'
+        Covers = @(
+            'test\win32\viewer-narrow-pane.ps1',
+            'src\apprt\win32\viewer_toc_layout.zig',
+            'src\apprt\win32\viewer_nav_layout.zig',
+            'src\apprt\win32\ViewerTOCPanel.zig',
+            'src\apprt\win32\ViewerNavBar.zig'
+        )
+    },
     # The feedback composer (T644): its undo behaviour, quote formatting and
     # send path live in ViewerFeedbackBar and are proved only by this harness
     # - the unit lanes see the pure modules but never a RichEdit. T644 itself

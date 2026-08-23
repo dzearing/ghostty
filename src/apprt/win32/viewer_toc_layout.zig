@@ -107,8 +107,23 @@ pub fn clampWidth(proposed_dip: f32, pane_w_dip: f32) f32 {
 /// The card width the compact overlay actually uses: the shared preference,
 /// clamped to what the pane can hold. Mac: `min(sidePanelWidth, max(120,
 /// bounds.width - outerMargin * 2))`.
+///
+/// The FLOOR is capped by the pane as well (T1130). Mac's expression floors the
+/// card at 120 unconditionally and relies on `clipsToBounds` to hide whatever
+/// hangs off the edge, which is the same shape as the defect 463dcb0b4 fixed
+/// one level up: chrome that insists on a minimum the pane cannot pay. Squeeze
+/// a pane to 62 DIP and that produces a card whose right half - rows, scrollbar
+/// and the rounded corner that says where it ends - is cut off by the pane
+/// rather than laid out inside it. A viewer is a leaf in the split tree and the
+/// tree decides the width, so the card compresses to the pane instead. A pane
+/// wide enough to pay the floor is unaffected, which is every pane above
+/// 120 + 2 * margin DIP.
 pub fn compactCardWidth(pref_dip: f32, pane_w_dip: f32) f32 {
-    return @min(pref_dip, @max(compact_floor_dip, pane_w_dip - margin_dip * 2));
+    const avail = pane_w_dip - margin_dip * 2;
+    const wanted = @min(pref_dip, @max(compact_floor_dip, avail));
+    // Never wider than the pane, and never inverted: a degenerate pane still
+    // yields a sliver rather than a negative width.
+    return @max(@min(wanted, avail), 1.0);
 }
 
 /// How much gutter the page reserves (CSS px == DIP): the card's LEFT margin
@@ -251,17 +266,29 @@ pub const Layout = struct {
                 // content's top-left. It sits over live document text, so it
                 // covers only what the card paints (the native side clips the
                 // window to the card's rounded shape).
+                //
+                // The width is re-clamped HERE in PIXELS as well as in DIP
+                // (T1130): `compactCardWidth` already keeps the card inside
+                // the pane, but two independent roundings — the pane into DIP
+                // and the card back into pixels — can each round up, and one
+                // pixel past the pane edge is still a card the pane has to
+                // clip. The clamp is the invariant; the DIP arithmetic is how
+                // the card gets its shape.
+                const fit_w = @max(@min(card_w, content_w - margin), 1);
                 const win = Rect{
                     .left = margin,
                     .top = margin,
-                    .right = margin + card_w,
+                    .right = margin + fit_w,
                     .bottom = margin + card_h,
                 };
                 return .{
                     .which = which,
                     .window = win,
-                    .card = .{ .left = 0, .top = 0, .right = card_w, .bottom = card_h },
-                    .card_w_dip = card_w_dip,
+                    .card = .{ .left = 0, .top = 0, .right = fit_w, .bottom = card_h },
+                    // Report what was PAINTED, not what was asked for, so the
+                    // drag's start width and the page's gutter agree with the
+                    // card on screen.
+                    .card_w_dip = @as(f32, @floatFromInt(fit_w)) / scale,
                 };
             },
             .hidden => unreachable,
@@ -331,8 +358,39 @@ test "compactCardWidth: preference clamped to the pane, with a floor" {
     try testing.expectEqual(@as(f32, 240), compactCardWidth(240, 700));
     // A narrow pane shrinks the card to fit inside its margins...
     try testing.expectEqual(@as(f32, 300 - 24), compactCardWidth(460, 300));
-    // ...but never below the floor, even in an absurdly narrow pane.
-    try testing.expectEqual(compact_floor_dip, compactCardWidth(460, 100));
+    // ...and it holds at the floor while the pane can still pay for it.
+    try testing.expectEqual(compact_floor_dip, compactCardWidth(460, compact_floor_dip + margin_dip * 2));
+    // T1130: below that, the PANE wins. The floor used to hold regardless,
+    // which put a 120 DIP card in a 76 DIP pane and let the pane clip the
+    // half that would not fit - rows, scrollbar and the rounded corner that
+    // says where the card ends.
+    try testing.expectEqual(@as(f32, 100 - 24), compactCardWidth(460, 100));
+    // Never inverted, however degenerate the pane.
+    try testing.expect(compactCardWidth(460, 10) >= 1);
+    try testing.expect(compactCardWidth(460, 0) >= 1);
+}
+
+test "T1130: the compact card never reaches past the pane, at any width" {
+    for (scales) |scale| {
+        var pane_dip: f32 = 20;
+        while (pane_dip <= 700) : (pane_dip += 1) {
+            const content_w = px(pane_dip, scale);
+            const l = Layout.init(scale, content_w, px(600, scale), 240, px(200, scale), 3);
+            if (l.which == .hidden) continue;
+            try testing.expect(l.window.left >= 0);
+            try testing.expect(l.window.right <= content_w);
+            try testing.expect(l.window.width() >= 1);
+            // Two independent clamps, and the test has to hold BOTH or the
+            // pixel one alone would mask a card whose ROWS were measured at
+            // the wrong width and then cropped. The width the card is laid
+            // out to must itself fit the pane.
+            if (l.which == .compact) {
+                const wanted = compactCardWidth(240, pane_dip);
+                try testing.expect(wanted * scale <= @as(f32, @floatFromInt(content_w)));
+                try testing.expect(l.card_w_dip * scale <= @as(f32, @floatFromInt(content_w)));
+            }
+        }
+    }
 }
 
 test "depth derives from the document's own top level, capped" {
