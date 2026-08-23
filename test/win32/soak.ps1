@@ -18,6 +18,16 @@
 #   soak.ps1                      # 30-minute bounded soak, foreground
 #   soak.ps1 -Minutes 5           # quick smoke
 #   soak.ps1 -Minutes 240 -Detach # relaunch self detached (T53b long run)
+#
+# The sampling loop below prints NOTHING between its start and its verdict, by
+# design - it samples counters every 15s and only speaks when something is
+# wrong. So an unattended runner sees a silent 30-minute process, which is what
+# the declaration on the next line is for: scripts\suite-run.ps1 reads it and
+# gives this script its own cap instead of the 600s one that killed it and
+# scored it `stall` on every sweep (T1125). 30 minutes of soak, plus the
+# launch, the 8MB asset build, the end-of-run probes and teardown.
+#
+# suite-timeout-sec: 2400
 param(
     [int]$Minutes = 30,
     [string]$ExePath = 'D:\git\ghoztty\zig-out-release\bin\ghoztty.exe',

@@ -30,6 +30,12 @@
     I. The between-script leak sweep is repo-scoped: it kills a process running
        out of the given repo's zig-out and leaves everything else alone.
     J. The duration in the report is the duration that was measured.
+    N. Per-script declared timeout - a script that declares `# suite-timeout-sec`
+       is measured against ITS number, an undeclared one against the run's, a
+       garbled one falls back rather than becoming unbounded, and -MaxTimeoutSec
+       bounds every declaration for a deliberately quick pass.
+    O. The line the report quotes is the last thing the script said on STDOUT,
+       not the stderr that is folded in after it.
 
   Prints a single ALL PASS / N FAILURE(S) line, like every other script here.
 
@@ -459,6 +465,154 @@ exit 0
     }
     Remove-Item -LiteralPath $modalPidFile -Force -ErrorAction SilentlyContinue
 
+    # --- N. per-script declared timeout (T1125) ----------------------------
+    Write-Host ''
+    Write-Host '-- N. per-script declared timeout'
+
+    # The failure this is for: `soak.ps1` runs a 30-minute soak by design and
+    # prints nothing while it samples, so the one global 600s cap killed it and
+    # scored it `stall` on every full sweep. Long-session stability - the thing
+    # the standing quality bar names - was therefore never measured, and the
+    # stall read exactly like the app having hung.
+    #
+    # i-slow.ps1 is that shape in miniature: it declares 40s, sleeps 12s, and is
+    # run under a 5s global cap. It must PASS.
+    Set-FixtureScript 'i-slow.ps1' @'
+# suite-timeout-sec: 40
+Start-Sleep -Seconds 12
+"ALL PASS (1 assertions)"
+exit 0
+'@
+
+    $dirN = Join-Path $Fixture 'runN'
+    $rN = Invoke-Runner @('-Include', 'i-slow.ps1', '-OutDir', $dirN, '-TimeoutSec', '5')
+    $sN = Get-Summary $dirN
+    $rowN = @($sN.results | Where-Object { $_.Name -eq 'i-slow.ps1' })
+    Check 'N1 a script that declares its own cap outlives the global one' `
+        ((Get-Verdict $sN 'i-slow.ps1') -eq 'pass') (Get-Verdict $sN 'i-slow.ps1')
+    Check 'N2 it really ran past the global cap (positive control)' `
+        (($rowN.Count -eq 1) -and ($rowN[0].Seconds -gt 5)) `
+        $(if ($rowN.Count) { "$($rowN[0].Seconds)s" } else { '(no row)' })
+    Check 'N3 the summary records the cap the row was measured against' `
+        (($rowN.Count -eq 1) -and ([int]$rowN[0].Timeout -eq 40)) `
+        $(if ($rowN.Count) { "timeout $($rowN[0].Timeout)" } else { '(no row)' })
+    Check 'N4 and that the script asked for it' `
+        (($rowN.Count -eq 1) -and ([int]$rowN[0].Declared -eq 40)) `
+        $(if ($rowN.Count) { "declared $($rowN[0].Declared)" } else { '(no row)' })
+    Check 'N5 the header says which scripts declared one' `
+        ($rN.Text -match 'per-script timeout: i-slow\.ps1 40s') $rN.Text
+
+    # -MaxTimeoutSec is the quick pass: the declaration is bounded rather than
+    # obeyed, and the script goes back to being a stall. Without it a caller who
+    # wanted a fast sweep would have to -Exclude the long scripts by name.
+    $dirN2 = Join-Path $Fixture 'runN2'
+    $rN2 = Invoke-Runner @('-Include', 'i-slow.ps1', '-OutDir', $dirN2, '-TimeoutSec', '5', '-MaxTimeoutSec', '6')
+    $sN2 = Get-Summary $dirN2
+    $rowN2 = @($sN2.results | Where-Object { $_.Name -eq 'i-slow.ps1' })
+    Check 'N6 -MaxTimeoutSec bounds a declaration' `
+        ((Get-Verdict $sN2 'i-slow.ps1') -eq 'stall') (Get-Verdict $sN2 'i-slow.ps1')
+    Check 'N7 and the row names the cap it was actually held to' `
+        (($rowN2.Count -eq 1) -and ([int]$rowN2[0].Timeout -eq 6)) `
+        $(if ($rowN2.Count) { "timeout $($rowN2[0].Timeout)" } else { '(no row)' })
+    Check 'N8 the header says the declaration was capped' `
+        ($rN2.Text -match 'capped from 40s') $rN2.Text
+
+    # An undeclared script is unaffected by any of this - the global cap is
+    # still the cap, which is the case 241 of the 242 scripts are in.
+    $dirN3 = Join-Path $Fixture 'runN3'
+    $null = Invoke-Runner @('-Include', 'g-hang.ps1', '-OutDir', $dirN3, '-TimeoutSec', '5')
+    $sN3 = Get-Summary $dirN3
+    $rowN3 = @($sN3.results | Where-Object { $_.Name -eq 'g-hang.ps1' })
+    Check 'N9 an undeclared script still gets the global cap' `
+        (((Get-Verdict $sN3 'g-hang.ps1') -eq 'stall') -and ($rowN3.Count -eq 1) -and ([int]$rowN3[0].Timeout -eq 5)) `
+        $(if ($rowN3.Count) { "$(Get-Verdict $sN3 'g-hang.ps1') timeout $($rowN3[0].Timeout)" } else { '(no row)' })
+    Check 'N10 and declares nothing' `
+        (($rowN3.Count -eq 1) -and ([int]$rowN3[0].Declared -eq 0)) ''
+
+    # A garbled declaration falls back to the run's cap, never to "no bound" -
+    # the same rule ipc_timeout.zig applies to its env var. Left unbounded, a
+    # typo would hang the sweep forever, which is worse than the stall it was
+    # trying to avoid.
+    Set-FixtureScript 'j-garbled.ps1' @'
+# suite-timeout-sec: soon
+Start-Sleep -Seconds 90
+"ALL PASS (1 assertions)"
+exit 0
+'@
+    $dirN4 = Join-Path $Fixture 'runN4'
+    $null = Invoke-Runner @('-Include', 'j-garbled.ps1', '-OutDir', $dirN4, '-TimeoutSec', '5')
+    $sN4 = Get-Summary $dirN4
+    $rowN4 = @($sN4.results | Where-Object { $_.Name -eq 'j-garbled.ps1' })
+    Check 'N11 an unparseable declaration falls back to the global cap' `
+        (((Get-Verdict $sN4 'j-garbled.ps1') -eq 'stall') -and ($rowN4.Count -eq 1) -and ([int]$rowN4[0].Timeout -eq 5)) `
+        $(if ($rowN4.Count) { "timeout $($rowN4[0].Timeout)" } else { '(no row)' })
+
+    # The real subject: soak.ps1 declares one, so the suite stops scoring it a
+    # stall. Read from the SHIPPING script, not a fixture - a declaration this
+    # harness proves in the abstract and the actual file has lost is the whole
+    # regression.
+    $soak = Join-Path $Repo 'test\win32\soak.ps1'
+    $soakText = ''
+    if (Test-Path -LiteralPath $soak) { $soakText = Get-Content -LiteralPath $soak -Raw }
+    $soakOk = $soakText -match '(?m)^#\s*suite-timeout-sec:\s*(\d+)\s*$'
+    $soakCap = $(if ($soakOk) { [int]$Matches[1] } else { 0 })
+    Check 'N12 soak.ps1 declares a cap longer than its own 30-minute default' `
+        ($soakOk -and ($soakCap -gt 1800)) "declared $soakCap"
+    # Not Invoke-Runner: that one binds -Repo to the throwaway fixture, and the
+    # claim here is about the real test\win32. Stdout only - merging stderr in
+    # would make the captured text depend on the host's buffer width (T883).
+    $soakList = & powershell -NoProfile -ExecutionPolicy Bypass -File $Runner `
+        list -Repo $Repo -Include 'soak.ps1' | Out-String
+    Check 'N13 and the runner reads it off the shipping script' `
+        ($soakList -match 'soak\.ps1\s+\(declares \d+s\)') $soakList
+
+    # --- O. stderr must not masquerade as the verdict line (T1125) ---------
+    Write-Host ''
+    Write-Host '-- O. the quoted line is what the script SAID'
+
+    # stderr is folded onto the end of the log so one file is the whole story.
+    # Scoring that folded file quotes the last stderr line as the verdict - so a
+    # soak killed 20 minutes into its silent sampling loop was reported as
+    # `Waiting for Ghoztty to answer '+list'`, a startup notice printed in its
+    # first seconds, and a hung app was the leading hypothesis for a day.
+    Set-FixtureScript 'k-noisy.ps1' @'
+[Console]::Error.WriteLine("a notice from twenty minutes ago")
+"the last thing stdout said"
+Start-Sleep -Seconds 90
+exit 0
+'@
+    $dirO = Join-Path $Fixture 'runO'
+    $null = Invoke-Runner @('-Include', 'k-noisy.ps1', '-OutDir', $dirO, '-TimeoutSec', '8')
+    $sO = Get-Summary $dirO
+    $rowO = @($sO.results | Where-Object { $_.Name -eq 'k-noisy.ps1' })
+    Check 'O1 a stalled script quotes its last STDOUT line' `
+        (($rowO.Count -eq 1) -and ($rowO[0].Line -match 'the last thing stdout said')) `
+        $(if ($rowO.Count) { $rowO[0].Line } else { '(no row)' })
+    Check 'O2 not the stderr line folded in after it' `
+        (($rowO.Count -eq 1) -and ($rowO[0].Line -notmatch 'twenty minutes ago')) `
+        $(if ($rowO.Count) { $rowO[0].Line } else { '(no row)' })
+    # The fold itself stays: the log is still the whole story, which is the
+    # reason it exists.
+    $logO = Join-Path $dirO 'k-noisy.log'
+    $textO = ''
+    if (Test-Path -LiteralPath $logO) { $textO = Get-Content -LiteralPath $logO -Raw }
+    Check 'O3 the log still holds both halves' `
+        (($textO -match 'twenty minutes ago') -and ($textO -match 'the last thing stdout said')) ''
+
+    # A script that only ever spoke on stderr still gets a hint rather than a
+    # blank: the rule is "stdout unless it said nothing", not "stdout only".
+    Set-FixtureScript 'l-silent-out.ps1' @'
+[Console]::Error.WriteLine("only stderr ever spoke")
+exit 9
+'@
+    $dirO2 = Join-Path $Fixture 'runO2'
+    $null = Invoke-Runner @('-Include', 'l-silent-out.ps1', '-OutDir', $dirO2, '-TimeoutSec', '30')
+    $sO2 = Get-Summary $dirO2
+    $rowO2 = @($sO2.results | Where-Object { $_.Name -eq 'l-silent-out.ps1' })
+    Check 'O4 a script that spoke only on stderr is still quoted' `
+        (($rowO2.Count -eq 1) -and ($rowO2[0].Line -match 'only stderr ever spoke')) `
+        $(if ($rowO2.Count) { $rowO2[0].Line } else { '(no row)' })
+
     # --- J. the duration in the report ------------------------------------
     Write-Host ''
     Write-Host '-- J. Format-Duration'
@@ -492,4 +646,4 @@ if ($script:failures -eq 0) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
         update -Guard suite-run -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
 }
-Write-TestVerdict -Pass $script:passes -Fail $script:failures -MinPass 34
+Write-TestVerdict -Pass $script:passes -Fail $script:failures -MinPass 50

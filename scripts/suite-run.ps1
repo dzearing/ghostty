@@ -24,6 +24,16 @@
       killed at the timeout   => stall
       anything else           => error     (crash, no verdict line, bad launch)
 
+  THE TIMEOUT IS PER SCRIPT, AND A SCRIPT MAY DECLARE ITS OWN. `-TimeoutSec`
+  (600 by default) is the cap for a script that says nothing; a script that
+  legitimately runs longer declares it in its own text with a
+  `# suite-timeout-sec: <N>` comment and is measured against that instead. That
+  declaration is the difference between "this script hung" and "this script is
+  a 30-minute soak" - a distinction the one global cap could not make, and did
+  not: `soak.ps1` was scored `stall` on every sweep (T1125). `-MaxTimeoutSec`
+  bounds every declaration for a deliberately quick pass, and the rows it
+  truncates say so.
+
   It prints one line per script as it goes - never at the end, because a suite
   measured in hours has to be readable while it runs - and writes the same rows
   incrementally to `summary.json`, so a run that is killed half way through
@@ -84,9 +94,17 @@ param(
     [int]$Limit = 0,
     [int]$Skip = 0,
 
-    # Per-script wall-clock cap. The tree is killed and the script scored
-    # `stall`; the suite carries on.
+    # Per-script wall-clock cap for a script that does not declare its own.
+    # The tree is killed and the script scored `stall`; the suite carries on.
     [int]$TimeoutSec = 600,
+
+    # Upper bound on a script's DECLARED cap (see Get-ScriptTimeout). 0 = the
+    # declaration is honoured in full, which is the default: a script that says
+    # it needs 45 minutes is believed, because the alternative is scoring it a
+    # stall every sweep. This exists for the quick pass - `-MaxTimeoutSec 120`
+    # bounds the whole run without having to -Exclude the long scripts by name,
+    # and the rows it truncates say so.
+    [int]$MaxTimeoutSec = 0,
 
     # Where the logs and summary.json go. Defaults to a timestamped directory
     # under temp\suite-runs\.
@@ -147,6 +165,46 @@ recursive, the same rule the verdict/skip/isolation audits use: `lib\` holds
 dot-sourced libraries and `artifacts\` holds fixtures, and neither has a verdict
 to score.
 #>
+<#
+A script's own declaration of how long it legitimately needs, read from a
+`# suite-timeout-sec: <N>` comment in its text. Returns 0 when it declares
+nothing, which means "use the run's -TimeoutSec".
+
+Why a declaration in the script rather than a table in this runner (T1125):
+`soak.ps1` runs a 30-minute soak by design and was killed at the 600s cap on
+every sweep and scored `stall` - a measurement artefact that read exactly like
+the app having hung. The number belongs beside the code that spends it, because
+a table here goes stale the moment somebody changes a script's -Minutes default
+and nobody edits the runner.
+
+Only the first match counts, and only a positive integer: a garbled declaration
+falls back to the run's cap rather than to "no bound", the same rule
+ipc_timeout.zig applies to its env var.
+#>
+function Get-ScriptTimeout {
+    param([string]$Text)
+    if (-not $Text) { return 0 }
+    $m = [regex]::Match($Text, '(?m)^[ \t]*#[ \t]*suite-timeout-sec[ \t]*:[ \t]*(\d+)[ \t]*$')
+    if (-not $m.Success) { return 0 }
+    $v = 0
+    if (-not [int]::TryParse($m.Groups[1].Value, [ref]$v)) { return 0 }
+    if ($v -le 0) { return 0 }
+    return $v
+}
+
+<#
+The cap this run will actually enforce on one script: its declaration when it
+has one, else the run's -TimeoutSec, and never more than -MaxTimeoutSec when
+that is set. Kept separate from Get-ScriptTimeout so the report can say WHICH
+of the two a row was measured against.
+#>
+function Resolve-ScriptTimeout {
+    param([int]$Declared, [int]$Default, [int]$Max)
+    $t = $(if ($Declared -gt 0) { $Declared } else { $Default })
+    if ($Max -gt 0 -and $t -gt $Max) { $t = $Max }
+    return $t
+}
+
 function Get-SuiteScript {
     param([string]$Root, [string]$SetName, [string[]]$Inc)
 
@@ -159,10 +217,11 @@ function Get-SuiteScript {
         # single call every such script must make (lib\TestDesktop.ps1).
         $gui = $text -match 'New-TestDesktop'
         $rows += [pscustomobject]@{
-            Name  = $f.Name
-            Path  = $f.FullName
-            Class = $(if ($gui) { 'gui' } else { 'cli' })
-            Lines = ($text -split "`n").Count
+            Name     = $f.Name
+            Path     = $f.FullName
+            Class    = $(if ($gui) { 'gui' } else { 'cli' })
+            Lines    = ($text -split "`n").Count
+            Declared = (Get-ScriptTimeout -Text $text)
         }
     }
 
@@ -228,10 +287,11 @@ script printing failure exits failure - and the verdict LINE is what a human
 reads. They are recorded separately on purpose: a script whose two disagree is
 a defect this runner should be able to name, not paper over.
 #>
-function Get-RunVerdict {
-    param([int]$ExitCode, [string]$LogPath, [bool]$TimedOut)
+function Get-VerdictLine {
+    param([string]$LogPath)
 
     $line = ''
+    if (-not $LogPath) { return $line }
     if (Test-Path -LiteralPath $LogPath) {
         $tail = @(Get-Content -LiteralPath $LogPath -Tail 40 -ErrorAction SilentlyContinue)
         for ($i = $tail.Count - 1; $i -ge 0; $i--) {
@@ -245,6 +305,21 @@ function Get-RunVerdict {
             if ($t -match 'ALL PASS|FAILURE\(S\)|ASSERTED (NOTHING|TOO LITTLE)|SKIP ALL') { $line = $t; break }
         }
     }
+    return $line
+}
+
+function Get-RunVerdict {
+    param([int]$ExitCode, [string]$LogPath, [bool]$TimedOut, [string]$AltLogPath)
+
+    # STDOUT decides the quoted line, and stderr is only the fallback for a
+    # script that said nothing there at all (T1125). The caller hands them in
+    # as two files on purpose: stderr is folded onto the END of the log, so
+    # scoring one merged file quotes the last stderr line as the verdict - which
+    # is how a soak killed 20 minutes into its silent sampling loop was reported
+    # as `Waiting for Ghoztty to answer '+list'`, a startup notice printed in its
+    # first seconds, and left a hung app as the leading hypothesis for a day.
+    $line = Get-VerdictLine -LogPath $LogPath
+    if (-not $line) { $line = Get-VerdictLine -LogPath $AltLogPath }
 
     if ($TimedOut) { return @{ Kind = 'stall'; Line = $line } }
 
@@ -371,6 +446,10 @@ function Invoke-SuiteScript {
     try { $code = $p.ExitCode } catch { $code = -1 }
     if ($null -eq $code) { $code = -1 }
 
+    # Scored BEFORE the fold below, from the two streams as separate files
+    # (T1125) - see Get-RunVerdict for why the merged file cannot be scored.
+    $v = Get-RunVerdict -ExitCode $code -LogPath $outFile -TimedOut $timedOut -AltLogPath $errFile
+
     # Fold stderr into the log so one file is the whole story, then drop it.
     if ((Test-Path -LiteralPath $errFile) -and (Get-Item -LiteralPath $errFile).Length -gt 0) {
         Add-Content -LiteralPath $outFile -Value "`n--- stderr ---"
@@ -378,13 +457,13 @@ function Invoke-SuiteScript {
     }
     Remove-Item -LiteralPath $errFile -ErrorAction SilentlyContinue
 
-    $v = Get-RunVerdict -ExitCode $code -LogPath $outFile -TimedOut $timedOut
     return [pscustomobject]@{
         Verdict = $v.Kind
         Line    = $v.Line
         Seconds = [math]::Round($sw.Elapsed.TotalSeconds, 1)
         Exit    = $code
         Log     = $outFile
+        Timeout = $TimeoutSeconds
     }
 }
 
@@ -416,6 +495,7 @@ function Save-Summary {
         set     = $Meta.Set
         order   = $Meta.Order
         timeout = $Meta.TimeoutSec
+        maxTimeout = $Meta.MaxTimeoutSec
         repo    = $Meta.Repo
         results = @($Rows)
     }
@@ -446,7 +526,10 @@ if ($Action -eq 'list') {
     $rows = @(Sort-SuiteOrder -Rows $rows -Spec $Order)
     if ($Skip -gt 0) { $rows = @($rows | Select-Object -Skip $Skip) }
     if ($Limit -gt 0) { $rows = @($rows | Select-Object -First $Limit) }
-    foreach ($r in $rows) { '{0,-4} {1}' -f $r.Class, $r.Name }
+    foreach ($r in $rows) {
+        $note = $(if ($r.Declared -gt 0) { "  (declares $($r.Declared)s)" } else { '' })
+        '{0,-4} {1}{2}' -f $r.Class, $r.Name, $note
+    }
     $gui = @($rows | Where-Object { $_.Class -eq 'gui' }).Count
     ''
     "{0} scripts selected ({1} gui, {2} cli) of {3} in $TestRoot" -f `
@@ -527,16 +610,28 @@ $zigOut = Join-Path $Repo 'zig-out'
 
 $meta = [pscustomobject]@{
     Started = (Get-Date).ToString('o'); Set = $Set; Order = $Order
-    TimeoutSec = $TimeoutSec; Repo = $Repo
+    TimeoutSec = $TimeoutSec; MaxTimeoutSec = $MaxTimeoutSec; Repo = $Repo
 }
 
 "suite-run: $($rows.Count) script(s), set=$Set order=$Order timeout=${TimeoutSec}s"
 "  out: $OutDir"
+$declared = @($rows | Where-Object { $_.Declared -gt 0 })
+if ($declared.Count -gt 0) {
+    $shown = @($declared | ForEach-Object {
+            $cap = Resolve-ScriptTimeout -Declared $_.Declared -Default $TimeoutSec -Max $MaxTimeoutSec
+            $note = $(if ($cap -lt $_.Declared) { " capped from $($_.Declared)s" } else { '' })
+            "$($_.Name) ${cap}s$note"
+        })
+    "  per-script timeout: $($shown -join ', ')"
+}
 if ($Resume) { "  resuming: $($done.Count) already recorded" }
 ''
 
 if ($DryRun) {
-    foreach ($r in $rows) { '  would run {0,-4} {1}' -f $r.Class, $r.Name }
+    foreach ($r in $rows) {
+        $cap = Resolve-ScriptTimeout -Declared $r.Declared -Default $TimeoutSec -Max $MaxTimeoutSec
+        '  would run {0,-4} {1,-42} timeout {2}s' -f $r.Class, $r.Name, $cap
+    }
     exit 0
 }
 
@@ -554,7 +649,8 @@ foreach ($r in $rows) {
         continue
     }
 
-    $run = Invoke-SuiteScript -Script $r -LogDir $OutDir -TimeoutSeconds $TimeoutSec -StdinFile $stdinFile
+    $cap = Resolve-ScriptTimeout -Declared $r.Declared -Default $TimeoutSec -Max $MaxTimeoutSec
+    $run = Invoke-SuiteScript -Script $r -LogDir $OutDir -TimeoutSeconds $cap -StdinFile $stdinFile
 
     $leaked = 0
     if (-not $NoSweep) { $leaked = Invoke-LeakSweep -ZigOut $zigOut }
@@ -587,6 +683,12 @@ foreach ($r in $rows) {
         Modals  = $modalLines.Count
         Log     = (Split-Path $run.Log -Leaf)
         Index   = $i
+        # The cap this row was measured against, and whether the script asked
+        # for it. A `stall` is only readable next to the number it hit - and the
+        # number is read back from the call that enforced it, not recomputed
+        # here, so the two cannot drift.
+        Timeout  = $run.Timeout
+        Declared = $r.Declared
     }
     $results += $row
     Write-ResultLine -Row $row -Index $i -Total $rows.Count

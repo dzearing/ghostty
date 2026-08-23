@@ -1229,7 +1229,13 @@ $GuardTable = @(
             'test\win32\suite-run.ps1',
             # T1098: the between-script modal sweep is the runner's, and section
             # M is the only thing that exercises it.
-            'test\win32\lib\ModalSweep.ps1'
+            'test\win32\lib\ModalSweep.ps1',
+            # T1125: soak.ps1 is the one script that declares its own timeout,
+            # and section N reads that declaration out of the shipping file. A
+            # turn that changes soak's runtime and not its declaration is
+            # exactly the regression that put it back to `stall`, so the
+            # harness owes an answer whenever that file moves.
+            'test\win32\soak.ps1'
         )
     },
     # The palette's "Focus: <pane>" jump entries (T555). The pure derivation
