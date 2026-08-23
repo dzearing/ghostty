@@ -30,8 +30,10 @@
 #     the plan's own appendix, checked out at 063ac3ecc, overlaid, and compared
 #     against HEAD. The number this reports is the honest version of the plan's
 #     claim: how many of the 52 the script really does resolve on its own, and
-#     which files still need a human. It is asserted against a baseline so a
-#     rule regression is red rather than merely quieter.
+#     which files still need a human. The baseline it is asserted against is
+#     per-file rather than a count (T1134), so absorbing main cannot turn a
+#     working overlay red - see $ReproManifestRelative below - and C8 proves on
+#     every run that a mis-spelled rule still can.
 # D - the negative control. Every rule is fired at a fixture carrying the
 #     upstream form; a rule that silently stopped matching would otherwise pass
 #     A and B forever, because both of those are assertions that nothing
@@ -65,12 +67,32 @@ $Overlay = Join-Path $Repo 'scripts\fork-identity.ps1'
 $PlanRelative = 'docs\design\windows-parity-upstream-pull-plan.md'
 $ForkPoint = '063ac3ecc'
 
-# The number of the 52 U-files that the overlay reproduces byte-for-byte from
-# the fork point. Measured, not aspirational: 24 of the 52 also carry real work
-# (the selectively-applied CI guards, the PaneView type rename, and genuine
-# feature deltas that happen to live in a small file), and no identity rule can
-# or should produce those. Raise this when a rule earns it.
-$ReproBaseline = 28
+# The reproduction baseline is a PER-FILE MANIFEST, not a count (T1134).
+#
+# It used to be `$ReproBaseline = 28` - "at least 28 of the 52 U-files come back
+# byte-identical". That asserts the right thing about a rule and the wrong thing
+# about the tree: every real edit that lands on a U-file, ours or one arriving
+# through the daily main intake, makes that file irreproducible from a
+# 2026-05-07 tree, so the number only ever falls. T1073's main merge added 45
+# lines to HACKING.md and took it from 28 to 27; three consecutive turns then
+# committed under `-NoGuardDue` past a red that meant nothing was wrong. A check
+# that can only go red is a check people learn to skip.
+#
+# The manifest separates the two questions that one number was answering:
+#
+#   REGRESSION (asserted, C4) - a file recorded as reproducing, whose HEAD blob
+#     has NOT changed since it was recorded, must still reproduce. That is a
+#     rule question, and it does not decay: absorbing main cannot move it.
+#   DRIFT (reported, never asserted) - a recorded file whose HEAD blob HAS
+#     changed and no longer reproduces has acquired real work. That is the
+#     tree's business, not the overlay's, so it is a line of output and a
+#     manifest entry that ages out on the next green run.
+#
+# What a drifted file loses is only the exact-bytes check; it stays covered by A
+# (the overlay reports nothing on it at HEAD) and C5 (the overlay leaves no
+# findings on it from the fork point). What C8 protects is the manifest's teeth:
+# a deliberately mis-spelled rule is proved, every run, to make C4 red.
+$ReproManifestRelative = 'test\win32\fork-identity-repro.json'
 
 function Invoke-GitIn {
     param([string]$At, [string[]]$GitArgs)
@@ -83,9 +105,10 @@ function Invoke-GitIn {
 # formatted to the host's buffer width, and an assertion over that text is an
 # assertion about the console it ran in.
 function Invoke-Overlay {
-    param([string[]]$OverlayArgs)
+    param([string[]]$OverlayArgs, [string]$OverlayPath)
     $ErrorActionPreference = 'SilentlyContinue'
-    $out = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $Overlay @OverlayArgs 2>$null)
+    if (-not $OverlayPath) { $OverlayPath = $Overlay }
+    $out = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $OverlayPath @OverlayArgs 2>$null)
     return [pscustomobject]@{ Code = $LASTEXITCODE; Text = ($out -join "`n"); Lines = $out }
 }
 
@@ -116,6 +139,61 @@ function Get-UFiles {
     }
     return $files
 }
+
+# The recorded side of the manifest: path -> the HEAD blob sha that path had
+# when it was last observed reproducing. Missing or unreadable is a FAILURE
+# rather than a skip - the file is committed, so its absence is a real defect
+# and not a property of this box.
+function Read-ReproManifest {
+    $path = Join-Path $Repo $ReproManifestRelative
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try { return (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json) }
+    catch { return $null }
+}
+
+function Get-ManifestMap {
+    param($doc)
+    $map = @{}
+    if ($null -eq $doc -or $null -eq $doc.reproduced) { return $map }
+    foreach ($p in $doc.reproduced.PSObject.Properties) { $map[$p.Name] = [string]$p.Value }
+    return $map
+}
+
+# Written only when the recorded map actually MOVED, exactly as
+# guard-due.ps1's Write-Stamp is: a green run that changed nothing must leave a
+# clean working tree, or every run produces a diff nobody means and nobody
+# reads.
+function Write-ReproManifest {
+    param([hashtable]$Live, [hashtable]$Existing)
+    $same = ($Existing.Count -eq $Live.Count)
+    if ($same) {
+        foreach ($k in $Live.Keys) {
+            if (-not $Existing.ContainsKey($k) -or $Existing[$k] -ne $Live[$k]) { $same = $false; break }
+        }
+    }
+    if ($same) { return $false }
+
+    $commit = (Invoke-GitIn $Repo @('rev-parse', '--short', 'HEAD')).Text.Trim()
+    $files = [ordered]@{}
+    foreach ($k in ($Live.Keys | Sort-Object)) { $files[$k] = $Live[$k] }
+    $doc = [ordered]@{
+        note       = 'T1134. Each entry is a U-file the overlay reproduces byte-for-byte from the fork point, recorded with the HEAD blob sha it had at the time. Unchanged sha + no longer reproducing = a rule regression (red). Changed sha = the file acquired real work (reported, ages out). Regenerated by a green test\win32\fork-identity.ps1 run; commit it with the change that moved it.'
+        forkPoint  = $ForkPoint
+        generated  = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK')
+        commit     = $commit
+        reproduced = $files
+    }
+    $json = ($doc | ConvertTo-Json -Depth 5)
+    [System.IO.File]::WriteAllText((Join-Path $Repo $ReproManifestRelative),
+        ($json -replace "`r`n", "`n") + "`n", (New-Object System.Text.UTF8Encoding($false)))
+    return $true
+}
+
+# Set only by a completed section C, so the skip path (no fork point in this
+# object store) cannot rewrite the baseline from a measurement it never made.
+$script:ReproLive = $null
+$script:ReproRecorded = @{}
+$script:ReproManifestMissing = $false
 
 $sandbox = Join-Path $env:TEMP "ghoztty-fork-identity-$PID"
 if (Test-Path -LiteralPath $sandbox) { Remove-Item -LiteralPath $sandbox -Recurse -Force }
@@ -192,20 +270,6 @@ try {
     if (-not $haveForkPoint) {
         Skip 'C1 reproduction measurement' "$ForkPoint is not in this object store (run scripts\upstream-remote.ps1 ensure)"
     } else {
-        $forkTree = Join-Path $sandbox 'forkpoint'
-        $staged = 0
-        foreach ($f in $uFiles) {
-            $blob = Invoke-GitIn $Repo @('show', "${ForkPoint}:$f")
-            if ($blob.Code -ne 0) { continue }
-            Write-Fixture $forkTree $f (($blob.Lines -join "`n") + "`n") | Out-Null
-            $staged++
-        }
-        Assert 'C1 U-files staged at the fork point' ($staged -ge 40) "staged=$staged"
-
-        $ap2 = Invoke-Overlay @('apply', '-Path', $forkTree)
-        Assert 'C2 apply exits 0 on the fork-point tree' ($ap2.Code -eq 0) "exit=$($ap2.Code)"
-        Assert 'C3 apply actually rewrote files' ($ap2.Text -match 'rewrote \d+ file') $ap2.Text
-
         # git's `show` gives LF; the working tree may hold CRLF. The subject
         # here is CONTENT, so both sides are compared with line endings and
         # trailing whitespace-only differences normalized away.
@@ -214,24 +278,91 @@ try {
             return ((($Text -replace "`r`n", "`n").TrimEnd("`n")))
         }
 
-        $repro = 0
-        $residual = New-Object System.Collections.ArrayList
-        foreach ($f in $uFiles) {
-            $applied = Join-Path $forkTree ($f -replace '/', '\')
-            if (-not (Test-Path -LiteralPath $applied)) { continue }
-            $head = Invoke-GitIn $Repo @('show', "HEAD:$f")
-            if ($head.Code -ne 0) { continue }
-            $a = Get-Normalized ([System.IO.File]::ReadAllText($applied))
-            $h = Get-Normalized (($head.Lines -join "`n"))
-            if ($a -ceq $h) { $repro++ } else { [void]$residual.Add($f) }
+        function New-ForkPointTree {
+            param([string]$Dest)
+            $n = 0
+            foreach ($f in $uFiles) {
+                $blob = Invoke-GitIn $Repo @('show', "${ForkPoint}:$f")
+                if ($blob.Code -ne 0) { continue }
+                Write-Fixture $Dest $f (($blob.Lines -join "`n") + "`n") | Out-Null
+                $n++
+            }
+            return $n
         }
 
-        Say ("     reproduced exactly: {0} of {1}" -f $repro, $staged)
+        # Which U-files an overlay reproduces byte-for-byte, and at what HEAD
+        # blob sha. Parameterized on the overlay script so C8 can run the same
+        # measurement against a deliberately broken copy.
+        function Measure-Reproduction {
+            param([string]$OverlayPath, [string]$TreeDir)
+            $repro = @{}
+            $residual = New-Object System.Collections.ArrayList
+            foreach ($f in $uFiles) {
+                $applied = Join-Path $TreeDir ($f -replace '/', '\')
+                if (-not (Test-Path -LiteralPath $applied)) { continue }
+                $head = Invoke-GitIn $Repo @('show', "HEAD:$f")
+                if ($head.Code -ne 0) { continue }
+                $a = Get-Normalized ([System.IO.File]::ReadAllText($applied))
+                $h = Get-Normalized (($head.Lines -join "`n"))
+                if ($a -ceq $h) {
+                    $sha = (Invoke-GitIn $Repo @('rev-parse', "HEAD:$f")).Text.Trim()
+                    $repro[$f] = $sha
+                } else { [void]$residual.Add($f) }
+            }
+            return [pscustomobject]@{ Repro = $repro; Residual = $residual }
+        }
+
+        $forkTree = Join-Path $sandbox 'forkpoint'
+        $staged = New-ForkPointTree $forkTree
+        Assert 'C1 U-files staged at the fork point' ($staged -ge 40) "staged=$staged"
+
+        $ap2 = Invoke-Overlay @('apply', '-Path', $forkTree)
+        Assert 'C2 apply exits 0 on the fork-point tree' ($ap2.Code -eq 0) "exit=$($ap2.Code)"
+        Assert 'C3 apply actually rewrote files' ($ap2.Text -match 'rewrote \d+ file') $ap2.Text
+
+        $measured = Measure-Reproduction $Overlay $forkTree
+        $reproMap = $measured.Repro
+        $residual = $measured.Residual
+
+        Say ("     reproduced exactly: {0} of {1}" -f $reproMap.Count, $staged)
         Say  '     residual (real work, not identity):'
         foreach ($r in $residual) { Say ("       {0}" -f $r) }
 
-        Assert "C4 at least $ReproBaseline of the U-files reproduce from the fork point" `
-        ($repro -ge $ReproBaseline) "reproduced=$repro baseline=$ReproBaseline"
+        # ---- the baseline, per file rather than as a count ------------------
+        $manifestDoc = Read-ReproManifest
+        $recorded = Get-ManifestMap $manifestDoc
+
+        $script:ReproManifestMissing = ($null -eq $manifestDoc)
+        Assert 'C4a the reproduction manifest is present and readable' ($null -ne $manifestDoc) `
+            "expected $ReproManifestRelative - one is being written from this run; re-run to measure against it"
+        Assert 'C4b the manifest was recorded at this fork point' `
+        ($null -eq $manifestDoc -or $manifestDoc.forkPoint -eq $ForkPoint) `
+            "manifest forkPoint=$($manifestDoc.forkPoint) harness=$ForkPoint"
+
+        # A recorded file that stopped reproducing splits cleanly in two: if its
+        # HEAD blob is byte-for-byte what it was when recorded, nothing about
+        # the tree moved and the overlay is the only thing that can have - that
+        # is the regression. If the blob moved, the file acquired real work.
+        $regressed = New-Object System.Collections.ArrayList
+        $drifted = New-Object System.Collections.ArrayList
+        foreach ($f in $recorded.Keys) {
+            if ($reproMap.ContainsKey($f)) { continue }
+            $now = (Invoke-GitIn $Repo @('rev-parse', "HEAD:$f")).Text.Trim()
+            if ($now -eq $recorded[$f]) { [void]$regressed.Add($f) } else { [void]$drifted.Add($f) }
+        }
+        $gained = @($reproMap.Keys | Where-Object { -not $recorded.ContainsKey($_) } | Sort-Object)
+
+        if ($drifted.Count -gt 0) {
+            Say ("     drifted since the baseline ({0}) - real work landed on these, no longer reproducible:" -f $drifted.Count)
+            foreach ($d in ($drifted | Sort-Object)) { Say ("       {0}" -f $d) }
+        }
+        if ($gained.Count -gt 0) {
+            Say ("     newly reproducing ({0}):" -f $gained.Count)
+            foreach ($g in $gained) { Say ("       {0}" -f $g) }
+        }
+
+        Assert 'C4 no U-file stopped reproducing while its content stood still' `
+        ($regressed.Count -eq 0) ("regressed=" + (($regressed | Sort-Object) -join ', '))
 
         $chk2 = Invoke-Overlay @('check', '-Path', $forkTree)
         Assert 'C5 check is clean on the overlaid fork-point tree' ($chk2.Code -eq 0) $chk2.Text
@@ -246,6 +377,46 @@ try {
         }
         $chk3 = Invoke-Overlay @('check', '-Path', $rawTree)
         Assert 'C6 check FAILS on the same tree before the overlay' ($chk3.Code -eq 1) "exit=$($chk3.Code)"
+
+        # C7/C8 - the manifest's own teeth (T1134). C4 asserts a per-file
+        # baseline, and a per-file baseline is only worth what its detector is:
+        # a manifest that has quietly emptied itself, or a comparison that can
+        # no longer tell a wrong rewrite from a right one, would sit green
+        # forever. Both are measured here rather than assumed.
+        Assert 'C7 the manifest still records a substantial share of the U-files' `
+        ($recorded.Count -ge 20) "recorded=$($recorded.Count) of $staged staged"
+
+        # The mis-spelled-rule control. Every rewriting rule's replacement text
+        # is corrupted by one character, which is the failure mode C5 cannot
+        # see: `check` looks for the UPSTREAM form and finds none, so a rule
+        # that writes the wrong fork spelling passes it. Only the byte
+        # comparison C4 makes can catch that, so C4 is proved able to catch it
+        # on every run.
+        $mutOverlay = Join-Path $sandbox 'fork-identity-mutated.ps1'
+        $src = [System.IO.File]::ReadAllText($Overlay)
+        $mut = $src -creplace "(Replace\s*=\s*'[^']*)ghoztty", '$1ghoztty0'
+        $mut = $mut -creplace "(Replace\s*=\s*'[^']*)Ghoztty", '$1Ghoztty0'
+        [System.IO.File]::WriteAllText($mutOverlay, $mut, (New-Object System.Text.UTF8Encoding($false)))
+        Assert 'C8a the mutation actually changed the overlay' ($mut -ne $src)
+
+        $mutTree = Join-Path $sandbox 'forkpoint-mutated'
+        New-ForkPointTree $mutTree | Out-Null
+        $apM = Invoke-Overlay @('apply', '-Path', $mutTree) -OverlayPath $mutOverlay
+        Assert 'C8b the mutated overlay still runs' ($apM.Code -eq 0) "exit=$($apM.Code)"
+
+        $mutMeasured = Measure-Reproduction $mutOverlay $mutTree
+        # Measured against the LIVE reproducing set rather than the manifest, so
+        # this control cannot be silenced by emptying the manifest: HEAD is the
+        # same on both sides, so a file that reproduces with the real overlay
+        # and not with the mis-spelled one is exactly what C4 calls a
+        # regression.
+        $mutRegressed = @($reproMap.Keys | Where-Object { -not $mutMeasured.Repro.ContainsKey($_) })
+        Say ("     under a mis-spelled rule, {0} of {1} reproducing files stop reproducing" -f $mutRegressed.Count, $reproMap.Count)
+        Assert 'C8 a mis-spelled rule makes C4 red (the baseline has teeth)' `
+        ($mutRegressed.Count -gt 0) "regressed=0 under mutation - C4 cannot fail"
+
+        $script:ReproLive = $reproMap
+        $script:ReproRecorded = $recorded
     }
 
     # -----------------------------------------------------------------------
@@ -433,7 +604,24 @@ try {
 # answer "has anybody run this against the overlay as it now stands?". A red run
 # - or the -NegativeControl run, which is red by construction - leaves the stamp
 # alone, and a run with skipped sections does not stamp at all.
-if ($script:failures -eq 0 -and $script:skips -eq 0 -and -not $NegativeControl) {
+# The reproduction baseline ages out on the same terms as the stamp: only a
+# fully green run may move it, and it is rewritten only when the recorded map
+# actually differs, so an ordinary run leaves the tree clean. A red run leaves
+# it alone, which is what keeps a regression red on the next run instead of
+# absorbing itself. The one exception is a MISSING manifest - there is nothing
+# to absorb and no baseline to measure against, so one is written from this
+# run and the run stays red, which is the honest report of "this measured
+# nothing".
+$greenRun = ($script:failures -eq 0 -and $script:skips -eq 0 -and -not $NegativeControl)
+if ($null -ne $script:ReproLive -and -not $NegativeControl -and
+    ($greenRun -or $script:ReproManifestMissing)) {
+    if (Write-ReproManifest $script:ReproLive $script:ReproRecorded) {
+        Say ("  reproduction manifest written: {0} entries (was {1}) - commit {2}" -f `
+                $script:ReproLive.Count, $script:ReproRecorded.Count, $ReproManifestRelative)
+    }
+}
+
+if ($greenRun) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
         update -Guard fork-identity -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
 }

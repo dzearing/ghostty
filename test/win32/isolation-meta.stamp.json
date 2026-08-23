@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-23T10:37:58-07:00",
-    "commit":  "40ceb1418",
+    "generated":  "2026-08-23T11:19:29-07:00",
+    "commit":  "2e3d4bde2",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
@@ -89,7 +89,7 @@
                   "test/win32/focus-follows-mouse.ps1":  "09c5f9884b9c51bdb0d91321a12c0e8b8c554552434fd78f7b6267826caaa4e1",
                   "test/win32/font-inherit.ps1":  "f303affd8f1c72da77f48f09a10b18d0c7c72af845a4602455bf013662d8c257",
                   "test/win32/foreground-audit.ps1":  "d343505dc8ede3b8a22d230eb7621f529f2a106a740301fead22d422b59310e3",
-                  "test/win32/fork-identity.ps1":  "65c627a7eddc8bf98968262669ab7ffb9a5e1365e93a6800d2d6d022da0e68ce",
+                  "test/win32/fork-identity.ps1":  "2a83e77b4f6fc5127e583e44175dc00a350ef16cacf5b9404c9e6e8fb388ab71",
                   "test/win32/gate-negatives.ps1":  "ebccd459b882a6e8c2301b256c4ccc1a0b067721bf3c9eff28abb0737ec599a8",
                   "test/win32/go-loop-guard.ps1":  "4a29dc1c5e0365adb4c5722f361c6023ea6daa66c1c2c7b9979480476132c612",
                   "test/win32/go-loop-uptime.ps1":  "a97005d970a564088741646542ffaca3cb9ffe03d2eb30c55b96841607948b82",
