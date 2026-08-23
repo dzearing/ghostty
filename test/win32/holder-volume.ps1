@@ -17,12 +17,29 @@
 #
 # SCALED-DOWN NUMBERS, deliberately. The shipped pair is a 1 MB holder ring and
 # a snapshot due at 512 KB of unsaved output; this run sets 64 KB and 32 KB via
-# the agent's env knobs and floods ~256 KB. Same ratio, same mechanism, and the
-# whole flood is over in a second or two - printing a megabyte through a ConPTY
-# would take long enough to race the 30-second timer this harness has to stay
-# inside, which would make the control arm measure the timer rather than the
-# trigger. That the SHIPPED numbers hold the same ratio is pinned where it
-# belongs, as a unit test over the two constants (`pty_holder_child.zig`).
+# the agent's env knobs. Same ratio, same mechanism, and the whole flood is over
+# in a second or two - printing a megabyte through a ConPTY would take long
+# enough to race the 30-second timer this harness has to stay inside, which would
+# make the control arm measure the timer rather than the trigger. That the
+# SHIPPED numbers hold the same ratio is pinned where it belongs, as a unit test
+# over the two constants (`pty_holder_child.zig`).
+#
+# THREE numbers decide whether this harness measures anything, not two (T1116).
+# The marker has to land in the gap between the holder's retention and the
+# AGENT's output ring: past the holder (or the holder alone could hand it back,
+# and the volume trigger is not what saved it) but still inside the ring (or no
+# snapshot can reach it, because a snapshot writes the ring as it stands). The
+# first version of this script sized the flood at "four times the holder ring"
+# in the bytes it TYPED - and a ConPTY does not pass those bytes through, it
+# re-renders: 256 KB of payload arrived as more than 2 MB, overran the agent's
+# own ring, and the marker was gone from the only buffer a snapshot could have
+# written. B4 and C3 read as "the flush never fires" when in fact it fired
+# throughout and had nothing left to save.
+#
+# So the flood is sized in what the ring actually RECORDS, the placement is
+# ASSERTED rather than assumed (B3b/B3c below, measured from the snapshot file's
+# own length), and the agent ring is pinned by env so an inherited
+# GHOSTTY_AGENT_RING_BYTES cannot move the target silently.
 #
 # Sections:
 #   A. Baseline: a holder-backed pane, and PROOF that ring snapshots are running
@@ -30,9 +47,11 @@
 #      That also synchronizes the clock: a snapshot just happened, so the whole
 #      30-second interval is available for section B.
 #   B. The overrun. A second marker is typed, confirmed on screen and confirmed
-#      ABSENT from disk; then ~256 KB is printed - four times what the holder
-#      can hold. THE assertion: the marker reaches a .ring file well inside the
-#      periodic interval, because the volume trigger fired, not the timer.
+#      ABSENT from disk; then enough is printed to push several times the
+#      holder's retention through the pane, MEASURED off the snapshot file
+#      rather than counted in typed bytes. THE assertion: the marker reaches a
+#      .ring file well inside the periodic interval, because the volume trigger
+#      fired, not the timer.
 #   C. The crash. The session manager is hard-killed and the replacement adopts
 #      the surviving holder. The marker is still on disk - the holder dropped it
 #      long ago, so nothing but the volume-triggered snapshot could have kept it.
@@ -72,9 +91,25 @@ function Say($m) { Write-Host $m }
 # The scaled-down pair, held in the shipped ratio (threshold = half the ring).
 $HolderReplayBytes = 65536
 $VolumeBytes = 32768
-# Four times the holder ring, so the marker is unquestionably past its horizon.
-$FloodLines = 512
-$FloodWidth = 500
+# The agent's own output ring - the buffer a snapshot writes. Pinned rather than
+# left at its 2 MB default so an inherited GHOSTTY_AGENT_RING_BYTES cannot move
+# the far edge of the window the marker has to land in, and deliberately the
+# widest of the three: the flood has to clear the holder's 64 KB and stay under
+# this, and both margins are asserted below (B3b/B3c).
+$RingBytes = 1048576
+# One CHUNK of the flood, typed as its own command. Section B keeps sending
+# chunks until the ring has RECORDED twice the holder's retention, so the volume
+# that matters is measured on the way rather than guessed from the payload - see
+# the flood block for why a ConPTY makes the two numbers unrelated.
+#
+# The line WIDTH is load-bearing and it is 80, inside the pane's 100 columns.
+# The first version printed 500-character lines: every one of them wrapped over
+# five rows, each row scrolled the viewport, and a ConPTY answers a scroll by
+# re-rendering - so 16 KB of payload took over a minute to get through the pane
+# and arrived as hundreds of KB. Lines that fit the pane cost about what they
+# say they cost.
+$FloodChunkLines = 256
+$FloodWidth = 80
 
 if (-not (Test-Path $Exe)) {
     Write-TestAssertedNothing -Label 'HOLDER-VOLUME' -Reason "exe not found: $Exe (build with: zig build -Dapp-runtime=win32 -Doptimize=Debug)"
@@ -205,6 +240,17 @@ function Ring-Has([string]$root, [string]$needle) {
     }
     return $false
 }
+# The length of ONE session's snapshot file - the observable this harness sizes
+# its flood against (T1116). It is the ring as the agent holds it, so its growth
+# across the flood is the real byte volume the ConPTY produced, and its ceiling
+# is the ring capacity. 0 when the session has never been snapshotted.
+function Ring-LenFor([string]$root, [string]$sessionId) {
+    if (-not $sessionId) { return 0 }
+    foreach ($f in (Get-RingFiles $root)) {
+        if ($f.BaseName -eq $sessionId) { return [int]$f.Length }
+    }
+    return 0
+}
 function Wait-RingHas([string]$root, [string]$needle, [int]$timeoutSec) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while ((Get-Date) -lt $deadline) {
@@ -222,6 +268,7 @@ $savedHolderFlag = $env:GHOZTTY_AGENT_PTY_HOLDER
 $savedDurable = $env:GHOZTTY_AGENT_DURABLE_ACK
 $savedReplay = $env:GHOZTTY_AGENT_HOLDER_REPLAY_BYTES
 $savedVolume = $env:GHOZTTY_AGENT_SNAPSHOT_VOLUME_BYTES
+$savedRing = $env:GHOSTTY_AGENT_RING_BYTES
 
 try {
     Stop-Everything
@@ -236,6 +283,7 @@ try {
     # frees on delivery and section C is a measurement of T911, not of T969.
     Remove-Item env:GHOZTTY_AGENT_DURABLE_ACK -ErrorAction SilentlyContinue
     $env:GHOZTTY_AGENT_HOLDER_REPLAY_BYTES = "$HolderReplayBytes"
+    $env:GHOSTTY_AGENT_RING_BYTES = "$RingBytes"
     if ($NegativeControl) {
         # The control arm: same build, same box, volume trigger OFF - i.e. the
         # pre-T969 behavior, where only the 30-second timer writes scrollback.
@@ -325,6 +373,9 @@ try {
         Write-TestVerdict -Label 'HOLDER-VOLUME' -Pass $script:passes -Fail $script:failures
     }
     $snapshotAt = Get-Date
+    # The far end of the flood's target window: what this session's snapshot file
+    # holds BEFORE the flood. Everything section B measures is growth from here.
+    $ringLenBefore = Ring-LenFor $tmp $sessionId
 
     # ========================================================================
     Say "== B: the overrun - a marker, then more output than the holder can hold"
@@ -339,31 +390,104 @@ try {
     # either way.
     Assert 'B2 premise: the marker is NOT in any ring snapshot yet' (-not (Ring-Has $tmp $marker))
 
-    # The flood: ~256 KB, four times what this run's holder retains. Typed as a
-    # file (`--keys-file` sends bytes verbatim) rather than as key notation, so
-    # the command line is not re-tokenized on its way through the CLI - and it
-    # calls powershell.exe explicitly, so it does not depend on which shell
-    # flavor this box opens panes with.
-    $done = "T969DONE$PID" + "Z"
-    $floodCmd = "powershell -NoProfile -Command `"1..$FloodLines | ForEach-Object { 'F' * $FloodWidth }; 'x' + '$done'`""
+    # THE FLOOD, measured in what the RING RECORDS (T1116). Chunks are typed
+    # until the snapshot file has grown by twice the holder's retention - which
+    # is the property section C depends on (the marker is past the holder's
+    # horizon) and the one B4 needs (it is still inside the ring a snapshot
+    # writes). Both edges are asserted below rather than assumed.
+    #
+    # Two things this deliberately does NOT do, each of which made an earlier
+    # version measure something else:
+    #
+    #  * It does not size the flood in TYPED bytes. A ConPTY re-renders rather
+    #    than forwarding, and the amplification is large (~17x here: 20 KB typed
+    #    arrives as ~348 KB) and not linear in the burst size. The original
+    #    256 KB burst overran the agent's whole 2 MB ring, so the marker was gone
+    #    from the only buffer a snapshot could write and B4/C3 read as a flush
+    #    that never fires.
+    #  * It does not wait for the flood's end marker to appear ON SCREEN. `+read`
+    #    answers from the APP's terminal state, and the app is far behind the
+    #    agent while a Debug build ingests a flood - the ring had all 348 KB
+    #    inside a minute while the pane still showed nothing but 'F's five
+    #    minutes later. The ring file is both the faster instrument and the one
+    #    this harness is actually about.
+    $floodTarget = $HolderReplayBytes * 2
+    $floodCeiling = [int]($RingBytes / 2)
     $floodFile = Join-Path $tmp 'flood.txt'
-    [IO.File]::WriteAllText($floodFile, $floodCmd, [Text.Encoding]::ASCII)
-    Run-CliArgs @('+send-keys', "--target=$pane", "--keys-file=$floodFile", 'Enter') "$tmp\keys-flood.txt" 15 | Out-Null
+    $recorded = 0
+    $typed = 0
+    $markerSecs = -1
+    # The control arm cannot measure: with the volume trigger off nothing
+    # rewrites the snapshot file during section B, by design. It types the same
+    # chunk and dwells instead - long enough for the same flood to have gone
+    # through the pane, and short enough that the 30-second periodic pass cannot
+    # write the marker and make the control a measurement of the clock. A dwell
+    # too short for this box announces itself: the control KEEPS the marker.
+    $ControlDwellSec = 10
+    $maxChunks = if ($NegativeControl) { 1 } else { 8 }
+    for ($c = 1; $c -le $maxChunks; $c++) {
+        # The end marker is assembled from two halves inside the pane's command so
+        # the contiguous string cannot appear in the shell's echo of the command
+        # line; it is a diagnostic here rather than a gate.
+        $doneHead = "T969DO"
+        $doneTail = "NE$PID" + "C$c" + "Z"
+        $done = $doneHead + $doneTail
+        $floodCmd = "powershell -NoProfile -Command `"1..$FloodChunkLines | ForEach-Object { 'F' * $FloodWidth }; 'x' + '$doneHead' + '$doneTail'`""
+        [IO.File]::WriteAllText($floodFile, $floodCmd, [Text.Encoding]::ASCII)
+        $t0 = Get-Date
+        $sendRc = Run-CliArgs @('+send-keys', "--target=$pane", "--keys-file=$floodFile", 'Enter') "$tmp\keys-flood$c.txt" 15
+        if ($sendRc -ne 0) { Say "    diagnostic: chunk $c send rc=$sendRc, cli said '$(('' + (Out-Text "$tmp\keys-flood$c.txt")).Trim())'" }
 
-    $floodDone = Wait-PaneHas $tmp $pane 'flood' $done 90
-    Assert 'B3 premise: the flood finished (its end marker printed)' $floodDone
+        # Watch the ring grow (and watch for the marker landing on disk, which is
+        # what B4 scores). Bounded, so a pane that prints nothing fails rather
+        # than hangs.
+        $chunkDeadline = (Get-Date).AddSeconds($(if ($NegativeControl) { $ControlDwellSec } else { 60 }))
+        while ((Get-Date) -lt $chunkDeadline) {
+            Start-Sleep -Milliseconds 700
+            if ($markerSecs -lt 0 -and (Ring-Has $tmp $marker)) {
+                $markerSecs = [int]((Get-Date) - $snapshotAt).TotalSeconds
+            }
+            if ($NegativeControl) { continue }
+            $recorded = (Ring-LenFor $tmp $sessionId) - $ringLenBefore
+            if ($recorded -ge $floodTarget -or $recorded -ge $floodCeiling) { break }
+        }
+        $typed += $FloodChunkLines * $FloodWidth
+        $secs = [Math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
+        if ($NegativeControl) {
+            Say "    chunk $c (control) : $($FloodChunkLines * $FloodWidth) B typed, dwelt $secs s"
+            break
+        }
+        Say "    chunk $c : $($FloodChunkLines * $FloodWidth) B typed; ring has recorded $recorded B in $secs s"
+        if ($recorded -ge $floodTarget -or $recorded -ge $floodCeiling) { break }
+    }
     $floodSecs = [int]((Get-Date) - $snapshotAt).TotalSeconds
-    Say "    (flood complete $floodSecs s after the last snapshot; the periodic pass is 30 s)"
+    Say "    (flood done $floodSecs s after the last snapshot; the periodic pass is 30 s)"
 
-    # THE assertion. Well inside the periodic interval, the marker is on disk -
-    # so the trigger that wrote it was the VOLUME of output, not the clock. The
-    # window is bounded so a periodic pass cannot be mistaken for the trigger.
-    $windowSecs = [Math]::Max(4, 24 - $floodSecs)
-    $early = Wait-RingHas $tmp $marker $windowSecs
+    # THE PLACEMENT, asserted rather than assumed. Both edges of the window the
+    # marker has to sit in: past the holder's retention (else the holder could
+    # hand the marker back on its own and B4/C3 would prove nothing about the
+    # trigger) and inside the agent's ring (else the marker is gone from the only
+    # buffer a snapshot writes, and no flush however prompt could have saved it).
+    if (-not $NegativeControl) {
+        Say ("    (typed $typed B -> ring recorded $recorded B; holder retains " +
+             "$HolderReplayBytes B, ring holds $RingBytes B)")
+        Assert 'B3 the flood pushed more through the pane than the holder retains' (
+            $recorded -gt $HolderReplayBytes)
+        Assert 'B3b premise: the flood stayed inside the agent ring (a snapshot can still reach the marker)' (
+            $recorded -lt $floodCeiling)
+    }
+
+    # THE assertion. The marker reached disk while the flood was still running -
+    # well inside the periodic interval - so the trigger that wrote it was the
+    # VOLUME of output, not the clock. `$markerSecs` is when it appeared, counted
+    # from section A's snapshot, so a periodic pass cannot be mistaken for it.
     if ($NegativeControl) {
-        Assert 'B4 (control) with the trigger off, nothing wrote the marker inside the interval' (-not $early)
+        Assert 'B4 (control) with the trigger off, nothing wrote the marker inside the interval' (
+            $markerSecs -lt 0)
     } else {
-        Assert 'B4 the marker reached a .ring file inside the periodic interval (the volume trigger fired)' $early
+        Say "    (the marker reached disk $markerSecs s after the last snapshot)"
+        Assert 'B4 the marker reached a .ring file inside the periodic interval (the volume trigger fired)' (
+            $markerSecs -ge 0 -and $markerSecs -lt 24)
     }
 
     # Hard kill: no shutdown path runs, so nothing flushes on the way out. That
@@ -417,6 +541,8 @@ try {
     else { Remove-Item env:GHOZTTY_AGENT_DURABLE_ACK -ErrorAction SilentlyContinue }
     if ($null -ne $savedReplay) { $env:GHOZTTY_AGENT_HOLDER_REPLAY_BYTES = $savedReplay }
     else { Remove-Item env:GHOZTTY_AGENT_HOLDER_REPLAY_BYTES -ErrorAction SilentlyContinue }
+    if ($null -ne $savedRing) { $env:GHOSTTY_AGENT_RING_BYTES = $savedRing }
+    else { Remove-Item env:GHOSTTY_AGENT_RING_BYTES -ErrorAction SilentlyContinue }
     if ($null -ne $savedVolume) { $env:GHOZTTY_AGENT_SNAPSHOT_VOLUME_BYTES = $savedVolume }
     else { Remove-Item env:GHOZTTY_AGENT_SNAPSHOT_VOLUME_BYTES -ErrorAction SilentlyContinue }
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue

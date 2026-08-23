@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-22T16:31:35-07:00",
-    "commit":  "6cada034a",
+    "generated":  "2026-08-22T19:12:03-07:00",
+    "commit":  "682161bdc",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
@@ -103,7 +103,7 @@
                   "test/win32/holder-adopt.ps1":  "851ec480e8d062783ea82e871c56f98bd6489425820138e2c2b96b58a44a7383",
                   "test/win32/holder-durable.ps1":  "e899234e7f8822ca60bf0cefb0c98a1d8db26787a899411a3c6a7d92aea2cd0d",
                   "test/win32/holder-soak.ps1":  "bc5784f0bf69a03b79039dcf7fd55a3ea7682a2edbc07e0e452c1d8a713c5fcd",
-                  "test/win32/holder-volume.ps1":  "51f5eaaa72ba780a146081b9e3e4733cfda1bf0d4515d2c197a31f630288e0fc",
+                  "test/win32/holder-volume.ps1":  "bdd715430e19b57d3a4a7da765a725f04b5e9b1a55413bae2cd283e14f92d84d",
                   "test/win32/hook-json.ps1":  "6ffe9bffa095bdeeb1d524990d3a7e695aa3d185596df39a7aeca44f7ed82119",
                   "test/win32/host-settings.ps1":  "4bc5045b4017d45d664d2f715b14e538022cb9ff87e40cedbdeecd4a1216ccb5",
                   "test/win32/hover-capture.ps1":  "0a8055d036ef8aa5ef83d91851c418f52dfdc09ea29d63f5eae9af87a9ee92a1",
