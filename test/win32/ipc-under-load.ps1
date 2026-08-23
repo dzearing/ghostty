@@ -47,6 +47,13 @@ function Assert([bool]$cond, [string]$label) {
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 Reset-GhozttyTestState -Exe $exe -SettleMs 500 | Out-Null
 
+# T1127: the cleanup at the bottom takes the app and nothing else, so this
+# script left the auto-launched agent AND its `--pty-host` holder running on
+# every ALL PASS. The holders escape the job on purpose (they own the ConPTY),
+# so only a path-scoped sweep reaches them.
+. (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
+Register-RepoBuildTeardown -Exe $exe | Out-Null
+
 & $exe +new-window --target=ipcload --shell=cmd | Out-Null
 Start-Sleep -Seconds 3
 & $exe +list | Out-Null

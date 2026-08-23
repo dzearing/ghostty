@@ -74,6 +74,13 @@ if ($ExePath) { $exe = $ExePath }
 $env:GHOZTTY_PIPE_SUFFIX = "-menubartest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+. (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
+
+# T1127: the finally at the bottom is a full Stop-RepoGhoztty and reaps this
+# build cleanly - but the setup guards above it (`SETUP FAIL ...; exit 1`) walk
+# out with a GUI already launched and never reach it. Arming the teardown makes
+# the ending that leaks the same as the ending that does not.
+Register-RepoBuildTeardown -Exe $exe | Out-Null
 
 $script:pass = 0
 $script:fail = 0

@@ -57,6 +57,13 @@ if ($ExePath) { $exe = $ExePath }
 $env:GHOZTTY_PIPE_SUFFIX = "-rempilltest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+. (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
+
+# T1127: the finally below kills the agent it started, and the agent's
+# `--pty-host` holders survive that by design - they own the ConPTY and escape
+# the job on purpose, so a per-pid kill never reaches them. Arm the
+# build-scoped teardown so nothing from zig-out outlives the script.
+Register-RepoBuildTeardown -Exe $exe | Out-Null
 
 $script:pass = 0
 $script:fail = 0

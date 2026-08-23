@@ -86,6 +86,7 @@ $root = Join-Path $env:TEMP "ghoztty-t167-$PID"
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
+. (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
 
 # -Release retargets the two DEFAULT paths only; an explicit -Exe/-AgentExe is
 # always obeyed (that is how a delivered install or a second staging tree gets
@@ -191,6 +192,16 @@ function Out-Text($f) { if (Test-Path $f) { (Get-Content $f -Raw) -replace "`0",
 # bystander checks at the end.
 $buildMode = Assert-GhozttyIsolatedBuild -Exe $Exe -Allow:$Release
 Say "build mode under test: $buildMode"
+
+# T1127: the by-PID cleanup below cannot reach a `--pty-host` holder - the
+# agent spawns it through the shell-parent hop precisely so it escapes the job
+# and outlives its agent, so it is neither in $script:mine nor a child of
+# anything that is. This run left one behind on every pass. The teardown armed
+# here is scoped to the DIRECTORY of the build under test, which is the same
+# discipline the by-PID list exists for: the loop's own agent runs from the
+# installed release, not from this tree, and is never a candidate. A run
+# pointed at a delivered install arms nothing and says so.
+Register-RepoBuildTeardown -Exe $Exe | Out-Null
 if ($Release) {
     # Positive control for the switch itself: a -Release run against a Debug
     # zig-out-release would exercise the -debug lineage and prove nothing about

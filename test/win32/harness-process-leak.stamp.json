@@ -1,0 +1,10 @@
+{
+    "guard":  "harness-leak",
+    "script":  "test/win32/harness-process-leak.ps1",
+    "generated":  "2026-08-23T02:45:36-07:00",
+    "commit":  "5befb777b",
+    "files":  {
+                  "test/win32/harness-process-leak.ps1":  "1b3ca8f6fae959330ae28f6f67a326a0bcb0ae67a457d3bf2e2965ba8e0c6215",
+                  "test/win32/lib/HarnessLeak.ps1":  "0a1ad6b292d6fda3e211a1667efc2eea3510418a38337e3691b612ac02972bff"
+              }
+}

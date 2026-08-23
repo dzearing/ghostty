@@ -233,6 +233,64 @@ function Register-HarnessGhozttyRoot {
     return $norm
 }
 
+function Register-RepoBuildTeardown {
+    <#
+    .SYNOPSIS
+    Tear down everything running out of the BUILD UNDER TEST when this
+    PowerShell exits - the app, the agent, and the ConPTY holders behind it.
+
+    .DESCRIPTION
+    Register-HarnessGhozttyRoot for the ordinary case: a script driving
+    `zig-out\bin\ghoztty.exe` rather than a stand-in install dir. The root is
+    derived from -Exe, so a script run with an -ExePath override arms the
+    teardown for the build it is actually driving.
+
+    WHY A SCRIPT THAT ALREADY KILLS ITS OWN AGENT STILL LEAKS (T1127). A
+    `--pty-host` holder is spawned to OUTLIVE the agent on purpose (T904/T906):
+    it owns the ConPTY so a session survives an agent restart, and it reaches
+    the desktop through the shell-parent hop, so it is neither a child of the
+    agent nor a member of any job that dies with it. `Stop-Process -Id
+    $agent.Id` therefore ends the agent and leaves its holders running. The
+    T1094 sweep measured six scripts leaking a live process apiece that way,
+    five of them while scoring ALL PASS - a leak is invisible to the script that
+    causes it and shows up as a failure in whichever script runs next.
+
+    Arming this beats writing the kill at the bottom of the script for the same
+    reason Register-HarnessGhozttyRoot does: the bottom of the script is exactly
+    what does not run when a run dies half way through.
+
+    Not called from Reset-GhozttyTestState on purpose. The handler kills by
+    PATH, not by descent, so a CHILD PowerShell that armed it would take its
+    parent's live app down on exit. Arming belongs to the top-level script that
+    owns the run.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [switch]$Quiet
+    )
+
+    $dir = Split-Path -Parent $Exe
+    if (-not $dir) {
+        throw "Register-RepoBuildTeardown refuses '$Exe': no directory to scope a teardown to."
+    }
+
+    # An exe outside the repo (and outside TEMP) is a delivered install or the
+    # user's own Ghoztty. Reaping THAT at exit is the one thing every helper
+    # here refuses, so decline - out loud, not silently, so a run that armed
+    # nothing says so. It is a decline rather than a throw because the scripts
+    # that can be pointed at either build (agent-instance-lineage's -Exe, the
+    # delivery harnesses) should arm in the case that matters and stay honest
+    # in the one that does not.
+    try { $norm = Assert-HarnessScratchRoot -Root $dir }
+    catch {
+        if (-not $Quiet) {
+            Write-Host "  (no build teardown armed: $dir is not under the repo or `$env:TEMP)"
+        }
+        return $null
+    }
+    return Register-HarnessGhozttyRoot -Root $norm
+}
+
 # There is deliberately no Unregister-HarnessGhozttyRoot: the handler carries
 # its root as a baked literal, so "forget this root" would have to hunt down the
 # right subscriber to be true, and a teardown that only PRETENDS to have been

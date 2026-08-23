@@ -1712,6 +1712,23 @@ $GuardTable = @(
             'test\win32\resize-flicker.ps1'
         )
     },
+    # The leak teardown (T199, T1127). `lib\HarnessLeak.ps1` is the only thing
+    # standing between a harness that dies mid-run and a live app left on the
+    # box, and since T1127 it is also what stops the ordinary scripts leaking
+    # the agent's `--pty-host` holders - a leak that is invisible to the script
+    # causing it and surfaces as a failure in whichever script runs NEXT. No
+    # lane touches it and P1-P3 does not either: it is harness plumbing, so the
+    # only thing that ever exercises it is its own acceptance. About a minute,
+    # off the input desktop.
+    [pscustomobject]@{
+        Name   = 'harness-leak'
+        Script = 'test\win32\harness-process-leak.ps1'
+        Stamp  = 'test\win32\harness-process-leak.stamp.json'
+        Covers = @(
+            'test\win32\lib\HarnessLeak.ps1',
+            'test\win32\harness-process-leak.ps1'
+        )
+    },
     # The honesty of every OTHER row in this table (T1039). A harness whose body
     # unwinds mid-run used to print ALL PASS and then STAMP - recording every
     # file it covers as freshly proven while a whole section measured nothing -

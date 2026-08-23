@@ -29,6 +29,10 @@
 #                registers its root, launches, then throws leaves nothing.
 #   D (teeth)    the same child WITHOUT the registration leaks - so C is a
 #                measurement, not a tautology.
+#   F (build)    the same teardown for the ORDINARY case (T1127): a script
+#                names the build it drives with -Exe, everything under that
+#                directory is reaped on exit - failure path included - and an
+#                exe outside the repo arms nothing. F4 is its teeth.
 #   E (sweep)    right now, on this box, no ghoztty process is running out of
 #                %TEMP% at all. This is the standing arm that must stay at zero;
 #                a failure names the pid, the path and the age in hours.
@@ -152,12 +156,17 @@ Say '== C/D: the failure path, and the control that proves it is measured'
 # measures neither - section B is where the real app is on trial.
 $childScript = Join-Path $root 'child.ps1'
 $childBody = @'
-param([string]$Lib, [string]$Root, [string]$FakeExe, [int]$Register)
+param([string]$Lib, [string]$Root, [string]$FakeExe, [int]$Register, [string]$Mode = 'root')
 . $Lib
 $install = Split-Path -Parent $FakeExe
 New-Item -ItemType Directory -Force $install | Out-Null
 Copy-Item -LiteralPath "$env:SystemRoot\System32\cmd.exe" -Destination $FakeExe -Force
-if ($Register -eq 1) { Register-HarnessGhozttyRoot -Root $Root | Out-Null }
+if ($Register -eq 1) {
+    # 'exe' is the T1127 entry point: a script names the build it is driving and
+    # the helper derives the directory to reap. 'root' is T199's original.
+    if ($Mode -eq 'exe') { Register-RepoBuildTeardown -Exe $FakeExe | Out-Null }
+    else { Register-HarnessGhozttyRoot -Root $Root | Out-Null }
+}
 # persistence: n/a - this is a copy of cmd.exe wearing the name, not the app.
 Start-Process -FilePath $FakeExe -ArgumentList '/c', 'ping -n 120 127.0.0.1 > nul' `
     -WindowStyle Hidden | Out-Null
@@ -166,12 +175,12 @@ throw 'deliberate mid-run failure (this is the point of the test)'
 '@
 Set-Content -LiteralPath $childScript -Value $childBody -Encoding ASCII
 
-function Invoke-LeakChild([string]$Root, [int]$Register) {
+function Invoke-LeakChild([string]$Root, [int]$Register, [string]$Mode = 'root') {
     $fake = Join-Path $Root 'install\ghoztty.exe'
     $p = Start-Process powershell -WindowStyle Hidden -PassThru -ArgumentList @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $childScript,
         '-Lib', (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1'),
-        '-Root', $Root, '-FakeExe', $fake, '-Register', "$Register")
+        '-Root', $Root, '-FakeExe', $fake, '-Register', "$Register", '-Mode', $Mode)
     # exitcode-audit: the oracle is the process table below, not this exit code;
     # the child is EXPECTED to die of a throw.
     $null = $p.Handle
@@ -195,6 +204,50 @@ Assert ($dKilled -ge 1) "D2 and the helper cleans up a leak it did not create ($
 Assert (@(Get-HarnessGhozttyProcess -Root $dRoot).Count -eq 0) 'D3 nothing left under the control root'
 
 # ---------------------------------------------------------------------------
+Say '== F: the BUILD-UNDER-TEST teardown (T1127)'
+# ---------------------------------------------------------------------------
+# The leak T199 chased was an app in a stand-in install dir. The leak T1094's
+# sweep measured is the ordinary case: six scripts driving zig-out left a live
+# process behind, five of them while scoring ALL PASS. The process was always a
+# `ghoztty-agent --pty-host` HOLDER, which owns the ConPTY and escapes the job
+# on purpose (T904/T906) - so it is not a child of the agent that asked for it,
+# and no by-PID teardown can reach it.
+#
+# Register-RepoBuildTeardown is the one-line answer: name the exe, and the
+# directory it lives in is reaped when this PowerShell exits.
+
+# F1 arms a REAL handler for zig-out\bin in this process. That is deliberate
+# and not a side effect worth avoiding: this script launches nothing out of
+# zig-out (section B runs a copy in its own scratch dir), and "nothing from the
+# build under test outlives the run" is the rule being asserted.
+$armed = Register-RepoBuildTeardown -Exe $exe
+Assert ($armed -and (Test-UnderRepo (Join-Path $armed 'ghoztty.exe'))) `
+    "F1 an exe in the repo build arms a teardown for its directory ($armed)"
+
+# The safety half: an exe outside the repo and outside %TEMP% is a delivered
+# install or the user's own Ghoztty. Reaping that is the one thing every helper
+# here refuses, so the answer is a decline, not a handler - and not a throw
+# either, because the scripts that can be pointed at either build must still run.
+$declined = Register-RepoBuildTeardown -Exe (Join-Path $env:SystemRoot 'System32\ghoztty.exe') -Quiet
+Assert ($null -eq $declined) 'F2 an exe outside the repo and %TEMP% arms nothing (the install is never a candidate)'
+
+# F3/F4 are C/D again through the new entry point: the failure path is where a
+# leak actually happens, so the teardown has to survive a harness that throws.
+$fRoot = Join-Path $root 'f'
+Register-HarnessGhozttyRoot -Root $fRoot | Out-Null
+Invoke-LeakChild -Root $fRoot -Register 1 -Mode 'exe'
+$fLeft = @(Get-HarnessGhozttyProcess -Root $fRoot)
+Assert ($fLeft.Count -eq 0) "F3 a build named by -Exe is reaped even when the harness THROWS ($($fLeft.Count) left)"
+
+$gRoot = Join-Path $root 'g'
+Register-HarnessGhozttyRoot -Root $gRoot | Out-Null
+Invoke-LeakChild -Root $gRoot -Register 0 -Mode 'exe'
+$gLeft = @(Get-HarnessGhozttyProcess -Root $gRoot)
+Assert ($gLeft.Count -ge 1) "F4 TEETH: the same run without it leaks ($($gLeft.Count) left)"
+$gKilled = Stop-HarnessGhoztty -Root $gRoot -SettleMs 700
+Assert ($gKilled -ge 1) "F5 and the control is cleaned up after ($gKilled)"
+
+# ---------------------------------------------------------------------------
 Say '== E: the standing sweep - nothing on this box runs ghoztty out of %TEMP%'
 # ---------------------------------------------------------------------------
 # Zero is the only acceptable answer, and it can be, because nobody runs their
@@ -209,6 +262,18 @@ Assert ($leaks.Count -eq 0) "E1 no ghoztty process is running out of %TEMP% ($($
 
 # ---------------------------------------------------------------------------
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+
+# A clean green run stamps the files this harness covers (T783), so
+# `scripts\guard-due.ps1` can answer "has anybody run this against the leak
+# library as it now stands?" - the library is harness plumbing, so no lane and
+# no P1-P3 script would ever notice it drifting. The pass floor is the full
+# assertion count: a run that stopped early has not proven the sections it
+# never reached.
+if ($script:fail -eq 0 -and $script:pass -ge 28) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard harness-leak -Repo $repo 2>&1 | ForEach-Object { Say "  $_" }
+}
+
 Say ''
 if ($script:fail -eq 0) { Say "ALL PASS ($script:pass)" }
 else { Say "$script:fail FAILURE(S) ($script:pass passed)" }

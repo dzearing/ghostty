@@ -51,7 +51,14 @@ $env:GHOZTTY_PIPE_SUFFIX = "-remfreshtest$PID"
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
 . (Join-Path $PSScriptRoot 'lib\PaneLiveness.ps1')
+. (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
 Assert-GhozttyIsolatedBuild -Exe $exe | Out-Null
+
+# T1127: the finally below kills the agent it started, and the agent's
+# `--pty-host` holders survive that by design - they own the ConPTY and escape
+# the job on purpose. This run left TWO of them behind on every pass. Arm the
+# build-scoped teardown so nothing from zig-out outlives the script.
+Register-RepoBuildTeardown -Exe $exe | Out-Null
 
 $script:pass = 0
 $script:fail = 0

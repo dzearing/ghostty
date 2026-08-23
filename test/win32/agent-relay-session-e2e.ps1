@@ -78,6 +78,13 @@ if (-not $ClientExe) {
 $buildMode = Assert-GhozttyIsolatedBuild -Exe $Exe
 $stateBase = if (Test-GhozttyIsolatedBuildMode -Mode $buildMode) { 'local-agent-debug' } else { 'local-agent' }
 
+# T1127: the finally below stops the agents this run started, and a
+# `--pty-host` holder survives that by design - it owns the ConPTY, escapes the
+# job, and is not a child of the agent that asked for it. This run left one
+# behind on every ALL PASS. Scoped to the directory of the build under test.
+. (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
+Register-RepoBuildTeardown -Exe $Exe | Out-Null
+
 # The console twin: an explicit-path `ghoztty.exe` is a GUI-subsystem binary and
 # writes nothing to a redirect file (the .com stub is what carries stdout).
 $CliExe = [System.IO.Path]::ChangeExtension($Exe, '.com')

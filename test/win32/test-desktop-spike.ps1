@@ -49,6 +49,14 @@ $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if ($ExePath) { $exe = $ExePath }
 if (-not (Test-Path $exe)) { Write-Host "SETUP FAIL: no exe at $exe"; exit 1 }
 
+# T1127: the teardown at the bottom is -AppOnly, and even the full one would
+# miss the agent's `--pty-host` holders, which own the ConPTY and escape the
+# job on purpose. Arm the build-scoped teardown so nothing from zig-out
+# outlives the script - failure path included, which is this script's normal
+# ending when the spike measures a regression.
+. (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
+Register-RepoBuildTeardown -Exe $exe | Out-Null
+
 $env:GHOZTTY_PIPE_SUFFIX = "-desktopspike$PID"
 
 $script:pass = 0
