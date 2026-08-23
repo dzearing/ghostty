@@ -368,6 +368,27 @@ $GuardTable = @(
             'src\remote\agent\pty_holder_child.zig'
         )
     },
+    # Pane INGEST LAG (T1142): the only harness that measures how far behind its
+    # own child a pane's SCREEN runs. Every other test asks whether output
+    # ARRIVES; this one asks how fast, on both the agent-backed path and the
+    # local `termio.Exec` one, and asserts that the backlog drains rather than
+    # stalls. It exists because "the app's terminal state trails the agent's ring
+    # by minutes on a burst" was folklore for a week - true on the Debug build,
+    # false on the release build, and nothing on the box could tell the two
+    # apart. Neither test lane can see any of it: the number only exists with a
+    # real ConPTY, a real child and a real parse loop under it.
+    [pscustomobject]@{
+        Name   = 'pane-ingest-lag'
+        Script = 'test\win32\pane-ingest-lag.ps1'
+        Stamp  = 'test\win32\pane-ingest-lag.stamp.json'
+        Covers = @(
+            'test\win32\pane-ingest-lag.ps1',
+            'src\termio\Remote.zig',
+            'src\termio\Exec.zig',
+            'src\renderer\State.zig',
+            'src\remote\inbound_ring.zig'
+        )
+    },
     # Holders AT SCALE (T909): once holder-backed spawning became the default,
     # the per-session process stopped being a cost an opt-in user chose and
     # became one every box pays. This is the only harness that runs a realistic

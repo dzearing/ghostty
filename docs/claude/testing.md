@@ -845,6 +845,34 @@ nothing else move, which is how each arm was teeth-checked. A viewer pane has
 no shell; its equivalent claim is that the PAGE still responds — see the
 page-server oracle in `test\win32\viewer-restore.ps1`.
 
+**A Debug pane's SCREEN runs about 12 KB/s, so never wait on it for a burst**
+(T1116, T1142). Measured on 2026-08-23 with 20000 numbered lines (180 KB) piped
+into a pane and `+read` polled for the highest line the app had reached: the app
+ingests **12–15 KB/s** on a Debug build and **~1 MB/s** on a ReleaseFast one — a
+~65x gap that is Debug codegen of the terminal parse path, not a defect in
+anything the user runs (a release pane tracks its child to inside one poll
+interval at 4.5 MB, against conhost's 1.9 MB/s on the identical payload). Two
+consequences for harness authors, and the first one has already cost a turn:
+
+- **The two pane paths differ in who absorbs the backlog, not in speed.** A
+  local (`termio.Exec`) pane's ConPTY back-pressures the child down to the app's
+  parse rate, so its screen is never more than a second behind. An agent-backed
+  pane's inbound ring takes the whole burst and lets the child run on — child
+  done at 2.6 s, screen caught up at 18.0 s in the same run. So a flood driven
+  to "the marker appeared on screen" pushes **many times** the volume it meant
+  to through an agent pane, which is exactly how T1116's marker got evicted from
+  the very ring its assertion was about. Drive volume off the ring or the
+  snapshot file, never off the app's screen.
+- **Budget for it.** A 180 KB burst costs ~18 s of Debug wall clock before the
+  screen agrees it happened; scale the timeout to the payload, not to intuition.
+
+The standing measurement is `test\win32\pane-ingest-lag.ps1` (guard
+`pane-ingest-lag`), which asserts the backlog DRAINS — a catch-up bound, an
+ingest floor, and the pane still LIVE afterwards — with regression headroom over
+the Debug numbers rather than a claim about how fast the product is. Its
+`-NegativeControl` hunts for a line the payload never contains, so the catch-up
+arms must go red while the setup arms stay green.
+
 **A probe of the terminal GLASS asks the app, not the desktop** (T275). The
 acceptance suite runs on a background desktop, where there is no composite to
 `GetPixel` and `PrintWindow` of a `GhozttyTerminal` child returns a **flat
