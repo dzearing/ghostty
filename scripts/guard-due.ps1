@@ -1215,6 +1215,25 @@ $GuardTable = @(
             'test\win32\parity-tasks-seat.ps1'
         )
     },
+    # The two gates every turn runs, held to the rule that a gate must be
+    # SHOWN to fail (T1133). Deliberately overlapping the `go-loop` and
+    # `parity-tasks` rows above: those two ask "does this script still work?",
+    # and this one asks the different question "can each of its refusals still
+    # go red, and is every condition it reports demonstrated somewhere?". An
+    # edit that adds a report to either gate must therefore re-run this and
+    # register the new condition, which is the whole point - three checks in
+    # one month turned out to be unable to fail, and nothing was obliged to
+    # notice.
+    [pscustomobject]@{
+        Name   = 'gate-negatives'
+        Script = 'test\win32\gate-negatives.ps1'
+        Stamp  = 'test\win32\gate-negatives.stamp.json'
+        Covers = @(
+            'scripts\parity-tasks.ps1',
+            'scripts\go-loop-exec.ps1',
+            'test\win32\gate-negatives.ps1'
+        )
+    },
     # The on-demand test client (T359). `remote-test-client` is built by its own
     # zig step and by nothing the default build reaches, so six acceptance
     # scripts produce it themselves through lib\TestClient.ps1. Nothing in the

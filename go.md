@@ -377,6 +377,25 @@ Concretely, in order, with no stops in between:
    sections does not stamp at all. Adding a row to the coverage table in
    `scripts\guard-due.ps1` is the whole cost of closing the same gap for the
    next harness that grows one.
+
+   **A new gate ships with the demonstration that it can fail, or it is not a
+   gate** (T1133). A check that has never been observed saying anything but
+   "fine" is indistinguishable from a check that cannot say anything else, and
+   this month that cost three times: the upstream verdict answered a weaker
+   question than the one it existed to answer and stayed green through it
+   (T1099), the go-loop guard sat 26-red for a day (T783), and the push rule
+   was a habit for two weeks before it was a check (T1057). So when you add a
+   refusal to `go-loop-exec.ps1 claim` or `parity-tasks.ps1 validate`,
+   construct the state it is supposed to catch and prove it goes red, in
+
+   ```
+   powershell -NoProfile -File test\win32\gate-negatives.ps1
+   ```
+
+   which carries the registry of every condition those two gates report. A
+   condition that is neither declared a gate with a demonstration nor declared
+   an informational line FAILS that harness, so an undemonstrated gate cannot
+   ship quietly. `-NegativeControl` is its own proof that it can score red.
 4. **Make sure it's right** — validation must actually pass, on the box. A
    clean build is not evidence, and neither is a passing script you did not
    read the last line of.

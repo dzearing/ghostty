@@ -431,6 +431,52 @@ function Get-OpenDeps {
     return $open
 }
 
+# T1133: dependency CYCLES. Nothing else in the tracker can see one. Each file
+# in the ring reads perfectly well on its own; `next` skips every member of it
+# for "unmet deps" forever, and that skip line is indistinguishable from the
+# ordinary case of waiting on work that is genuinely still open. A ring is
+# therefore a permanent, silent stall - which is exactly the class of failure
+# this gate exists to make loud.
+#
+# Reported once per ring rather than once per member, keyed on the ring's
+# member set, so a two-task cycle is one line and not two. A dep naming an id
+# that does not exist is skipped here and owned by DANGLING DEP above.
+function Invoke-DepWalk {
+    param([string]$Id, [hashtable]$ById, [System.Collections.ArrayList]$Path)
+    $script:dcColor[$Id] = 1        # 1 = on the current path, 2 = finished
+    [void]$Path.Add($Id)
+    foreach ($d in @($ById[$Id].Deps)) {
+        if (-not $d -or -not $ById.ContainsKey($d)) { continue }
+        if ($script:dcColor[$d] -eq 1) {
+            $at = $Path.IndexOf($d)
+            if ($at -ge 0) {
+                $ring = @($Path[$at..($Path.Count - 1)])
+                $key = (@($ring | Sort-Object) -join '>')
+                if (-not $script:dcSeen.ContainsKey($key)) {
+                    $script:dcSeen[$key] = $true
+                    $script:dcCycles = @($script:dcCycles) + , $ring
+                }
+            }
+        }
+        elseif ($script:dcColor[$d] -ne 2) {
+            Invoke-DepWalk -Id $d -ById $ById -Path $Path
+        }
+    }
+    $Path.RemoveAt($Path.Count - 1)
+    $script:dcColor[$Id] = 2
+}
+function Get-DepCycles {
+    param([hashtable]$ById)
+    $script:dcColor = @{}
+    $script:dcCycles = @()
+    $script:dcSeen = @{}
+    foreach ($id in @($ById.Keys | Sort-Object)) {
+        if ($script:dcColor[$id] -eq 2) { continue }
+        Invoke-DepWalk -Id $id -ById $ById -Path (New-Object System.Collections.ArrayList)
+    }
+    return @($script:dcCycles)
+}
+
 # --------------------------------------------------------------- commands ---
 
 switch ($Command) {
@@ -959,6 +1005,14 @@ switch ($Command) {
                     Write-Host ("NO PROGRESS LOG: {0} is in-progress with no '## Progress log' section (add one: parity-tasks.ps1 note {0} -Text ...)" -f $t.Id); $problems++
                 }
             }
+        }
+
+        # A ring of tasks that wait on each other (T1133). Checked over the
+        # whole graph rather than per task, because a cycle is a property of
+        # the graph and no single file in it looks wrong.
+        foreach ($ring in @(Get-DepCycles -ById $byId)) {
+            $shown = @($ring) + @($ring)[0]
+            Write-Host ("DEP CYCLE: {0} - nothing in this ring can ever be offered by next" -f ($shown -join ' -> ')); $problems++
         }
 
         # An acceptance harness that has gone unrun since the code it covers
