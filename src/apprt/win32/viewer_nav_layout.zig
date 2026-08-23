@@ -181,6 +181,44 @@ fn px(dip: f32, scale: f32) i32 {
 }
 
 // -----------------------------------------------------------------------------
+// Pin policy
+// -----------------------------------------------------------------------------
+
+/// Every reason the bar stays on screen instead of peeking on hover. Mac's
+/// `ViewerView.chromeAlwaysVisible`, in one place for the same reason it is
+/// one place there: the conditions OVERLAP, and a pane pinned by two of them
+/// at once must not lose the bar when the first one ends.
+///
+/// A struct of named bools rather than positional ones so a fourth condition
+/// cannot silently swap with a third at the call site.
+pub const Pin = struct {
+    /// The pane is on a LIVE PAGE - a website, or a local `.html` file the web
+    /// view renders as one (`viewer_content.Mode.isLivePage`). That is
+    /// something you navigate, so the address and the history controls are
+    /// part of using it, and a blank browser pane is nothing but its address
+    /// field. A markdown or code viewer is a reading surface whose address
+    /// rarely changes, so it keeps the hover peek rather than spending a
+    /// permanent strip of the document on chrome (T1131; Mac 5241d7bec).
+    live_page: bool = false,
+    /// The compact table-of-contents layout: the card's only opener is the
+    /// bar's contents button, so a bar that auto-hides strands the card
+    /// (T160).
+    compact_toc: bool = false,
+    /// The feedback composer is open: its only close affordance lives in the
+    /// bar, so a bar that auto-hid out from under it would leave the composer
+    /// with no way out (T634).
+    feedback_open: bool = false,
+};
+
+/// Whether the bar is pinned open right now. Deliberately a function over the
+/// whole struct rather than an `or` at each site: the poll, the mode change
+/// and the composer all ask the same question, and three copies of it is three
+/// chances to disagree.
+pub fn pinned(p: Pin) bool {
+    return p.live_page or p.compact_toc or p.feedback_open;
+}
+
+// -----------------------------------------------------------------------------
 // Reveal policy
 // -----------------------------------------------------------------------------
 
@@ -569,4 +607,34 @@ test "hover policy: strip reveals, drift and leave pull the deadline in" {
     });
     try testing.expect(!a.show and !a.hide);
     try testing.expectEqual(@as(u64, 0), a.deadline_ms);
+}
+
+test "T1131: pin policy is the OR of every reason, and nothing else" {
+    // Nothing pinning: the bar peeks on hover, which is the reading-surface
+    // default (markdown, code).
+    try testing.expect(!pinned(.{}));
+
+    // Each reason pins on its own.
+    try testing.expect(pinned(.{ .live_page = true }));
+    try testing.expect(pinned(.{ .compact_toc = true }));
+    try testing.expect(pinned(.{ .feedback_open = true }));
+
+    // And they OVERLAP: a live page whose composer closes is still a live
+    // page, so the bar stays. This is the whole reason the question is asked
+    // in one place instead of at each site (Mac 5241d7bec).
+    try testing.expect(pinned(.{ .live_page = true, .feedback_open = true }));
+    try testing.expect(pinned(.{ .live_page = true, .feedback_open = false }));
+    try testing.expect(pinned(.{ .compact_toc = true, .feedback_open = true }));
+}
+
+test "T1131: a live page pins the bar, a reading surface does not" {
+    const content = @import("viewer_content.zig");
+    // The split the user feels: navigate-able pages keep their address on
+    // screen; documents keep the hover peek.
+    for ([_]content.Mode{ .web, .html }) |m| {
+        try testing.expect(pinned(.{ .live_page = m.isLivePage() }));
+    }
+    for ([_]content.Mode{ .markdown, .code, .diff }) |m| {
+        try testing.expect(!pinned(.{ .live_page = m.isLivePage() }));
+    }
 }

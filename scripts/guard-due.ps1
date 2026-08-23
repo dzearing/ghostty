@@ -218,6 +218,22 @@ $GuardTable = @(
             'src\apprt\win32\ViewerNavBar.zig'
         )
     },
+    # The viewer nav-bar PIN (T1131): which viewer flavors keep their address
+    # bar on screen and which peek on hover. The unit lanes assert the policy
+    # table and the pane's own record of it; only this script proves that a
+    # real `+split --view=` pane comes up with the bar shown - or hidden - and
+    # that a shown bar reserves its band instead of covering the page. Covers
+    # the pane that applies the pin and the module that decides it.
+    [pscustomobject]@{
+        Name   = 'viewer-nav-pin'
+        Script = 'test\win32\viewer-nav-pin.ps1'
+        Stamp  = 'test\win32\viewer-nav-pin.stamp.json'
+        Covers = @(
+            'test\win32\viewer-nav-pin.ps1',
+            'src\apprt\win32\viewer_nav_layout.zig',
+            'src\apprt\win32\ViewerPane.zig'
+        )
+    },
     # The feedback composer (T644): its undo behaviour, quote formatting and
     # send path live in ViewerFeedbackBar and are proved only by this harness
     # - the unit lanes see the pure modules but never a RichEdit. T644 itself

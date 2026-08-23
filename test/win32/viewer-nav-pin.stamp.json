@@ -1,0 +1,11 @@
+{
+    "guard":  "viewer-nav-pin",
+    "script":  "test/win32/viewer-nav-pin.ps1",
+    "generated":  "2026-08-23T07:38:57-07:00",
+    "commit":  "155ac6b27",
+    "files":  {
+                  "src/apprt/win32/viewer_nav_layout.zig":  "984630df5656911b7d2f21ccbfe9bcd0eca9aecaca9a260a80bb350479ad6799",
+                  "src/apprt/win32/ViewerPane.zig":  "9e11d25d252b04519be8171363010dbb69d4bb965f5a84759657cd617f8e5f81",
+                  "test/win32/viewer-nav-pin.ps1":  "f96acd0e9478195b660b6ca9024e069cab06dcb8b2300aff238b8459929d1294"
+              }
+}
