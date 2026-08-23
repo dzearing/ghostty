@@ -19,6 +19,14 @@ Concretely, in order, with no stops in between:
    - Exit **0** (`PRIMARY …`): you are the execution window. Carry on.
    - Exit **3** (`STAND-DOWN …`): another session already holds the loop.
      This window has been unmarked and closed; **stop, do not pick a task.**
+   - Exit **4** (`STOPPED by request …`): the user asked the queue to drain
+     (`go-loop-exec.ps1 stop`). **Stop, do not pick a task, and do not
+     `/reset-context`** — perpetuating the loop is the one thing that defeats
+     the request. Report what the last turn finished and that the loop is
+     parked; the window has already unmarked itself and given up the lock. This
+     is not a failure: it is quiet on purpose, and nothing needs diagnosing.
+     Only the user resumes it, with
+     `powershell -NoProfile -File scripts\go-loop-exec.ps1 resume`.
    - What it does: takes the lock (`scripts\go-loop-lock.ps1`), pins this
      window's title to `[go-loop] …` so the execution window is identifiable
      on sight and in `+list --json`, then resolves duplicates **without

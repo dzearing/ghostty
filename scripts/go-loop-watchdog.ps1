@@ -8,6 +8,9 @@
 # and re-enters the loop when the heartbeat goes stale while tasks remain.
 #
 # Per tick:
+#   0. If a stop has been requested (go-loop-exec.ps1 stop), do nothing at all.
+#      This must come first: "tasks remain" is the re-entry trigger, so a
+#      requested stop is exactly the state that would otherwise revive the loop.
 #   1. If no open task file remains that this seat could work (status todo/
 #      in-progress/blocked under docs\design\windows-parity-tasks\, minus
 #      seat: mac tasks), do nothing - the loop is finished, not stuck.
@@ -461,6 +464,18 @@ if ($Status) {
 # --- one tick -------------------------------------------------------------
 
 function Invoke-Tick {
+    # A deliberate stop outranks everything below, including open tasks -
+    # "tasks remain" is the watchdog's whole trigger, so without this check a
+    # requested stop is precisely the condition that makes it re-enter. Checked
+    # first and cheaply, before any lock or pane probe.
+    $stop = Get-LoopStop -Repo $Repo
+    if ($stop) {
+        Log ("stopped by request at $($stop.requested_at) by $($stop.requested_by)" +
+             $(if ($stop.reason) { " - $($stop.reason)" } else { '' }) +
+             '; not re-entering. Clear with go-loop-exec.ps1 resume')
+        return 'stopped'
+    }
+
     $remaining = Get-RemainingTasks
     if ($remaining -eq 0) { Log 'idle: no open tasks for this seat'; return 'none' }
 

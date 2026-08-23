@@ -591,3 +591,82 @@ function Invoke-GhozttyListJson {
         Remove-Item $out -Force -ErrorAction SilentlyContinue
     }
 }
+
+# --------------------------------------------------------------------------
+# Graceful stop (user, 2026-08-23: "stop the task queue after the current one
+# is complete and merged").
+#
+# The loop has no off switch. Closing the window does not stop it - the
+# watchdog re-enters whenever the lock's heartbeat goes stale while open tasks
+# remain, which is exactly what a closed window looks like. Killing the
+# watchdog too stops it, but by amputation: it interrupts whatever turn is
+# mid-build, leaves a claimed task in-progress and a dirty tree, and there is
+# no record anywhere of why the loop went quiet.
+#
+# So the stop is a REQUEST, honoured at a turn boundary. A flag file says "no
+# new turns"; the current turn runs to completion - build, test, commit, push -
+# and the NEXT `claim` refuses. Three readers must agree or the loop comes
+# back: `go-loop-exec.ps1 claim` (exit 4), `go-loop-watchdog.ps1` (skip the
+# tick), and `go-loop-health.ps1` (report stopped, not down - otherwise the
+# 2-hourly supervisor check reads a deliberate stop as a failure and revives
+# it, which is the bug this is meant to prevent).
+#
+# The flag is a file and not a lock field on purpose: it must outlive the lock,
+# survive the owner's death, and be greppable by a human who finds the loop
+# quiet and wants to know why.
+# --------------------------------------------------------------------------
+
+function Get-LoopStopPath {
+    param([Parameter(Mandatory)][string]$Repo)
+    Join-Path (Join-Path $Repo 'temp') 'go-loop.stop.json'
+}
+
+function Get-LoopStop {
+    # Returns the stop request object, or $null when the loop is free to run.
+    # NEVER throws: every caller is on the loop's critical path, and a stop
+    # check that can fail is a stop check that can wedge the loop.
+    param([Parameter(Mandatory)][string]$Repo)
+    $path = Get-LoopStopPath -Repo $Repo
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try {
+        $raw = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
+        if (-not $raw -or -not $raw.Trim()) {
+            # An empty or half-written file still means somebody asked to stop.
+            # Honour it: the failure mode of a false stop is a quiet loop the
+            # user can resume in one command; of a missed stop, a loop that
+            # keeps taking tasks after being told not to.
+            return [pscustomobject]@{ requested_at = ''; requested_by = 'unknown'; reason = '(stop file present but empty)' }
+        }
+        return ($raw | ConvertFrom-Json -ErrorAction Stop)
+    } catch {
+        return [pscustomobject]@{ requested_at = ''; requested_by = 'unknown'; reason = "(stop file unreadable: $($_.Exception.Message))" }
+    }
+}
+
+function Set-LoopStop {
+    param(
+        [Parameter(Mandatory)][string]$Repo,
+        [string]$Reason = '',
+        [string]$By = ''
+    )
+    if (-not $By) { $By = "$env:USERNAME@$env:COMPUTERNAME" }
+    $dir = Join-Path $Repo 'temp'
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    $path = Get-LoopStopPath -Repo $Repo
+    $obj = [ordered]@{
+        requested_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        requested_by = $By
+        reason       = $Reason
+    }
+    # -Encoding utf8 explicitly: Set-Content defaults to the ANSI codepage here
+    # and this file is read back by ConvertFrom-Json.
+    ($obj | ConvertTo-Json) | Set-Content -LiteralPath $path -Encoding utf8
+    return $path
+}
+
+function Clear-LoopStop {
+    param([Parameter(Mandatory)][string]$Repo)
+    $path = Get-LoopStopPath -Repo $Repo
+    if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force; return $true }
+    return $false
+}

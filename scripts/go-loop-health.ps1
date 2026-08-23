@@ -21,6 +21,9 @@
 #   1 degraded     - running, but something is off (no marked window, no
 #                    watchdog, dashboard down, activity going stale)
 #   2 down         - no live loop owner at all
+#   3 stopped      - quiet ON PURPOSE: somebody ran `go-loop-exec.ps1 stop`.
+#                    Distinct from `down` because a supervisor that cannot tell
+#                    them apart re-enters the loop the user just stopped.
 [CmdletBinding()]
 param(
     # Resolved in the body, not here: $PSScriptRoot is not yet bound while
@@ -39,6 +42,8 @@ param(
 
 $ErrorActionPreference = 'Continue'
 if (-not $Repo) { $Repo = Split-Path -Parent $PSScriptRoot }
+# Get-LoopStop. loop-session.ps1 is documented as free of load-time side effects.
+. (Join-Path $PSScriptRoot 'loop-session.ps1')
 $IsoFmt = 'yyyy-MM-ddTHH:mm:ssK'
 function Now-Iso { (Get-Date).ToString($IsoFmt) }
 
@@ -131,6 +136,20 @@ $code = 0
 if (-not $alive) { $verdict = 'down'; $code = 2 }
 elseif ($notes.Count -gt 0) { $verdict = 'degraded'; $code = 1 }
 
+# A requested stop reads EXACTLY like a dead loop - no owner, no marked window,
+# no activity - so without this the 2-hourly supervisor check answers DOWN and
+# revives the thing the user just asked to stop. Its own verdict and its own
+# exit code (3), because "stopped" is not a degraded "down": nothing is wrong.
+$stopReq = Get-LoopStop -Repo $Repo
+if ($stopReq) {
+    $verdict = 'stopped'
+    $code = 3
+    $notes = @(("stopped by request at $($stopReq.requested_at) by $($stopReq.requested_by)" +
+        $(if ($stopReq.reason) { " - $($stopReq.reason)" } else { '' }))) +
+        @('resume with: powershell -NoProfile -File scripts\go-loop-exec.ps1 resume') +
+        ($notes | Where-Object { $_ -notmatch '^loop owner is |^watchdog is not running$' })
+}
+
 if ($Json) {
     [ordered]@{
         at             = Now-Iso
@@ -147,6 +166,7 @@ if ($Json) {
         dashboard      = $dashboard
         in_progress    = $inProgress
         open_decisions = $openDecisions
+        stopped        = [bool]$stopReq
         notes          = $notes
     } | ConvertTo-Json -Depth 4
 } else {

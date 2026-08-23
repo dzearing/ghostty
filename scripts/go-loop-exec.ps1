@@ -21,14 +21,21 @@
 # The arbiter is the lock, not a negotiation: whoever holds it is primary. That
 # is symmetric (both sides compute the same answer) and cannot deadlock.
 #
-# Actions: claim | mark | unmark | list
-# Exit codes: 0 primary (carry on), 3 stood down (stop), 2 error.
+# `stop` / `resume` are the loop's off switch (user, 2026-08-23). `stop` does
+# not interrupt anything: it writes a request that the NEXT `claim` refuses, so
+# the turn in flight finishes its build, test, commit and push first. The
+# watchdog and the health check read the same flag, or the loop simply comes
+# back - see the Graceful stop block in loop-session.ps1.
+#
+# Actions: claim | mark | unmark | list | stop | resume
+# Exit codes: 0 primary (carry on), 3 stood down (stop), 4 stopped by request
+#             (the queue is drained; do not pick a task), 2 error.
 #
 #   powershell -NoProfile -File scripts\go-loop-exec.ps1 claim
 #   powershell -NoProfile -File scripts\go-loop-exec.ps1 list
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('claim', 'mark', 'unmark', 'list')]
+    [ValidateSet('claim', 'mark', 'unmark', 'list', 'stop', 'resume')]
     [string]$Action = 'list',
 
     [string]$Repo,
@@ -42,6 +49,8 @@ param(
     [int]$GraceSeconds = 5,
     [switch]$NoSelfClose,     # stand down without closing this window (tests)
     [switch]$NoClose,         # find duplicates but do not close them (tests)
+    [string]$Reason,          # stop: why, recorded in the flag for whoever finds it
+    [switch]$Force,           # stop: also give up the lock now, do not wait for the turn
     [switch]$Json
 )
 
@@ -186,7 +195,51 @@ switch ($Action) {
         exit 0
     }
 
+    'stop' {
+        $path = Set-LoopStop -Repo $Repo -Reason $Reason
+        "STOP REQUESTED $path"
+        if ($Reason) { "  reason: $Reason" }
+        "  the turn in flight finishes normally - build, test, commit, push, merge."
+        "  the NEXT claim refuses (exit 4), so no new task is picked up."
+        "  resume with: powershell -NoProfile -File scripts\go-loop-exec.ps1 resume"
+        if ($Force) {
+            # Only for a loop that is already dead: releasing a live turn's lock
+            # invites a second window to claim it mid-build.
+            & powershell @(Lock-Args 'release') 2>&1 | Out-String | Out-Null
+            if ($PaneId) { Clear-Mark $PaneId | Out-Null }
+            "  -Force: lock released and window unmarked now"
+        }
+        exit 0
+    }
+
+    'resume' {
+        if (Clear-LoopStop -Repo $Repo) {
+            "RESUMED stop request cleared"
+            "  claim will take the loop again on the next turn"
+        } else {
+            "RESUMED no stop request was set (nothing to clear)"
+        }
+        exit 0
+    }
+
     'claim' {
+        # 0. Has somebody asked the queue to drain? Checked BEFORE the lock, so
+        # a stop costs nothing and cannot be defeated by lock contention. Exit 4
+        # is its own code: 3 means "another window is primary" and would send a
+        # reader looking for a rival that does not exist.
+        $stop = Get-LoopStop -Repo $Repo
+        if ($stop) {
+            "STOPPED by request at $($stop.requested_at) by $($stop.requested_by)"
+            if ($stop.reason) { "  reason: $($stop.reason)" }
+            "  do NOT pick up a task. The queue is drained by request, not broken."
+            "  resume with: powershell -NoProfile -File scripts\go-loop-exec.ps1 resume"
+            # Hand back the loop so nothing looks alive: an unreleased lock with
+            # a stale heartbeat is precisely what the watchdog re-enters on.
+            & powershell @(Lock-Args 'release') 2>&1 | Out-String | Out-Null
+            if ($PaneId) { Clear-Mark $PaneId | Out-Null; "  unmarked this window" }
+            exit 4
+        }
+
         # 1. The lock is the arbiter.
         $acq = & powershell @(Lock-Args 'acquire') 2>&1 | Out-String
         $acqCode = $LASTEXITCODE
