@@ -153,6 +153,23 @@ $GuardTable = @(
             'scripts\fork-identity.ps1'
         )
     },
+    # The ghoztty:// URL scheme (T1124). The registration is a REGISTRY write
+    # the user's shell then obeys, and nothing in the P1-P3 floor launches a GUI
+    # to watch it happen: the unit lanes see the scheme name and the command
+    # string, never the decision to write them. That is how a release build
+    # sitting in `zig-out-release` came to own the user's links for days with
+    # every lane green. This row ties that decision - the build-mode split and
+    # the source-checkout location gate - to the one harness that measures it.
+    [pscustomobject]@{
+        Name   = 'url-scheme'
+        Script = 'test\win32\url-scheme.ps1'
+        Stamp  = 'test\win32\url-scheme.stamp.json'
+        Covers = @(
+            'test\win32\url-scheme.ps1',
+            'src\apprt\win32\url_scheme.zig',
+            'src\apprt\ipc\url_scheme.zig'
+        )
+    },
     # The startup job self-escape (T675): the only harness that proves a
     # pane-launched app respawns itself OUT of a kill-on-close job and
     # survives the teardown that used to kill it mid-refresh. Interactive

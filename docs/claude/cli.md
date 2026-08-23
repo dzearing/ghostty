@@ -695,6 +695,16 @@ Consequences, all deliberate and the same on both platforms:
   rewritten every launch so an upgrade or a move re-points it. `HKCU`, never
   `HKLM`: Ghoztty installs per user and a machine-wide association would need
   elevation. `GHOZTTY_URL_SCHEME=0`/`off` skips registration.
+- **On Windows the release scheme is also gated by LOCATION** (T1124): a build
+  whose exe sits inside a source checkout — any ancestor directory holding
+  `build.zig` — registers nothing. The build-mode split alone was not enough,
+  because the staging release we package deliveries from lives at
+  `zig-out-release\bin` *in the checkout*: it is a release build, so one launch
+  of it pointed the user's `ghoztty://` links at a scratch directory that
+  ordinary development rebuilds and deletes. The installed release and a
+  portable unpack are both outside a checkout and are unaffected.
+  `GHOZTTY_URL_SCHEME=force` skips the gate; `=gate` applies it to a debug build
+  too, which is how `test\win32\url-scheme.ps1` measures it.
 - **Both spellings parse in both builds.** Links clicked *inside* Ghoztty are
   short-circuited in process and never reach the shell, so a document that
   hardcodes `ghoztty://` still focuses the right pane when a debug build is

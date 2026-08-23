@@ -22,6 +22,12 @@
 #   E. A FAILED LINK SAYS SO. Run without the quiet seam, a warning dialog
 #      appears naming the one supported form, and a burst of links produces ONE
 #      dialog rather than one each.
+#   F. LOCATION GATE (T1124). A build whose exe lives inside a source checkout
+#      registers nothing at all -- `zig-out-release` is a RELEASE build sitting
+#      in build output, and one launch of it pointed the user's ghoztty:// links
+#      at a scratch directory. Measured with `GHOZTTY_URL_SCHEME=gate`, which
+#      applies the release build's location gate to this debug build, paired
+#      with a control that registers again without it.
 #
 # ORACLE, and why it is the app's own log. Focus is a foreground change on a
 # BACKGROUND test desktop (T233), where "which window is active" is not a
@@ -393,12 +399,74 @@ try {
     Assert ($third -ne [IntPtr]::Zero) `
         'control: once the warning is dismissed, the next link shows its own'
     if ($third -ne [IntPtr]::Zero) { Send-TestWindowClose $third | Out-Null }
+
+    # --- F. a build living in the source tree registers NOTHING (T1124) ------
+    # The build-mode split alone let `zig-out-release` -- a RELEASE build, but
+    # build output -- point the user's ghoztty:// links at a scratch directory
+    # inside this repo. The gate is by LOCATION, and `GHOZTTY_URL_SCHEME=gate`
+    # applies it to a debug build so this can be measured without launching a
+    # release build at the user's endpoints (T350).
+    #
+    # The debug class is deleted first, so "still absent" is a real answer
+    # rather than the leftovers of arm A; the positive control below puts it
+    # back, which is also what leaves the box as this script found it.
+    Stop-RepoInstances
+    Remove-Item -Path "Registry::$debugKey" -Recurse -Force -ErrorAction SilentlyContinue
+    Assert ($null -eq (Get-RegValue "$debugKey\shell\open\command" '')) `
+        'setup: the debug class is gone before the gated launch'
+
+    $gateLog = Join-Path $env:TEMP 'ghoztty-url-scheme-gate.log'
+    Remove-Item $gateLog -ErrorAction SilentlyContinue
+    $env:GHOZTTY_URL_SCHEME = 'gate'
+    $gated = Start-OnTestDesktop -Exe $exe -StdErr $gateLog -Arguments @('--session-persistence=false')
+    $gatedOk = (Wait-TestWindow -ProcessId $gated.Pid -Class 'GhozttyWindow') -ne [IntPtr]::Zero
+    Assert $gatedOk 'setup: the gated build launched'
+    Start-Sleep -Seconds 3
+    Assert ($null -eq (Get-RegValue "$debugKey\shell\open\command" '')) `
+        'a build inside the checkout registers nothing (the class stays absent)'
+    # The oracle that says WHY nothing was written: the app declined on purpose
+    # rather than dying before it got there.
+    $said = @(Select-String -Path $gateLog -Pattern 'not registered from a source checkout' -ErrorAction SilentlyContinue).Count
+    Assert ($said -ge 1) "...and says so in the log (matches=$said)"
+    $releaseGated = Get-RegValue "$releaseKey\shell\open\command" ''
+    Assert ($releaseGated -eq $releaseBefore) `
+        'the release class is still untouched by the gated launch'
+
+    # POSITIVE CONTROL: the same exe, same directory, no seam -- registers. So
+    # the arm above measured the gate, not a launch that never reached it.
+    Stop-RepoInstances
+    Remove-Item Env:\GHOZTTY_URL_SCHEME -ErrorAction SilentlyContinue
+    $back = Start-OnTestDesktop -Exe $exe -Arguments @('--session-persistence=false')
+    [void](Wait-TestWindow -ProcessId $back.Pid -Class 'GhozttyWindow')
+    $restored = $null
+    for ($t = 0; $t -lt 30; $t++) {
+        $restored = Get-RegValue "$debugKey\shell\open\command" ''
+        if ($restored) { break }
+        Start-Sleep -Milliseconds 200
+    }
+    Assert ($restored -eq ('"' + $exe + '" "%1"')) `
+        "control: without the gate the same build registers again (got '$restored')"
+
+    # And the whole run leaves the user's release registration exactly as it
+    # found it -- the failure that filed T1124 was a leftover, not a live write.
+    $releaseEnd = Get-RegValue "$releaseKey\shell\open\command" ''
+    Assert ($releaseEnd -eq $releaseBefore) `
+        "the run leaves the release registration as it found it (before='$releaseBefore' after='$releaseEnd')"
 } finally {
+    Remove-Item Env:\GHOZTTY_URL_SCHEME -ErrorAction SilentlyContinue
     $env:GHOZTTY_URL_SCHEME_QUIET = '1'
     Stop-RepoInstances
     Remove-TestDesktop $td
     Stop-TestForegroundWatch
     Remove-Item Env:\GHOZTTY_URL_SCHEME_QUIET -ErrorAction SilentlyContinue
+}
+
+# A clean green run stamps the covered files (T783/T1124) so scripts\guard-due.ps1
+# can answer "has anybody run this against the registration as it now stands?".
+# A red run leaves the stamp alone.
+if ($script:fail -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard url-scheme -Repo $repo 2>&1 | ForEach-Object { "  $_" }
 }
 
 Write-Host ''

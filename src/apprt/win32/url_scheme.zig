@@ -25,6 +25,17 @@
 //! names, so the shell never has to choose between them. Both spellings still
 //! PARSE in both builds — see the shared module.
 //!
+//! The build-mode split is not enough on its own (T1124). The staging release
+//! we build to package a delivery lives at `zig-out-release\bin` INSIDE the
+//! checkout, and it is a release build, so launching it once pointed the user's
+//! `ghoztty://` links at a scratch directory that ordinary development rebuilds,
+//! moves and deletes. So the release scheme carries a LOCATION gate as well: a
+//! build whose exe sits under a source checkout (an ancestor directory holding
+//! `build.zig`) never claims it. A portable unpack and the installed release are
+//! both outside a checkout and register exactly as before — the gate excludes
+//! build output, not unusual install locations. Same shape as
+//! `PathInstaller`'s canonical-install gate, and the same `force` escape hatch.
+//!
 //! ## Who shows the failure
 //!
 //! Whichever process noticed it, because they have different tools. The
@@ -122,12 +133,29 @@ fn registerThread() void {
 /// (an upgrade, a portable copy) and the last launch is the one that should
 /// answer links.
 fn register(arena: std.mem.Allocator) !void {
-    if (try disabled(arena)) {
+    const mode = envMode(arena);
+    if (mode == .off) {
         log.info("url scheme: registration disabled by GHOZTTY_URL_SCHEME", .{});
         return;
     }
 
     const exe = try std.fs.selfExePathAlloc(arena);
+
+    // Location gate (T1124). A release build is the one that answers the user's
+    // links, so a release build that is really build OUTPUT — `zig-out-release`
+    // in this very checkout is one — must not claim them. `force` is the escape
+    // hatch; `gate` applies the same rule to a debug build, which is how the
+    // acceptance script exercises this path without a release build in hand.
+    if (mode != .force and (!build_config.is_debug or mode == .gate)) {
+        const exe_dir = std.fs.path.dirname(exe) orelse exe;
+        if (inSourceCheckout(arena, exe_dir)) {
+            log.info(
+                "url scheme: {s}:// not registered from a source checkout ({s})",
+                .{ registeredScheme(), exe_dir },
+            );
+            return;
+        }
+    }
 
     var key_buf: [128]u8 = undefined;
     const class_path = classKeyPath(&key_buf) orelse return error.NameTooLong;
@@ -160,13 +188,61 @@ fn register(arena: std.mem.Allocator) !void {
     log.info("url scheme: {s}:// -> {s}", .{ registeredScheme(), exe });
 }
 
-/// `GHOZTTY_URL_SCHEME=0`/`off` skips registration entirely — the escape hatch
-/// for a box where the user wants their links to keep landing in a different
-/// build, and the way an acceptance script proves registration is a deliberate
-/// act rather than a side effect of launching.
-fn disabled(arena: std.mem.Allocator) !bool {
-    const v = std.process.getEnvVarOwned(arena, "GHOZTTY_URL_SCHEME") catch return false;
-    return std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off");
+/// What `GHOZTTY_URL_SCHEME` asks of the registration.
+///
+///  * `0` / `off` — register nothing. The escape hatch for a box where the user
+///    wants their links to keep landing in a different build, and the way an
+///    acceptance script proves registration is a deliberate act rather than a
+///    side effect of launching.
+///  * `force` — register regardless of where this exe lives (the location gate
+///    below is skipped). Mirrors `GHOZTTY_PATH_SELFHEAL=force`.
+///  * `gate` — apply the location gate even to a debug build. The seam the
+///    acceptance script needs: it can prove a build inside a checkout registers
+///    nothing without asking anyone to launch a release build at the user's
+///    endpoints (T350).
+pub const Mode = enum { default, off, force, gate };
+
+pub fn parseMode(v: []const u8) Mode {
+    if (std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off")) return .off;
+    if (std.ascii.eqlIgnoreCase(v, "force")) return .force;
+    if (std.ascii.eqlIgnoreCase(v, "gate")) return .gate;
+    return .default;
+}
+
+fn envMode(arena: std.mem.Allocator) Mode {
+    const v = std.process.getEnvVarOwned(arena, "GHOZTTY_URL_SCHEME") catch return .default;
+    return parseMode(v);
+}
+
+/// How far up the tree the checkout marker is looked for. A build output
+/// directory sits a couple of levels under the repo root (`zig-out\bin`); the
+/// bound exists so a pathological path cannot turn a launch into a long walk.
+const max_checkout_depth: usize = 16;
+
+/// Does `dir` sit inside a source checkout — i.e. does it, or any ancestor,
+/// hold a `build.zig`?
+///
+/// This is what tells build OUTPUT apart from an install (T1124). Both
+/// `zig-out\bin` and `zig-out-release\bin` answer yes; `%LOCALAPPDATA%\Programs\
+/// Ghoztty` and a portable unpack on the Desktop answer no, so neither of the
+/// two real install shapes loses its registration. The marker is the build file
+/// rather than `.git`, because a checkout with no git dir (an archive, a
+/// worktree's copy) still builds and still must not claim the scheme.
+pub fn inSourceCheckout(alloc: std.mem.Allocator, dir: []const u8) bool {
+    var cur: []const u8 = dir;
+    var depth: usize = 0;
+    while (depth < max_checkout_depth) : (depth += 1) {
+        const marker = std.fs.path.join(alloc, &.{ cur, "build.zig" }) catch return false;
+        defer alloc.free(marker);
+        if (std.fs.accessAbsolute(marker, .{})) |_| return true else |_| {}
+
+        const parent = std.fs.path.dirname(cur) orelse return false;
+        // `dirname` of a root ("D:\\", "\\\\host\\share") returns the root or
+        // null; either way there is nowhere further up to look.
+        if (parent.len >= cur.len) return false;
+        cur = parent;
+    }
+    return false;
 }
 
 fn createKey(arena: std.mem.Allocator, path: []const u8, out: *w32.HKEY) !void {
@@ -483,6 +559,68 @@ test "the URL is found among ordinary arguments, and not past -e" {
         "ghoztty://focus/dev",
         urlArg(&.{ exe, "ghoztty://focus/dev", "-e", "echo", "hi" }).?,
     );
+}
+
+test "GHOZTTY_URL_SCHEME spells out off, force and gate" {
+    try testing.expectEqual(Mode.off, parseMode("0"));
+    try testing.expectEqual(Mode.off, parseMode("off"));
+    try testing.expectEqual(Mode.off, parseMode("OFF"));
+    try testing.expectEqual(Mode.force, parseMode("force"));
+    try testing.expectEqual(Mode.gate, parseMode("gate"));
+    // Anything else is the ordinary launch, not an error: an unrecognised value
+    // must never turn registration off by accident.
+    try testing.expectEqual(Mode.default, parseMode(""));
+    try testing.expectEqual(Mode.default, parseMode("1"));
+    try testing.expectEqual(Mode.default, parseMode("yes please"));
+}
+
+test "build output is recognised as a source checkout, an install is not" {
+    const alloc = testing.allocator;
+
+    // Deliberately NOT `testing.tmpDir`: that lands under `.zig-cache` INSIDE
+    // this checkout, where every path in the test has THIS repo's `build.zig`
+    // as an ancestor and the negative cases could not fail. The OS temp dir is
+    // the only place on the box guaranteed to be outside a source tree.
+    const tmp_root = std.process.getEnvVarOwned(alloc, "TEMP") catch return error.SkipZigTest;
+    defer alloc.free(tmp_root);
+    const root = try std.fmt.allocPrint(alloc, "{s}{c}ghoztty-urlscheme-test", .{
+        tmp_root,
+        std.fs.path.sep,
+    });
+    defer alloc.free(root);
+    std.fs.deleteTreeAbsolute(root) catch {};
+    defer std.fs.deleteTreeAbsolute(root) catch {};
+
+    var dir = try std.fs.cwd().makeOpenPath(root, .{});
+    defer dir.close();
+
+    // A checkout: build.zig at the root, build output a couple of levels down.
+    try dir.makePath("repo" ++ std.fs.path.sep_str ++ "zig-out-release" ++ std.fs.path.sep_str ++ "bin");
+    try dir.writeFile(.{
+        .sub_path = "repo" ++ std.fs.path.sep_str ++ "build.zig",
+        .data = "// marker\n",
+    });
+    const staging = try std.fs.path.join(alloc, &.{ root, "repo", "zig-out-release", "bin" });
+    defer alloc.free(staging);
+    try testing.expect(inSourceCheckout(alloc, staging));
+
+    // The repo root itself, and the debug output beside it, answer the same.
+    const repo = try std.fs.path.join(alloc, &.{ root, "repo" });
+    defer alloc.free(repo);
+    try testing.expect(inSourceCheckout(alloc, repo));
+
+    // An install: same tree, no build.zig above it. This is the shape of both
+    // %LOCALAPPDATA%\Programs\Ghoztty and a portable unpack, and both must keep
+    // registering.
+    try dir.makePath("Programs" ++ std.fs.path.sep_str ++ "Ghoztty");
+    const install = try std.fs.path.join(alloc, &.{ root, "Programs", "Ghoztty" });
+    defer alloc.free(install);
+    try testing.expect(!inSourceCheckout(alloc, install));
+
+    // A directory that does not exist is not a checkout, and does not error.
+    const missing = try std.fs.path.join(alloc, &.{ root, "nope", "bin" });
+    defer alloc.free(missing);
+    try testing.expect(!inSourceCheckout(alloc, missing));
 }
 
 test "exit codes tell the two failures apart" {
