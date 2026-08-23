@@ -155,3 +155,14 @@ as the digest that showed them.
 - One key hides every piece of chrome (presentation mode)
 - Mute a chatty pane (per-pane bell/notification control)
 - Tab-completion for the ghoztty command itself (pwsh completer with live pane ids)
+
+## 2026-08-23
+
+- Copy a wrapped line and get one line (unwrap soft line breaks on copy)
+- The port a pane just opened becomes a link (listening-port detection)
+- Resizing the window rewraps what is already on screen (scrollback reflow)
+- The wheel scrolls inside programs that do not handle it (alt-screen wheel translation)
+- Snap Layouts from our own maximize button (Windows 11 snap flyout on custom chrome)
+- Paste from a history of what you copied here (terminal clipboard ring)
+- Drag a selection out of the pane (drag-and-drop selected output)
+- Scrolling that feels like the rest of Windows (precision-touchpad momentum)
