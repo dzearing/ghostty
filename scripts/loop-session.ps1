@@ -617,7 +617,15 @@ function Invoke-GhozttyListJson {
 # --------------------------------------------------------------------------
 
 function Get-LoopStopPath {
-    param([Parameter(Mandatory)][string]$Repo)
+    # -Path wins over -Repo. Every other piece of loop state the acceptance
+    # harness touches (LockPath, StatePath, TaskDir) is overridable, and this
+    # one has to be too: the harness runs the watchdog against the REAL repo
+    # with fixture paths for everything else, so a repo-derived stop file makes
+    # every watchdog arm fail whenever a stop happens to be pending. That is
+    # not a hypothetical - it is how this parameter got written.
+    param([string]$Repo, [string]$Path)
+    if ($Path) { return $Path }
+    if (-not $Repo) { throw 'Get-LoopStopPath needs -Repo or -Path.' }
     Join-Path (Join-Path $Repo 'temp') 'go-loop.stop.json'
 }
 
@@ -625,8 +633,8 @@ function Get-LoopStop {
     # Returns the stop request object, or $null when the loop is free to run.
     # NEVER throws: every caller is on the loop's critical path, and a stop
     # check that can fail is a stop check that can wedge the loop.
-    param([Parameter(Mandatory)][string]$Repo)
-    $path = Get-LoopStopPath -Repo $Repo
+    param([string]$Repo, [string]$Path)
+    $path = Get-LoopStopPath -Repo $Repo -Path $Path
     if (-not (Test-Path -LiteralPath $path)) { return $null }
     try {
         $raw = Get-Content -LiteralPath $path -Raw -ErrorAction Stop
@@ -645,14 +653,15 @@ function Get-LoopStop {
 
 function Set-LoopStop {
     param(
-        [Parameter(Mandatory)][string]$Repo,
+        [string]$Repo,
+        [string]$Path,
         [string]$Reason = '',
         [string]$By = ''
     )
     if (-not $By) { $By = "$env:USERNAME@$env:COMPUTERNAME" }
-    $dir = Join-Path $Repo 'temp'
-    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    $path = Get-LoopStopPath -Repo $Repo
+    $path = Get-LoopStopPath -Repo $Repo -Path $Path
+    $dir = Split-Path -Parent $path
+    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     $obj = [ordered]@{
         requested_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
         requested_by = $By
@@ -665,8 +674,8 @@ function Set-LoopStop {
 }
 
 function Clear-LoopStop {
-    param([Parameter(Mandatory)][string]$Repo)
-    $path = Get-LoopStopPath -Repo $Repo
+    param([string]$Repo, [string]$Path)
+    $path = Get-LoopStopPath -Repo $Repo -Path $Path
     if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force; return $true }
     return $false
 }

@@ -31,6 +31,7 @@ param(
     # dies before the first line runs.
     [string]$Repo,
     [int]$Port = 7788,
+    [string]$StopPath,
     # Activity older than this means the loop is not turning even if the
     # process is alive. Deliberately generous: a build-and-test task legitimately
     # runs long, and a false "stalled" is worse than a late one.
@@ -140,7 +141,7 @@ elseif ($notes.Count -gt 0) { $verdict = 'degraded'; $code = 1 }
 # no activity - so without this the 2-hourly supervisor check answers DOWN and
 # revives the thing the user just asked to stop. Its own verdict and its own
 # exit code (3), because "stopped" is not a degraded "down": nothing is wrong.
-$stopReq = Get-LoopStop -Repo $Repo
+$stopReq = Get-LoopStop -Repo $Repo -Path $StopPath
 if ($stopReq) {
     $verdict = 'stopped'
     $code = 3

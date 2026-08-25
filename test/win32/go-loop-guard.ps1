@@ -78,6 +78,9 @@ $taskDir = Join-Path $root 'tasks'
 $emptyTaskDir = Join-Path $root 'tasks-empty'
 $macOnlyTaskDir = Join-Path $root 'tasks-mac-only'
 $log = Join-Path $root 'watchdog.log'
+# Isolated like the lock and the state file: a stop pending in the REAL repo
+# must not decide what these arms observe.
+$stopFile = Join-Path $root 'go-loop.stop.json'
 $lockScript = Join-Path $Repo 'scripts\go-loop-lock.ps1'
 $dogScript = Join-Path $Repo 'scripts\go-loop-watchdog.ps1'
 $execScript = Join-Path $Repo 'scripts\go-loop-exec.ps1'
@@ -114,14 +117,15 @@ function Dog-Run([string[]]$extra, [string]$taskDirPath) {
     if (-not $taskDirPath) { $taskDirPath = $taskDir }
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dogScript,
         '-Repo', $Repo, '-LockPath', $lock, '-StatePath', $state,
-        '-TaskDir', $taskDirPath, '-LogPath', $log, '-Once') + $extra
+        '-TaskDir', $taskDirPath, '-LogPath', $log,
+        '-StopPath', $stopFile, '-Once') + $extra
     $out = & powershell @argList 2>&1 | ForEach-Object { $_.ToString() } | Out-String
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
 
 function Exec-Run([string[]]$extra) {
     $argList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $execScript,
-        '-Repo', $Repo, '-LockPath', $lock, '-GhozttyExe', $Exe) + $extra
+        '-Repo', $Repo, '-LockPath', $lock, '-StopPath', $stopFile, '-GhozttyExe', $Exe) + $extra
     $out = & powershell @argList 2>&1 | ForEach-Object { $_.ToString() } | Out-String
     return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
 }
@@ -948,7 +952,7 @@ $dog = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList @(
     '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dogScript,
     '-Repo', $Repo, '-LockPath', $lock, '-StatePath', $pState,
     '-TaskDir', $emptyTaskDir, '-LogPath', $pLog, '-MutexName', $pMutex,
-    '-PollSeconds', '2', '-DryRun')
+    '-StopPath', $stopFile, '-PollSeconds', '2', '-DryRun')
 $beacon = $null
 foreach ($i in 1..40) {
     Start-Sleep -Milliseconds 500
@@ -976,7 +980,7 @@ $onceState = Join-Path $root 'go-loop.watchdog-once.json'
     Out-File -FilePath $onceState -Encoding utf8
 $argsOnce = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dogScript,
     '-Repo', $Repo, '-LockPath', $lock, '-StatePath', $onceState,
-    '-TaskDir', $emptyTaskDir, '-LogPath', $pLog, '-Once')
+    '-TaskDir', $emptyTaskDir, '-LogPath', $pLog, '-StopPath', $stopFile, '-Once')
 & powershell @argsOnce | Out-Null
 $onceObj = Get-Content $onceState -Raw | ConvertFrom-Json
 Assert 'P6 a -Once tick writes no beacon' ($null -eq $onceObj.tick_at)
@@ -1484,6 +1488,119 @@ Assert 'W33 validate goes green once the commit is pushed' ($r.Code -eq 0 -and $
 $realHooks = (& git -C $Repo config --local --get core.hooksPath 2>$null)
 Assert 'W15 the real repo has the guard armed (run go-loop-exec.ps1 claim if this fails)' `
     ($realHooks -match 'githooks')
+
+# --- X. the loop has an off switch, and the watchdog honours it (2026-08-23/24)
+# The loop had no way to be stopped on purpose. Closing the window is not it:
+# the watchdog re-enters whenever the lock goes stale while tasks remain, which
+# is exactly what a closed window looks like. The stop is therefore a request
+# honoured at a turn boundary - and it is only a stop if EVERY re-entry path
+# reads it, which is what these arms score.
+#
+# X7 exists because the first attempt shipped broken in the most invisible way
+# possible: the check was added to the watchdog and armed, and the watchdog
+# went on opening a window every twenty minutes for a full day, because
+# PowerShell reads a script once and that process had been up for six days.
+# Nothing anywhere reported that the running copy was stale.
+$xRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("gz-stop-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$xRepo = Join-Path $xRoot 'repo'
+New-Item -ItemType Directory -Force -Path (Join-Path $xRepo 'temp') | Out-Null
+$xFlag = Join-Path $xRepo 'temp\go-loop.stop.json'
+$Exec = Join-Path $Repo 'scripts\go-loop-exec.ps1'
+
+function XExec([string[]]$a) {
+    # .ToString() per record before Out-String: a merged stream formats
+    # ErrorRecords differently per host, so the captured text would depend on
+    # who ran the suite (test\win32\stderr-capture-audit.ps1 C1).
+    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $Exec @a 2>&1 |
+        ForEach-Object { $_.ToString() } | Out-String
+    return @{ Out = $out; Code = $LASTEXITCODE }
+}
+
+$r = XExec @('stop', '-Repo', $xRepo, '-PaneId', 'none', '-Reason', 'harness arm')
+Assert 'X1 stop writes the flag and says the turn in flight finishes' `
+    ($r.Code -eq 0 -and (Test-Path -LiteralPath $xFlag) -and $r.Out -match 'STOP REQUESTED')
+
+$r = XExec @('claim', '-Repo', $xRepo, '-PaneId', 'none')
+Assert 'X2 claim refuses with exit 4 and names the reason, not a rival' `
+    ($r.Code -eq 4 -and $r.Out -match 'STOPPED by request' -and $r.Out -match 'harness arm' -and $r.Out -notmatch 'STAND-DOWN')
+
+# Exit 4 must be its OWN code: 3 means "another window is primary" and would
+# send whoever reads it hunting for a duplicate that does not exist.
+Assert 'X3 the refusal tells the reader how to undo it' ($r.Out -match 'go-loop-exec\.ps1 resume')
+
+$r = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\go-loop-health.ps1') -Repo $xRepo 2>&1 |
+    ForEach-Object { $_.ToString() } | Out-String
+$hCode = $LASTEXITCODE
+Assert 'X4 health calls it STOPPED (exit 3), not DOWN - a supervisor must not revive it' `
+    ($hCode -eq 3 -and $r -match 'STOPPED')
+
+$r = XExec @('resume', '-Repo', $xRepo, '-PaneId', 'none')
+Assert 'X5 resume clears the flag' ($r.Code -eq 0 -and -not (Test-Path -LiteralPath $xFlag) -and $r.Out -match 'RESUMED')
+
+# -NoSelfClose -NoClose: this arm runs a REAL claim, and claim resolves
+# duplicates by closing windows. The fixture must never be able to reach the
+# user's actual windows.
+$r = XExec @('claim', '-Repo', $xRepo, '-PaneId', 'none', '-NoSelfClose', '-NoClose')
+Assert 'X6 and claim stops answering 4 once the request is cleared' `
+    ($r.Code -ne 4 -and $r.Out -notmatch 'STOPPED by request')
+
+# --- the watchdog reads the same flag, and re-reads its own source ---------
+# Run a COPY so editing it cannot disturb the real supervisor, and give it its
+# own mutex or it exits against the live one.
+$xScripts = Join-Path $xRoot 'scripts'
+Copy-Item -Path (Join-Path $Repo 'scripts') -Destination $xScripts -Recurse -Force
+$xWd = Join-Path $xScripts 'go-loop-watchdog.ps1'
+$xLog = Join-Path $xRoot 'wd.log'
+$xMutex = "Global\GhozttyGoLoopWatchdogTest$([guid]::NewGuid().ToString('N').Substring(0,8))"
+& powershell -NoProfile -ExecutionPolicy Bypass -File $Exec stop -Repo $xRepo -PaneId 'none' -Reason 'watchdog arm' | Out-Null
+
+$xProc = Start-Process -FilePath 'powershell.exe' -PassThru -WindowStyle Hidden -ArgumentList @(
+    '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $xWd,
+    '-Repo', $xRepo, '-LogPath', $xLog, '-PollSeconds', '2', '-MutexName', $xMutex)
+$null = $xProc.Handle   # cache before the child can exit (ExitCodeAudit)
+
+function XWaitLog([string]$needle, [int]$sec) {
+    $deadline = (Get-Date).AddSeconds($sec)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-Path -LiteralPath $xLog) {
+            $t = Get-Content -LiteralPath $xLog -Raw -ErrorAction SilentlyContinue
+            if ($t -and $t -match [regex]::Escape($needle)) { return $true }
+        }
+        Start-Sleep -Milliseconds 400
+    }
+    return $false
+}
+
+Assert 'X7 the watchdog refuses to re-enter while a stop is pending' (XWaitLog 'not re-entering' 25)
+Assert 'X8 and it says out loud that it is watching its own source' (XWaitLog 'watching own source' 25)
+
+# The arm that the first attempt would have failed: change the source under a
+# RUNNING watchdog and it must pick the change up by itself.
+Add-Content -LiteralPath $xWd -Value "`n# harness: a real byte change to force a self-restart`n"
+$restarted = XWaitLog 'own source changed on disk' 30
+Assert 'X9 a running watchdog re-execs when its own source changes' $restarted
+Assert 'X10 and the replacement actually started' (XWaitLog 'replacement started' 15)
+
+# The replacement must be a DIFFERENT live process, or "restarted" is a log line
+# that means nothing.
+$xAlive = $false
+if ($restarted) {
+    $deadline = (Get-Date).AddSeconds(15)
+    while ((Get-Date) -lt $deadline) {
+        $live = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandLine -and $_.CommandLine.Contains($xWd) -and $_.ProcessId -ne $xProc.Id })
+        if ($live.Count -ge 1) { $xAlive = $true; break }
+        Start-Sleep -Milliseconds 400
+    }
+}
+Assert 'X11 a new watchdog process is alive after the re-exec' $xAlive
+
+# Tear down every fixture watchdog, parent and replacement alike.
+foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -and $_.CommandLine.Contains($xWd) })) {
+    Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+}
+Remove-Item -LiteralPath $xRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 # --- cleanup --------------------------------------------------------------
 Kill-Sleepers

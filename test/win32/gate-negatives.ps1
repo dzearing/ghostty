@@ -124,6 +124,13 @@ $Registry = @(
     [pscustomobject]@{ Label = 'MARKED'; Kind = 'status' }
     [pscustomobject]@{ Label = 'UNMARKED'; Kind = 'status' }
     [pscustomobject]@{ Label = 'EXEC'; Kind = 'status' }
+    # The off switch (2026-08-23). STOPPED is a GATE, not a status line: it is a
+    # red verdict that ends the turn before a task is picked up, and it earns a
+    # demonstration for the same reason STAND-DOWN does - a refusal nobody
+    # exercises is a refusal that quietly stops refusing.
+    [pscustomobject]@{ Label = 'STOPPED'; Kind = 'gate'; Demo = $Loop; Marker = 'STOPPED by request' }
+    [pscustomobject]@{ Label = 'STOP REQUESTED'; Kind = 'status' }
+    [pscustomobject]@{ Label = 'RESUMED'; Kind = 'status' }
 
     # --- what claim DELEGATES ----------------------------------------------
     [pscustomobject]@{ Label = 'GUARD DUE'; Kind = 'gate'; Demo = 'test\win32\guard-due.ps1'

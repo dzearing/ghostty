@@ -49,6 +49,7 @@ param(
     [int]$GraceSeconds = 5,
     [switch]$NoSelfClose,     # stand down without closing this window (tests)
     [switch]$NoClose,         # find duplicates but do not close them (tests)
+    [string]$StopPath,        # override the stop-flag location (tests)
     [string]$Reason,          # stop: why, recorded in the flag for whoever finds it
     [switch]$Force,           # stop: also give up the lock now, do not wait for the turn
     [switch]$Json
@@ -196,7 +197,7 @@ switch ($Action) {
     }
 
     'stop' {
-        $path = Set-LoopStop -Repo $Repo -Reason $Reason
+        $path = Set-LoopStop -Repo $Repo -Path $StopPath -Reason $Reason
         "STOP REQUESTED $path"
         if ($Reason) { "  reason: $Reason" }
         "  the turn in flight finishes normally - build, test, commit, push, merge."
@@ -213,7 +214,7 @@ switch ($Action) {
     }
 
     'resume' {
-        if (Clear-LoopStop -Repo $Repo) {
+        if (Clear-LoopStop -Repo $Repo -Path $StopPath) {
             "RESUMED stop request cleared"
             "  claim will take the loop again on the next turn"
         } else {
@@ -227,7 +228,7 @@ switch ($Action) {
         # a stop costs nothing and cannot be defeated by lock contention. Exit 4
         # is its own code: 3 means "another window is primary" and would send a
         # reader looking for a rival that does not exist.
-        $stop = Get-LoopStop -Repo $Repo
+        $stop = Get-LoopStop -Repo $Repo -Path $StopPath
         if ($stop) {
             "STOPPED by request at $($stop.requested_at) by $($stop.requested_by)"
             if ($stop.reason) { "  reason: $($stop.reason)" }

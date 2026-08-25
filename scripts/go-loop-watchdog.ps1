@@ -40,6 +40,10 @@
 # (scripts\go-loop-pane-probe.ps1), and every typed re-entry is verified by
 # reading the pane back afterwards.
 #
+# It also watches its own source and re-execs when this file or
+# loop-session.ps1 changes, so an edit here takes effect without anyone
+# remembering to restart a process that has been up for a week.
+#
 # Run detached so it survives the terminal that started it:
 #   Start-Process powershell -WindowStyle Hidden -ArgumentList `
 #     '-NoProfile','-ExecutionPolicy','Bypass','-File',
@@ -108,6 +112,9 @@ param(
     [int]$ProbeLines = 60,
     [int]$VerifySeconds = 6,    # how long to give a shim'd pane to paint claude
     [string]$LogPath,
+    # Overridable for the same reason LockPath and StatePath are: the harness
+    # drives this script against the real repo with fixture state.
+    [string]$StopPath,
     [string]$StatePath,
     [switch]$Once,          # single tick then exit (used by the acceptance test)
     # Re-enter even though the lock looks healthy (T439). The two gates this
@@ -468,7 +475,7 @@ function Invoke-Tick {
     # "tasks remain" is the watchdog's whole trigger, so without this check a
     # requested stop is precisely the condition that makes it re-enter. Checked
     # first and cheaply, before any lock or pane probe.
-    $stop = Get-LoopStop -Repo $Repo
+    $stop = Get-LoopStop -Repo $Repo -Path $StopPath
     if ($stop) {
         Log ("stopped by request at $($stop.requested_at) by $($stop.requested_by)" +
              $(if ($stop.reason) { " - $($stop.reason)" } else { '' }) +
@@ -604,14 +611,81 @@ if ($Once) {
     exit 0
 }
 
+# --- self-restart on a script change ---------------------------------------
+#
+# This process runs for weeks. PowerShell reads a script ONCE, at start, so
+# every edit to this file or to loop-session.ps1 is inert until somebody
+# remembers to restart it - and nothing anywhere says the running copy is
+# stale. That is not hypothetical: on 2026-08-23 a stop check was added here
+# and armed, and the watchdog kept opening a window every twenty minutes for a
+# full day because the process had been up since 2026-08-18 and was still
+# executing the old body. The user saw the loop restarting itself and had no
+# way to tell why.
+#
+# So the process watches its own source. When the bytes change it re-execs and
+# lets the replacement pick up where it left off; a watchdog is exactly the
+# kind of thing that must not need a human to notice it is out of date.
+$WatchedScripts = @($PSCommandPath, (Join-Path $PSScriptRoot 'loop-session.ps1'))
+
+function Get-ScriptStamp {
+    # Content hash, not mtime: `git pull` and `git checkout` both rewrite
+    # mtimes on files whose content did not change, and a false restart every
+    # pull is its own bug.
+    $parts = foreach ($f in $WatchedScripts) {
+        if (Test-Path -LiteralPath $f) {
+            try { (Get-FileHash -LiteralPath $f -Algorithm SHA256).Hash } catch { 'unreadable' }
+        } else { 'missing' }
+    }
+    return ($parts -join '/')
+}
+
+function Restart-Self {
+    param([string]$Why)
+    Log "$Why; re-executing this watchdog so the change takes effect"
+    # Release the single-instance mutex FIRST or the replacement finds it held
+    # and exits immediately, leaving no watchdog at all - strictly worse than
+    # the stale one we are replacing.
+    try { $mutex.ReleaseMutex() } catch { }
+    try { $mutex.Dispose() } catch { }
+    $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
+           '-File', $PSCommandPath, '-Repo', $Repo)
+    try {
+        Start-Process -FilePath 'powershell.exe' -ArgumentList $a -WindowStyle Hidden | Out-Null
+        Log '  replacement started'
+    } catch {
+        Log "  replacement FAILED to start: $($_.Exception.Message) - staying up on the old body"
+        return $false
+    }
+    return $true
+}
+
 # Single instance: a second watchdog would double every re-entry. This is also
 # what makes the revive scheduled task safe to fire every few minutes forever.
+#
+# The wait retries briefly rather than failing instantly: a self-restart hands
+# the mutex from parent to child, and a child that gave up on the first try
+# would leave the box with no watchdog at all.
 $mutex = New-Object System.Threading.Mutex($false, $MutexName)
-if (-not $mutex.WaitOne(0)) { Log 'another go-loop watchdog is running; exiting'; exit 0 }
+$got = $false
+foreach ($attempt in 1..10) {
+    if ($mutex.WaitOne(0)) { $got = $true; break }
+    Start-Sleep -Milliseconds 500
+}
+if (-not $got) { Log 'another go-loop watchdog is running; exiting'; exit 0 }
 
 Log "=== go-loop watchdog start (poll=${PollSeconds}s, stale=${StaleMinutes}m, rearm=${RearmMinutes}m, repo=$Repo)"
 Write-Health 'start'
+$ScriptStamp = Get-ScriptStamp
+Log "  watching own source ($($WatchedScripts.Count) files) for changes"
 while ($true) {
+    $now = Get-ScriptStamp
+    if ($now -ne $ScriptStamp) {
+        if (Restart-Self -Why 'own source changed on disk') { exit 0 }
+        # Start-Process failed: keep running the old body rather than dying,
+        # but re-stamp so the failure is logged once and not every poll.
+        $ScriptStamp = $now
+    }
+
     $action = 'error'
     try { $action = Invoke-Tick } catch { Log "tick error: $_" }
     if ($action -is [array]) { $action = $action[-1] }
