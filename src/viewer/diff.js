@@ -899,8 +899,29 @@ window.__viewerDiff = (function () {
       }
     }
 
+    /* What find-in-page is NOT covering, for the find bar's honesty line (see
+     * find.js, which calls this through `window.__ghozttyFindScope`).
+     *
+     * Two things a diff pane hides from the DOM, and therefore from find: it
+     * holds ONE file's patch at a time — the other changed files are in the
+     * tree but not on the page — and past MAX_ROWS it holds only part of even
+     * that one. Searching a diff and being told "no results" without either
+     * fact would be a lie by omission. */
+    function findScope() {
+      if (root.className !== "viewer-diff-root") return null;
+      const listing = state.listing || {};
+      if (listing.message) return null;
+      const file = state.file;
+      if (!file) return "no file open";
+      const name = file.path ? file.path.split("/").pop() : "this file";
+      return root.querySelector(".d-cap")
+        ? "in " + name + " — rows past the cap are not searched"
+        : "in " + name;
+    }
+
     return {
       setListing: setListing,
+      findScope: findScope,
       setFile: function (payload) {
         setFile(payload);
         applyEntryScroll(payload && payload.scrollTo);

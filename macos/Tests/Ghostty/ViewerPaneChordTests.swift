@@ -28,10 +28,22 @@ struct ViewerPaneChordClassificationTests {
         #expect(ViewerView.paneChord(for: keyEvent("R", [.command])) == .reload)
     }
 
+    /// Find-in-page: Cmd-F opens the bar, and the macOS-standard
+    /// Cmd-G / Cmd-Shift-G step matches without it.
+    @Test func recognizesTheFindChords() {
+        #expect(ViewerView.paneChord(for: keyEvent("f", [.command])) == .find)
+        #expect(ViewerView.paneChord(for: keyEvent("g", [.command])) == .findNext)
+        #expect(ViewerView.paneChord(for: keyEvent("G", [.command, .shift])) == .findPrevious)
+    }
+
     @Test func leavesShiftedAndUnmodifiedKeysAlone() {
         // Cmd+Shift+R is "Change Window Title"; Cmd+Shift+D splits down.
         #expect(ViewerView.paneChord(for: keyEvent("r", [.command, .shift])) == nil)
         #expect(ViewerView.paneChord(for: keyEvent("d", [.command, .shift])) == nil)
+        // Cmd+Shift+F is not find; only Cmd+Shift+G (find previous) is shifted.
+        #expect(ViewerView.paneChord(for: keyEvent("f", [.command, .shift])) == nil)
+        // Ctrl+Cmd+F is "Toggle Full Screen" and must survive untouched.
+        #expect(ViewerView.paneChord(for: keyEvent("f", [.command, .control])) == nil)
         // Plain typing is never a chord.
         #expect(ViewerView.paneChord(for: keyEvent("r", [])) == nil)
         // Control/option combos belong to something else.
