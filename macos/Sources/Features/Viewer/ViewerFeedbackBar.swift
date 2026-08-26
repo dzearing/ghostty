@@ -62,7 +62,6 @@ struct ViewerFeedbackBar: View {
         .frame(maxWidth: .infinity)
         .modifier(ChromeBarBackground())
         .background(heightReporter)
-        .onHover { viewerView.holdChrome($0) }
     }
 
     /// Reports the bar's laid-out height to the viewer so it reserves exactly

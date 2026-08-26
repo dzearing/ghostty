@@ -12,7 +12,7 @@ enum ViewerCommands {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        panel.message = "Choose a markdown or text file to view"
+        panel.message = "Choose a markdown, code, or image file to view"
         // Sheet (not app-modal): the run loop keeps servicing IPC.
         panel.beginSheetModal(for: window) { response in
             guard response == .OK, let url = panel.url else { return }

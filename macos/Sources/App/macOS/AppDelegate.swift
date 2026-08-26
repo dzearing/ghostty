@@ -667,12 +667,17 @@ class AppDelegate: NSObject,
         var isDirectory = ObjCBool(true)
         guard FileManager.default.fileExists(atPath: filename, isDirectory: &isDirectory) else { return false }
 
-        // Markdown files open as a viewer pane in a new window (File → Open,
-        // dock drops, `open -a`), not as an executed terminal command. Other
-        // extensions keep the terminal behavior below.
+        // Markdown and image files open as a viewer pane in a new window (File
+        // → Open, dock drops, `open -a`), not as an executed terminal command.
+        // Other extensions keep the terminal behavior below.
+        //
+        // Only handed-to-us files: `CFBundleDocumentTypes` still declares only
+        // markdown, deliberately. Claiming `public.image` would put Ghoztty in
+        // the Open With menu for every screenshot on the machine, which is a
+        // system-wide decision about what this app IS, not a consequence of
+        // being able to display one.
         if !isDirectory.boolValue,
-           ["md", "markdown", "mdown", "mkd", "mdwn"]
-               .contains((filename as NSString).pathExtension.lowercased()) {
+           ViewerView.opensAsViewerWindow(path: filename) {
             // The file's own directory is also its origin: if the user later
             // navigates this pane to a dev-server URL, feedback still has a
             // directory to fall back to.

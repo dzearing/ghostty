@@ -32,10 +32,10 @@ struct ViewerAddressCompletionTests {
     }
 }
 
-/// The viewer chrome bar must reserve space at the pane top while visible:
-/// the web view is inset below the bar, so top-of-page content is never
-/// covered and stays clickable. (The bar originally floated over the web
-/// view, swallowing clicks on anything at the top of the page.)
+/// The viewer chrome bar must reserve space at the pane top: the content view
+/// is inset below the bar, so top-of-page content is never covered and stays
+/// clickable. (The bar originally floated over the web view, swallowing
+/// clicks on anything at the top of the page.)
 @MainActor
 struct ViewerChromeBarTests {
     /// Mount a viewer in an offscreen window, sized and laid out.
@@ -62,16 +62,14 @@ struct ViewerChromeBarTests {
         return file.path
     }
 
-    /// The revealed bar and the web view split the pane: bar flush at the
-    /// top, web view starting at the bar's bottom edge, no overlap.
-    @Test func revealedBarReservesSpaceAboveWebView() throws {
+    /// The bar and the web view split the pane: bar flush at the top, web
+    /// view starting at the bar's bottom edge, no overlap — from the pane's
+    /// FIRST layout, with no hover and nothing to wait for.
+    @Test func theBarReservesSpaceAboveWebView() throws {
         let (window, viewer) = makeViewer(location: try makeMarkdownFile())
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
 
-        // Bar hidden: content owns the whole pane.
-        #expect(viewer.webView.frame == viewer.bounds)
-
-        viewer.holdChrome(true)
+        #expect(viewer.chromeVisible)
         // Let the hosting view size its SwiftUI content, then lay out.
         RunLoop.main.run(until: Date().addingTimeInterval(0.05))
         viewer.layoutSubtreeIfNeeded()
@@ -92,10 +90,8 @@ struct ViewerChromeBarTests {
         #expect(hit === viewer.webView || hit?.isDescendant(of: viewer.webView) == true)
     }
 
-    /// A live page pins the bar (see `ViewerChromePinTests`), so its space is
-    /// reserved from the moment the pane opens — no hover, and no reflow of a
-    /// page that has already painted.
-    @Test func livePageReservesBarSpaceWithoutHovering() throws {
+    /// Same for a live page — the mode is irrelevant, which is the point.
+    @Test func livePageReservesBarSpaceToo() throws {
         let (window, viewer) = makeViewer(location: "https://example.invalid/page")
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
 
@@ -114,7 +110,6 @@ struct ViewerChromeBarTests {
         let (window, viewer) = makeViewer(location: try makeMarkdownFile())
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
 
-        viewer.holdChrome(true)
         // Offscreen windows take the non-animated path (geometry lands
         // synchronously); the spin just lets SwiftUI size the bar content.
         RunLoop.main.run(until: Date().addingTimeInterval(0.05))
@@ -126,12 +121,11 @@ struct ViewerChromeBarTests {
     }
 }
 
-/// Which viewer modes pin the navigation bar open. A live page — a website
-/// or a local HTML file the web view renders as one — is something you
-/// NAVIGATE, so its address and history controls are part of using it and
-/// stay on screen. A markdown or code viewer is a reading surface whose
-/// address rarely changes, so it keeps the hover peek rather than spending
-/// vertical space on chrome permanently.
+/// The navigation bar is pinned open in EVERY viewer mode. It used to peek in
+/// on a mouse-to-the-top-edge for markdown and code panes; that was the one
+/// mode where content reflowed under the pointer, and where the address, Home,
+/// and Back/Forward — the only way out of a viewer pane — had to be hunted for
+/// with the mouse first.
 @MainActor
 struct ViewerChromePinTests {
     private func makeViewer(location: String) -> (NSWindow, ViewerView) {
@@ -178,37 +172,55 @@ struct ViewerChromePinTests {
         #expect(viewer.chromeVisible)
     }
 
-    @Test func markdownAndCodePanesKeepTheHoverPeek() throws {
+    /// The modes that used to peek. Both now open pinned, with the bar's
+    /// space already reserved in the pane's first layout.
+    @Test func markdownAndCodePanesOpenPinned() throws {
         for path in [
             try makeFile(named: "a.md", contents: "# hi\n"),
             try makeFile(named: "a.swift", contents: "let x = 1\n"),
         ] {
             let (window, viewer) = makeViewer(location: path)
             defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
-            #expect(!viewer.chromeVisible, "\(path) should peek, not pin")
-            #expect(viewer.webView.frame == viewer.bounds)
+            #expect(viewer.chromeVisible, "\(path) should open pinned")
+            #expect(viewer.webView.frame.height < viewer.bounds.height,
+                    "\(path) should reserve the bar's row")
         }
     }
 
-    /// A pane's mode is not fixed at open: the address field navigates a
-    /// markdown viewer to the web, which makes it a live page and must pin the
-    /// bar — and pointing it back at a file must hand the bar back to the
-    /// hover timer. (Back over the same boundary goes through
-    /// `syncMode(toCommitted:)`, which changes `mode` the same way; see
-    /// `ViewerNavigationTests.backFromWebReturnsToRenderedFile`.)
-    @Test func navigatingBetweenAFileAndTheWebFollowsTheMode() async throws {
+    /// An image pane too — its content is native, but the chrome is the same
+    /// chrome and reserves space the same way.
+    @Test func imagePanesOpenPinned() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("viewer-chrome-pin-image-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let rep = NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: 64, pixelsHigh: 64,
+            bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        let file = dir.appendingPathComponent("a.png")
+        try rep.representation(using: .png, properties: [:])!.write(to: file)
+
+        let (window, viewer) = makeViewer(location: file.path)
+        defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
+        #expect(viewer.chromeVisible)
+        #expect(viewer.webView.frame.height < viewer.bounds.height)
+    }
+
+    /// A pane's mode is not fixed at open — the address field navigates a
+    /// markdown viewer to the web and Back brings it home — and the bar stays
+    /// put across all of it. There is no longer anything mode-dependent to
+    /// follow.
+    @Test func theBarStaysPinnedAcrossAModeChange() throws {
         let path = try makeFile(named: "a.md", contents: "# hi\n")
         let (window, viewer) = makeViewer(location: path)
         defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
-        #expect(!viewer.chromeVisible)
+        #expect(viewer.chromeVisible)
 
         viewer.navigate(to: "https://example.invalid/page")
         #expect(viewer.chromeVisible)
 
         viewer.navigate(to: path)
-        // Unpinning hands the bar to the auto-hide timer rather than yanking
-        // it away mid-glance, so this is a wait, not an immediate check.
-        #expect(await poll(timeout: 10) { !viewer.chromeVisible })
+        #expect(viewer.chromeVisible)
     }
 }
 

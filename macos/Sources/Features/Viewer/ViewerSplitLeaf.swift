@@ -1,12 +1,11 @@
 import SwiftUI
 
 /// SwiftUI leaf for a viewer pane inside the split tree. Every viewer pane
-/// gets a chrome bar mounted by ViewerView itself as an NSHostingView — it
-/// peeks in (animated) on mouse-over of the thin strip at the pane top and
-/// auto-hides after inactivity. While visible the bar reserves its space
-/// (the web view is inset below it), so top-of-page content is never
-/// covered. Every pane — website or rendered file — gets the same
-/// back/forward/reload/home controls and an editable address field.
+/// gets a chrome bar mounted by ViewerView itself as an NSHostingView, pinned
+/// open in every mode. It reserves its space (the content view is inset below
+/// it), so top-of-page content is never covered. Every pane — website,
+/// rendered file, diff, or image — gets the same back/forward/reload/home
+/// controls and an editable address field.
 struct ViewerSplitLeaf: View {
     @ObservedObject var viewerView: ViewerView
 
@@ -58,12 +57,11 @@ private struct ViewerRepresentable: NSViewRepresentable {
 
 /// Chrome bar for viewer panes: anchored flush to the pane top, stretched
 /// full width. Uses Liquid Glass on macOS 26+ (translucent material fallback)
-/// so it feels native. Hosted by ViewerView in an NSHostingView; revealed on
-/// mouse-over at the pane top, auto-hidden after inactivity. The web view
-/// is inset below the bar while it shows, so the bar never covers content.
-/// Every viewer mode gets the same interactive toolbar (back/forward/reload/
-/// home + an editable address field): a markdown pane is a page you can
-/// navigate away from and come home to, not a dead end.
+/// so it feels native. Hosted by ViewerView in an NSHostingView and pinned
+/// open in every mode; the content view is inset below it, so the bar never
+/// covers content. Every viewer mode gets the same interactive toolbar
+/// (back/forward/reload/home + an editable address field): a markdown pane is
+/// a page you can navigate away from and come home to, not a dead end.
 struct WebChromeBar: View {
     @ObservedObject var viewerView: ViewerView
 
@@ -77,7 +75,6 @@ struct WebChromeBar: View {
             .padding(.vertical, 7)
             .frame(maxWidth: .infinity)
             .modifier(ChromeBarBackground())
-            .onHover { viewerView.holdChrome($0) }
     }
 
     /// One bar for every viewer mode: back/forward/reload/home + an
@@ -88,9 +85,7 @@ struct WebChromeBar: View {
         HStack(spacing: 4) {
             // Contents toggle, leading. Only in the compact TOC layout: a
             // wide pane shows the card in its gutter permanently, so there
-            // is nothing to toggle. While this is present the bar stops
-            // auto-hiding (see ViewerView.chromeAlwaysVisible) — it would be
-            // useless otherwise.
+            // is nothing to toggle.
             if viewerView.sidePanelLayout == .compact {
                 Button(action: { viewerView.toggleSidePanel() }) {
                     Image(systemName: viewerView.isDiffMode
@@ -137,11 +132,11 @@ struct WebChromeBar: View {
             .help("Home — back to \(viewerView.homeLocation)")
 
             // Diff controls, in the same 24pt squares as the rest of the bar.
-            // They live HERE rather than in a second toolbar because a diff
-            // pane pins this bar open anyway (see chromeAlwaysVisible), so a
-            // separate strip would be a second permanent row of chrome buying
-            // nothing. The bar is a single flexible row, so a narrow pane just
-            // gives the address field less width.
+            // They live HERE rather than in a second toolbar because this bar
+            // is always open anyway, so a separate strip would be a second
+            // permanent row of chrome buying nothing. The bar is a single
+            // flexible row, so a narrow pane just gives the address field less
+            // width.
             if viewerView.isDiffMode {
                 Divider().frame(height: 16).padding(.horizontal, 2)
 

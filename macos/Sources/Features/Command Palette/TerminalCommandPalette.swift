@@ -196,7 +196,7 @@ struct TerminalCommandPaletteView: View {
         [
             CommandOption(
                 title: "Viewer: Open File in Pane…",
-                description: "Render a markdown or text file beside this pane",
+                description: "Render a markdown, code, or image file beside this pane",
                 leadingIcon: "doc.richtext"
             ) {
                 ViewerCommands.openFileFromPalette(surfaceView: surfaceView)

@@ -15,7 +15,7 @@ ghoztty +new-window --target=<name> --working-directory=<path> --command=<cmd> -
 ```
 
 - `--shell`: Shell to use for `--command`/`--split-command`, invoked with `-lic` so profile is loaded. Falls back to config `command-shell`, then `$SHELL`, then `/bin/zsh`.
-- `--view`: Open a window whose single pane is a **viewer** (see Viewer Panes below) instead of a terminal — a file (markdown, HTML rendered as a live page, or code), a website, or a **git diff** (`git-status:` / `git-diff:<revspec>`, see Git diff panes). Mutually exclusive with `--command`/`-e`.
+- `--view`: Open a window whose single pane is a **viewer** (see Viewer Panes below) instead of a terminal — a file (markdown, HTML rendered as a live page, code, or an **image**), a website, or a **git diff** (`git-status:` / `git-diff:<revspec>`, see Git diff panes). Mutually exclusive with `--command`/`-e`.
 - `--title`: Set the **window title**. A window title pins the titlebar — it wins over any tab or pane title and survives pane focus changes and shell OSC title updates — until cleared. The titlebar falls back to window title → active tab's title → active pane's title. Interactive equivalents: Cmd+Shift+R ("Change Window Title", also sets/clears it), plus separate "Change Tab Title" and "Change Pane Title" commands in the menu and command palette. `ghoztty +rename --target=<name> --title=<title>` changes it later (`--title=""` clears the pin).
 
 ### `ghoztty +split`
@@ -31,7 +31,7 @@ ghoztty +split --direction=right|down|left|up --target=<name> --name=<name> --co
   invoked from** (see Caller anchoring), falling back to the most recently
   focused window.
 - `--name`: Register the new pane with a name for later targeting.
-- `--view`: Open a **viewer** pane (see Viewer Panes below) instead of a terminal — a file (markdown, HTML rendered as a live page, or code), a website, or a **git diff** (`git-status:` / `git-diff:<revspec>`, see Git diff panes). Mutually exclusive with `--command`/`-e`. Works with `--pane` targeting, including splitting off an existing viewer pane.
+- `--view`: Open a **viewer** pane (see Viewer Panes below) instead of a terminal — a file (markdown, HTML rendered as a live page, code, or an **image**), a website, or a **git diff** (`git-status:` / `git-diff:<revspec>`, see Git diff panes). Mutually exclusive with `--command`/`-e`. Works with `--pane` targeting, including splitting off an existing viewer pane.
 
 ### `ghoztty +close`
 
@@ -227,8 +227,10 @@ caches); file viewers re-render the file preserving scroll position (they
 already live-reload on their own, so this mainly matters for URL viewers —
 and for an **HTML** pane, whose save-watcher covers the HTML file but not the
 sibling CSS/JS it pulls in, which this bypasses the cache for);
-**diff viewers re-run their git command**, picking up commits, staging, and
-edits, and keeping the open file and its scroll position.
+**image viewers re-decode the file**, keeping the zoom and scroll position
+unless the pixel dimensions changed; **diff viewers re-run their git
+command**, picking up commits, staging, and edits, and keeping the open file
+and its scroll position.
 
 ```
 ghoztty +reload --target=<name>
@@ -473,14 +475,16 @@ Entry points: `application(_:open:)` (`AppDelegate.swift`) for LaunchServices,
 ## Viewer Panes
 
 A pane (or a whole window) can render **content** instead of a terminal: a
-markdown file, an HTML file (as a live page), a plain text/code file, a
-website, or a **git diff**. Viewers live in the normal split tree — they
-resize, focus, zoom, close, and persist like any pane. View-only, no editing.
+markdown file, an HTML file (as a live page), a plain text/code file, an
+**image**, a website, or a **git diff**. Viewers live in the normal split tree
+— they resize, focus, zoom, close, and persist like any pane. View-only, no
+editing.
 
 ```bash
 ghoztty +new-window --view=README.md                 # viewer window
 ghoztty +split --target=dev --name=doc --view=docs/design.md
 ghoztty +split --target=dev --name=mock --view=mock/index.html   # a live page
+ghoztty +split --target=dev --name=shot --view=temp/screenshot.png  # an image
 ghoztty +split --pane=doc --direction=down --view=https://example.com
 ghoztty +split --target=dev --name=diff --view=git-status:   # a git diff
 ghoztty +close --target=doc
@@ -514,8 +518,9 @@ ghoztty +close --target=doc
   and the document's text column follow in the same layout pass). The width
   is a preference in defaults, shared by every viewer pane.
   In a **narrow pane** (< 720pt) the gutter would crowd the text, so the card
-  becomes an overlay: the navigation bar stays pinned open and gains a
-  contents button as its first item, which slides the card in and out. The
+  becomes an overlay: the navigation bar (always open — see Navigation
+  chrome) gains a contents button as its first item, which slides the card in
+  and out. The
   switch follows the *pane* width live, so dragging a split divider reflows
   it. The card is the same glass card as the pane banner overlay (shared
   `GlassCardBackground`), opaque so document text never shows through it.
@@ -541,6 +546,9 @@ ghoztty +close --target=doc
   grant, exactly as they would if the folder were hosted (Links, below, is the
   one exception) — and Back/Forward cross into and out of it. A file
   that cannot be opened shows the usual in-page error card.
+- **Images** (`.png`, `.jpg`/`.jpeg`, `.gif`, `.webp`, `.heic`/`.heif`,
+  `.avif`, `.tiff`, `.bmp`, `.ico`/`.icns`, `.svg`, plus a few spellings of
+  the same): see Image panes.
 - **Text/code files** (anything else): syntax-highlighted by extension.
 - **Websites** (`http://`/`https://`): the pane navigates there directly.
 - **Git diffs** (`git-status:` / `git-diff:<revspec>`): see Git diff panes.
@@ -614,7 +622,10 @@ ghoztty +close --target=doc
 - **Live reload**: file viewers watch the file (including atomic saves) and
   re-render preserving scroll position — an HTML pane re-fetches the page from
   disk, and WebKit restores the scroll offset across it, so a save does not
-  throw you back to the top. Only the viewed file is watched: editing a
+  throw you back to the top; an image pane re-decodes, keeping the zoom and
+  scroll position when the pixel dimensions are unchanged and re-fitting when
+  they are not (the old magnification describes a picture that no longer
+  exists). Only the viewed file is watched: editing a
   sibling `style.css` does not trigger a reload, and a saved HTML file may
   still serve that stylesheet from WebKit's memory cache. `+reload`/Cmd+R
   bypasses the cache (`reloadFromOrigin`) and is the way to pick up a changed
@@ -653,6 +664,11 @@ ghoztty +close --target=doc
   - **The count is live**: the page re-scans when it changes underneath an
     open search, which is what makes find work on a diff still appending rows
     a chunk per frame, or a file viewer that just live-reloaded.
+  - **An image pane DECLINES Cmd+F** rather than opening a bar over it.
+    There is no text, so the only thing a bar there could ever say is
+    "no results" — which reads as a broken search rather than an
+    inapplicable one. Declining lets the chord fall through to its global
+    binding; Cmd+G is declined the same way.
   - **It is honest about what it is NOT searching**, on a second line under
     the field: text in the tree but not laid out is excluded (counting a
     match nobody can be scrolled to is a promise you can't keep); a page with
@@ -660,23 +676,26 @@ ghoztty +close --target=doc
     only, since one count cannot span two documents); a diff pane says which
     file (see Git diff panes); and past 5 000 matches the count reads
     `12/5000+` rather than a precise-looking number nobody counted.
-- **Navigation chrome**: every mode gets a bar with back / forward / reload /
-  **home** and an **editable address field**; what differs is whether it is
-  always there. A **live page** — a website, or a local HTML file the web view
-  renders as one — **pins it open**: that is something you navigate, so the
-  address and the history controls are part of using it, and a blank browser
-  pane is nothing but its address field. A **markdown or code** viewer is a
-  reading surface whose address rarely changes, so it keeps the **hover peek**:
-  the bar slides in when the mouse reaches the thin strip at the pane's top and
-  auto-hides after inactivity. The pin follows the pane's CURRENT mode, not the
-  location it was opened with — a markdown pane that browses to a website gains
-  the pinned bar, and Back to the file hands it back to the hover timer. Either
-  way a visible bar **reserves** its space (the page is inset below it, never
-  covered), so a pinned pane's content is laid out below the bar from the first
-  frame. (A diff pane and the compact side-panel layout pin it too, for their
-  own reasons — see Git diff panes and Table of contents.) Typing an `http(s)`
-  address (or a bare `example.com`, completed omnibox-style) navigates the pane
-  to the web; typing an absolute or `~` path points it back at a file. Back and
+- **Navigation chrome**: **every mode** gets the same bar — back / forward /
+  reload / **home** and an **editable address field** — and it is **pinned
+  open in every mode**, from the pane's first layout. There is nothing
+  mode-dependent left about it.
+  It used to **hover-peek** in markdown and code panes: the bar slid in when
+  the mouse reached a thin strip at the pane's top and auto-hid after
+  inactivity, on the theory that a reading surface should not spend a
+  permanent row on chrome. Every other case had already been carved out —
+  live pages, diffs, the compact side-panel layout, an open feedback composer
+  — so what was left was one mode, out of step with the rest, in which the
+  document reflowed under the pointer and the only way out of the pane (the
+  address, Home, Back) had to be hunted for with the mouse before every use.
+  A control you go hunting for is not a control.
+  The bar **reserves** its space rather than floating over the content (the
+  content view is inset below it, never covered), and because the reservation
+  happens in `init`, the content is laid out below the bar from the **first
+  frame** in every mode — it paints once, at its final size. Typing an
+  `http(s)` address (or a bare `example.com`, completed omnibox-style)
+  navigates the pane to the web; typing an absolute or `~` path points it back
+  at a file. Back and
   forward reflect real history (disabled when there is none) and work across
   the file↔web boundary — going Back from a website re-renders the file.
   **Home** returns to the location the pane was originally opened with, which
@@ -687,14 +706,18 @@ ghoztty +close --target=doc
   viewer pane — its page, its nav bar, its find bar, or its feedback composer
   — in any viewer mode):
   - **Cmd+R** reloads the pane in place, exactly like `+reload` (web
-    re-fetches from origin, files re-render with scroll preserved).
-  - **Cmd+D** slides the nav bar in if hidden and puts the caret in the
-    address field with the whole address selected — the keyboard version of
-    clicking into it.
+    re-fetches from origin, files re-render with scroll preserved, images
+    re-decode keeping their zoom).
+  - **Cmd+D** puts the caret in the address field with the whole address
+    selected — the keyboard version of clicking into it.
   - **Cmd+F** opens the find bar and puts the caret in it (see Find in page).
     **Cmd+G** / **Cmd+Shift+G** step to the next / previous match, re-opening
     the bar if it was closed. With no query yet there is nothing to step, so
-    they are declined rather than swallowed.
+    they are declined rather than swallowed — as is every one of the three in
+    an image pane, which has no text to search.
+  - **Cmd+plus / Cmd+minus / Cmd+0** zoom. In a page they are page zoom; in an
+    **image pane** they drive the image's own zoom, where **Cmd+0 is 100%**
+    (Preview's "Actual Size"), not best-fit — fit is one double-click away.
   - The standard editing chords (Cmd+C/V/X/A) reach whichever field inside the
     pane holds focus — the address bar, a diff panel's filter, or the find
     field — which they otherwise would not, because Cmd+C/V are terminal
@@ -726,13 +749,102 @@ ghoztty +close --target=doc
 - `+read`/`+send-keys`/`+set-state`/`+set-banner` against a viewer fail with
   `... is a viewer pane, not a terminal` (exit 1). `+close` works normally
   and never prompts for viewers.
-- Session persistence: viewer panes restore by re-opening their file/URL, and
-  a diff pane by RE-RUNNING its spec against the origin directory the manifest
-  persisted — so a restored `git-status:` pane shows today's working tree, not
-  a snapshot of the one it was closed on. (Terminals in the same window
-  re-attach as usual.) A missing file restores as an in-page error card.
+- Session persistence: viewer panes restore by re-opening their file/URL —
+  an image pane comes back at best-fit, since a zoom is a transient reading
+  posture rather than something the pane IS — and a diff pane by RE-RUNNING
+  its spec against the origin directory the manifest persisted, so a restored
+  `git-status:` pane shows today's working tree, not a snapshot of the one it
+  was closed on. (Terminals in the same window re-attach as usual.) A missing
+  file restores as an in-page error card.
 - File → Open (or dragging onto the dock icon, or `open -a Ghoztty file.md`)
-  opens `.md`-family files as a viewer window.
+  opens `.md`-family files **and images** as a viewer window. Deliberately
+  just those two: a `.swift` or `.sh` dropped on the dock has always opened a
+  terminal, and changing that would break a workflow to buy a nicety.
+  Ghoztty does **not** declare `public.image` in `CFBundleDocumentTypes` — it
+  would put Ghoztty in the Open With menu for every screenshot on the machine,
+  which is a system-wide claim about what this app IS rather than a
+  consequence of being able to display one.
+
+### Image panes
+
+`--view=<path>.png` (and the other image extensions) opens a pane that renders
+the picture on a **native `NSScrollView`**, not as an `<img>` in the web view.
+
+```bash
+ghoztty +split --target=dev --name=shot --view=temp/feedback/new/x/images/image-1.png
+ghoztty +new-window --view=~/Desktop/mock.png
+ghoztty +reload --target=shot        # re-decode from disk
+```
+
+**Why it is native.** Every other viewer mode is a page, and the whole stack —
+find (`src/viewer/find.js`), quoting (`selection.js`), the link menu
+(`links.js`), history — is web-side, so an `<img>` would have been the tidier
+choice architecturally. It loses the actual requirement. `WKWebView`'s pinch is
+WebKit's *page* magnification: it has no notion of the image's natural size (so
+no real "fit" and no pixel-exact "100%") and its double-tap smart-zoom targets
+DOM elements. `NSScrollView` is what Preview and Xcode's canvas use, and it is
+where macOS's own gesture handling lives — pinch anchored at the gesture
+centroid, rubber-banding past the zoom limits, elastic edges and momentum on a
+two-finger pan, `smartMagnify` for a two-finger double-tap. All of that is free
+and none of it is reproducible in a page. Trackpad feel was the requirement, so
+it won.
+
+**The web view is still there, underneath.** The pane navigates to the render
+template exactly as a markdown pane does; the surface is a sibling mounted over
+it. That is what buys an image pane everything structural for free: a real
+history entry (Back out of a website lands on the image), Home, an address
+field that shows and accepts the path, `+list --json`'s `"url"`, session
+restore, and — when the file cannot be decoded — the same in-page **error card**
+every other file mode shows, rather than a second one written for images.
+
+- **Zoom.** Trackpad **pinch** is AppKit's, anchored at the gesture centroid.
+  **Two-finger pan** scrolls with the standard elastic edges and momentum.
+  **Double-click** (and two-finger **double-tap**) toggles **best-fit ⇄ 100%**,
+  anchored where you clicked. **Cmd+plus/minus** step by 1.25× (coarser than
+  the web viewer's 1.1 — an image's useful range spans two orders of magnitude
+  where a page's spans one) and **Cmd+0** is 100%. Limits are 5%–3200%, with
+  the floor yielding to whatever best-fit needs for a very large image.
+- **"100%" means one image pixel per DEVICE pixel.** Two reasons, in order: it
+  is the only definition under which 100% is actually pixel-exact — every image
+  pixel lands on one screen pixel, nothing is resampled, and a 1px hairline is
+  a 1px hairline, which is the whole reason anyone asks for 100% — and most of
+  what these panes get pointed at is screen capture (the feedback composer's
+  own screenshots, an agent's UI render), which is captured at device
+  resolution, so 100% shows it at exactly the size it was on screen. One image
+  pixel per *point* would show a 2x screenshot at twice the size of the screen
+  it came from. The natural size comes from the image's REPRESENTATIONS, not
+  from `NSImage.size`, which is DPI-derived and would silently halve 100% for
+  anything tagged 144dpi. **Vector art (SVG) has no pixel grid to be 1:1 with**,
+  so its 100% is its intrinsic size in points.
+- **Best-fit never upscales.** A pane opens at best-fit, capped at 100%: a 32px
+  icon in a 900pt pane stays 32 device pixels, crisp and centered, rather than
+  being blown up into a blurry lie about the asset. The consequence is that fit
+  and 100% coincide for a small image, which would make the double-click toggle
+  visibly do nothing — so in that one case the first double-click goes to
+  **200%** instead and the next comes back to fit. The toggle always toggles.
+- **Resizing the pane re-fits — unless you chose a zoom.** Dragging a split
+  divider re-fits a fitted image; once you have pinched or stepped to a
+  magnification of your own, a resize preserves it. (The magnification is still
+  re-derived on a resize, because moving the pane between a Retina and a
+  non-Retina display changes what 100% means and it has to stay 100%.)
+- **Rendering.** Interpolation is high-quality at or below native resolution
+  and switches to **hard pixels from 2x up** — the only reason to magnify a
+  screenshot that far is to look at individual pixels, and a bilinear smear of
+  them answers no question anyone had. An image smaller than the pane is
+  **centered** (a custom `NSClipView`; AppKit pins it to a corner otherwise).
+  Animated GIFs animate. The matte is `windowBackgroundColor`, a dynamic color,
+  so light/dark follows the window the way every other viewer mode's background
+  does.
+- **What an image pane does NOT have**, and why that is stated rather than
+  faked: **find** (declined — see Find in page), **text selection**, and
+  **quoting**. There is no text. **Feedback capture still works** — the
+  worktree is the image file's own directory, the composer takes a written
+  report and pasted screenshots as usual, and the report's `source.kind` is
+  `image` (rather than `file`) so a downstream agent knows there will be no
+  `selection` and no `quotes`.
+- **No pop-out or lightbox.** "Make this pane big" is Hero mode
+  (`toggle_hero_mode`), which already exists and already works on viewer panes.
+  A second expansion affordance would be two answers to one question.
 
 ### Git diff panes
 
@@ -834,9 +946,10 @@ answers "what changed in abc123". Use `a..b` when you mean a comparison.
   updates only when the file list actually moved, so an edit or a `git add` in
   another pane shows up without a reload and without a flicker. A commit or a
   range is a fixed pair of trees and is not polled.
-- The nav bar **stays pinned open** in a diff pane (it carries the change and
-  layout controls, and shows the revspec) — one of several pinned cases, along
-  with live pages and the compact side-panel layout (see Navigation chrome).
+- The nav bar carries a diff pane's change and layout controls, and shows its
+  revspec. It is pinned open, but so is every other viewer pane's (see
+  Navigation chrome) — a diff pane was once one of the modes that had to
+  carve out an exception, and no longer needs to.
 
 ### Worktree feedback capture
 
@@ -851,7 +964,9 @@ the queue; consuming it is separate and not built here).
   worktree is derived live from the pane's *current* location, re-resolved on
   every navigation (a pane can move between a file, `localhost:3000`, and a
   remote site, each a different worktree or none):
-  1. **File viewers** → the viewed file's own directory.
+  1. **File viewers** → the viewed file's own directory. An image pane is a
+     file viewer for this purpose like any other, so a screenshot sitting in a
+     repo files feedback to that repo.
   2. **`http://localhost:PORT` / `127.0.0.1` / `0.0.0.0` viewers** → the port's
      listening pid's cwd, via `lsof` (`-iTCP:<port> -sTCP:LISTEN -t`, then
      `-p <pid> -d cwd -Fn`) run off the main thread. lsof, not
@@ -944,9 +1059,11 @@ the queue; consuming it is separate and not built here).
   path). `body` is markdown with each chip rendered as a
   `![Image #N](images/image-N.png)` reference relative to the folder.
   Alongside it, deliberately generous context so a downstream agent needn't ask
-  follow-ups: `source` (`location`, `kind`, `filePath`, **`relativePath`** —
-  repo-relative, `pageTitle`, **`selection`** — the text the user had selected,
-  i.e. what they were pointing at, `paneID`, `viewport`), `worktree` (`path`,
+  follow-ups: `source` (`location`, `kind` — `file`, `web`, or **`image`**,
+  which tells a reader up front that there will be no `selection` and no
+  `quotes`, `filePath`, **`relativePath`** — repo-relative, `pageTitle`,
+  **`selection`** — the text the user had selected, i.e. what they were
+  pointing at, `paneID`, `viewport`), `worktree` (`path`,
   `name`, **`branch`**, **`commit`** — the exact revision they saw), `app`,
   `quotes` (see above), and `images` (with pixel dimensions and byte size). On success the composer
   clears and the toolbar shows a "Filed …" confirmation before closing.
