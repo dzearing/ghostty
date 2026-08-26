@@ -126,6 +126,7 @@ Fields worth using rather than skimming:
 | --- | --- |
 | `body` | The user's message. Markdown; `![Image #N](images/image-N.png)` marks where each screenshot belongs, and `> …` blocks are page quotes. |
 | `source.location` | Where they were — a file path or a URL. Reopen it. |
+| `source.kind` | `file`, `web`, or `image`. **`image`** means the pane was showing a picture, so there is no `selection` and no `quotes` — the report is the body plus whatever the image itself shows. |
 | `source.relativePath` | Repo-relative path of the viewed file — start here. |
 | `source.selection` | What they had selected, i.e. what they were pointing at. |
 | `source.pageTitle`, `source.viewport` | Which page, at what size (layout bugs). |

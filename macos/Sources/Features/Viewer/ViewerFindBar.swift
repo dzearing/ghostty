@@ -56,10 +56,9 @@ struct ViewerFindResult: Equatable {
 /// corner, below whatever top chrome is currently showing.
 ///
 /// A FLOATING card rather than a strip under the nav bar, deliberately. The
-/// nav bar reserves its space and a markdown/code pane hides it until you
-/// reach for it (see `chromeAlwaysVisible`); making find a second strip would
-/// mean Cmd-F both pins the nav bar open AND adds a row under it, reflowing a
-/// reading surface by ~80pt and scrolling the very text you are searching. The
+/// nav bar already reserves a permanent row of the pane; making find a second
+/// strip would add another one under it on every Cmd-F, reflowing a reading
+/// surface by ~40pt and scrolling the very text you are searching. The
 /// card costs no layout, appears identically in every viewer mode, and is the
 /// shape Chrome trained people to expect. The cost — it covers the document's
 /// top-right corner — is paid back by scrolling matches to the middle of the

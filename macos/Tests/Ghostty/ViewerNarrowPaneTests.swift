@@ -47,9 +47,6 @@ struct ViewerNarrowPaneTests {
 
     @Test func aNarrowPaneNeverMakesTheViewerWiderThanThePane() throws {
         let viewer = ViewerView(location: try makeMarkdownFile())
-        // A narrow pane pins the bar open (it carries the contents toggle), so
-        // this is the state the bug shows up in.
-        viewer.holdChrome(true)
 
         let paneWidth: CGFloat = 120
         let window = mount(viewer, paneWidth: paneWidth)
@@ -69,7 +66,6 @@ struct ViewerNarrowPaneTests {
     /// has to do so by fitting the pins, not by Auto Layout breaking one of them.
     @Test func theNavBarCompressesToThePaneRatherThanWideningIt() throws {
         let viewer = ViewerView(location: try makeMarkdownFile())
-        viewer.holdChrome(true)
 
         let paneWidth: CGFloat = 120
         let window = mount(viewer, paneWidth: paneWidth)
