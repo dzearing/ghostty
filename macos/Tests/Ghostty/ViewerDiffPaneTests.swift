@@ -348,6 +348,42 @@ struct ViewerDiffPaneTests {
         #expect(viewer.diffRows.isEmpty)
     }
 
+    // MARK: - Find in page
+
+    /// Find-in-page in a diff pane searches the OPEN FILE's patch, because
+    /// that is all the page holds — the rest of the diff is in the file tree,
+    /// not the DOM. So the bar names the file it is searching; silence would
+    /// read as "searched the whole diff", and a "No results" under that
+    /// reading would be a lie.
+    @Test func findNamesTheFileItIsSearching() async throws {
+        let repo = try makeRepo()
+        let (window, viewer) = makeViewer(location: "git-status:", repo: repo)
+        defer { window.contentView?.subviews.forEach { $0.removeFromSuperview() } }
+
+        #expect(await wait { viewer.diffFiles.count >= 3 })
+        let app = try #require(viewer.diffFiles.first { $0.path == "src/app.swift" })
+        viewer.selectDiffFile(app)
+        #expect(await waitAsync { await pageChangeCount(in: viewer) >= 3 },
+                "the file's patch never rendered")
+
+        // `line21` is one of the three edited lines, so it is on the page
+        // twice — once removed, once added.
+        viewer.setFindQuery("line21")
+        #expect(await wait { viewer.findResult.total > 0 },
+                "found nothing in a rendered patch that contains the query")
+        #expect(viewer.findResult.note == "in app.swift", """
+            the bar did not say which file it searched; note was \
+            \(String(describing: viewer.findResult.note))
+            """)
+
+        // A file the diff HAS but has not opened is not on the page, and find
+        // must not pretend otherwise.
+        viewer.setFindQuery("Staged edit")
+        #expect(await wait { viewer.findResult.total == 0 },
+                "matched text from a file that is not open")
+        #expect(viewer.findResult.note == "in app.swift")
+    }
+
     // MARK: - Change navigation
 
     /// Next-change walks the hunks of the open file...

@@ -393,6 +393,14 @@ final class ViewerView: NSView, Codable, ObservableObject {
             // The bar is gone; a re-attach re-mounts and re-measures it. Keep
             // `feedbackDraftStem` so an undo restores the same draft folder.
             feedbackBarHeight = 0
+            // Same retain-cycle reasoning again for the find card. The QUERY
+            // is kept (it lives on this view), so an undo that re-attaches the
+            // pane can resume the search with Cmd-G — but the bar comes back
+            // closed, because a detached pane's highlights are gone with its
+            // page state.
+            unmountFindHost()
+            findOpen = false
+            findResult = .none
             chromeAnimating = false
             webViewTopConstraint?.constant = 0
             // Same reasoning as the chrome bar: these hosting views' root
@@ -437,6 +445,18 @@ final class ViewerView: NSView, Codable, ObservableObject {
     /// same menu as one outside it.
     static func linkMenuUserScript() -> WKUserScript? {
         userScript(named: "links", degradesTo: "the link menu", forMainFrameOnly: false)
+    }
+
+    /// The bundled find-in-page user script, or nil if the resource is missing
+    /// (a broken bundle degrades to "Cmd-F does nothing", never a crash).
+    ///
+    /// Main frame only. Highlighting, counting, and stepping all happen in one
+    /// document's coordinate and offset space; a subframe would be a second,
+    /// independent search with its own count, and merging the two into one
+    /// "3/17" is not something one script in each frame can do. The find bar
+    /// says so instead (see `find.js` → `scopeNote`).
+    static func findUserScript() -> WKUserScript? {
+        userScript(named: "find", degradesTo: "find-in-page", forMainFrameOnly: true)
     }
 
     private static func userScript(
@@ -568,6 +588,14 @@ final class ViewerView: NSView, Codable, ObservableObject {
             // anything else — page background, an image, selected text, a
             // `mailto:` — still gets WebKit's own menu, unchanged.
             if let script = Self.linkMenuUserScript() {
+                config.userContentController.addUserScript(script)
+            }
+
+            // Find-in-page, injected into every page for the same reason.
+            // WKWebView's own `find(_:configuration:)` reports only
+            // `matchFound` — no count, no ordinal — so the browser-standard
+            // "3/17" is unreachable through it and the search has to be ours.
+            if let script = Self.findUserScript() {
                 config.userContentController.addUserScript(script)
             }
 
@@ -890,33 +918,49 @@ final class ViewerView: NSView, Codable, ObservableObject {
     }
 
     /// A key event this pane wants before the focused element sees it (from the
-    /// pane's local event monitor). Today: Escape while a chrome text field —
-    /// the address bar, or the diff panel's filter — is being edited. Returns
-    /// true when the event was consumed.
+    /// pane's local event monitor): Escape while a chrome text field — the
+    /// address bar, the diff panel's filter, or the find field — is being
+    /// edited or while find is open, and Return/Shift-Return in the find field.
+    /// Returns true when the event was consumed.
     ///
     /// AppKit-level rather than a SwiftUI `.onExitCommand` for the same reason
     /// the rest of the chrome's focus handling is: @FocusState does not
     /// propagate reliably inside an NSHostingView, and the field editor — not
-    /// the SwiftUI view — is what actually holds the keystroke.
+    /// the SwiftUI view — is what actually holds the keystroke. Shift-Return is
+    /// the other half of that: a single-line field editor turns it into an
+    /// ordinary `insertNewline:`, indistinguishable from Return by the time
+    /// SwiftUI's `onSubmit` sees it, so "find previous" has to be read off the
+    /// event itself.
     func handleChromeKeyDown(_ event: NSEvent) -> Bool {
         guard event.window === window else { return false }
-        let editingAddress = chromeTextFieldFocused
-        let editingFilter = sidePanelTextFieldFocused
-        guard editingAddress || editingFilter else { return false }
-        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
-        guard event.keyCode == 53,  // Escape
-              !mods.contains(.command),
-              !mods.contains(.control),
-              !mods.contains(.option)
+        // Escape closes find from the PAGE too, so this is no longer gated on a
+        // text field having the caret — but it must still be gated on the
+        // keystroke belonging to THIS pane, or a viewer split would eat Escape
+        // from the terminal next door.
+        guard paneHoldsFocus else { return false }
+        guard let action = Self.fieldKeyAction(
+            for: event,
+            addressFocused: chromeTextFieldFocused,
+            diffFilterFocused: sidePanelTextFieldFocused,
+            findFocused: findTextFieldFocused,
+            findOpen: findOpen)
         else { return false }
-        if editingAddress {
+
+        switch action {
+        case .revertAddress:
             cancelAddressEditing()
-        } else {
+        case .clearDiffFilter:
             // Escape in the filter puts the whole list back and hands focus to
             // the diff — the same "throw the edit away" contract the address
             // field has.
             setDiffFilter("")
             window?.makeFirstResponder(webView)
+        case .closeFind:
+            closeFind()
+        case .findNext:
+            stepFind(1)
+        case .findPrevious:
+            stepFind(-1)
         }
         return true
     }
@@ -1102,12 +1146,13 @@ final class ViewerView: NSView, Codable, ObservableObject {
     }
 
     /// True when keyboard focus is on an element inside THIS viewer pane that
-    /// should receive the standard editing chords: the address field's editor or
-    /// the web content. Deliberately excludes the bar's buttons and the feedback
-    /// composer (which handles the chords itself). Gates the editing routing in
-    /// `performKeyEquivalent`.
+    /// should receive the standard editing chords: one of the pane's three text
+    /// fields (address, diff filter, find) or the web content. Deliberately
+    /// excludes the bar's buttons and the feedback composer (which handles the
+    /// chords itself). Gates the editing routing in `performKeyEquivalent`.
     private var paneHoldsEditingFocus: Bool {
-        chromeTextFieldFocused || sidePanelTextFieldFocused || isViewerContentFocused
+        chromeTextFieldFocused || sidePanelTextFieldFocused
+            || findTextFieldFocused || isViewerContentFocused
     }
 
     private func scheduleChromeHide(after delay: TimeInterval = 2.0) {
@@ -1827,6 +1872,8 @@ final class ViewerView: NSView, Codable, ObservableObject {
             handleQuoteMessage(payload)
         case "linkMenu":
             presentLinkMenu(payload)
+        case "find":
+            handleFindMessage(payload)
         case "diffNavOverflow":
             // The open file has no further hunk in that direction; the next
             // change is in the next FILE.
@@ -2028,6 +2075,9 @@ final class ViewerView: NSView, Codable, ObservableObject {
         // Panes are resized constantly by split-tree drags, so the gutter ⇄
         // compact switch has to ride layout rather than any one-shot setup.
         updateSidePanelLayout()
+        // Same reason: a squeezed pane has to squeeze the find card rather
+        // than push it off the trailing edge.
+        updateFindBarWidth()
     }
 
     /// Mount, size, or tear down the TOC views for the current pane width,
@@ -2582,6 +2632,240 @@ final class ViewerView: NSView, Codable, ObservableObject {
         updateSidePanelLayout()
     }
 
+    // MARK: - Find in page
+
+    /// Whether the find bar is mounted and showing.
+    @Published private(set) var findOpen = false
+    /// What the user has typed. Outlives the bar being closed so Cmd-G can
+    /// resume the last search the way Safari does.
+    @Published private(set) var findQuery = ""
+    /// The page's answer for `findQuery` (see `find.js`).
+    @Published private(set) var findResult = ViewerFindResult.none
+    /// Bumped to ask the bar to put the caret back in its field; the bar
+    /// watches this rather than exposing its @FocusState upward, the same
+    /// one-way channel `addressFocusRequest` uses.
+    @Published private(set) var findFocusRequest = 0
+
+    private var findHost: NSHostingView<ViewerFindBar>?
+    private var findWidthConstraint: NSLayoutConstraint?
+
+    /// Widest the card is allowed to get, in points (its own margins included).
+    /// Wide enough for a real phrase plus the count and three buttons; capped
+    /// so it never spans a wide pane like a toolbar, which is exactly what the
+    /// card is not.
+    private static let findBarMaxWidth: CGFloat = 400
+
+    /// Open the find bar and put the caret in it, selecting whatever query is
+    /// already there so the next keystroke replaces it — the browser rule, and
+    /// the same one `focusAddressBar` follows.
+    ///
+    /// Returns false when this pane could never mount a bar (it is not in a
+    /// window), so Cmd-F falls through to its global binding rather than being
+    /// silently swallowed.
+    @discardableResult
+    func openFind() -> Bool {
+        guard window != nil else { return false }
+        if !findOpen {
+            findOpen = true
+            mountFindHost()
+        }
+        findFocusRequest += 1
+        claimFindField()
+        // Re-running the search on open is what makes Cmd-F, Escape, Cmd-F
+        // come back to the same highlights instead of an empty page with a
+        // query still in the field.
+        if !findQuery.isEmpty { pushFindQuery() }
+        return true
+    }
+
+    /// Close the bar, drop the query, and clear the page's highlights.
+    ///
+    /// Closing CLEARS rather than hides: highlights painted over a document
+    /// nobody is searching any more are just noise, and a browser's Escape
+    /// does the same. `findQuery` is kept so Cmd-G can resume it, which is why
+    /// the page is told to clear explicitly rather than by pushing "".
+    func closeFind() {
+        // The page is cleared unconditionally, ahead of the open check: the
+        // highlights are the page's state, not the bar's, and "close" must
+        // never be able to leave them painted on a pane with no bar to remove
+        // them with.
+        findResult = .none
+        evaluateFind("window.__ghozttyFind.clear()")
+        guard findOpen else { return }
+        findOpen = false
+        unmountFindHost()
+        // Hand focus back to the page so the pane is usable again — the same
+        // thing the feedback composer does when it closes.
+        if let responder = window?.firstResponder as? NSView,
+           responder === self || responder.isDescendant(of: self) {
+            window?.makeFirstResponder(webView)
+        }
+    }
+
+    func toggleFind() {
+        if findOpen { closeFind() } else { openFind() }
+    }
+
+    /// The user typed. Pushed straight through (no debounce): the page caches
+    /// its text index between keystrokes and only rebuilds it when the DOM
+    /// actually moves, so a keystroke costs a scan of an already-built buffer.
+    func setFindQuery(_ text: String) {
+        guard findQuery != text else { return }
+        findQuery = text
+        if text.isEmpty { findResult = .none }
+        pushFindQuery()
+    }
+
+    /// Step to the next (+1) or previous (-1) match, wrapping.
+    func stepFind(_ delta: Int) {
+        guard !findQuery.isEmpty else { return }
+        evaluateFind("window.__ghozttyFind.step(\(delta))")
+    }
+
+    /// Cmd-G / Cmd-Shift-G: step the last search, re-opening the bar if it was
+    /// closed. Returns false when there is nothing to step, so the chord falls
+    /// through to its global binding instead of being eaten.
+    @discardableResult
+    func stepFindFromKeyboard(_ delta: Int) -> Bool {
+        guard !findQuery.isEmpty else { return false }
+        if !findOpen {
+            guard openFind() else { return false }
+        }
+        stepFind(delta)
+        return true
+    }
+
+    private func pushFindQuery() {
+        evaluateFind("window.__ghozttyFind.search(\(Self.js(findQuery)))")
+    }
+
+    /// Run a find call in the page, tolerating a page that has not installed
+    /// the script yet (a load in flight, or a `pdf`/plugin document WebKit
+    /// renders without running user scripts). A find that cannot reach the
+    /// page reports nothing rather than throwing into the console.
+    private func evaluateFind(_ call: String) {
+        guard webView != nil else { return }
+        webView.evaluateJavaScript("if (window.__ghozttyFind) { \(call); }")
+    }
+
+    /// The page reported a new match count (see `find.js` → `post`).
+    fileprivate func handleFindMessage(_ payload: [String: Any]) {
+        // A result for a query the user has already moved on from is stale;
+        // the push for the current one is on its way.
+        guard let reported = payload["query"] as? String, reported == findQuery else { return }
+        findResult = ViewerFindResult(payload: payload)
+    }
+
+    /// Re-arm the search after a navigation: the user script is re-injected
+    /// into the new document with no state, so an open find bar would be
+    /// showing a count for a page that is gone.
+    private func refreshFindAfterLoad() {
+        guard findOpen, !findQuery.isEmpty else { return }
+        pushFindQuery()
+    }
+
+    private func mountFindHost() {
+        guard findHost == nil else { return }
+        let host = NSHostingView(rootView: ViewerFindBar(viewerView: self))
+        host.translatesAutoresizingMaskIntoConstraints = false
+        // Height from the content (the honesty note makes the card two lines);
+        // width from the constraint below, so a narrow pane shrinks the card
+        // instead of the card flooring the pane's width.
+        host.sizingOptions = [.intrinsicContentSize]
+        // Above the side panel card: in the compact layout that card is an
+        // overlay from the left, and the two can meet in a narrow pane.
+        addSubview(
+            host, positioned: .above,
+            relativeTo: sidePanelResizeHandle ?? sidePanelContainer ?? webView)
+        // The nav bar stays on top. The card never overlaps it in steady state
+        // (it hangs off the web view's top edge, which the bar insets), but the
+        // two move in the same animation group and must not cross mid-slide.
+        if let chromeHost {
+            addSubview(chromeHost, positioned: .above, relativeTo: host)
+        }
+        let width = host.widthAnchor.constraint(equalToConstant: Self.findBarMaxWidth)
+        NSLayoutConstraint.activate([
+            // The WEB VIEW's top, not the pane's: when the nav bar slides in it
+            // insets the web view, and the card has to move down with the
+            // content rather than slide under the bar. Same anchor the side
+            // panel card uses, for the same reason.
+            host.topAnchor.constraint(equalTo: webView.topAnchor),
+            host.trailingAnchor.constraint(equalTo: trailingAnchor),
+            width,
+        ])
+        findWidthConstraint = width
+        findHost = host
+        updateFindBarWidth()
+    }
+
+    private func unmountFindHost() {
+        findHost?.removeFromSuperview()
+        findHost = nil
+        findWidthConstraint = nil
+    }
+
+    /// Keep the card inside a narrow pane. Runs from `layout()`, so dragging a
+    /// split divider squeezes the card rather than pushing it off the edge.
+    private func updateFindBarWidth() {
+        guard let findWidthConstraint else { return }
+        let width = min(Self.findBarMaxWidth, max(0, bounds.width))
+        if abs(findWidthConstraint.constant - width) > 0.5 {
+            findWidthConstraint.constant = width
+        }
+    }
+
+    /// Make the find field first responder and select what is in it.
+    ///
+    /// Retried for the same reason `claimAddressField` is: the bar's SwiftUI
+    /// content is not built in the run-loop turn the host is mounted, so the
+    /// field usually does not exist yet on the first pass.
+    private func claimFindField(attempt: Int = 0) {
+        guard let window, let findHost,
+              let field = Self.firstTextField(in: findHost)
+        else {
+            guard attempt < 50, findOpen else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.02) { [weak self] in
+                self?.claimFindField(attempt: attempt + 1)
+            }
+            return
+        }
+        // A terminal surface sharing this window keeps its `focused` flag set
+        // even while this field holds keyboard focus, so its
+        // performKeyEquivalent would eat Cmd-C/V before the field editor sees
+        // them. The same yield the address and filter fields perform.
+        if let controller = window.windowController as? BaseTerminalController {
+            _ = controller.focusedSurface?.resignFirstResponder()
+        }
+        window.makeFirstResponder(field)
+        field.currentEditor()?.selectAll(nil)
+    }
+
+    /// The find field gained or lost keyboard focus. Only the yield above
+    /// matters here; the bar keeps its own caret.
+    func findFieldFocusChanged(_ focused: Bool) {
+        guard focused else { return }
+        if let controller = window?.windowController as? BaseTerminalController {
+            _ = controller.focusedSurface?.resignFirstResponder()
+        }
+    }
+
+    /// True when the find bar's own text field holds keyboard focus. Separate
+    /// from the chrome bar's and the side panel's for the same reason those are
+    /// separate from each other: three hosting views, and all three have to be
+    /// able to claim the standard editing chords.
+    private var findTextFieldFocused: Bool {
+        guard let findHost, window?.firstResponder is NSText,
+              let responder = window?.firstResponder as? NSView
+        else { return false }
+        return responder === findHost || responder.isDescendant(of: findHost)
+    }
+
+    /// The mounted find field, for tests that assert where the caret landed.
+    var findFieldForTesting: NSTextField? {
+        guard let findHost else { return nil }
+        return Self.firstTextField(in: findHost)
+    }
+
     // MARK: - Loading
 
     private func load() {
@@ -2854,23 +3138,34 @@ final class ViewerView: NSView, Codable, ObservableObject {
         case reload
         /// Cmd-D — focus and select the address field.
         case focusAddress
+        /// Cmd-F — open the find bar and focus its field.
+        case find
+        /// Cmd-G — step to the next match without reaching for the bar.
+        case findNext
+        /// Cmd-Shift-G — step to the previous match.
+        case findPrevious
     }
 
     /// Classify a key event as one of the viewer's pane-scoped chords, or nil
     /// if it is not one. Pure classification (no side effects) so the mapping is
-    /// unit-testable without a live pane. Requires exactly Command (no
-    /// Control/Option/Shift) so Cmd+Shift+R ("Change Window Title") and the
-    /// other Cmd+Shift bindings are untouched.
+    /// unit-testable without a live pane. Requires Command and rejects
+    /// Control/Option, so Ctrl+Cmd+F ("Toggle Full Screen") is untouched. Shift
+    /// is rejected for every chord but Cmd+Shift+G — the macOS-standard "find
+    /// previous" — so Cmd+Shift+R ("Change Window Title") and Cmd+Shift+D
+    /// (split down) keep their global meanings.
     static func paneChord(for event: NSEvent) -> PaneChord? {
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         guard mods.contains(.command),
               !mods.contains(.control),
-              !mods.contains(.option),
-              !mods.contains(.shift)
+              !mods.contains(.option)
         else { return nil }
-        switch event.charactersIgnoringModifiers?.lowercased() {
-        case "r": return .reload
-        case "d": return .focusAddress
+        let shift = mods.contains(.shift)
+        switch (event.charactersIgnoringModifiers?.lowercased() ?? "", shift) {
+        case ("r", false): return .reload
+        case ("d", false): return .focusAddress
+        case ("f", false): return .find
+        case ("g", false): return .findNext
+        case ("g", true): return .findPrevious
         default: return nil
         }
     }
@@ -2885,6 +3180,64 @@ final class ViewerView: NSView, Codable, ObservableObject {
             return true
         case .focusAddress:
             return focusAddressBar()
+        case .find:
+            return openFind()
+        case .findNext:
+            return stepFindFromKeyboard(1)
+        case .findPrevious:
+            return stepFindFromKeyboard(-1)
+        }
+    }
+
+    /// What Escape or Return means to a viewer pane's transient fields.
+    enum FieldKeyAction: Equatable {
+        /// Throw away a half-typed address and show the pane's real location.
+        case revertAddress
+        /// Put the whole file list back in a diff pane's side panel.
+        case clearDiffFilter
+        /// Close the find bar and clear its highlights.
+        case closeFind
+        /// Step to the next / previous match.
+        case findNext
+        case findPrevious
+    }
+
+    /// Decide what Escape/Return means given which of the pane's three text
+    /// fields has the caret. Pure so the PRECEDENCE is checkable — a viewer
+    /// pane can have an address field, a diff file filter, and a find field all
+    /// alive at once, and each of them wants Escape.
+    ///
+    /// Escape belongs to whichever field is being EDITED before it belongs to
+    /// find: an abandoned address edit left sitting in the bar is a lie about
+    /// where the pane is, and closing find would not fix it. With no field
+    /// focused, Escape closes find from the page — which is what a browser does,
+    /// and where the highlights are.
+    static func fieldKeyAction(
+        for event: NSEvent,
+        addressFocused: Bool,
+        diffFilterFocused: Bool,
+        findFocused: Bool,
+        findOpen: Bool
+    ) -> FieldKeyAction? {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        guard !mods.contains(.command),
+              !mods.contains(.control),
+              !mods.contains(.option)
+        else { return nil }
+
+        switch event.keyCode {
+        case 53:  // Escape
+            if addressFocused { return .revertAddress }
+            if diffFilterFocused { return .clearDiffFilter }
+            if findOpen { return .closeFind }
+            return nil
+        case 36, 76:  // Return, keypad Enter
+            // Only the find field: Return in the filter opens the top file and
+            // in the address bar navigates, both via their own onSubmit.
+            guard findFocused else { return nil }
+            return mods.contains(.shift) ? .findPrevious : .findNext
+        default:
+            return nil
         }
     }
 
@@ -3136,6 +3489,13 @@ extension ViewerView: WKNavigationDelegate {
         // as the user follows links / types addresses within the pane (all
         // modes). Cheap no-op at 100%.
         if zoomFactor != 1.0 { pushZoomToWebView() }
+        // The find user script is re-injected into the new document with no
+        // state, so an open bar would be showing a count for a page that is
+        // gone. Before the `.web` early return: a website navigation needs this
+        // most, since it is the one that changes the document out from under a
+        // search. (Ahead of `renderFileContent` too — the page's own mutation
+        // observer picks the rendered content up 200ms later.)
+        refreshFindAfterLoad()
         if case .web = mode { return }
         pageLoaded = true
         // An HTML file IS the page — there is no template to inject into, and

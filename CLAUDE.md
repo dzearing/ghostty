@@ -619,6 +619,47 @@ ghoztty +close --target=doc
   still serve that stylesheet from WebKit's memory cache. `+reload`/Cmd+R
   bypasses the cache (`reloadFromOrigin`) and is the way to pick up a changed
   subresource.
+- **Find in page** (**Cmd+F**): a browser find bar, the same one in every
+  viewer mode — markdown, code, a local HTML page, a website, and a diff.
+  Typing highlights every match as you go (yellow, with the current one
+  orange), the bar shows a live `3/17`, and Enter / Shift-Enter — or the
+  bar's own chevrons, or **Cmd+G** / **Cmd+Shift+G** — step through them,
+  wrapping at each end. Escape closes the bar and clears the highlights; the
+  QUERY survives, so Cmd-G resumes the search and Cmd-F comes back to it
+  pre-selected. Matching is case-insensitive substring, and a match may not
+  straddle a block boundary (no browser matches "foo bar" across two
+  paragraphs).
+  - **A floating glass card at the pane's top-trailing corner**, not a strip
+    under the nav bar and not part of the nav bar. The nav bar reserves its
+    space and a markdown/code pane hides it until you reach for it, so a find
+    strip would mean Cmd-F both pins the bar open AND adds a row beneath it —
+    reflowing a reading surface by ~80pt and scrolling the very text you are
+    searching. The card costs no layout and appears identically in every mode.
+    It hangs off the web view's top edge, so it moves down with the content
+    when the nav bar slides in, and it squeezes with a narrowing pane.
+    Matches are scrolled to the MIDDLE of the pane, which is what keeps the
+    card from ever covering the match it just found.
+  - **The search is ours, in JavaScript** (`src/viewer/find.js`), because
+    WKWebView's own `find(_:configuration:)` reports only `matchFound` — no
+    count, no ordinal — so `3/17` is unreachable through it. Like
+    `selection.js` and `links.js` it is a **`WKUserScript`**, not something in
+    `viewer.js`, or it would never reach a website. It paints with the **CSS
+    Custom Highlight API**, so it never mutates the page (a find on your own
+    dev server cannot corrupt its rendering, and our painting cannot
+    re-trigger the observer that keeps the count live). On WebKit older than
+    Safari 17.2 the API is missing and the current match is shown as an
+    ordinary selection instead — count and stepping still work, only the
+    all-matches paint degrades.
+  - **The count is live**: the page re-scans when it changes underneath an
+    open search, which is what makes find work on a diff still appending rows
+    a chunk per frame, or a file viewer that just live-reloaded.
+  - **It is honest about what it is NOT searching**, on a second line under
+    the field: text in the tree but not laid out is excluded (counting a
+    match nobody can be scrolled to is a promise you can't keep); a page with
+    a visible frame says `frames not searched` (the search is main-frame
+    only, since one count cannot span two documents); a diff pane says which
+    file (see Git diff panes); and past 5 000 matches the count reads
+    `12/5000+` rather than a precise-looking number nobody counted.
 - **Navigation chrome**: every mode gets a bar with back / forward / reload /
   **home** and an **editable address field**; what differs is whether it is
   always there. A **live page** — a website, or a local HTML file the web view
@@ -643,20 +684,33 @@ ghoztty +close --target=doc
   survive a session restore). Clicking into the address field selects the whole
   address; clicking again inside it just moves the caret.
 - **Keyboard** (pane-scoped: live only while keyboard focus is inside a
-  viewer pane — its page, its nav bar, or its feedback composer — in any
-  viewer mode):
+  viewer pane — its page, its nav bar, its find bar, or its feedback composer
+  — in any viewer mode):
   - **Cmd+R** reloads the pane in place, exactly like `+reload` (web
     re-fetches from origin, files re-render with scroll preserved).
   - **Cmd+D** slides the nav bar in if hidden and puts the caret in the
     address field with the whole address selected — the keyboard version of
     clicking into it.
+  - **Cmd+F** opens the find bar and puts the caret in it (see Find in page).
+    **Cmd+G** / **Cmd+Shift+G** step to the next / previous match, re-opening
+    the bar if it was closed. With no query yet there is nothing to step, so
+    they are declined rather than swallowed.
   - The standard editing chords (Cmd+C/V/X/A) reach whichever field inside the
-    pane holds focus — the address bar, or a diff panel's filter — which they
-    otherwise would not, because Cmd+C/V are terminal keybindings.
-  - Both **override their global binding only while the viewer holds focus**
+    pane holds focus — the address bar, a diff panel's filter, or the find
+    field — which they otherwise would not, because Cmd+C/V are terminal
+    keybindings.
+  - **Escape and Return belong to whichever field has the caret**, in that
+    order of precedence (`ViewerView.fieldKeyAction`, which is pure so the
+    ordering is testable): Escape reverts a half-typed **address**, else
+    clears a **diff filter**, else closes **find** — including from the page,
+    which is where the highlights are. Return steps a match only from the find
+    field; in the filter it opens the top file and in the address bar it
+    navigates, each via its own field.
+  - These **override their global binding only while the viewer holds focus**
     (Cmd+R = "Set Pane Banner…", Cmd+D = split right). Focus a terminal pane
-    and they do their global thing again; Cmd+Shift+R ("Change Window Title")
-    and Cmd+Shift+D (split down) are never affected.
+    and they do their global thing again; Cmd+Shift+R ("Change Window Title"),
+    Cmd+Shift+D (split down), and Ctrl+Cmd+F (Toggle Full Screen) are never
+    affected.
 - `--view=about:blank` opens a **blank browser pane**. The command palette's
   "Viewer: Open Browser Pane" does the same interactively and puts the caret
   straight in the address field — the equivalent of `+split --view=<url>` for
@@ -766,6 +820,16 @@ answers "what changed in abc123". Use `a..b` when you mean a comparison.
   It steps from a remembered index, not from the scroll position, so a fast
   double-press advances twice instead of re-picking the change the smooth
   scroll has not reached yet; your own next scroll hands it back.
+- **Three things that are not each other.** A diff pane has a
+  next/previous-**change** stepper (nav bar), a **file filter** (side panel),
+  and **find in page** (Cmd+F). They step hunks, narrow the file list, and
+  search text respectively, and each owns Enter/Escape only while ITS field
+  has the caret (see Viewer Panes → Keyboard for the precedence). Find
+  searches the **open file's patch and nothing else** — the rest of the diff
+  is in the file tree, not in the DOM — so the find bar names the file
+  (`in app.swift`), and says `rows past the cap are not searched` while the
+  20 000-row cap is in force. Without that line a "No results" would read as
+  "not in this diff", which would be a lie.
 - **Live**: a `git-status:` pane re-checks the working tree every 2s and
   updates only when the file list actually moved, so an edit or a `git add` in
   another pane shows up without a reload and without a flicker. A commit or a
