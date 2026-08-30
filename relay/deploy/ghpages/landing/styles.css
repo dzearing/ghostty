@@ -212,13 +212,8 @@ nav { position: fixed; top: 0; left: 0; right: 0; z-index: 100; padding: 0 24px;
 .remote-card .install-card-header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
 .remote-card h3 { font-size: 18px; font-weight: 650; }
 .remote-card p { font-size: 14px; color: var(--text-secondary); line-height: 1.6; margin-bottom: 14px; }
-.remote-card .code-block { margin-bottom: 16px; }
 .remote-card .install-alt { margin-bottom: 0 !important; }
 .remote-card .install-alt a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
-.code-block-copy { position: relative; padding-right: 84px; }
-.copy-btn { position: absolute; top: 10px; right: 10px; font-family: var(--mono); font-size: 12px; font-weight: 600; color: var(--text-secondary); background: var(--bg-card); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 8px; padding: 6px 12px; cursor: pointer; transition: color 0.15s ease, border-color 0.15s ease; }
-.copy-btn:hover { color: var(--text); border-color: var(--border-accent); }
-.copy-btn.copied { color: var(--accent); border-color: var(--border-accent); }
 #agent-version { color: var(--text-dim); }
 .remote-card .dl-btn { display: inline-flex; align-items: center; gap: 10px; background: var(--accent); color: #0a0a0c; font-size: 15px; font-weight: 650; border-radius: var(--radius-sm); padding: 13px 22px; text-decoration: none; margin-bottom: 18px; transition: filter 0.15s ease, box-shadow 0.15s ease; }
 .remote-card .dl-btn:hover { filter: brightness(1.1); box-shadow: 0 0 24px var(--accent-glow); }
@@ -226,14 +221,6 @@ nav { position: fixed; top: 0; left: 0; right: 0; z-index: 100; padding: 0 24px;
 .remote-steps li::marker { color: var(--accent); font-weight: 600; }
 .remote-steps code { font-family: var(--mono); font-size: 13px; color: var(--green); }
 .remote-steps b { color: var(--text); font-weight: 600; }
-.remote-advanced { margin-top: 18px; border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--bg-surface); }
-.remote-advanced summary { cursor: pointer; padding: 12px 16px; font-size: 13px; font-weight: 600; color: var(--text-secondary); list-style: none; }
-.remote-advanced summary::-webkit-details-marker { display: none; }
-.remote-advanced summary::before { content: "\25B8  "; color: var(--accent); }
-.remote-advanced[open] summary::before { content: "\25BE  "; }
-.remote-advanced summary:hover { color: var(--text); }
-.remote-advanced > p, .remote-advanced .code-block, .remote-advanced .install-alt { margin-left: 16px; margin-right: 16px; }
-.remote-advanced .install-alt { margin-bottom: 14px !important; }
 
 /* ── Footer ── */
 footer { padding: 40px 24px; border-top: 1px solid var(--border); }

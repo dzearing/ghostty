@@ -113,23 +113,29 @@ Windows; `flock` on `~/.config/ghoztty/agent.lock` elsewhere), so competing
 supervisors can't stack up duplicate agents — `--stdio` and `--enroll` are
 exempt and still work while a daemon runs.
 
-### Hosted Windows installer
+### Hosted Windows installer — retired (T1175)
 
-The one-liner installer served at `/dl/install.ps1` (source:
-`relay/deploy/install.ps1` in this repo; the live copy sits on the VM at
-`/var/www/ghoztty-dl/` — re-upload after editing) uses this flow. On a fresh
-box with no `DEVICE_TOKEN` it downloads the agent and runs
-`ghoztty-agent.exe --enroll --relay=<base>` interactively — a browser window
-opens, approve the Google sign-in, done — then installs the autostart
-launcher:
+There is no standalone agent installer any more. Windows ships **one**
+installer, the Ghoztty MSI, and `ghoztty-agent.exe` is a required sibling of
+`ghoztty.exe` inside it — so a box with Ghoztty on it already has the agent,
+and a box without it could previously end up with half a product. Enrollment
+and serving moved to the machine chooser (`Ctrl+Shift+N` → sign in → **Share
+this machine**), which is where the account UI lives on both platforms.
+
+`/dl/install.ps1` **keeps answering**: the hosted copy (source:
+`relay/deploy/install.ps1`; the live copy sits on the VM at
+`/var/www/ghoztty-dl/` — re-upload after editing) is now a signpost that
+prints where to get Ghoztty and how to share the machine. Old docs and old
+chat logs still carry the one-liner, and a 404 teaches nobody anything:
 
 ```powershell
 irm https://<relay>/dl/install.ps1 | iex
 ```
 
-Setting `$env:DEVICE_TOKEN` beforehand still skips the interactive sign-in
-(pre-minted token path); re-running with an existing `relay.env` just updates
-the binary.
+The enrollment flow described above is unchanged — it is what the agent runs
+when the chooser's toggle turns sharing on, and an existing `relay.env` is
+kept and reused, so a machine that was enrolled by the old installer stays
+enrolled. Background: `docs/design/one-installer-agent-consolidation.md`.
 
 ### End-to-end tests against the real agent binary
 
@@ -403,4 +409,5 @@ rename preserves it, the control-connect header updates it).
 | `auth_oidc_test.go`          | OIDC client-auth tests against a fake local issuer (JWKS + self-minted RS256 tokens). |
 | `enroll_test.go`             | Self-enroll tests against fake Google device-code/token endpoints (happy path, idempotent re-enroll, denied/expired, allowlist rejection, poll rate limit). |
 | `agent_enroll_e2e_test.go`   | Gated e2e: the REAL Zig `ghoztty-agent --enroll` against this relay + the fake issuer (`GHOZTTY_AGENT_BIN`). |
-| `deploy/install.ps1`         | Source of the hosted Windows one-liner installer (`/dl/install.ps1` on the VM — re-upload after editing). |
+| `deploy/install.ps1`         | Source of the hosted `/dl/install.ps1`, which since T1175 is a signpost that prints where to get Ghoztty rather than an installer (re-upload after editing). |
+| `deploy/publish-agent.sh`    | Publishes `ghoztty-agent.exe`, `version.json`, the signpost and the relay's landing page to the VM. |

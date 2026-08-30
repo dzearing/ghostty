@@ -1,28 +1,35 @@
 #!/usr/bin/env bash
-# publish-agent.sh — publish the Windows agent + download site to the relay VM.
+# publish-agent.sh — publish the Windows agent binary + download site to the
+# relay VM.
 #
 # Uploads (idempotent; safe to re-run):
 #   ghoztty-agent.exe            -> /var/www/ghoztty-dl/ghoztty-agent.exe
-#   Ghoztty-Agent-<semver>[.N]-x64.msi
-#                                -> /var/www/ghoztty-dl/  (built via msi/build-msi.sh;
-#                                   DMG-style versioned filename; older ones pruned)
-#   ghoztty-agent.msi            -> stable-URL alias of that same MSI
 #   version.json                 -> /var/www/ghoztty-dl/version.json   (generated here)
 #   install.ps1                  -> /var/www/ghoztty-dl/install.ps1
 #   www/index.html               -> /var/www/ghoztty-www/index.html
 #
-# version.json schema (consumed by the landing pages and the agent updater;
-# `msi`/`semver`/`msi_build` are used by the pages to link the versioned
-# installer and by this script to auto-bump the republish counter):
+# WHAT IS NO LONGER HERE (T1175). This script used to build and publish a
+# standalone Ghoztty-Agent MSI, plus a stable-URL alias for it, so a Windows
+# box could install the agent on its own. Windows ships ONE installer now and
+# it carries `ghoztty-agent.exe` as a required sibling of `ghoztty.exe`, so the
+# second installer only ever let a new user end up with half a product. The
+# `msi/` directory went with it, `install.ps1` is a signpost that keeps the
+# hosted one-liner answering, and `www/index.html` points at the product site.
+# See docs/design/one-installer-agent-consolidation.md.
+#
+# The exe and version.json stay because the standalone `--relay` agent's
+# self-updater still reads them (`src/remote/agent/self_update.zig`,
+# `GET /dl/version.json`); retiring that code path is T550.
+#
+# version.json schema (FIXED — shared with the agent updater; do not reorder or
+# rename fields without changing self_update.zig in the same commit):
 #   {"windows-x86_64": {"version": "20260703-c322788", "commit": "<hash>",
-#     "sha256": "<hex>", "path": "/dl/ghoztty-agent.exe",
-#     "semver": "1.11.0", "msi_build": 1, "msi": "/dl/Ghoztty-Agent-1.11.0-x64.msi"}}
+#     "sha256": "<hex>", "path": "/dl/ghoztty-agent.exe"}}
 #
 # Usage:
 #   relay/deploy/publish-agent.sh [path/to/ghoztty-agent.exe]
 #                                 [--version <string>] [--host <ssh-host>]
-#                                 [--build-num <N>] [--skip-msi] [--if-changed]
-#                                 [--dry-run]
+#                                 [--if-changed] [--dry-run]
 #
 # Defaults:
 #   exe      zig-out/bin/ghoztty-agent.exe (relative to the repo root)
@@ -31,11 +38,11 @@
 #            a binary built from a different commit than HEAD.
 #   host     azureuser@ghoztty-relay-dz17575.westus2.cloudapp.azure.com
 #
-# --if-changed: skip publishing when nothing that goes into the agent /
-#   installer / download site has changed since the currently-DEPLOYED build.
-#   The live version.json records the `commit` it was built from; this compares
-#   that commit to HEAD over AGENT_PATHS (below) and exits 0 without uploading
-#   when the diff is empty. Over-inclusive on purpose (a needless republish is
+# --if-changed: skip publishing when nothing that goes into the agent or the
+#   download site has changed since the currently-DEPLOYED build. The live
+#   version.json records the `commit` it was built from; this compares that
+#   commit to HEAD over AGENT_PATHS (below) and exits 0 without uploading when
+#   the diff is empty. Over-inclusive on purpose (a needless republish is
 #   harmless — self-update is idle-gated — but a missed one ships stale bits).
 #
 # Requires: ssh access to the VM as a sudo-capable user. Caddy must already
@@ -52,22 +59,20 @@ WWW_DIR="/var/www/ghoztty-www"
 
 EXE="$REPO_ROOT/zig-out/bin/ghoztty-agent.exe"
 VERSION=""
-BUILD_NUM=1
-SKIP_MSI=0
 DRY_RUN=0
 IF_CHANGED=0
 
-# Source paths whose changes require re-publishing the agent + installer + site.
+# Source paths whose changes require re-publishing the agent + site.
 # Deliberately broad (over-inclusion just costs an unnecessary, seamless
 # self-update; under-inclusion ships stale bits). Relative to the repo root.
 AGENT_PATHS=(
   "src/remote"                 # agent + shared remote protocol/transport code
   "src/build/GhosttyAgent.zig" # agent build + version stamping
   "build.zig"                  # agent build wiring
-  "relay/deploy"               # MSI (.wxs/build-msi.sh), install.ps1, website, this script
+  "relay/deploy"               # install.ps1 signpost, website, this script
 )
 
-usage() { sed -n '2,43p' "${BASH_SOURCE[0]}"; }
+usage() { sed -n '2,49p' "${BASH_SOURCE[0]}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -75,9 +80,6 @@ while [[ $# -gt 0 ]]; do
     --version=*) VERSION="${1#*=}"; shift ;;
     --host)     HOST="${2:?--host needs a value}"; shift 2 ;;
     --host=*)   HOST="${1#*=}"; shift ;;
-    --build-num) BUILD_NUM="${2:?--build-num needs a value}"; shift 2 ;;
-    --build-num=*) BUILD_NUM="${1#*=}"; shift ;;
-    --skip-msi) SKIP_MSI=1; shift ;;
     --if-changed) IF_CHANGED=1; shift ;;
     --dry-run)  DRY_RUN=1; shift ;;
     -h|--help)  usage; exit 0 ;;
@@ -99,30 +101,8 @@ if [[ -z "$VERSION" ]]; then
   VERSION="$(date +%Y%m%d)-$CUR_COMMIT"
 fi
 
-# Release semver (latest tag, v stripped) — same version the DMG wears; drives
-# the MSI filename + ProductVersion (see msi/build-msi.sh).
-SEMVER="$(git -C "$REPO_ROOT" describe --tags --abbrev=0 2>/dev/null || true)"
-SEMVER="${SEMVER#v}"
-[[ "$SEMVER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-  || { echo "error: cannot derive release semver from git tags (got: '$SEMVER')" >&2; exit 1; }
-
 DL_BASE="https://${HOST#*@}/dl"
 PREV_JSON="$(curl -fsS "$DL_BASE/version.json" 2>/dev/null || true)"
-
-# Auto-bump the republish counter: publishing the SAME semver again (an
-# agent-only publish between releases) must raise the MSI ProductVersion, or
-# the new MSI would collide with the deployed one. Explicit --build-num wins.
-if [[ "$BUILD_NUM" -eq 1 ]]; then
-  PREV_SEMVER="$(printf '%s' "$PREV_JSON" | sed -n 's/.*"semver"[[:space:]]*:[[:space:]]*"\([0-9.]*\)".*/\1/p')"
-  PREV_BUILD="$(printf '%s' "$PREV_JSON" | sed -n 's/.*"msi_build"[[:space:]]*:[[:space:]]*\([0-9]*\).*/\1/p')"
-  if [[ "$PREV_SEMVER" == "$SEMVER" && -n "$PREV_BUILD" ]]; then
-    BUILD_NUM=$((PREV_BUILD + 1))
-    echo "== publish-agent: same semver as deployed ($SEMVER); auto-bumping MSI build-num to $BUILD_NUM =="
-  fi
-fi
-
-MSI_BASENAME="Ghoztty-Agent-$SEMVER-x64.msi"
-[[ "$BUILD_NUM" -gt 1 ]] && MSI_BASENAME="Ghoztty-Agent-$SEMVER.$BUILD_NUM-x64.msi"
 
 # --if-changed: compare HEAD to the commit the DEPLOYED agent was built from
 # (recorded in the live version.json) over AGENT_PATHS. Skip when unchanged.
@@ -135,7 +115,7 @@ if [[ "$IF_CHANGED" -eq 1 ]]; then
   fi
   if [[ -n "$PREV_COMMIT" ]] && git -C "$REPO_ROOT" cat-file -e "${PREV_COMMIT}^{commit}" 2>/dev/null; then
     if git -C "$REPO_ROOT" diff --quiet "$PREV_COMMIT" HEAD -- "${AGENT_PATHS[@]}"; then
-      echo "== publish-agent: no agent/installer/site changes since deployed build ($PREV_COMMIT); skipping publish. =="
+      echo "== publish-agent: no agent/site changes since deployed build ($PREV_COMMIT); skipping publish. =="
       exit 0
     fi
     echo "== publish-agent: changes since deployed build ($PREV_COMMIT):"
@@ -150,25 +130,12 @@ SHA256="$(shasum -a 256 "$EXE" | awk '{print $1}')"
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/ghoztty-publish.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
 
-# Build (and validate) the per-user MSI alongside the raw exe.
-MSI="$STAGE/$MSI_BASENAME"
-if [[ "$SKIP_MSI" -eq 0 ]]; then
-  "$SCRIPT_DIR/msi/build-msi.sh" "$EXE" \
-    --semver "$SEMVER" --version "$VERSION" --build-num "$BUILD_NUM" --out "$MSI"
-fi
-
 VERSION_JSON="$STAGE/version.json"
-printf '{"windows-x86_64": {"version": "%s", "commit": "%s", "sha256": "%s", "path": "/dl/ghoztty-agent.exe", "semver": "%s", "msi_build": %d, "msi": "/dl/%s"}}\n' \
-  "$VERSION" "$CUR_COMMIT" "$SHA256" "$SEMVER" "$BUILD_NUM" "$MSI_BASENAME" > "$VERSION_JSON"
+printf '{"windows-x86_64": {"version": "%s", "commit": "%s", "sha256": "%s", "path": "/dl/ghoztty-agent.exe"}}\n' \
+  "$VERSION" "$CUR_COMMIT" "$SHA256" > "$VERSION_JSON"
 
 echo "== publish-agent =="
 echo "   exe      : $EXE ($(du -h "$EXE" | awk '{print $1}'))"
-if [[ "$SKIP_MSI" -eq 0 ]]; then
-  echo "   msi      : $MSI ($(du -h "$MSI" | awk '{print $1}'))"
-else
-  echo "   msi      : skipped (--skip-msi)"
-fi
-echo "   semver   : $SEMVER (msi build $BUILD_NUM)"
 echo "   version  : $VERSION"
 echo "   sha256   : $SHA256"
 echo "   host     : $HOST"
@@ -187,23 +154,12 @@ run() {
 # enough for our purposes: `install` replaces each file in one step).
 REMOTE_STAGE="ghoztty-publish.$$"
 UPLOADS=("$EXE" "$VERSION_JSON" "$INSTALL_PS1" "$INDEX_HTML")
-MSI_INSTALL=""
-if [[ "$SKIP_MSI" -eq 0 ]]; then
-  UPLOADS+=("$MSI")
-  # Versioned filename is the real artifact; the historical stable URL stays a
-  # byte-identical alias so old links/scripts keep working. Prune all but the
-  # newest few versioned MSIs so /dl doesn't grow forever.
-  MSI_INSTALL="sudo install -m 644 $REMOTE_STAGE/$MSI_BASENAME $DL_DIR/$MSI_BASENAME
-  sudo install -m 644 $REMOTE_STAGE/$MSI_BASENAME $DL_DIR/ghoztty-agent.msi
-  ls -t $DL_DIR/Ghoztty-Agent-*.msi 2>/dev/null | tail -n +5 | xargs -r sudo rm -f"
-fi
 run ssh "$HOST" "mkdir -p $REMOTE_STAGE"
 run scp "${UPLOADS[@]}" "$HOST:$REMOTE_STAGE/"
 run ssh "$HOST" "
   set -eu
   sudo install -d -m 755 $DL_DIR $WWW_DIR
   sudo install -m 644 $REMOTE_STAGE/$(basename "$EXE") $DL_DIR/ghoztty-agent.exe
-  $MSI_INSTALL
   sudo install -m 644 $REMOTE_STAGE/version.json       $DL_DIR/version.json
   sudo install -m 644 $REMOTE_STAGE/install.ps1        $DL_DIR/install.ps1
   sudo install -m 644 $REMOTE_STAGE/index.html         $WWW_DIR/index.html
@@ -213,12 +169,9 @@ run ssh "$HOST" "
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "OK (dry-run): nothing uploaded. version.json rendered above."
 else
-  echo "OK: published agent $VERSION (MSI $MSI_BASENAME)."
+  echo "OK: published agent $VERSION."
   echo "   verify: curl -fsS https://${HOST#*@}/dl/version.json"
   echo "           curl -fsSI https://${HOST#*@}/dl/ghoztty-agent.exe | head -5"
-  if [[ "$SKIP_MSI" -eq 0 ]]; then
-    echo "           curl -fsSI https://${HOST#*@}/dl/$MSI_BASENAME | head -5"
-    echo "           curl -fsSI https://${HOST#*@}/dl/ghoztty-agent.msi | head -5"
-  fi
+  echo "           curl -fsS https://${HOST#*@}/dl/install.ps1 | head -5"
   echo "           curl -fsS https://${HOST#*@}/ | head -5"
 fi

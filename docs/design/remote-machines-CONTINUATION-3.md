@@ -1,5 +1,13 @@
 # CONTINUATION 3 — remote machines / relay (2026-07-03, end of dogfooding day)
 
+> **Superseded in part (2026-08-30, T1175):** the standalone agent installer
+> this session shipped — the website's agent download card, the one-liner, the
+> `Ghoztty-Agent` MSI — is retired. Windows ships one installer, the Ghoztty
+> MSI, which carries the agent; `/dl/install.ps1` is now a signpost. The
+> self-updater described below still runs in `--relay` mode and retires under
+> T550. See `one-installer-agent-consolidation.md` and
+> `remote-relay-roadmap.md` §0.
+
 > **Resume protocol:** read this file, then `remote-relay-roadmap.md` §0 (the
 > canonical rolling snapshot — every landing today is recorded there), then
 > `git log --oneline -20` on `feature/remote-machines`. Delegate implementation

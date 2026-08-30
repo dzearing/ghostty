@@ -55,17 +55,6 @@
     letter-spacing: -0.02em;
     line-height: 1.2;
   }
-  .version-badge {
-    display: none; /* shown by JS when /dl/version.json resolves */
-    font: 12px/1 var(--mono);
-    color: var(--accent);
-    background: var(--accent-soft);
-    border: 1px solid rgba(122, 162, 247, 0.25);
-    border-radius: 999px;
-    padding: 5px 10px;
-    vertical-align: middle;
-    white-space: nowrap;
-  }
   .pitch {
     color: var(--text-dim);
     font-size: 18px;
@@ -97,38 +86,6 @@
     color: var(--text-dim);
   }
   .install-card .bar .os { font-weight: 600; color: var(--text); }
-  .codewrap {
-    position: relative;
-    display: flex;
-    align-items: stretch;
-  }
-  pre {
-    flex: 1;
-    overflow-x: auto;
-    padding: 18px 84px 18px 16px;
-    background: var(--bg-code);
-  }
-  code { font: 14px/1.5 var(--mono); color: var(--green); white-space: pre; }
-  code .p { color: var(--text-dim); user-select: none; }
-  .copy-btn {
-    position: absolute;
-    top: 12px; right: 12px;
-    font: 12px/1 var(--mono);
-    color: var(--text-dim);
-    background: var(--bg-panel);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 7px 12px;
-    cursor: pointer;
-    transition: color .15s, border-color .15s;
-  }
-  .copy-btn:hover { color: var(--text); border-color: var(--accent); }
-  .copy-btn.ok { color: var(--green); border-color: var(--green); }
-  .alt {
-    margin-top: 12px;
-    font-size: 14px;
-    color: var(--text-dim);
-  }
   .dl-body { padding: 20px 18px; }
   .dl-btn {
     display: inline-flex;
@@ -153,35 +110,8 @@
     font-size: 15px;
   }
   ol.steps li::marker { color: var(--accent); font-weight: 600; }
-  ol.steps code { font: 13px/1.4 var(--mono); color: var(--green); }
   .note {
     margin-top: 16px;
-    font-size: 13px;
-    color: var(--text-dim);
-  }
-  details.advanced {
-    margin-top: 14px;
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    background: var(--bg-panel);
-    overflow: hidden;
-  }
-  details.advanced summary {
-    cursor: pointer;
-    padding: 12px 16px;
-    font-size: 14px;
-    color: var(--text-dim);
-    list-style: none;
-  }
-  details.advanced summary::-webkit-details-marker { display: none; }
-  details.advanced summary::before { content: "▸ "; color: var(--accent); }
-  details.advanced[open] summary::before { content: "▾ "; }
-  details.advanced summary:hover { color: var(--text); }
-  details.advanced .inner {
-    border-top: 1px solid var(--border);
-  }
-  details.advanced p.hint {
-    padding: 12px 16px 0;
     font-size: 13px;
     color: var(--text-dim);
   }
@@ -222,120 +152,43 @@
 <main>
   <div class="mark">
     <div class="glyph" aria-hidden="true">&#128123;</div>
-    <h1>Ghoztty Remote Agent <span class="version-badge" id="version-badge"></span></h1>
+    <h1>Ghoztty Remote Agent</h1>
   </div>
   <p class="pitch">Connect this machine to your Ghoztty terminal from anywhere.</p>
 
-  <h2>Install on Windows</h2>
+  <h2>It comes with Ghoztty</h2>
   <div class="install-card">
     <div class="bar">
       <span><span class="os">Windows</span> &middot; per-user install, no admin required</span>
     </div>
     <div class="dl-body">
-      <a class="dl-btn" id="msi-link" href="/dl/ghoztty-agent.msi"><span class="arrow" aria-hidden="true">&#8595;</span> Download the installer (.msi)</a>
+      <a class="dl-btn" id="msi-link" href="https://dzearing.github.io/ghoztty/#download"><span class="arrow" aria-hidden="true">&#8595;</span> Get Ghoztty for Windows</a>
       <ol class="steps">
-        <li>Run the downloaded <code id="msi-name">ghoztty-agent.msi</code>.</li>
-        <li>Click <b>Ghoztty Agent</b> in the Start Menu.</li>
-        <li>Sign in with Google in the browser that opens to link this machine to your account.</li>
+        <li>Install Ghoztty on this machine. There is one installer and it carries the agent.</li>
+        <li>Open the machine chooser with <b>Ctrl+Shift+N</b> and sign in with Google.</li>
+        <li>Turn on <b>Share this machine</b> to make it reachable from your other machines.</li>
       </ol>
       <p class="note">
-        The agent keeps itself up to date automatically and starts at logon.
-        To remove it, use Settings &rarr; Apps &rarr; Ghoztty Remote Agent &rarr; Uninstall.
+        There used to be a separate Remote Agent installer here. There is not
+        any more &mdash; a machine with Ghoztty on it already has everything it
+        needs, and one install cannot leave you with half a product. To remove
+        it, use Settings &rarr; Apps &rarr; Ghoztty &rarr; Uninstall.
       </p>
     </div>
   </div>
 
-  <details class="advanced">
-    <summary>Advanced: headless install (PowerShell)</summary>
-    <div class="inner">
-      <p class="hint">Installs and enrolls without the MSI &mdash; useful for scripted setups.</p>
-      <div class="codewrap">
-        <pre><code id="install-cmd"><span class="p">PS&gt;</span> irm https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/install.ps1 | iex</code></pre>
-        <button class="copy-btn" id="copy-btn" type="button" aria-label="Copy install command">Copy</button>
-      </div>
-    </div>
-  </details>
-  <p class="alt">
-    Prefer the raw binary? <a href="/dl/ghoztty-agent.exe">Download ghoztty-agent.exe</a> directly.
-  </p>
-
   <h2>What it does</h2>
   <ul class="features">
     <li><div><b>Outbound-only connection</b> &mdash; <span>the agent dials out over WSS (port 443); nothing listens on your machine and no inbound firewall rules are needed.</span></div></li>
-    <li><div><b>Google sign-in enrollment</b> &mdash; <span>a browser window opens once during install to approve this machine on your account.</span></div></li>
-    <li><div><b>Auto-updates</b> &mdash; <span>the agent keeps itself current with the latest published build.</span></div></li>
-    <li><div><b>Tray icon</b> &mdash; <span>a system-tray icon shows connection status, with a Disconnect option when you want it offline.</span></div></li>
+    <li><div><b>Google sign-in enrollment</b> &mdash; <span>a browser window opens once, from the machine chooser, to approve this machine on your account.</span></div></li>
+    <li><div><b>Sharing is opt-in</b> &mdash; <span>signing in connects you outward; this machine is only reachable once you turn on Share this machine, and the same switch turns it off.</span></div></li>
+    <li><div><b>Updated with the app</b> &mdash; <span>the agent is part of the Ghoztty install, so updating Ghoztty updates it &mdash; there is no second thing to keep current.</span></div></li>
   </ul>
 </main>
 
 <footer>
-  Ghoztty &mdash; <a href="#">GitHub repository</a>
+  Ghoztty &mdash; <a href="https://github.com/dzearing/ghoztty">GitHub repository</a>
 </footer>
 
-<script>
-(function () {
-  "use strict";
-
-  // Keep the one-liner correct for whatever host is serving this page.
-  var cmdEl = document.getElementById("install-cmd");
-  if (location.protocol === "https:" || location.protocol === "http:") {
-    var base = location.protocol + "//" + location.host;
-    cmdEl.innerHTML = '<span class="p">PS&gt;</span> ' +
-      "irm " + base + "/dl/install.ps1 | iex";
-  }
-
-  // Copy button — copies the command without the "PS>" prompt decoration.
-  var btn = document.getElementById("copy-btn");
-  btn.addEventListener("click", function () {
-    var text = cmdEl.textContent.replace(/^PS>\s*/, "");
-    function done() {
-      btn.textContent = "Copied!";
-      btn.classList.add("ok");
-      setTimeout(function () {
-        btn.textContent = "Copy";
-        btn.classList.remove("ok");
-      }, 1600);
-    }
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(done, function () { fallback(); });
-    } else {
-      fallback();
-    }
-    function fallback() {
-      var ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      try { document.execCommand("copy"); done(); } catch (e) { /* ignore */ }
-      document.body.removeChild(ta);
-    }
-  });
-
-  // Current published version — graceful no-op if version.json is missing.
-  fetch("/dl/version.json", { cache: "no-store" })
-    .then(function (r) { return r.ok ? r.json() : null; })
-    .then(function (v) {
-      var win = v && v["windows-x86_64"];
-      if (win && win.version) {
-        var badge = document.getElementById("version-badge");
-        badge.textContent = win.semver ? "v" + win.semver : "v" + win.version;
-        badge.title = "build " + win.version;
-        badge.style.display = "inline-block";
-      }
-      // Point the download button at the versioned installer filename
-      // (Ghoztty-Agent-X.Y.Z-x64.msi); the static href stays a working
-      // stable-URL fallback when version.json is unavailable.
-      if (win && win.msi) {
-        document.getElementById("msi-link").setAttribute("href", win.msi);
-        var name = win.msi.split("/").pop();
-        var el = document.getElementById("msi-name");
-        if (el) el.textContent = name;
-      }
-    })
-    .catch(function () { /* no version info available */ });
-})();
-</script>
 </body>
 </html>

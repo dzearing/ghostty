@@ -8,7 +8,11 @@
 # mutually exclusive and matched by path specificity):
 #
 #   /dl/*            -> file_server from /var/www/ghoztty-dl
-#                       (ghoztty-agent.exe, install.ps1, version.json)
+#                       (ghoztty-agent.exe + version.json for the agent's
+#                        self-updater; install.ps1, which since T1175 is a
+#                        signpost that prints where to get Ghoztty rather than
+#                        an installer — the standalone agent MSI is gone and
+#                        its /dl/*.msi URLs with it)
 #   /   (exact)      -> file_server from /var/www/ghoztty-www (landing page)
 #   everything else  -> reverse_proxy to the Go relay on 127.0.0.1:8080
 #

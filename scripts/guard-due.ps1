@@ -701,6 +701,26 @@ $GuardTable = @(
     # with zero failures: sections E and F need the network and cover neither
     # script, so gating the stamp on their skips would make this row a wedge on
     # an offline box (the T898 lesson).
+    # One Windows installer (T1175). The retirement of the standalone agent
+    # MSI is a SHAPE, not a code path: nothing crashes if a link, a publish
+    # target or a doc paragraph brings the second installer back, and nothing
+    # else in the tree reads these files. This row is what makes an edit to
+    # any download surface ask whether the invariant still holds.
+    [pscustomobject]@{
+        Name   = 'one-installer'
+        Script = 'test\win32\one-installer.ps1'
+        Stamp  = 'test\win32\one-installer.stamp.json'
+        Covers = @(
+            'relay\deploy\ghpages\index.html',
+            'relay\deploy\ghpages\landing\main.js',
+            'relay\deploy\www\index.html',
+            'relay\deploy\install.ps1',
+            'relay\deploy\publish-agent.sh',
+            'relay\deploy\Caddyfile.example',
+            'relay\README.md',
+            'test\win32\one-installer.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'website-windows-links'
         Script = 'test\win32\website-windows-download.ps1'

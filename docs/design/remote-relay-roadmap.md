@@ -9,6 +9,17 @@
 
 ## 0. Status snapshot (the baseline — read first on resume)
 
+**2026-08-30 — THE STANDALONE AGENT INSTALLER IS RETIRED (T1175).** Everything
+below that describes installing the agent by itself — the one-liner, the
+`Ghoztty-Agent-X.Y.Z-x64.msi`, `relay/deploy/msi/` — is HISTORY, kept because
+it records how the bring-up actually went. Today Windows ships **one**
+installer, the Ghoztty MSI, which carries `ghoztty-agent.exe`; enrollment and
+serving live in the machine chooser (`Ctrl+Shift+N` → sign in → **Share this
+machine**). `/dl/install.ps1` still answers, as a signpost that prints where to
+get Ghoztty, because old docs still carry the one-liner. `/dl/ghoztty-agent.exe`
+and `/dl/version.json` remain for the `--relay` agent's self-updater, whose own
+retirement is T550. Design: `one-installer-agent-consolidation.md`.
+
 **2026-07-16 — BROKERED OAUTH (BFF): the Google `client_secret` moved off the app
 onto the relay.** The desktop app no longer performs the Google token exchange or
 holds any Google credential. New model:

@@ -124,22 +124,23 @@ Every release also publishes the Windows agent (installer + self-update manifest
 
 Prerequisites (all already set up on the release machine):
 - Zig toolchain: `export PATH=/opt/homebrew/opt/zig@0.15/bin:/opt/homebrew/opt/gettext/bin:$PATH; export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`
-- `wixl` (msitools, `brew install msitools`) for building the MSI
 - SSH access to the relay VM as a sudo-capable user (`azureuser@ghoztty-relay-dz17575.westus2.cloudapp.azure.com`)
 
-Build the Windows agent and publish it (exe + per-user MSI + `version.json` + `install.ps1` + relay landing page) to the relay's `/dl/`:
+Build the Windows agent and publish it (exe + `version.json` + the `install.ps1` signpost + relay landing page) to the relay's `/dl/`:
 
 ```bash
 zig build agent -Dtarget=x86_64-windows-gnu
 relay/deploy/publish-agent.sh --if-changed
 ```
 
-`--if-changed` makes this a no-op when nothing in the agent/installer/site changed since the deployed build (it compares HEAD to the `commit` recorded in the live `version.json` over the agent's input paths, and exits without uploading) — so it's always safe to run this step on every release; it publishes only when the agent actually changed. When it does publish, it stamps the build as `$(date +%Y%m%d)-$(git rev-parse --short HEAD)` (the same string the binary embeds), takes the release semver from the latest git tag (so the MSI ships as `Ghoztty-Agent-X.Y.Z-x64.msi`, matching the DMG's version — run this AFTER Step 3 has tagged), regenerates `version.json`, and uploads exe + versioned MSI (plus the stable `ghoztty-agent.msi` alias) + installer + landing page. Republishing the same semver (an agent-only publish between releases) auto-bumps the MSI build counter from the live manifest — no flag needed. Already-installed agents pick it up on their next self-update check (idle-gated, seamless — no session interruption).
+`--if-changed` makes this a no-op when nothing in the agent/site changed since the deployed build (it compares HEAD to the `commit` recorded in the live `version.json` over the agent's input paths, and exits without uploading) — so it's always safe to run this step on every release; it publishes only when the agent actually changed. When it does publish, it stamps the build as `$(date +%Y%m%d)-$(git rev-parse --short HEAD)` (the same string the binary embeds), regenerates `version.json`, and uploads exe + `install.ps1` + landing page. Already-installed agents pick it up on their next self-update check (idle-gated, seamless — no session interruption).
+
+There is no standalone agent MSI here any more (T1175): Windows ships one installer, the Ghoztty MSI, and it carries `ghoztty-agent.exe`. `/dl/install.ps1` is a signpost that says so.
 
 Verify it went live:
 ```bash
 curl -fsS  https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/version.json
-curl -fsSI https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/ghoztty-agent.msi | head -1
+curl -fsSI https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/ghoztty-agent.exe | head -1
 ```
 `version.json` should show the new `date-hash` version and the download should be HTTP 200.
 
