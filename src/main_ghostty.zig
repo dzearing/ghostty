@@ -168,12 +168,20 @@ pub fn main() !MainReturn {
     }
 
     // Create our app state
-    const app: *App = try App.create(alloc);
+    //
+    // T1177: every startup step from here on reports its failure to the USER
+    // rather than returning an error into nothing. On Windows `ghoztty.exe` is
+    // a GUI-subsystem binary with no console, so an error unwound out of
+    // `main` produced a process that exited with no window, no dialog and no
+    // message of any kind — the silent startup failure this guards against.
+    const app: *App = App.create(alloc) catch |err|
+        startupFailed("preparing the application", err);
     defer app.destroy();
 
     // Create our runtime app
     var app_runtime: apprt.App = undefined;
-    try app_runtime.init(app, .{});
+    app_runtime.init(app, .{}) catch |err|
+        startupFailed("starting the window system", err);
     defer app_runtime.terminate();
 
     // Since - by definition - there are no surfaces when first started, the
@@ -182,7 +190,47 @@ pub fn main() !MainReturn {
     if (@hasDecl(apprt.App, "startQuitTimer")) app_runtime.startQuitTimer();
 
     // Run the GUI event loop
-    try app_runtime.run();
+    //
+    // `run` is where the win32 apprt reports the one failure that has no error
+    // of its own: a startup that finished with NO WINDOW on screen. It returns
+    // `error.NoStartupWindow` for it, which is what turns "nothing happened"
+    // into a dialog. Compared by name so this stays one line on every apprt,
+    // including the ones whose `run` cannot return that error at all.
+    app_runtime.run() catch |err| startupFailed(
+        if (std.mem.eql(u8, @errorName(err), "NoStartupWindow"))
+            "opening its first window"
+        else
+            "running the terminal",
+        err,
+    );
+}
+
+/// Report a startup failure the user can SEE, then exit non-zero (T1177).
+///
+/// `stage` is a sentence fragment naming what was underway, so the dialog's
+/// first line reads as something a person would say: "Ghoztty ran into a
+/// problem while opening its first window and had to close." The apprt supplies the presentation:
+/// on Windows a modal dark dialog with a plain-language remedy, since there is
+/// no console to print to. Everywhere else — and on any apprt that has not
+/// declared a reporter — stderr, which IS the user-visible channel there.
+///
+/// Never returns: there is nothing left to run, and the one thing a startup
+/// failure must never do is fall through and pretend it started.
+fn startupFailed(stage: []const u8, err: anyerror) noreturn {
+    std.log.err("startup failed while {s}: {s}", .{ stage, @errorName(err) });
+    if (@hasDecl(apprt.App, "reportStartupFailure")) {
+        apprt.App.reportStartupFailure(stage, err);
+    } else {
+        var buffer: [1024]u8 = undefined;
+        var stderr_writer = std.fs.File.stderr().writer(&buffer);
+        const stderr = &stderr_writer.interface;
+        stderr.print(
+            "Error: Ghoztty could not start while {s}: {s}\n",
+            .{ stage, @errorName(err) },
+        ) catch {};
+        stderr.flush() catch {};
+    }
+    posix.exit(1);
 }
 
 /// Open `name` in `dir` for ATOMIC APPEND, creating it if absent (Windows).

@@ -71,6 +71,24 @@ const failure_cooldown_ms: i64 = 15_000;
 /// info file.
 const poll_interval_ms: u64 = 100;
 
+/// Why a find-or-spawn gave up, in the terms the APP has to act on (T1177).
+/// Deliberately coarser than the errors underneath: what changes the user's
+/// experience is "the agent is not installed" versus "the agent is installed
+/// and something is wrong with it", and only the first has a remedy a person
+/// can carry out.
+pub const Failure = enum {
+    /// `ghoztty-agent.exe` is not where it should be — a broken or partial
+    /// install. The one failure with a user-facing fix (reinstall).
+    agent_binary_missing,
+    /// The binary is there and would not launch.
+    spawn_failed,
+    /// Spawned (or already running) and never became dialable in time.
+    unresponsive,
+    /// Answered, and speaks a protocol this app cannot agree with. Handled by
+    /// the mandatory-update path (T125), not by this notice.
+    protocol_skew,
+};
+
 alloc: Allocator,
 
 /// The cached shared connection. Every persistent window/tab/split rides this
@@ -113,6 +131,13 @@ state_handler: ?connection.StateHandler = null,
 /// Timestamp (ms) of the last find-or-spawn failure, or null. Guards the
 /// cooldown so a broken agent falls back to exec immediately.
 last_failure_ms: ?i64 = null,
+
+/// WHY the last find-or-spawn failed, or null when the last one succeeded
+/// (T1177). `last_failure_ms` above says only *that* it failed, which is all
+/// the cooldown needs — but it is not enough to tell the user anything, and a
+/// missing agent binary (a half-installed Ghoztty) is a startup precondition
+/// they have to hear about. Recorded at each failing arm, cleared on success.
+resolve_failure: ?Failure = null,
 
 /// True while a find-or-spawn is in flight on the GUI thread (T188). The
 /// resolve pumps IPC while it waits, so a request served from inside it can
@@ -396,6 +421,7 @@ pub fn sharedConnection(self: *LocalAgent) ?*connection.Connection {
     self.shared = dialed;
     self.shared_pid = if (self.readInfoFile()) |i| i.pid else 0;
     self.last_failure_ms = null;
+    self.resolve_failure = null;
     self.applyStateObserver();
     log.info("shared local-agent connection ready (agent pid {d})", .{self.shared_pid});
 
@@ -836,6 +862,7 @@ fn findOrSpawn(self: *LocalAgent) ?tcp_dial.Dialed {
     //     the mandatory-update path, which is the only thing that can fix this.
     if (self.protocol_skew != null) {
         log.info("not spawning a local agent: the running one is protocol-skewed, not absent", .{});
+        self.resolve_failure = .protocol_skew;
         return null;
     }
 
@@ -843,6 +870,10 @@ fn findOrSpawn(self: *LocalAgent) ?tcp_dial.Dialed {
     const deadline = std.time.milliTimestamp() + spawn_deadline_ms;
     self.spawnAgent() catch |err| {
         log.warn("local agent spawn failed err={}", .{err});
+        self.resolve_failure = if (err == error.AgentBinaryNotFound)
+            .agent_binary_missing
+        else
+            .spawn_failed;
         return null;
     };
     while (std.time.milliTimestamp() < deadline) {
@@ -859,9 +890,13 @@ fn findOrSpawn(self: *LocalAgent) ?tcp_dial.Dialed {
         // re-runs the same handshake to the same conclusion, and every extra
         // second of that is spent blocking the GUI thread. Stop and let the
         // caller take the mandatory-update path.
-        if (self.protocol_skew != null) return null;
+        if (self.protocol_skew != null) {
+            self.resolve_failure = .protocol_skew;
+            return null;
+        }
     }
     log.warn("local agent did not become dialable within {d}ms", .{spawn_deadline_ms});
+    self.resolve_failure = .unresponsive;
     return null;
 }
 
@@ -899,6 +934,13 @@ fn dialExisting(self: *LocalAgent) ?tcp_dial.Dialed {
     // A dial we could negotiate is proof the skew (if any) is over.
     self.protocol_skew = null;
     return dialed;
+}
+
+/// Why the last find-or-spawn failed, or null when the last one succeeded
+/// (T1177). Read by the app at startup to decide whether the user needs to be
+/// told that a precondition of session persistence is missing.
+pub fn resolveFailure(self: *const LocalAgent) ?Failure {
+    return self.resolve_failure;
 }
 
 /// The protocol skew the last dial hit, or null. Read by the app to decide

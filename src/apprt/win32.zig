@@ -11,6 +11,15 @@ pub const resourcesDir = internal_os.resourcesDir;
 
 test {
     _ = @import("win32/ConfirmDialog.zig");
+    // The startup-failure reporter (T1177). Its message composition is the
+    // only part of that path a lane can check — the dialog itself needs a
+    // desktop — and the whole point of the module is that it speaks when
+    // nothing else can, so an untested message is how "loud" becomes "loud and
+    // wrong". Listed here because THIS LIST is what pulls a file's tests into
+    // the lane: the module was already imported by `App.zig` and compiled, and
+    // a deliberately broken assertion inside it still went green until the line
+    // below existed.
+    _ = @import("win32/startup_error.zig");
     _ = @import("win32/RenameDialog.zig");
     _ = @import("win32/MachineChooser.zig");
     _ = @import("win32/DarkMode.zig");

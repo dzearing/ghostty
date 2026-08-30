@@ -274,7 +274,18 @@ pub fn show(
     refocus: ?w32.HWND,
     opts: Options,
 ) Result {
-    return run(app, owner, scale, refocus, opts, null);
+    return run(app.hinstance, owner, scale, refocus, opts, null);
+}
+
+/// The same dialog with NO App behind it — the startup-failure path (T1177),
+/// which runs when `App.create` or the runtime's `init` failed and there is
+/// therefore no app, no window and no message loop to borrow. The dialog only
+/// ever needed the app for its window-class instance handle, so that is all
+/// this asks for; `null` resolves the process instance, which is what every
+/// other class registration in this app uses.
+pub fn showStandalone(owner: ?w32.HWND, scale: f32, opts: Options) Result {
+    const hinstance = w32.GetModuleHandleW(null);
+    return run(hinstance, owner, scale, null, opts, null);
 }
 
 /// Show a dialog carrying a text field (`opts.input` MUST be set) and return
@@ -293,7 +304,7 @@ pub fn prompt(
 ) ?[]const u8 {
     std.debug.assert(opts.input != null);
     var out: Output = .{ .buf = buf };
-    if (run(app, owner, scale, refocus, opts, &out) != .ok) return null;
+    if (run(app.hinstance, owner, scale, refocus, opts, &out) != .ok) return null;
     return buf[0..out.len];
 }
 
@@ -305,14 +316,14 @@ const Output = struct {
 };
 
 fn run(
-    app: *App,
+    hinstance: ?w32.HINSTANCE,
     owner: ?w32.HWND,
     scale: f32,
     refocus: ?w32.HWND,
     opts: Options,
     out: ?*Output,
 ) Result {
-    registerClass(app) orelse return fallback(owner, opts);
+    registerClass(hinstance) orelse return fallback(owner, opts);
 
     const style: u32 = w32.WS_POPUP | w32.WS_CAPTION | w32.WS_SYSMENU;
     const ex_style: u32 = w32.WS_EX_DLGMODALFRAME;
@@ -502,7 +513,7 @@ fn run(
         outer_h,
         owner,
         null,
-        app.hinstance,
+        hinstance,
         null,
     ) orelse return fallback(owner, opts);
     self.hwnd = hwnd;
@@ -528,7 +539,7 @@ fn run(
         l.text.bottom - l.text.top,
         hwnd,
         null,
-        app.hinstance,
+        hinstance,
         null,
     );
 
@@ -548,7 +559,7 @@ fn run(
             r.bottom - r.top,
             hwnd,
             @ptrFromInt(100 + i),
-            app.hinstance,
+            hinstance,
             null,
         ) orelse continue;
         _ = w32.SetWindowTheme(btn, std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"), null);
@@ -572,7 +583,7 @@ fn run(
             l.note.bottom - l.note.top,
             hwnd,
             null,
-            app.hinstance,
+            hinstance,
             null,
         );
     }
@@ -590,7 +601,7 @@ fn run(
             l.input.bottom - l.input.top,
             hwnd,
             null,
-            app.hinstance,
+            hinstance,
             null,
         );
         if (self.edit) |e| {
@@ -610,7 +621,7 @@ fn run(
         l.ok.bottom - l.ok.top,
         hwnd,
         @ptrFromInt(@as(usize, @intCast(w32.IDOK))),
-        app.hinstance,
+        hinstance,
         null,
     ) orelse {
         _ = w32.DestroyWindow(hwnd);
@@ -631,7 +642,7 @@ fn run(
             l.cancel.bottom - l.cancel.top,
             hwnd,
             @ptrFromInt(@as(usize, @intCast(w32.IDCANCEL))),
-            app.hinstance,
+            hinstance,
             null,
         ) orelse {
             _ = w32.DestroyWindow(hwnd);
@@ -879,7 +890,7 @@ fn handleKey(self: *ConfirmDialog, vk: u16) bool {
     }
 }
 
-fn registerClass(app: *App) ?void {
+fn registerClass(hinstance: ?w32.HINSTANCE) ?void {
     if (class_registered) return;
     bg_brush = w32.CreateSolidBrush(COLOR_BG);
     field_brush = w32.CreateSolidBrush(COLOR_FIELD_BG);
@@ -889,7 +900,7 @@ fn registerClass(app: *App) ?void {
         .lpfnWndProc = &dialogWndProc,
         .cbClsExtra = 0,
         .cbWndExtra = 0,
-        .hInstance = app.hinstance,
+        .hInstance = hinstance,
         .hIcon = null,
         .hCursor = w32.LoadCursorW(null, w32.IDC_ARROW),
         .hbrBackground = bg_brush,

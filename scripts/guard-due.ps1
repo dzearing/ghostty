@@ -739,6 +739,25 @@ $GuardTable = @(
             'test\win32\install-launch.ps1'
         )
     },
+    # A startup failure is VISIBLE (T1177). The whole point of this code is a
+    # dialog that appears when nothing else can, so an edit to any link in that
+    # chain - the reporter, the dialog it builds on, the message text, or the
+    # `main` that routes every startup error into it - has to re-answer "does
+    # the failure still reach the user?". `App.zig` holds the no-window guard
+    # that MINTS the error and is deliberately not listed: no guard in this
+    # table covers it, because a file every task touches would leave this row
+    # permanently due and therefore permanently ignored.
+    [pscustomobject]@{
+        Name   = 'startup-failure'
+        Script = 'test\win32\startup-failure.ps1'
+        Stamp  = 'test\win32\startup-failure.stamp.json'
+        Covers = @(
+            'src\apprt\win32\startup_error.zig',
+            'src\apprt\win32\ConfirmDialog.zig',
+            'src\main_ghostty.zig',
+            'test\win32\startup-failure.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'website-windows-links'
         Script = 'test\win32\website-windows-download.ps1'

@@ -66,6 +66,7 @@ const url_scheme = @import("url_scheme.zig");
 const provenance = @import("provenance.zig");
 const host_defaults = @import("host_defaults.zig");
 const gui_pump = @import("gui_pump.zig");
+const startup_error = @import("startup_error.zig");
 const surface_reap = @import("surface_reap.zig");
 const surface_window_role = @import("surface_window_role.zig");
 const resize_paint = @import("resize_paint.zig");
@@ -887,6 +888,63 @@ fn openConfigFile(self: *App) void {
     }
 }
 
+/// True when the `GHOZTTY_STARTUP_FAIL` test seam names `which` (T1177).
+///
+/// Debug builds only, like every other seam in this file: a stray environment
+/// variable must never be able to stop a user's terminal from opening. It
+/// forces a startup state that is real in the field (a half-laid-down install,
+/// a window class that would not register) and that an acceptance script has no
+/// other way to build — there is no supported way to make window creation fail
+/// from outside the process.
+fn startupFailSeam(self: *App, which: []const u8) bool {
+    if (comptime !build_config.is_debug) return false;
+    const alloc = self.core_app.alloc;
+    const value = std.process.getEnvVarOwned(alloc, "GHOZTTY_STARTUP_FAIL") catch return false;
+    defer alloc.free(value);
+    if (!std.mem.eql(u8, value, which)) return false;
+    log.warn("startup failure seam active: {s} (debug test hook)", .{which});
+    return true;
+}
+
+/// Present a fatal startup failure to the user (T1177), called by
+/// `main_ghostty.zig` when any step of startup returns an error.
+///
+/// A free function with no `self`, because most of the failures it reports
+/// happen BEFORE an App exists — `App.create` running out of memory is one of
+/// them. `main_ghostty` discovers it with `@hasDecl`, which is how the win32
+/// apprt gets a dialog while the apprts with a console keep stderr.
+pub fn reportStartupFailure(stage: []const u8, err: anyerror) void {
+    startup_error.reportFatal(stage, err);
+}
+
+/// Tell the user, once, when the app came up but a startup precondition did
+/// NOT (T1177). Today that is exactly one condition: the session agent is not
+/// in the installation, which is what a half-laid-down install looks like from
+/// in here (T1175). The terminal works without it, so this is a notice rather
+/// than a refusal — but silence was the defect, and "session persistence
+/// silently stopped existing" is precisely the kind of thing the user has to
+/// discover the hard way otherwise.
+fn showStartupWarningsIfAny(self: *App, owner: ?*Window) void {
+    const failure = self.local_agent.resolveFailure() orelse return;
+    if (failure != .agent_binary_missing) return;
+
+    var buf: [startup_error.max_message]u8 = undefined;
+    const text = startup_error.describeDegraded(
+        &buf,
+        "Ghoztty's session agent is missing from this installation.",
+        "Terminals will still open, but they will not survive quitting or " ++
+            "restarting Ghoztty, and the session chooser will be empty.",
+        "Reinstall Ghoztty to restore it.",
+    );
+    startup_error.reportDegraded(
+        self,
+        if (owner) |w| w.hwnd else null,
+        if (owner) |w| w.scale else 1.0,
+        std.unicode.utf8ToUtf16LeStringLiteral("Session persistence unavailable"),
+        text,
+    );
+}
+
 /// Show the given config's load diagnostics in a dialog, if it has any
 /// (T69). Without this the diagnostics only reach `log.err`, which is
 /// invisible in a GUI-subsystem release build — the user just silently
@@ -1236,7 +1294,16 @@ pub fn run(self: *App) !void {
     // startup window exactly as it does to every later `new_window`. Skipped
     // when restore already opened at least one window, and when the launch
     // command above already opened one.
-    if (startup_window == null and !restored) {
+    //
+    // The TEST SEAM (T1177, debug builds only) suppresses this last window so
+    // the guard below meets the real state it exists for: a launch that ends
+    // with nothing on screen. Seaming HERE rather than short-circuiting the
+    // guard is the point — an acceptance run then exercises the guard, the
+    // error, `main_ghostty`'s reporter and the dialog, which is the whole
+    // chain that used to be a silent exit. Unset (every real launch) leaves
+    // the code below byte-identical.
+    const force_no_window = self.startupFailSeam("no-window");
+    if (startup_window == null and !restored and !force_no_window) {
         startup_window = try self.createWindow(.{});
     }
 
@@ -1249,6 +1316,17 @@ pub fn run(self: *App) !void {
         }
     }
 
+    // T1177: a launch that reaches this point with NO WINDOW is the silent
+    // startup failure, and it is silent precisely because nothing errored — the
+    // restore reported success, or a window was created and never materialized,
+    // and the process then sat in a message loop with nothing on screen. There
+    // is no error to propagate here, so this MAKES one: `main_ghostty` turns it
+    // into a dialog naming the failure instead of an exit nobody sees.
+    if (self.windows.items.len == 0) {
+        log.err("startup finished with no window; refusing to run headless", .{});
+        return error.NoStartupWindow;
+    }
+
     // Surface config load diagnostics once at startup (T69). After the
     // first window exists so the dialog has an owner to center on; the
     // dialog pumps its own modal loop, so startup messages (paints, IPC)
@@ -1257,6 +1335,7 @@ pub fn run(self: *App) !void {
     const diag_owner: ?*Window = startup_window orelse
         (if (self.windows.items.len > 0) self.windows.items[0] else null);
     if (diag_owner) |w| self.showConfigErrorsIfAny(&self.config, w);
+    self.showStartupWarningsIfAny(diag_owner);
 
     // T145: start watching the shared local-agent link, now that the startup
     // windows (restored or blank) have resolved a connection. From here a dead
