@@ -48,6 +48,8 @@ const clipboard_open = @import("clipboard_open.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const update_check = @import("update_check.zig");
+const update_apply = @import("update_apply.zig");
+const update_install = @import("update_install.zig");
 const utf16_text = @import("utf16_text.zig");
 const tray_notify = @import("tray_notify.zig");
 const orphan_notify = @import("orphan_notify.zig");
@@ -364,9 +366,28 @@ notif_desktop_surface_id: u64 = 0,
 orphan_check_inflight: bool = false,
 
 /// Version text of the newest win-v release the update check found (heap,
-/// app allocator). A click on the update balloon opens that release's
-/// GitHub page. Null until an update notification has been shown.
+/// app allocator). A click on the update balloon offers to install that
+/// release, and opens its GitHub page when there is nothing installable.
+/// Null until an update notification has been shown.
 update_latest_ver: ?[]u8 = null,
+
+/// The `.msi` asset URL for `update_latest_ver` (heap, app allocator), or
+/// null when that release published no installable package. This is what
+/// separates "install it for me" from the old notify-only behavior: with no
+/// asset there is nothing to download, and the balloon falls back to opening
+/// the release page (T1178).
+update_asset_url: ?[]u8 = null,
+
+/// Path of the verified package already downloaded for `update_latest_ver`
+/// (heap, app allocator). Set by the background download that `auto-update =
+/// download` performs, so a click on the balloon installs immediately rather
+/// than starting a fetch the user has to wait through.
+update_staged_msi: ?[]u8 = null,
+
+/// True while a download worker is out. At most one is ever in flight: a
+/// second click while the first is still fetching must not start a second
+/// 40MB transfer into the same staged path.
+update_download_inflight: bool = false,
 
 /// Whether CoInitializeEx has been called on the main thread.
 com_initialized: bool = false,
@@ -716,6 +737,14 @@ pub fn init(
 
     // Check for updates in the background (non-blocking). Only acts in
     // -Dwindows-update-check channel builds (T24).
+    // Clear what a previous update left behind (T1178): the staged package,
+    // the applier copy, and any image that had to be renamed aside because a
+    // PTY holder was still running out of it. BEFORE the check, and on this
+    // thread: a sweep racing the check's background pre-download would delete
+    // the package it just staged. It walks two small directories and treats
+    // every failure as "not yet, try next launch".
+    update_install.sweep(self.core_app.alloc);
+
     self.startUpdateCheck(.automatic);
 
     // First long-unattached session check (T534) shortly after launch — late
@@ -1609,6 +1638,14 @@ pub fn terminate(self: *App) void {
     if (self.update_latest_ver) |v| {
         self.core_app.alloc.free(v);
         self.update_latest_ver = null;
+    }
+    if (self.update_asset_url) |v| {
+        self.core_app.alloc.free(v);
+        self.update_asset_url = null;
+    }
+    if (self.update_staged_msi) |v| {
+        self.core_app.alloc.free(v);
+        self.update_staged_msi = null;
     }
 
     // Unregister all global hotkeys.
@@ -7352,10 +7389,33 @@ fn keyToVk(key: @import("../../input/key.zig").Key) ?u32 {
 const UPDATE_URL = "https://api.github.com/repos/dzearing/ghoztty/releases?per_page=30";
 
 /// Custom message posted from the update thread to the message loop.
-/// wparam = heap ptr to the newer version text, lparam = its length.
+/// wparam = heap ptr to an `UpdateFound` the handler takes ownership of.
 /// wparam == 0 carries manual-check feedback instead: lparam 0 = up to
-/// date, 1 = check failed (only posted for user-initiated checks).
+/// date, 1 = check failed, 2 = a download failed (only posted for checks the
+/// user asked for, or for a download the user consented to).
 const WM_APP_UPDATE_AVAILABLE: u32 = w32.WM_APP + 2;
+
+/// What a completed update check hands the GUI thread. Heap-allocated and
+/// handed over by pointer rather than assembled from wparam/lparam widths:
+/// there are three owned strings now, and a static buffer here would be a
+/// race between the worker writing and the message thread reading.
+const UpdateFound = struct {
+    /// The newer release's version text ("1.5.0").
+    version: []u8,
+    /// Its `.msi` asset URL, or null when the release has no installable
+    /// package (then the offer degrades to opening the release page).
+    asset_url: ?[]u8,
+    /// A verified package already on disk, when `auto-update = download`
+    /// fetched it in the background.
+    staged_msi: ?[]u8,
+
+    fn destroy(self: *UpdateFound, alloc: Allocator) void {
+        alloc.free(self.version);
+        if (self.asset_url) |u| alloc.free(u);
+        if (self.staged_msi) |p| alloc.free(p);
+        alloc.destroy(self);
+    }
+};
 
 /// Tray-icon notification callback (uCallbackMessage). The wparam is
 /// the tray icon's uID; lparam carries NIN_* events.
@@ -7416,8 +7476,16 @@ const UPDATE_CHECK_INTERVAL_SECS: i64 = 60 * 60; // 1 hour
 /// run and report their outcome in a balloon.
 const UpdateTrigger = enum { automatic, manual };
 
-/// Start a background thread to check for updates (T24, notify-only: the
-/// balloon links to the release page; nothing is downloaded or installed).
+/// What `auto-update` asks this platform to do (T1178). Unset means
+/// `download`, which is Sparkle's default on the Mac and therefore what
+/// "update it like the normal mac ghoztty" means here.
+fn updatePolicy(self: *const App) update_apply.Policy {
+    const name: ?[]const u8 = if (self.config.@"auto-update") |au| @tagName(au) else null;
+    return update_apply.policyFromName(name);
+}
+
+/// Start a background thread to check for updates (T24, extended by T1178
+/// from notify-only to notify-download-install).
 ///
 /// Automatic checks run ONLY in builds stamped with -Dwindows-update-check
 /// (the MSI release pipeline sets it) so dev/portable/script-refreshed
@@ -7430,10 +7498,10 @@ fn startUpdateCheck(self: *App, trigger: UpdateTrigger) void {
     if (trigger == .automatic) {
         const overridden = envUpdateUrlIsSet(self.core_app.alloc);
         if (!build_config.windows_update_check and !overridden) return;
-        if (self.config.@"auto-update") |au| if (au == .off) {
-            log.debug("update check disabled (auto-update = off)", .{});
+        if (self.updatePolicy() == .off) {
+            log.info("update check disabled (auto-update = off)", .{});
             return;
-        };
+        }
         if (!overridden and !self.shouldRunUpdateCheck()) {
             log.debug("skipping update check (last run within {d}s)", .{UPDATE_CHECK_INTERVAL_SECS});
             return;
@@ -7490,7 +7558,7 @@ fn updateCheckThread(app: *App, trigger: UpdateTrigger) void {
     const alloc = app.core_app.alloc;
     const manual = trigger == .manual;
 
-    const latest_ver: []u8 = fetchLatestWinVersion(alloc) catch |err| switch (err) {
+    var release = fetchLatestWinRelease(alloc) catch |err| switch (err) {
         error.NoWinRelease => {
             // No Windows release published (or a fake feed without win-v
             // tags): nothing to offer, which for a manual check reads as
@@ -7509,64 +7577,145 @@ fn updateCheckThread(app: *App, trigger: UpdateTrigger) void {
     // Compare against the binary's own version (from -Dversion-string,
     // which the MSI release pipeline stamps with the win-v tag's semver).
     const current_sv = build_config.version;
-    if (!update_check.isNewer(current_sv, latest_ver)) {
+    if (!update_check.isNewer(current_sv, release.version)) {
         log.info("update check: up to date (current={s} latest=win-v{s})", .{
-            build_config.version_string, latest_ver,
+            build_config.version_string, release.version,
         });
-        alloc.free(latest_ver);
+        release.deinit(alloc);
         if (manual) postUpdateFeedback(app, 0);
         return;
     }
-    log.info("update available: current={s} latest=win-v{s}", .{
-        build_config.version_string, latest_ver,
+    log.info("update available: current={s} latest=win-v{s} msi={s}", .{
+        build_config.version_string,
+        release.version,
+        release.asset_url orelse "(none published)",
     });
 
+    // `auto-update = download` (the default) fetches the package here, on the
+    // worker, so the click that follows the balloon installs immediately
+    // instead of starting a transfer the user waits through. A download that
+    // fails is not an error the user is shown: the notification still goes
+    // out, and the click path downloads again with feedback.
+    var staged: ?[]u8 = null;
+    if (app.updatePolicy() == .download) {
+        if (release.asset_url) |url| {
+            staged = update_install.download(alloc, url, release.version) catch |err| blk: {
+                log.warn("update pre-download failed: {}", .{err});
+                break :blk null;
+            };
+        }
+    }
+    if (staged != null) log.info("update staged for win-v{s}", .{release.version});
+
+    const found = alloc.create(UpdateFound) catch {
+        if (staged) |p| alloc.free(p);
+        release.deinit(alloc);
+        return;
+    };
+    found.* = .{
+        .version = release.version,
+        .asset_url = release.asset_url,
+        .staged_msi = staged,
+    };
+
     const hwnd = app.msg_hwnd orelse {
-        alloc.free(latest_ver);
+        found.destroy(alloc);
         return;
     };
 
-    // Hand ownership of the heap version text to the message handler via
-    // wparam/lparam. This avoids a static-buffer race between this worker
-    // thread writing the version and the message thread reading it.
-    const wparam: usize = @intFromPtr(latest_ver.ptr);
-    const lparam: isize = @intCast(latest_ver.len);
-    if (w32.PostMessageW(hwnd, WM_APP_UPDATE_AVAILABLE, wparam, lparam) == 0) {
-        // PostMessage failed (e.g., HWND already destroyed). Free the
-        // buffer here since the handler will never run.
-        alloc.free(latest_ver);
+    // Hand ownership of the heap payload to the message handler. This avoids a
+    // static-buffer race between this worker thread writing and the message
+    // thread reading.
+    if (w32.PostMessageW(hwnd, WM_APP_UPDATE_AVAILABLE, @intFromPtr(found), 1) == 0) {
+        // PostMessage failed (e.g., HWND already destroyed). Free here since
+        // the handler will never run.
+        found.destroy(alloc);
     }
 }
 
 /// Post manual-check feedback to the GUI thread: code 0 = up to date,
-/// 1 = check failed (see WM_APP_UPDATE_AVAILABLE's encoding).
+/// 1 = check failed, 2 = a consented download failed (see
+/// WM_APP_UPDATE_AVAILABLE's encoding).
 fn postUpdateFeedback(app: *App, code: isize) void {
     const hwnd = app.msg_hwnd orelse return;
     _ = w32.PostMessageW(hwnd, WM_APP_UPDATE_AVAILABLE, 0, code);
 }
 
+/// Worker for a download the user consented to at the balloon (the
+/// `auto-update = check` path, or a background pre-download that failed).
+/// Posts the staged package back so the GUI thread can install it.
+fn updateDownloadThread(app: *App, version: []u8, url: []u8) void {
+    const alloc = app.core_app.alloc;
+    defer alloc.free(version);
+    defer alloc.free(url);
+
+    const staged: []u8 = update_install.download(alloc, url, version) catch |err| {
+        log.warn("update download failed: {}", .{err});
+        postUpdateFeedback(app, 2);
+        return;
+    };
+
+    const found = alloc.create(UpdateFound) catch {
+        alloc.free(staged);
+        return;
+    };
+    found.* = .{
+        .version = alloc.dupe(u8, version) catch {
+            alloc.destroy(found);
+            alloc.free(staged);
+            return;
+        },
+        .asset_url = null,
+        .staged_msi = staged,
+    };
+
+    const hwnd = app.msg_hwnd orelse {
+        found.destroy(alloc);
+        return;
+    };
+    // lparam 2 = "the user already consented; install it".
+    if (w32.PostMessageW(hwnd, WM_APP_UPDATE_AVAILABLE, @intFromPtr(found), 2) == 0) {
+        found.destroy(alloc);
+    }
+}
+
 /// Show a notification balloon that an update is available. Remembers the
 /// version so a balloon click opens that release's GitHub page. The caller
 /// (message handler) still owns and frees `ver`.
-fn showUpdateNotification(self: *App, ver: []const u8) void {
-    if (ver.len == 0) return;
-    log.info("showing update balloon for win-v{s}", .{ver});
+fn showUpdateNotification(self: *App, found: *UpdateFound) void {
+    if (found.version.len == 0) return;
+    log.info("showing update balloon for win-v{s}", .{found.version});
 
     const alloc = self.core_app.alloc;
     if (self.update_latest_ver) |old| alloc.free(old);
-    self.update_latest_ver = alloc.dupe(u8, ver) catch null;
+    self.update_latest_ver = alloc.dupe(u8, found.version) catch null;
+    if (self.update_asset_url) |old| alloc.free(old);
+    self.update_asset_url = if (found.asset_url) |u| (alloc.dupe(u8, u) catch null) else null;
+    if (self.update_staged_msi) |old| alloc.free(old);
+    self.update_staged_msi = if (found.staged_msi) |p| (alloc.dupe(u8, p) catch null) else null;
 
+    // Three sentences, one per state, because they promise different things:
+    // a staged package installs on the spot, an asset still has to be fetched,
+    // and a release with neither is the old notify-only outcome.
     var body_utf8: [256]u8 = undefined;
-    const body = std.fmt.bufPrint(
+    const body = if (self.update_staged_msi != null) std.fmt.bufPrint(
+        &body_utf8,
+        "Version {s} is ready to install.\nClick to install and restart.",
+        .{found.version},
+    ) catch return else if (self.update_asset_url != null) std.fmt.bufPrint(
+        &body_utf8,
+        "Version {s} is available.\nClick to download and install.",
+        .{found.version},
+    ) catch return else std.fmt.bufPrint(
         &body_utf8,
         "Version {s} is available.\nClick to open the download page.",
-        .{ver},
+        .{found.version},
     ) catch return;
     self.showUpdateBalloon("Ghoztty Update Available", body);
 }
 
-/// Show manual-check feedback: code 0 = up to date, anything else =
-/// check failed.
+/// Show manual-check feedback: code 0 = up to date, 2 = a download the user
+/// consented to failed, anything else = the check itself failed.
 fn showUpdateFeedback(self: *App, code: isize) void {
     if (code == 0) {
         var body_utf8: [256]u8 = undefined;
@@ -7576,9 +7725,109 @@ fn showUpdateFeedback(self: *App, code: isize) void {
             .{build_config.version_string},
         ) catch return;
         self.showUpdateBalloon("Ghoztty", body);
+    } else if (code == 2) {
+        self.update_download_inflight = false;
+        self.showUpdateBalloon("Ghoztty", "The update could not be downloaded.\nClick to open the releases page.");
     } else {
         self.showUpdateBalloon("Ghoztty", "Could not check for updates.\nClick to open the releases page.");
     }
+}
+
+/// Act on a click of the update balloon (T1178). Returns true when the click
+/// was handled as an offer to install — false means there is nothing
+/// installable and the caller should fall back to opening the release page,
+/// which is exactly what this notification did before there was an installer.
+///
+/// The confirmation is mandatory and it is Ghoztty's own dialog rather than
+/// msiexec's: what the user is consenting to is their terminal CLOSING, and
+/// that sentence has to be said by the thing that is about to close.
+fn offerUpdate(self: *App) bool {
+    const alloc = self.core_app.alloc;
+    const ver = self.update_latest_ver orelse return false;
+    if (self.update_staged_msi == null and self.update_asset_url == null) return false;
+
+    if (self.update_download_inflight) {
+        self.showUpdateBalloon("Ghoztty", "The update is still downloading.");
+        return true;
+    }
+
+    var text_buf: [512]u8 = undefined;
+    const text = std.fmt.bufPrint(
+        &text_buf,
+        "Ghoztty {s} is available. You have {s}.\n\n" ++
+            "Ghoztty will close, install the update and reopen. " ++
+            "Your terminal sessions are kept.",
+        .{ ver, build_config.version_string },
+    ) catch return false;
+    const text_w = std.unicode.utf8ToUtf16LeAllocZ(alloc, text) catch return false;
+    defer alloc.free(text_w);
+
+    const owner: ?*Window = if (self.windows.items.len > 0) self.windows.items[0] else null;
+    if (owner) |win| {
+        if (win.hwnd) |wh| _ = w32.SetForegroundWindow(wh);
+    }
+    const result = ConfirmDialog.show(
+        self,
+        if (owner) |win| win.hwnd else null,
+        if (owner) |win| win.scale else 1.0,
+        if (owner) |win| (if (win.getActiveSurface()) |s| s.hwnd else null) else null,
+        .{
+            .title = std.unicode.utf8ToUtf16LeStringLiteral("Update Ghoztty"),
+            .text = text_w,
+            .icon = .info,
+            .ok_label = std.unicode.utf8ToUtf16LeStringLiteral("Install and Restart"),
+            .cancel_label = std.unicode.utf8ToUtf16LeStringLiteral("Later"),
+        },
+    );
+    if (result != .ok) {
+        log.info("update: user deferred win-v{s}", .{ver});
+        return true;
+    }
+
+    // Already downloaded (the `auto-update = download` default): install now.
+    if (self.update_staged_msi != null) {
+        self.applyStagedUpdate();
+        return true;
+    }
+
+    // `auto-update = check`: fetch it, then install without asking again —
+    // consent was given for the whole operation, not for the download.
+    const url = self.update_asset_url orelse return true;
+    const ver_copy = alloc.dupe(u8, ver) catch return true;
+    const url_copy = alloc.dupe(u8, url) catch {
+        alloc.free(ver_copy);
+        return true;
+    };
+    self.update_download_inflight = true;
+    _ = std.Thread.spawn(.{}, updateDownloadThread, .{ self, ver_copy, url_copy }) catch |err| {
+        log.warn("failed to start update download thread: {}", .{err});
+        self.update_download_inflight = false;
+        alloc.free(ver_copy);
+        alloc.free(url_copy);
+        return true;
+    };
+    self.showUpdateBalloon("Ghoztty", "Downloading the update…");
+    return true;
+}
+
+/// Hand the staged package to a detached applier and quit. Everything after
+/// this point happens in `update_install.zig`, outside this process, because
+/// the file being replaced is the one this process is running from.
+///
+/// A refusal here is loud and NON-destructive: if the applier cannot be armed
+/// the app does not quit, so the user keeps the terminal they have.
+fn applyStagedUpdate(self: *App) void {
+    const msi = self.update_staged_msi orelse return;
+    if (!update_install.arm(self.core_app.alloc, msi)) {
+        self.showUpdateBalloon(
+            "Ghoztty",
+            "The update could not be started.\nClick to open the releases page.",
+        );
+        return;
+    }
+    log.warn("update: applier armed, quitting to install", .{});
+    self.quit_requested = true;
+    w32.PostQuitMessage(0);
 }
 
 /// Show a balloon on the update tray icon. A click is delivered as
@@ -7644,10 +7893,27 @@ fn showTrayBalloon(
 /// large; 30 releases with long bodies stay well under this.
 const UPDATE_RESPONSE_MAX: usize = 1024 * 1024;
 
-/// Fetch the releases list from GitHub (or GHOZTTY_UPDATE_URL) and return
-/// the newest win-v release's version text (e.g. "1.4.1"), caller-owned.
-/// error.NoWinRelease if the feed has no win-v tag.
-fn fetchLatestWinVersion(alloc: Allocator) ![]u8 {
+/// The newest published Windows release, as far as the feed describes it.
+/// Both fields are caller-owned.
+const LatestRelease = struct {
+    /// Version text, e.g. "1.4.1".
+    version: []u8,
+    /// Its `.msi` asset URL, or null when the release published none — an
+    /// update that can be announced but not installed.
+    asset_url: ?[]u8,
+
+    fn deinit(self: *LatestRelease, alloc: Allocator) void {
+        alloc.free(self.version);
+        if (self.asset_url) |u| alloc.free(u);
+        self.* = undefined;
+    }
+};
+
+/// Fetch the releases list from GitHub (or GHOZTTY_UPDATE_URL) and return the
+/// newest win-v release: its version text and, when the release carries one,
+/// the download URL of its MSI. error.NoWinRelease if the feed has no win-v
+/// tag.
+fn fetchLatestWinRelease(alloc: Allocator) !LatestRelease {
     const url_owned: ?[]u8 = std.process.getEnvVarOwned(alloc, "GHOZTTY_UPDATE_URL") catch null;
     defer if (url_owned) |u| alloc.free(u);
     const url: []const u8 = if (url_owned) |u| (if (u.len > 0) u else UPDATE_URL) else UPDATE_URL;
@@ -7661,8 +7927,7 @@ fn fetchLatestWinVersion(alloc: Allocator) ![]u8 {
         defer f.close();
         const data = f.readToEndAlloc(alloc, UPDATE_RESPONSE_MAX) catch return error.ReadFailed;
         defer alloc.free(data);
-        const ver = update_check.findLatestWinVersion(data) orelse return error.NoWinRelease;
-        return try alloc.dupe(u8, ver);
+        return try releaseFromFeed(alloc, data);
     }
 
     const agent = std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty-UpdateCheck/1.0");
@@ -7699,9 +7964,21 @@ fn fetchLatestWinVersion(alloc: Allocator) ![]u8 {
         body.items.len += bytes_read;
     }
 
-    const ver = update_check.findLatestWinVersion(body.items) orelse
-        return error.NoWinRelease;
-    return try alloc.dupe(u8, ver);
+    return try releaseFromFeed(alloc, body.items);
+}
+
+/// Pull the newest win-v release out of a releases-list body. Shared by both
+/// arms of `fetchLatestWinRelease` so the canned `file://` feed the acceptance
+/// test serves is parsed by exactly the code the network path uses.
+fn releaseFromFeed(alloc: Allocator, data: []const u8) !LatestRelease {
+    const ver = update_check.findLatestWinVersion(data) orelse return error.NoWinRelease;
+    const version = try alloc.dupe(u8, ver);
+    errdefer alloc.free(version);
+    const asset_url: ?[]u8 = if (update_apply.findMsiUrl(data, ver)) |u|
+        try alloc.dupe(u8, u)
+    else
+        null;
+    return .{ .version = version, .asset_url = asset_url };
 }
 
 /// Was this process started as the agent-refresh relaunch guard (T421)? If so,
@@ -7711,6 +7988,16 @@ fn fetchLatestWinVersion(alloc: Allocator) ![]u8 {
 /// `startQuitTimer`, instead of importing a win32 module directly.
 pub fn runRelaunchGuard(alloc: Allocator) ?u8 {
     return relaunch_guard.runFromEnv(alloc);
+}
+
+/// Was this process started as the update applier (T1178)? If so, run it and
+/// hand `main` the exit code — an applier never becomes a terminal. It is a
+/// COPY of ghoztty.exe living in the staging directory, precisely so the
+/// installed exe it is about to replace is not open.
+///
+/// A DECL on the apprt for the same reason `runRelaunchGuard` is one.
+pub fn runUpdateApplier(alloc: Allocator) ?u8 {
+    return update_install.runFromEnv(alloc);
 }
 
 /// T675: is this process inside a kill-on-close job it does not own — the
@@ -8833,16 +9120,20 @@ fn msgWndProc(
     }
 
     if (msg == WM_APP_UPDATE_AVAILABLE) {
-        // wparam = heap pointer to the version string, lparam = length.
-        // We own the buffer and must free it after use. wparam == 0 is
-        // manual-check feedback (lparam 0 = up to date, 1 = failed).
-        if (wparam != 0 and lparam > 0) {
-            const ptr: [*]u8 = @ptrFromInt(wparam);
-            const len: usize = @intCast(lparam);
-            const ver = ptr[0..len];
-            defer app.core_app.alloc.free(ver);
-            app.showUpdateNotification(ver);
-        } else if (wparam == 0) {
+        // wparam = heap pointer to an UpdateFound we now own. lparam 1 = a
+        // check found this; lparam 2 = a download the user already consented
+        // to finished, so it installs without asking twice. wparam == 0 is
+        // feedback (lparam 0 = up to date, 1 = check failed, 2 = download
+        // failed).
+        if (wparam != 0) {
+            const found: *UpdateFound = @ptrFromInt(wparam);
+            defer found.destroy(app.core_app.alloc);
+            app.showUpdateNotification(found);
+            if (lparam == 2) {
+                app.update_download_inflight = false;
+                app.applyStagedUpdate();
+            }
+        } else {
             app.showUpdateFeedback(lparam);
         }
         return 0;
@@ -8888,6 +9179,11 @@ fn msgWndProc(
                 }
             },
             .open_release_page => {
+                // T1178: when there is something installable, a click INSTALLS
+                // it — that is the whole point of the notification now, and
+                // the release page is what is left when there is not.
+                if (app.offerUpdate()) return 0;
+
                 // Open the specific win-v release page when a version is
                 // known (update balloon); the releases list otherwise
                 // (up-to-date / check-failed feedback balloons).

@@ -1,0 +1,12 @@
+{
+    "guard":  "update-apply",
+    "script":  "test/win32/update-apply.ps1",
+    "generated":  "2026-08-30T16:33:17-07:00",
+    "commit":  "38927a404",
+    "files":  {
+                  "src/apprt/win32/update_apply.zig":  "da3a5f65d077a64031382beb7b9399ab23693c12ee8728cba74c1960223c00f7",
+                  "src/apprt/win32/update_check.zig":  "073e7dd2478907d881649e1e3ae5d6c2115ff451bad16056da5635c97adaf25b",
+                  "src/apprt/win32/update_install.zig":  "ad6210b39cb077ebf9845640907ef251bafd7119b2441393090b78d3ef67035a",
+                  "test/win32/update-apply.ps1":  "be843708bad5aebac0a889653126144d1129c89ec59c1784c8d96c352c68b017"
+              }
+}

@@ -75,6 +75,22 @@ pub fn main() !MainReturn {
         }
     }
 
+    // T1178: this process may be the update applier — a detached COPY of
+    // ghoztty.exe, spawned to wait for the app to exit and then let msiexec
+    // replace the installed one. Asked here, beside the relaunch guard and for
+    // the same reasons: it must never look like a second instance of the app
+    // it is waiting for, and it exists before any window or IPC endpoint does.
+    //
+    // Gated on there being no `+action` for the same reason the guard is: the
+    // app sets the variable on ITSELF for the instant it takes to spawn the
+    // applier, and a pane started in exactly that window must stay a pane.
+    if (@hasDecl(apprt.App, "runUpdateApplier") and state.action == null) {
+        if (apprt.App.runUpdateApplier(alloc)) |code| {
+            posix.exit(code);
+            return;
+        }
+    }
+
     // T695: this process may be a `ghoztty://` URL activation — the shell
     // launching our registered protocol handler with a clicked link as argv.
     // Asked before the single-instance bind, because an activation must never

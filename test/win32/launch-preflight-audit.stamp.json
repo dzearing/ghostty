@@ -1,8 +1,8 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-08-30T15:03:30-07:00",
-    "commit":  "38c08ba23",
+    "generated":  "2026-08-30T16:31:27-07:00",
+    "commit":  "38927a404",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
@@ -252,6 +252,7 @@
                   "test/win32/test-desktop-spike.ps1":  "2b39b095c17ead46920c49c3dc066d5fede7fbc5814ab8d4fffb57a599868f58",
                   "test/win32/title-font.ps1":  "946fd12880bb0433a535283fb6146fb7d2a8fd1b2d1f0f74e00fa7ce1720dcb8",
                   "test/win32/title-jitter.ps1":  "305bd304faf09988c8852f7fa69f2c780212b639fb837085b5869ab5457acab7",
+                  "test/win32/update-apply.ps1":  "be843708bad5aebac0a889653126144d1129c89ec59c1784c8d96c352c68b017",
                   "test/win32/update-check.ps1":  "0f33c9ef1d2a1d6101db6f431b4d0c46949a564eec8c50c0c6d69e6eea1f189a",
                   "test/win32/upgrade-no-fork.ps1":  "76264704b07c6d8267edda9d19349210a5462999cc8321b7c6b4d1f5e09df56c",
                   "test/win32/upgrade-resume-readiness.ps1":  "9df12a1d37c47dddc89f67af6056dd1c850a055e8b11b119ba272f24922e61f8",

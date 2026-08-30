@@ -6492,3 +6492,85 @@ back with `+read`), it unmarks itself, and with self-close on it closes itself.
 
 This session's own window is marked on the box (`[go-loop] ghoztty parity`),
 and `go-loop-exec.ps1 list` shows the user's other two windows unmarked.
+
+## T1178 — In-app update: download and apply from inside Ghoztty
+
+T24 shipped the notification and stopped there, deliberately: "notify-only,
+no auto-install", because the MSI has no taskkill custom action and
+installing over a running terminal hits files-in-use. The consequence the
+user actually felt was that upgrading Windows Ghoztty meant
+`scripts\upgrade-ghoztty-windows.ps1` and hand steps, while the Mac build
+updates itself — "I want to be able to upgrade it like the normal mac
+ghoztty, so no more weird scripts for upgrading this one" (2026-08-30).
+
+**What the user sees.** A balloon says a version is available (or ready to
+install, when it has already been fetched). Clicking it asks once, in
+Ghoztty's own dialog — *"Ghoztty will close, install the update and reopen.
+Your terminal sessions are kept."* — and then that is what happens. No
+scripts, no manual download, no msiexec dialog to find.
+
+**`auto-update` now means on Windows what it means on the Mac.** `off` never
+checks; `check` notifies and downloads only when the user clicks; `download`
+(and unset, which is Sparkle's default) fetches the package in the
+background so the click installs immediately. `update_apply.policyFromName`
+is the whole mapping, and an unparseable value falls to `download` rather
+than silently disabling updates.
+
+**The asset is found by URL, not by position.** `findMsiUrl` considers every
+`browser_download_url` in the releases feed and accepts one only if it is an
+`.msi` published under `/download/win-v<version>/`. Scanning "the first
+asset after the tag" would be a bet on field order inside a JSON object,
+which nothing promises, and could hand back a different release's package.
+A release with no MSI (portable-zip only) degrades to exactly T24's
+notify-and-open-the-release-page.
+
+**Nothing reaches msiexec unverified.** The download is checked for the OLE
+compound-file signature and a size floor before the path is handed on, so an
+HTML error page, a rate-limit JSON body or a truncated transfer is refused
+with a balloon rather than executed.
+
+**The files-in-use problem, solved without killing the user's shells.** This
+is the part T24 declined to solve. Two processes hold images in INSTALLDIR:
+the app itself, and every per-session PTY holder (`ghoztty-agent.exe
+--pty-host`), which outlives the agent *by design* (docs/claude/sessions.md)
+and is the only reason a restart keeps the user's shells. So:
+
+- The app spawns a **copy of itself** (`…\ghoztty[-debug]\updates\
+  ghoztty-updater.exe`) carrying `GHOZTTY_UPDATE_APPLY=<pid>|<msi>|<exe>`,
+  escaping its own job object (T524's lesson), and quits. A copy because the
+  installed exe is exactly what msiexec is about to replace.
+- The applier waits for the app's pid, then **renames** — never deletes —
+  any image still locked, to `<name>.old-<stamp>` in the same directory.
+  Windows refuses to delete a running image but will rename one, and the
+  open handle follows the file. msiexec then writes a fresh
+  `ghoztty-agent.exe` into a path that is now empty, the holders keep
+  running the old code they already mapped, and the app↔agent handshake
+  handles the version skew it was built to handle.
+- `msiexec /i … /qb-! /norestart /l*v <log>`: a progress bar with no cancel
+  and no terminal modal (the user consented in a dialog that has since
+  closed), no reboot for a per-user install, and a log to read when it
+  fails. Exit 3010 ("success, reboot desired") counts as success.
+- **Every path relaunches.** A failed install leaves the user with the
+  version they already had plus an msiexec log — never with no terminal.
+- The next launch sweeps the staging directory and any `.old-<stamp>`
+  leftover whose holder has since restarted.
+
+**Where the scripts stand now.** `scripts\upgrade-ghoztty-windows.ps1` and
+`scripts\morning-refresh.ps1` are DEV tooling — they swap a `zig-out` build
+into the install for the loop's own morning delivery, which is not a release
+and has no MSI. They are no longer the user-facing upgrade path and are not
+documented as one.
+
+*Validation:* `test\win32\update-apply.ps1` — canned `file://` feed and a
+canned package, so nothing publishes, downloads from GitHub or installs over
+the user's Ghoztty. It covers: asset found + pre-downloaded + staged
+(byte-length checked, and a debug run staging only into `updates-debug`); a
+non-package refused with nothing left on disk; a zip-only release degrading
+to notify-only; `--auto-update=check` not pre-downloading; `--auto-update=
+off` not checking; a leftover `.old-<stamp>` swept at launch while a
+similarly named file is left alone; the applier refusing a malformed spec;
+and the applier driven end to end against a package msiexec REJECTS —
+waiting on the pid, running the exact command line, reading the verdict, and
+still relaunching the terminal. The one thing deliberately not exercised is
+msiexec SUCCEEDING: that needs a signed, versioned MSI and would replace the
+installed app (CLAUDE.md's first non-negotiable).

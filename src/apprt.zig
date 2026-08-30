@@ -142,6 +142,12 @@ test {
     // Pure win32 update-check tag scan/compare (T24), same no-OS-imports deal.
     _ = @import("apprt/win32/update_check.zig");
 
+    // Pure win32 update-APPLY decisions (T1178): which asset, is it really a
+    // package, what msiexec is told, how the applier is told what to do. Every
+    // lane, same no-OS-imports deal — the one place where "is this an MSI"
+    // and "does this URL belong to this release" are answered.
+    _ = @import("apprt/win32/update_apply.zig");
+
     // Pure win32 window-placement memory parse/format/clamp (T85), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/window_memory.zig");

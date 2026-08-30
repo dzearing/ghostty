@@ -758,6 +758,25 @@ $GuardTable = @(
             'test\win32\startup-failure.ps1'
         )
     },
+    # The in-app update (T1178). This is the one code path that REPLACES the
+    # app on disk and quits the terminal to do it, and every failure mode is
+    # invisible to a compiler: an asset matcher that picks the wrong release,
+    # a content check that lets an HTML page reach msiexec, an applier that
+    # forgets to relaunch. `App.zig` holds the balloon and the dialog and is
+    # deliberately not listed, for the same reason the startup-failure row
+    # leaves it out - a file every task touches would leave this row
+    # permanently due and therefore permanently ignored.
+    [pscustomobject]@{
+        Name   = 'update-apply'
+        Script = 'test\win32\update-apply.ps1'
+        Stamp  = 'test\win32\update-apply.stamp.json'
+        Covers = @(
+            'src\apprt\win32\update_apply.zig',
+            'src\apprt\win32\update_install.zig',
+            'src\apprt\win32\update_check.zig',
+            'test\win32\update-apply.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'website-windows-links'
         Script = 'test\win32\website-windows-download.ps1'

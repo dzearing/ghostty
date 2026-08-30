@@ -173,8 +173,10 @@ jobs:
           **Portable:** \`Ghoztty-portable-$VERSION-x64.zip\` needs no installer --
           unzip it and run \`Ghoztty\ghoztty.exe\`.
 
-          Installed builds check this channel and show a notification when a newer
-          \`win-v*\` release appears (notify-only; nothing downloads automatically).
+          Installed builds update themselves from this channel: they check it, fetch
+          the MSI in the background, and offer to install and reopen when you click
+          the notification. \`auto-update = off\` in your config turns the check off;
+          \`auto-update = check\` downloads only when you ask.
           EOF
 
           if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then

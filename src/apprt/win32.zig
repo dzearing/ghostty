@@ -49,6 +49,11 @@ test {
     // waits on the wrong pid, so the lane compiles and checks it in its own
     // right.
     _ = @import("win32/relaunch_guard.zig");
+    // The update applier (T1178). Same argument as the guard above: it is the
+    // process that replaces the app on disk, it runs when no app is left to
+    // notice it going wrong, and its staging paths are per lineage so a debug
+    // run cannot install over the user's release.
+    _ = @import("win32/update_install.zig");
     // Escaping the app's job object, and measuring who is in it (T524, T426).
     // Both are what stands between a daemon/supervisor and dying with the
     // process it exists to outlive, so the lane compiles and checks them in
