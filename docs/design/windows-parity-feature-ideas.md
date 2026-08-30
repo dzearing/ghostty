@@ -166,3 +166,14 @@ as the digest that showed them.
 - Paste from a history of what you copied here (terminal clipboard ring)
 - Drag a selection out of the pane (drag-and-drop selected output)
 - Scrolling that feels like the rest of Windows (precision-touchpad momentum)
+
+## 2026-08-30
+
+- Print or share what a viewer pane is showing (PDF / self-contained HTML export)
+- A viewer pane that keeps your place when the file changes
+- Jump from a diff line into your editor at that line
+- An outline for code files, like markdown gets (contents card of functions and types)
+- Fold enormous output automatically (collapse a huge block to one expandable row)
+- A shortlist of docs you keep opening in side panes (pinned quick-open)
+- Zoom the viewer's content, and remember it per pane
+- A viewer pane that survives its renderer crashing (reload card, keeps address and history)
