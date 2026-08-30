@@ -1,8 +1,8 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-08-30T12:34:11-07:00",
-    "commit":  "326a04243",
+    "generated":  "2026-08-30T13:34:00-07:00",
+    "commit":  "689aeb94d",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
@@ -108,6 +108,7 @@
                   "test/win32/hook-json.ps1":  "6ffe9bffa095bdeeb1d524990d3a7e695aa3d185596df39a7aeca44f7ed82119",
                   "test/win32/host-settings.ps1":  "4bc5045b4017d45d664d2f715b14e538022cb9ff87e40cedbdeecd4a1216ccb5",
                   "test/win32/hover-capture.ps1":  "0a8055d036ef8aa5ef83d91851c418f52dfdc09ea29d63f5eae9af87a9ee92a1",
+                  "test/win32/install-launch.ps1":  "902445a9bd03556321f294284c2d3d7e81db009bc9b9eeca39d0582577c6e2d2",
                   "test/win32/ipc-child-exited.ps1":  "d976a5172b4773f582972eedc3fa1b00bb1c03f5c33eeb5efc06e5d52542112b",
                   "test/win32/ipc-command-keepalive.ps1":  "3e16597ad1d157d43c6581b946f35aada744b80f52ca38d52f678095975c2b14",
                   "test/win32/ipc-fake-server.ps1":  "d8a18c722615e1ca8582e804d794886cb7734a9eb084f87add9d411b285a689b",

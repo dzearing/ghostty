@@ -721,6 +721,24 @@ $GuardTable = @(
             'test\win32\one-installer.ps1'
         )
     },
+    # Installing ends with a running terminal, and installs the whole product
+    # (T1176). Both halves are shapes inside one bash script: a dropped agent
+    # or twin makes a half-product that looks installed, and a dropped custom
+    # action makes an install that finishes with nothing on screen. Neither is
+    # visible without building an MSI, which needs Docker on this box - so
+    # this row is what makes an edit to build-msi.sh ask the question here,
+    # where it can be answered with no toolchain at all.
+    [pscustomobject]@{
+        Name   = 'install-launch'
+        Script = 'test\win32\install-launch.ps1'
+        Stamp  = 'test\win32\install-launch.stamp.json'
+        Covers = @(
+            'dist\windows-installer\build-msi.sh',
+            'dist\windows-installer\build-release-artifacts.sh',
+            '.github\workflows\fork-ci.yml',
+            'test\win32\install-launch.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'website-windows-links'
         Script = 'test\win32\website-windows-download.ps1'

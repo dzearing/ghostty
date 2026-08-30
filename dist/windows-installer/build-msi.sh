@@ -372,8 +372,51 @@ template = """<?xml version="1.0" encoding="utf-8"?>
          fresh install. If a future upgrade needs to replace a running exe,
          the user is told to close Ghoztty first. Keep the install a pure
          file-copy + shortcut + registry write for maximum robustness. -->
+
+    <!-- Installing ends with a running terminal, not a Start Menu entry the
+         user has to go find (T1176). The pair is the shape the retired agent
+         MSI proved on this same wixl 0.106 pipeline: a type-51 action puts
+         the exe path in a property, then a type-50 action runs THAT property
+         as the command. ghoztty.exe is GUI-subsystem, so unlike the taskkill
+         action above this spawns no console window.
+
+         asyncNoWait: the terminal is a long-lived app — msiexec must not wait
+         for it to exit, and its exit code must not fail the install.
+         Immediate execution after InstallFinalize runs it as the installing
+         user, which is what a per-user install wants.
+
+         When it does NOT fire, and why:
+           NOT Installed          — uninstall and repair leave nothing new to
+                                    show; Installed is empty on a fresh
+                                    install and on a major upgrade's new
+                                    package.
+           NOT OLDERVERSIONFOUND  — an upgrade-in-place is the updater's
+                                    path: the user already has Ghoztty open,
+                                    and a surprise second window on top of it
+                                    is not what "update" means.
+           UILevel > 3            — a silent (/qn, UILevel 2) or basic-UI
+                                    (/qb, 3) install is scripted, and nothing
+                                    scripted wants a window it did not ask
+                                    for. Only reduced (4) and full (5) UI —
+                                    i.e. somebody double-clicked the MSI —
+                                    end with a terminal.
+           LAUNCHAPP = "1"        — the escape hatch: LAUNCHAPP=0 on the
+                                    msiexec command line suppresses the
+                                    launch without suppressing the UI. -->
+    <Property Id="LAUNCHAPP" Value="1"/>
+    <CustomAction Id="SetLaunchAppCmd"
+                  Property="LAUNCHAPPCMD"
+                  Value="[INSTALLDIR]ghoztty.exe"/>
+    <CustomAction Id="LaunchApp"
+                  Property="LAUNCHAPPCMD"
+                  ExeCommand=""
+                  Execute="immediate"
+                  Return="asyncNoWait"/>
+
     <InstallExecuteSequence>
       <RemoveExistingProducts After="InstallValidate"/>
+      <Custom Action="SetLaunchAppCmd" Before="LaunchApp"/>
+      <Custom Action="LaunchApp" After="InstallFinalize">NOT Installed AND NOT OLDERVERSIONFOUND AND UILevel &gt; 3 AND LAUNCHAPP = "1"</Custom>
     </InstallExecuteSequence>
   </Product>
 </Wix>
@@ -462,6 +505,74 @@ msibuild "$OUT" -i "$WORK/File.idt"
 echo "==> drop MsiFileHash table (force unversioned-file recopy on upgrade)"
 printf 'File_\tOptions\tHashPart1\tHashPart2\tHashPart3\tHashPart4\r\ns72\ti2\ti4\ti4\ti4\ti4\r\nMsiFileHash\tFile_\r\n' > "$WORK/MsiFileHash.idt"
 msibuild "$OUT" -i "$WORK/MsiFileHash.idt"
+
+# Read the launch-on-finish wiring back out of the compiled package (T1176).
+# wixl is a third-party compiler on a pinned version and the Environment/File
+# patches above exist precisely because it does not always emit what the wxs
+# says; "the wxs has a CustomAction in it" is not evidence that the MSI does.
+# A build whose install would end WITHOUT a terminal fails here instead of
+# shipping.
+echo "==> verify launch-on-finish (CustomAction + InstallExecuteSequence)"
+msiinfo export "$OUT" CustomAction > "$WORK/CustomAction.idt" || {
+  echo "error: the MSI has no CustomAction table — wixl dropped the launch-on-finish actions entirely" >&2; exit 1; }
+msiinfo export "$OUT" InstallExecuteSequence > "$WORK/InstallExecuteSequence.idt" || {
+  echo "error: the MSI has no InstallExecuteSequence table" >&2; exit 1; }
+python3 - "$WORK/CustomAction.idt" "$WORK/InstallExecuteSequence.idt" <<'PYEOF'
+import sys
+
+def rows(path):
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        lines = f.read().replace("\r\n", "\n").split("\n")
+    # .idt header: column names, column types, table name.
+    return [l.split("\t") for l in lines[3:] if l.strip()]
+
+ca = {r[0]: r for r in rows(sys.argv[1])}
+seq = {r[0]: r for r in rows(sys.argv[2])}
+errs = []
+
+# msidbCustomActionTypeExe(2) + msidbCustomActionTypeProperty(48) = 50,
+# plus Async(64) + Continue(128) for Return="asyncNoWait".
+if "LaunchApp" not in ca:
+    errs.append("CustomAction table has no LaunchApp row — the install would end with no terminal")
+else:
+    t = int(ca["LaunchApp"][1])
+    if t & 0x3F != 50:
+        errs.append(f"LaunchApp base type is {t & 0x3F}, expected 50 (exe from property)")
+    if not (t & 64) or not (t & 128):
+        errs.append(f"LaunchApp type {t} is not asyncNoWait — msiexec would block on the terminal or fail the install on its exit code")
+    if ca["LaunchApp"][2] != "LAUNCHAPPCMD":
+        errs.append(f"LaunchApp source is {ca['LaunchApp'][2]!r}, expected LAUNCHAPPCMD")
+
+if "SetLaunchAppCmd" not in ca:
+    errs.append("CustomAction table has no SetLaunchAppCmd row — LAUNCHAPPCMD would be empty and nothing would launch")
+else:
+    if int(ca["SetLaunchAppCmd"][1]) != 51:
+        errs.append(f"SetLaunchAppCmd type is {ca['SetLaunchAppCmd'][1]}, expected 51 (property set)")
+    if ca["SetLaunchAppCmd"][3] != "[INSTALLDIR]ghoztty.exe":
+        errs.append(f"SetLaunchAppCmd target is {ca['SetLaunchAppCmd'][3]!r}, expected [INSTALLDIR]ghoztty.exe")
+
+for action in ("LaunchApp", "SetLaunchAppCmd", "InstallFinalize"):
+    if action not in seq:
+        errs.append(f"InstallExecuteSequence has no {action} row")
+if not errs:
+    n_launch = int(seq["LaunchApp"][2])
+    n_set = int(seq["SetLaunchAppCmd"][2])
+    n_final = int(seq["InstallFinalize"][2])
+    if n_launch <= n_final:
+        errs.append(f"LaunchApp is sequenced at {n_launch}, before InstallFinalize at {n_final} — the exe would not be on disk yet")
+    if n_set >= n_launch:
+        errs.append(f"SetLaunchAppCmd is sequenced at {n_set}, not before LaunchApp at {n_launch}")
+    cond = seq["LaunchApp"][1]
+    for want in ("NOT Installed", "OLDERVERSIONFOUND", "UILevel", "LAUNCHAPP"):
+        if want not in cond:
+            errs.append(f"LaunchApp condition {cond!r} does not gate on {want}")
+
+if errs:
+    for e in errs:
+        print(f"error: {e}", file=sys.stderr)
+    sys.exit(1)
+print("launch-on-finish ok: SetLaunchAppCmd -> LaunchApp (asyncNoWait) after InstallFinalize")
+PYEOF
 
 echo "==> validate"
 msiinfo suminfo "$OUT" | head -12
