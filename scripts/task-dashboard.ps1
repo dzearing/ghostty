@@ -86,8 +86,22 @@ function Get-KeepAliveCommand {
     # schtasks wants the whole command as ONE /tr argument with its inner
     # quotes backslash-escaped; anything else silently loses everything after
     # the first space (the trap T440 documents).
-    return '\"powershell.exe\" -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden' +
-           " -File \`"$PSCommandPath\`" -Port $Port -NoPane"
+    #
+    # The action is wscript.exe, NOT powershell.exe, and that is the whole
+    # point. This task fires every 5 minutes under LogonType=Interactive, so
+    # the Task Scheduler creates its process on the user's desktop - and
+    # powershell.exe there means a console window flashing up and TAKING FOCUS
+    # every tick, all day (user report 2026-08-30). `-WindowStyle Hidden` does
+    # not help: powershell reads it only after its console already exists.
+    # wscript.exe is GUI-subsystem, so it is never given a console at all, and
+    # the launcher starts powershell with window style 0 behind it.
+    #
+    # S4U (`/RU <user> /NP`) would also work and was tried first; registering
+    # it needs the "log on as a batch job" right and returns "Access is denied"
+    # unelevated on this box. `conhost --headless` was probed and did not run
+    # the command at all. The launcher needs no elevation and no privilege.
+    return '\"wscript.exe\" //B //Nologo' +
+           " \`"$PSScriptRoot\dashboard-keepalive.vbs\`""
 }
 
 if ($Uninstall) {
@@ -97,6 +111,9 @@ if ($Uninstall) {
 }
 
 if ($Install) {
+    # The task stays Interactive (S4U needs a right we do not have unelevated);
+    # what keeps it from stealing focus is the wscript launcher in
+    # Get-KeepAliveCommand above.
     schtasks /Create /TN $taskName /TR (Get-KeepAliveCommand) /SC MINUTE /MO 5 /F 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "could not register the keep-alive task '$taskName'" }
     Write-Host "task-dashboard: keep-alive task '$taskName' registered (every 5m)"
