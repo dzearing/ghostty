@@ -199,6 +199,7 @@ WXS="$WORK/ghoztty.wxs"
 # identity is stable across builds (MSI component rules).
 python3 - "$EXE" "$COM_EXE" "$AGENT_EXE" "$SHARE" "$WXS" "$TEST_IDENTITY" <<'PYEOF'
 import os, sys, uuid, hashlib
+import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 exe, com_exe, agent_exe, share, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
@@ -444,15 +445,21 @@ template = """<?xml version="1.0" encoding="utf-8"?>
                                     launch without suppressing the UI. -->
     <!-- T1207: make room for the installer BEFORE it asks who is in its way.
 
+         (Nothing in this comment may contain a double hyphen: XML forbids one
+         inside a comment, and wixl's parser rejects the whole document with a
+         line number that points at the comment rather than at anything real.
+         Write flags without their leading dashes here.)
+
          Session persistence means `ghoztty-agent.exe` and one
-         `--pty-host` holder per live session keep the user's shells running
+         `pty-host` holder per live session keep the user's shells running
          after the terminal closes. Those processes have no windows, and the
          Restart Manager only offers a graceful close to processes that do -
          its only move on a windowless holder is to terminate it. So a
          double-clicked MSI over a running Ghoztty would end every restored
          session, which is precisely what the feature exists to prevent.
 
-         This runs `ghoztty.exe --install-prepare` out of the OLD install,
+         This runs `ghoztty.exe` with the `install-prepare` flag out of the
+         OLD install,
          immediately before InstallValidate - the action where Windows
          Installer asks the Restart Manager which processes hold the files it
          is about to write. It renames `ghoztty-agent.exe` aside (Windows
@@ -513,6 +520,23 @@ xml = xml.replace("@SHORTCUT_GUID@", guid("__startmenu_shortcut__"))
 xml = xml.replace("@PATHENV_GUID@", guid("__user_path_entry__"))
 xml = xml.replace("@PRODUCT_NAME@", PRODUCT_NAME)
 xml = xml.replace("@UPGRADE_CODE@", UPGRADE_CODE)
+# Parse what we just generated, BEFORE wixl sees it. wixl reports a broken
+# document as a libxml2 line number and "Failed to parse XML", which on
+# 2026-08-31 was the entire diagnosis available for a release that could not
+# build: a comment added with T1207 mentioned `--pty-host`, and XML forbids a
+# double hyphen inside a comment. Ten minutes of ReleaseFast build ran first,
+# and the failure landed in CI rather than on the box, because the only
+# harness that compiles an MSI needs Docker. Parsing here costs nothing, runs
+# wherever this script runs, and names the trap in the error text.
+try:
+    ET.fromstring(xml)
+except ET.ParseError as e:
+    raise SystemExit(
+        f"error: generated WXS is not well-formed XML: {e}\n"
+        "       (a '--' inside an <!-- comment --> is the usual cause; XML "
+        "forbids it)"
+    )
+
 # Version/stamp substituted by the shell (python only handles layout).
 with open(out, "w") as f:
     f.write(xml)

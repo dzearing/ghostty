@@ -325,6 +325,70 @@ if (-not $builtZip) {
         Assert "B4 portable ZIP console twin is console-subsystem" $false
     }
 }
+# -- B5-B7: the WXS the MSI is compiled from is well-formed, checked WITHOUT
+# Docker. On 2026-08-31 the win-v1.36.0 release run died after a ten-minute
+# ReleaseFast build with `Failed to parse XML` and a libxml2 line number: a
+# comment T1207 added to the package quoted the flag `--pty-host`, and XML
+# forbids a double hyphen inside a comment. Nothing on this box could have
+# caught it, because the only section that compiles a package is B1 and Docker
+# is deliberately never started here - so the first thing to notice was a
+# failed release, on the gate task's own critical path.
+#
+# The generator is pure python and needs no exe to run over, so it is
+# extracted from build-msi.sh and run against a fixture. B7 is the negative
+# control: put the double hyphen back and the check must go red, or it is not
+# a check (go.md).
+$pyExe = $null
+foreach ($cand in @('py.exe', 'python.exe')) {
+    $c = Get-Command $cand -ErrorAction SilentlyContinue
+    # The stock `python3` on PATH is the Store alias, which prints an ad and
+    # exits 49; `py` and `python` are the real interpreters.
+    if ($c) { $pyExe = $c.Source; break }
+}
+# The WXS generator is the python heredoc that writes "$WXS".
+$genMatch = [regex]::Match($msiSh, "(?s)python3 - [^\r\n]*?\`"\`$WXS\`"[^\r\n]*<<'PYEOF'\r?\n(.*?)\r?\nPYEOF\r?\n")
+$wxsWork = Join-Path ([IO.Path]::GetTempPath()) "release-artifacts-wxs-$PID"
+if (-not $genMatch.Success) {
+    Assert "B5 WXS generator located in build-msi.sh" $false
+    Assert "B6 generated WXS is well-formed XML" $false
+    Assert "B7 a double hyphen in a WXS comment is caught" $false
+} elseif (-not $pyExe) {
+    Assert "B5 WXS generator located in build-msi.sh" $true
+    Skip "B6 generated WXS is well-formed XML" 'no python interpreter on PATH'
+    Skip "B7 a double hyphen in a WXS comment is caught" 'no python interpreter on PATH'
+} else {
+    Assert "B5 WXS generator located in build-msi.sh" $true
+    $gen = $genMatch.Groups[1].Value
+    New-Item -ItemType Directory -Path (Join-Path $wxsWork 'share\sub') -Force | Out-Null
+    foreach ($f in @('exe.exe', 'com.com', 'agent.exe', 'share\a.txt', 'share\sub\b.txt')) {
+        [IO.File]::WriteAllText((Join-Path $wxsWork $f), 'x')
+    }
+    $enc = New-Object Text.UTF8Encoding $false
+    $goodPy = Join-Path $wxsWork 'gen.py'
+    [IO.File]::WriteAllText($goodPy, $gen, $enc)
+    $genArgs = @('exe.exe', 'com.com', 'agent.exe', 'share')
+    Push-Location $wxsWork
+    $goodOut = & $pyExe $goodPy @genArgs 'good.wxs' 2>&1 | Out-String
+    $goodRc = $LASTEXITCODE
+    # The negative control: reintroduce the exact 2026-08-31 defect.
+    $badPy = Join-Path $wxsWork 'gen-bad.py'
+    [IO.File]::WriteAllText($badPy, ($gen -replace '`pty-host`', '`--pty-host`'), $enc)
+    $badOut = & $pyExe $badPy @genArgs 'bad.wxs' 2>&1 | Out-String
+    $badRc = $LASTEXITCODE
+    Pop-Location
+    $wellFormed = $false
+    $goodWxs = Join-Path $wxsWork 'good.wxs'
+    if ($goodRc -eq 0 -and (Test-Path -LiteralPath $goodWxs)) {
+        try { [xml](Get-Content -LiteralPath $goodWxs -Raw) | Out-Null; $wellFormed = $true } catch { }
+    }
+    Assert "B6 generated WXS is well-formed XML" $wellFormed
+    if (-not $wellFormed) { "    $($goodOut.Trim())" }
+    Assert "B7 a double hyphen in a WXS comment is caught" (
+        $badRc -ne 0 -and $badOut -match 'not well-formed')
+    if ($badRc -eq 0) { "    the generator accepted a comment containing a double hyphen" }
+}
+Remove-Item -LiteralPath $wxsWork -Recurse -Force -ErrorAction SilentlyContinue
+
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 
 # ============================================================================
