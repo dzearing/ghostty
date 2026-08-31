@@ -756,6 +756,24 @@ $GuardTable = @(
             'test\win32\install-launch.ps1'
         )
     },
+    # Installing over a running Ghoztty closes it and brings it back, and never
+    # asks for a reboot (T1204). The app half is a registration and one branch
+    # in a window handler - both invisible until an installer meets a locked
+    # file, which is the worst possible time to discover them missing - and the
+    # MSI half is a property nobody would notice going absent until a user is
+    # told to restart their PC. `Window.zig` and `App.zig` are deliberately not
+    # listed: they are touched by nearly every task, and a row that is
+    # permanently due is a row nobody reads.
+    [pscustomobject]@{
+        Name   = 'install-restart'
+        Script = 'test\win32\install-restart.ps1'
+        Stamp  = 'test\win32\install-restart.stamp.json'
+        Covers = @(
+            'src\apprt\win32\restart_manager.zig',
+            'dist\windows-installer\build-msi.sh',
+            'test\win32\install-restart.ps1'
+        )
+    },
     # A startup failure is VISIBLE (T1177). The whole point of this code is a
     # dialog that appears when nothing else can, so an edit to any link in that
     # chain - the reporter, the dialog it builds on, the message text, or the

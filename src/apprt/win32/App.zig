@@ -64,6 +64,7 @@ const RemoteReconnect = @import("RemoteReconnect.zig");
 const agent_upgrade = @import("agent_upgrade.zig");
 const job_escape = @import("job_escape.zig");
 const relaunch_guard = @import("relaunch_guard.zig");
+const restart_manager = @import("restart_manager.zig");
 const url_scheme = @import("url_scheme.zig");
 const provenance = @import("provenance.zig");
 const host_defaults = @import("host_defaults.zig");
@@ -1355,6 +1356,14 @@ pub fn run(self: *App) !void {
         log.err("startup finished with no window; refusing to run headless", .{});
         return error.NoStartupWindow;
     }
+
+    // T1204: tell Windows to bring this terminal BACK after an installer
+    // closes it. An upgrade over a running Ghoztty is the normal case — it is
+    // what the in-app updater does every time — and without this registration
+    // the Restart Manager's best outcome is "your terminal is gone now".
+    // Registered here, after a window exists, so a launch that never got that
+    // far is not a thing Windows would relaunch into the same failure.
+    restart_manager.register();
 
     // Surface config load diagnostics once at startup (T69). After the
     // first window exists so the dialog has an owner to center on; the

@@ -302,6 +302,30 @@ template = """<?xml version="1.0" encoding="utf-8"?>
     <Property Id="ARPCOMMENTS" Value="Build @STAMP@"/>
     <Property Id="ARPNOMODIFY" Value="1"/>
 
+    <!-- T1204: a per-user terminal NEVER asks for a reboot.
+
+         On 2026-08-31 an upgrade over a running Ghoztty ended by demanding a
+         restart of the PC. The file replacement had already completed; what
+         Windows Installer had done was pick up the machine's unrelated
+         pending-reboot state (Windows Update and Component Based Servicing
+         each had a flag set) and present it as this install's requirement.
+         Nothing this package installs can need one: every file lands under
+         %LOCALAPPDATA%, there is no service, no driver, no shared in-use
+         system component, and the only processes that can hold a file here
+         are ours - which the Restart Manager closes and reopens.
+
+         ReallySuppress is the strong form: it suppresses the reboot AND the
+         prompt, in UI and silent installs alike, where REBOOT=Suppress still
+         leaves the "restart now?" question at the end.
+
+         Deliberately NOT set beside it: MSIRESTARTMANAGERCONTROL. Its only
+         value is "Disable", and disabling the Restart Manager is the opposite
+         of what this task is for - RM is what closes the running terminal,
+         lets the files be replaced, and starts it back up (the app asks to be
+         restarted in src/apprt/win32/restart_manager.zig). The read-back
+         below fails the build if that property ever appears. -->
+    <Property Id="REBOOT" Value="ReallySuppress"/>
+
     <Upgrade Id="@UPGRADE_CODE@">
       <UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes"
                       Maximum="@PRODUCT_VERSION@" IncludeMaximum="no"
@@ -572,6 +596,58 @@ if errs:
         print(f"error: {e}", file=sys.stderr)
     sys.exit(1)
 print("launch-on-finish ok: SetLaunchAppCmd -> LaunchApp (asyncNoWait) after InstallFinalize")
+PYEOF
+
+# Read the no-reboot / Restart-Manager wiring back out of the compiled package
+# (T1204). Same argument as the block above and the same history behind it:
+# wixl has twice emitted an MSI that disagreed with the wxs it was given, and
+# the cost of this one being wrong is the defect the user hit - an upgrade that
+# ends by demanding a reboot of the whole PC for a per-user terminal.
+echo "==> verify no-reboot + restart-manager wiring (Property table)"
+msiinfo export "$OUT" Property > "$WORK/Property.idt" || {
+  echo "error: the MSI has no Property table" >&2; exit 1; }
+python3 - "$WORK/Property.idt" <<'PYEOF'
+import sys
+
+def rows(path):
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        lines = f.read().replace("\r\n", "\n").split("\n")
+    # .idt header: column names, column types, table name.
+    return [l.split("\t") for l in lines[3:] if l.strip()]
+
+props = {r[0]: (r[1] if len(r) > 1 else "") for r in rows(sys.argv[1])}
+errs = []
+
+if "REBOOT" not in props:
+    errs.append(
+        "Property table has no REBOOT row - Windows Installer is free to inherit "
+        "the machine's unrelated pending-reboot state and demand a restart for a "
+        "per-user install"
+    )
+elif props["REBOOT"] != "ReallySuppress":
+    errs.append(
+        f"REBOOT is {props['REBOOT']!r}, expected 'ReallySuppress' - "
+        "'Suppress' still leaves the restart prompt at the end of the install"
+    )
+
+if props.get("MSIRESTARTMANAGERCONTROL", "").lower() == "disable":
+    errs.append(
+        "MSIRESTARTMANAGERCONTROL=Disable turns the Restart Manager OFF - the "
+        "installer would then have no way to close and reopen a running Ghoztty, "
+        "which is the whole graceful-upgrade path"
+    )
+
+if props.get("MSIDISABLERMRESTART", "0") not in ("0", ""):
+    errs.append(
+        f"MSIDISABLERMRESTART is {props['MSIDISABLERMRESTART']!r} - a non-zero "
+        "value closes the running terminal for the install and never brings it back"
+    )
+
+if errs:
+    for e in errs:
+        print(f"error: {e}", file=sys.stderr)
+    sys.exit(1)
+print("no-reboot ok: REBOOT=ReallySuppress, Restart Manager left enabled")
 PYEOF
 
 echo "==> validate"

@@ -1,8 +1,8 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-30T17:46:50-07:00",
-    "commit":  "ac4493830",
+    "generated":  "2026-08-31T07:43:11-07:00",
+    "commit":  "2403c51b7",
     "files":  {
                   "docs/claude/testing.md":  "1b503c70c1fc424dc7a2583a8ef10a7216f91586d06e0983bfb9ecc7f139f5c3",
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -111,6 +111,7 @@
                   "test/win32/host-settings.ps1":  "4bc5045b4017d45d664d2f715b14e538022cb9ff87e40cedbdeecd4a1216ccb5",
                   "test/win32/hover-capture.ps1":  "0a8055d036ef8aa5ef83d91851c418f52dfdc09ea29d63f5eae9af87a9ee92a1",
                   "test/win32/install-launch.ps1":  "902445a9bd03556321f294284c2d3d7e81db009bc9b9eeca39d0582577c6e2d2",
+                  "test/win32/install-restart.ps1":  "c41b5d41f9a6f3aadcbdde6f99989c35e77ddfe412b4968deb0baf956e5af1b2",
                   "test/win32/ipc-child-exited.ps1":  "d976a5172b4773f582972eedc3fa1b00bb1c03f5c33eeb5efc06e5d52542112b",
                   "test/win32/ipc-command-keepalive.ps1":  "3e16597ad1d157d43c6581b946f35aada744b80f52ca38d52f678095975c2b14",
                   "test/win32/ipc-fake-server.ps1":  "d8a18c722615e1ca8582e804d794886cb7734a9eb084f87add9d411b285a689b",
@@ -179,7 +180,7 @@
                   "test/win32/msi-upgrade.ps1":  "596f855376fa9af1f3ed137c55c060c10e872f2c6555b20b774688f0ca28e425",
                   "test/win32/new-window-cwd.ps1":  "0c35d0adaf39cdd7fa733c5e2912f1cb4dce1f7c12f05ed63b90a851acd5c440",
                   "test/win32/notification-click-focus.ps1":  "7382c18defc188e5036e2549119e6611615af455dbd696ceec2fe7eacb39040a",
-                  "test/win32/one-installer.ps1":  "59e6d9355f1265a2b2aa78e47dd50a81a6c70ade12cc611b0f9814210edd277a",
+                  "test/win32/one-installer.ps1":  "3413396544b4a1bc7e114543cd2dab21bc7c2f9c3a74e25a640d082ee9346d36",
                   "test/win32/orphan-notify.ps1":  "200452e245fcaca1b85e2ee96a2a226b93e71ac607d1f30f41a1c623458149de",
                   "test/win32/overlay-zorder.ps1":  "48f8bcc2f312e6031dede6f4c19fa50a961804fdbe81de80b2ed27247f92c6aa",
                   "test/win32/palette-close-crash.ps1":  "e6046113e0de2c089224b358bac4ef12ed298e86983c3bf68bd48588a34c964d",

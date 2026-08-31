@@ -54,6 +54,12 @@ test {
     // notice it going wrong, and its staging paths are per lineage so a debug
     // run cannot install over the user's release.
     _ = @import("win32/update_install.zig");
+    // Restart Manager participation (T1204). Listed here for the T1191 reason
+    // the startup reporter above is: nothing else pulls this module's tests
+    // into the lane, and its whole subject — which restart flags we ask for,
+    // and telling an installer's close from a logoff — is decided by constants
+    // that a lane can check and a running install cannot be asked to repeat.
+    _ = @import("win32/restart_manager.zig");
     // Escaping the app's job object, and measuring who is in it (T524, T426).
     // Both are what stands between a daemon/supervisor and dying with the
     // process it exists to outlive, so the lane compiles and checks them in

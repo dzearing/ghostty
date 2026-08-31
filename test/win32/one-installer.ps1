@@ -125,8 +125,16 @@ $checks = [ordered]@{
         { param($t) $t.selfupd -match '/dl/version\.json' -and $t.publish -match 'version\.json' }
 
     # D - the pages point at the one installer.
-    'D1 ghpages remote section sends you to the download' =
-        { param($t) $t.ghpages -match 'remote-download-link' -and $t.ghpages -match 'href="#download"' }
+    # The Remote Agent section this used to check was REMOVED on 2026-08-31
+    # (341f48c39): its card carried a second "Get the Windows installer" button,
+    # which is the two-installers-on-one-page failure T1175 exists to end,
+    # rebuilt out of page parts instead of binaries. So the invariant moved with
+    # it - what matters now is that the page offers the Windows installer
+    # exactly ONCE, wherever a future section might be tempted to offer it again.
+    'D1 the page offers the Windows installer exactly once' =
+        { param($t)
+          ([regex]::Matches($t.ghpages, 'id="win-msi-link"').Count -eq 1) -and
+          ([regex]::Matches($t.ghpages, '\.msi').Count -eq 1) }
     'D2 relay landing page sends you to the product site' =
         { param($t) $t.www -match 'dzearing\.github\.io/ghoztty' }
 
@@ -157,7 +165,7 @@ $mutations = @{
     'C4 publish-agent still uploads the install.ps1 signpost' = @('publish',   '')   # emptied
     'C5 manifest carries the fields self_update.zig parses'   = @('publish',   '')   # emptied
     'C6 the manifest path both sides use still agrees'        = @('selfupd',   '')   # emptied
-    'D1 ghpages remote section sends you to the download'     = @('ghpages',   '')   # emptied
+    'D1 the page offers the Windows installer exactly once'   = @('ghpages',   '<a id="win-msi-link" href="/dl/Ghoztty-x64.msi">Get the Windows installer</a>')
     'D2 relay landing page sends you to the product site'     = @('www',       '')   # emptied
     'E1 relay README does not present a standalone installer as live' = @('readme',  'Ghoztty-Agent-1.2.3-x64.msi')
     'E2 release runbook publishes no agent MSI'               = @('release',   'curl -I https://relay/dl/ghoztty-agent.msi')

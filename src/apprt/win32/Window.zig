@@ -26,6 +26,7 @@ const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const terminal = @import("../../terminal/main.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
+const restart_manager = @import("restart_manager.zig");
 const remote_connection = @import("../../remote/connection.zig");
 const RemoteReconnect = @import("RemoteReconnect.zig");
 
@@ -7561,11 +7562,13 @@ pub fn windowWndProc(
             return 0;
         },
         w32.WM_QUERYENDSESSION => {
-            // Logoff / shutdown / reboot (T89e): allow it (return TRUE). This
-            // is an app-EXIT path, NOT a user window-close — we deliberately
-            // do NOT mark sessions CLOSE here, so the local agent keeps its
-            // pinned sessions + ring snapshots and they re-attach on the next
-            // launch. (WM_QUERYENDSESSION never routes through window.close.)
+            // Logoff / shutdown / reboot (T89e), and since T1204 an installer
+            // asking us to close so it can replace our files: allow it (return
+            // TRUE). This is an app-EXIT path, NOT a user window-close — we
+            // deliberately do NOT mark sessions CLOSE here, so the local agent
+            // keeps its pinned sessions + ring snapshots and they re-attach on
+            // the next launch. (WM_QUERYENDSESSION never routes through
+            // window.close.)
             return 1;
         },
         w32.WM_ENDSESSION => {
@@ -7574,7 +7577,25 @@ pub fn windowWndProc(
             // Flush the layout manifest NOW (synchronously — there may be no
             // more message pump) so re-attach restores the window geometry
             // after the logoff/reboot (T89f).
+            //
+            // wParam FALSE means the session end was cancelled after we agreed
+            // to it; nothing is ending, so there is nothing to flush and
+            // certainly nothing to exit.
+            if (wparam == 0) return 0;
             window.app.syncSessionLayout();
+
+            // T1204: when this is the RESTART MANAGER closing us for an
+            // installer, somebody is WAITING on this process to end — and an
+            // app that says "yes I can close" and then keeps running is worse
+            // than one that refuses, because the installer waits out its
+            // timeout and falls back to files-in-use (or to demanding a
+            // reboot) anyway. A logoff needs none of this: Windows terminates
+            // us itself, and exiting early would only race the rest of the
+            // shutdown, so this is deliberately narrowed to the RM case.
+            if (restart_manager.isCloseAppRequest(@bitCast(lparam))) {
+                log.info("restart manager asked us to close for an update; exiting", .{});
+                std.process.exit(0);
+            }
             return 0;
         },
         w32.WM_DESTROY => {
