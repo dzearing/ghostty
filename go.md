@@ -566,37 +566,43 @@ Concretely, in order, with no stops in between:
    manual refresh still matters as the fallback for a session whose transcript
    could not be resolved (`acquire` says which: `pulse=transcript` vs
    `pulse=heartbeat-only`).
-6.5. **Morning client refresh** (T525; user, 2026-08-07) — right after the
-   push, one command:
+6.5. **The user's terminal is not yours to swap** (T1218; decision D85,
+   2026-08-31). There is no command at this step any more, and that absence is
+   the point.
 
-   ```
-   powershell -NoProfile -File scripts\morning-refresh.ps1
-   ```
+   Until 2026-08-31 this step ran a morning refresh that replaced the user's
+   installed Ghoztty out of a repo build. D85 put the question to them and the
+   answer was the option the loop had NOT assumed:
 
-   The user works all day inside one Ghoztty, which keeps running whatever exe
-   it was launched with, so work that shipped days ago reads to them as a
-   missing feature (measured twice: 2026-08-06, and 2026-08-07's "still no
-   address bar" over a feature already at HEAD). The **first task-boundary push
-   at or after 5am local** is the signal that the day has started and there are
-   bits worth having — a push, not a clock, because a push is the loop saying
-   "this commit is good".
+   > "the terminal should only ever run something that was actually published"
 
-   - **exit 0** — not due (before 5am, already refreshed today, or not in a
-     Ghoztty pane). Carry on to step 7 exactly as normal.
-   - **exit 10** — the refresh is running. **END THE TURN HERE. Do NOT run
-     `/reset-context`**: the delivery types `/reset-context read go.md and go`
-     into this very pane once the app is back, and a second reset races it.
-   - **exit 1** — it was due and the launch failed; nothing was delivered. Do
-     step 7 normally so a bad delivery cannot stall the loop.
+   So the installed app at `%LOCALAPPDATA%\Programs\Ghoztty` is the product, and
+   the ONLY thing that may replace it is the in-app updater taking a published
+   release. `scripts\install-ownership.ps1` is the rule;
+   `scripts\upgrade-ghoztty-windows.ps1` and `scripts\launch-upgrade.ps1` refuse
+   a user-install target rather than merely defaulting away from it, and
+   `test\win32\install-ownership.ps1` is the demonstration that the refusal
+   actually fires.
 
-   It delivers the **app only, never the agent** — `ghoztty-agent.exe` is not
-   swapped anywhere, and the mandatory agent-restart confirmation is deferred
-   past the unattended restart — because an agent update ends the loop, which
-   is what the directive rules out ("avoid an agent update because that will
-   shut down the loop"). The staged agent keeps for the next deliberate,
-   attended delivery. Once per day: the watermark is stamped BEFORE the launch,
-   so a failed refresh cannot re-fire on the next push and restart the user's
-   terminal all day. Acceptance: `test\win32\morning-refresh.ps1`.
+   What that changes for a turn:
+
+   - **To get today's work to the user, PUBLISH it.** At the end of a day's
+     work — not at every task boundary — one publish carries everything that
+     landed:
+
+     ```
+     powershell -NoProfile -File scripts\publish-windows-release.ps1
+     ```
+
+     Their terminal then offers the update the way it does for every other
+     user, which is also the T1179 install-and-update walk being exercised
+     continuously instead of once.
+   - **To run what you just built, run what you just built.**
+     `zig-out\bin\ghoztty.exe` directly, or point the upgrade script at the dev
+     install (`%LOCALAPPDATA%\ghoztty\dev-install`), which the loop owns.
+   - **Never reach for a "just this once" swap.** That failure is silent by
+     construction: the swap succeeds, the terminal keeps working, and the only
+     symptom is a version number describing bytes nobody ever released.
 6.9. **The ship workflow — where a turn's commit goes** (T1058). Today it goes
    straight onto `users/dzearing/windows-amd64`, and steps 1 and 6 above are
    written for that. That is the CURRENT path and it stays the current path
@@ -826,11 +832,16 @@ the fix is the message.
   adversarial investigation for hard problems and recommended approaches
   where they exist. After a task: verify, mark the doc, audit the task
   list for gaps, commit/push, `/reset-context read go.md and go`, repeat.
-- **Deliver to every install location** when a fix matters to the user:
-  installed release (`%LOCALAPPDATA%\Programs\Ghoztty`), Desktop portable
-  (`D:\Users\David\Desktop\Ghoztty-portable-x64`), and the share copy
-  (`\\homeassistant\share\ghoztty-windows`). A fix that only lives in
-  zig-out does not exist as far as the user can tell (the T49 lesson).
+- **Deliver by PUBLISHING** when a fix matters to the user (T1218/D85,
+  2026-08-31 — this bullet used to say "deliver to every install location", and
+  the installed release was one of them). The installed release
+  (`%LOCALAPPDATA%\Programs\Ghoztty`) is the user's, and only the in-app
+  updater may replace it, with a published build. The Desktop portable
+  (`D:\Users\David\Desktop\Ghoztty-portable-x64`) and the share copy
+  (`\\homeassistant\share\ghoztty-windows`) are still scripted delivery
+  targets, and they are what `deliver-windows-build.ps1` proves below. A fix
+  that only lives in zig-out still does not exist as far as the user can tell
+  (the T49 lesson) — the answer to that is now a release, not a swap.
 
   **Locations 2 and 3 are scripted now, and every claim they make is measured**
   (T198). `launch-upgrade.ps1` runs `scripts\deliver-windows-build.ps1`

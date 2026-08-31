@@ -1,5 +1,11 @@
 # Launch upgrade-ghoztty-windows.ps1 detached, and PROVE it started (T200).
 #
+# T1218 / decision D85 (2026-08-31): what this launches is a DEV delivery now.
+# The user's installed Ghoztty is no longer swapped by anything in this repo -
+# only the in-app updater replaces it, and only with a published release. To get
+# today's work to the user, publish it (scripts\publish-windows-release.ps1);
+# this path exists for a dev install the loop owns.
+#
 # The delivery at a task boundary is fire-and-forget by necessity: nothing in
 # the Claude session's process tree can swap the exe out from under its own GUI,
 # so the upgrade has to outlive the turn that starts it. That makes the launch
@@ -100,6 +106,28 @@ function Fail-Launch([string]$msg, [int]$code) {
 }
 
 . (Join-Path $PSScriptRoot 'delivery-version.ps1')
+. (Join-Path $PSScriptRoot 'install-ownership.ps1')
+
+# T1218/D85: the child refuses to write the user's installed Ghoztty, but this
+# is where a delivery is LAUNCHED from - and the child is detached, so its
+# refusal would land in a log nobody is reading. Refuse here, in the caller's
+# own console, before a multi-minute staging build is spent on a delivery that
+# cannot happen. Exit 3 is "nothing was delivered", the same as a stale staging
+# prefix, which is exactly what this is.
+#
+# Both spellings, because they are not interchangeable at this boundary: called
+# in-process the array is real and the value is the NEXT element, while under
+# `powershell -File` the whole list arrives as one string element
+# (`-InstallDir,C:\...`) - measured, not assumed. A guard that only understood
+# the first spelling would be silently absent from every command-line caller.
+for ($i = 0; $i -lt $ExtraArgs.Count; $i++) {
+    $target = ''
+    if ($ExtraArgs[$i] -match '^-InstallDir[,=](.+)$') { $target = $Matches[1] }
+    elseif ($ExtraArgs[$i] -eq '-InstallDir' -and $i + 1 -lt $ExtraArgs.Count) { $target = $ExtraArgs[$i + 1] }
+    else { continue }
+    $refusal = Assert-NotUserInstall -Path $target -Who 'launch-upgrade.ps1' -Quiet
+    if ($refusal) { Fail-Launch $refusal 3 }
+}
 
 if (-not $UpgradeScript) { $UpgradeScript = Join-Path $PSScriptRoot 'upgrade-ghoztty-windows.ps1' }
 if (-not (Test-Path -LiteralPath $UpgradeScript -PathType Leaf)) {

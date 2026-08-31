@@ -1,8 +1,8 @@
 {
     "guard":  "cleanslate",
     "script":  "test/win32/cleanslate-audit.ps1",
-    "generated":  "2026-08-31T12:36:02-07:00",
-    "commit":  "fa2f93c1f",
+    "generated":  "2026-08-31T15:18:23-07:00",
+    "commit":  "ef652123e",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
@@ -110,6 +110,7 @@
                   "test/win32/host-settings.ps1":  "4bc5045b4017d45d664d2f715b14e538022cb9ff87e40cedbdeecd4a1216ccb5",
                   "test/win32/hover-capture.ps1":  "0a8055d036ef8aa5ef83d91851c418f52dfdc09ea29d63f5eae9af87a9ee92a1",
                   "test/win32/install-launch.ps1":  "a4ffeece18fd6409c71581b61632df08620e4d63cf3fd3676147f3d7b395d62e",
+                  "test/win32/install-ownership.ps1":  "cdc00459bfc7611fca1aacc6756977bc9eb46e87e2b32d543638eacfe578447c",
                   "test/win32/install-prepare.ps1":  "6d8277dab8e947ddd944dbd1ce556f711cbb8e345703f06d32b17dec8995bc06",
                   "test/win32/install-restart.ps1":  "c41b5d41f9a6f3aadcbdde6f99989c35e77ddfe412b4968deb0baf956e5af1b2",
                   "test/win32/ipc-child-exited.ps1":  "d976a5172b4773f582972eedc3fa1b00bb1c03f5c33eeb5efc06e5d52542112b",
@@ -175,7 +176,6 @@
                   "test/win32/machine-chooser.ps1":  "c69e331b19e83e300b5f0c22860220ea1d2de144d587db1ee4ae4e797ce6b79e",
                   "test/win32/menu-bar.ps1":  "f7d997e96194fc3ce9f65b61fa7af77add347166cab9bac5e31473faa0409c4e",
                   "test/win32/merge-terminology.ps1":  "c6e28d4f5dac63e423b492c7e854a11ae24e754ddf56587a8dd6cbeeb5efa6eb",
-                  "test/win32/morning-refresh.ps1":  "e0551f73edda29af9e36294b9d897e1c13cc5c8f237f84c2f69389730aeb72e4",
                   "test/win32/mouse-nc-routing.ps1":  "0e9c09958e46b3444898c47fdcadfbd1c509854b6c07e5bb8c5086abd2f80969",
                   "test/win32/msi-upgrade.ps1":  "596f855376fa9af1f3ed137c55c060c10e872f2c6555b20b774688f0ca28e425",
                   "test/win32/new-window-cwd.ps1":  "0c35d0adaf39cdd7fa733c5e2912f1cb4dce1f7c12f05ed63b90a851acd5c440",

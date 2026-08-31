@@ -1,4 +1,15 @@
-# Upgrade the installed Windows release Ghoztty in place and resume work.
+# Upgrade a DEV install of Ghoztty in place and resume work.
+#
+# T1218 / decision D85 (2026-08-31) - READ THIS FIRST. This script used to own
+# the user's installed terminal: it swapped `%LOCALAPPDATA%\Programs\Ghoztty`
+# out of a repo build every morning. It does not any more, and it refuses to.
+# The installed app is the product, only the in-app updater may replace it, and
+# only with a published release ("the terminal should only ever run something
+# that was actually published"). What survives here is the DEV path: the same
+# kill/swap/verify/resume machinery pointed at an install the loop owns
+# (`%LOCALAPPDATA%\ghoztty\dev-install` by default). The rule and the refusal
+# both live in scripts\install-ownership.ps1; the way to get today's work to the
+# user is scripts\publish-windows-release.ps1.
 #
 # Designed to be launched DETACHED from a Claude Code session running inside
 # the very Ghoztty instance being upgraded (nothing in that process tree can
@@ -58,7 +69,12 @@
 [CmdletBinding(PositionalBinding = $false)]
 param(
     [string]$Staging = 'D:\git\ghoztty\zig-out-release',
-    [string]$InstallDir = "$env:LOCALAPPDATA\Programs\Ghoztty",
+    # T1218/D85: the DEV install, not the user's. This script used to default to
+    # `%LOCALAPPDATA%\Programs\Ghoztty` - the product the user installed - and
+    # that is now a refusal rather than a default (see install-ownership.ps1).
+    # Only the in-app updater replaces the installed app, and only with a
+    # published release.
+    [string]$InstallDir = "$env:LOCALAPPDATA\ghoztty\dev-install",
     [string]$WorkingDirectory = 'D:\git\ghoztty',
     # Runs in the relaunched window; --continue resumes the most recent
     # Claude session in WorkingDirectory (i.e. the one this kill orphaned).
@@ -145,6 +161,19 @@ function Log($m) { "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $m" | Add-Content 
 
 . (Join-Path $PSScriptRoot 'loop-session.ps1')
 . (Join-Path $PSScriptRoot 'delivery-version.ps1')
+. (Join-Path $PSScriptRoot 'install-ownership.ps1')
+
+# T1218/D85: this script may swap a dev install; it may not touch the user's.
+# Checked here, before anything is read or killed, and logged as well as printed
+# because this script normally runs detached with nobody reading its stdout.
+$ownership = Assert-NotUserInstall -Path $InstallDir -Who 'upgrade-ghoztty-windows.ps1' -Quiet
+if ($ownership) {
+    Log '=== upgrade start (refused)'
+    foreach ($line in ($ownership -split "`n")) { Log $line }
+    Write-Host $ownership
+    [Console]::Error.WriteLine($ownership)
+    exit 3
+}
 
 # T1098: no dialog, ever, from anything this run starts.
 #
@@ -608,6 +637,12 @@ if ($script:deliveryFailure) {
 } else {
     foreach ($dir in $ExtraInstallDirs) {
         if (-not $dir) { continue }
+        # T1218/D85: the same refusal as the primary target. A mirror list is
+        # exactly where the user's install would come back in quietly.
+        if (Test-IsUserInstallPath -Path $dir) {
+            Log "extra install '$dir': REFUSED - that is the user's installed Ghoztty, which only the in-app updater may replace (D85/T1218)"
+            continue
+        }
         if (-not (Test-Path -LiteralPath $dir -PathType Container)) {
             Log "extra install '$dir': not present, skipped"
             continue

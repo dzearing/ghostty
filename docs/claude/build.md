@@ -108,6 +108,25 @@ zig build -Dapp-runtime=win32 -Doptimize=Debug      # -> zig-out\bin\ghoztty.exe
   under `%LOCALAPPDATA%\Programs\Ghoztty`, not an extracted portable copy. This
   is the on-box analog of the `/Applications/Ghoztty.app` rule. Always run the
   freshly built `zig-out\bin\ghoztty.exe`.
+- **The installed app is the user's, and only the updater may replace it**
+  (T1218; decision D85, 2026-08-31). The rule above used to have a sanctioned
+  exception: a morning job swapped `%LOCALAPPDATA%\Programs\Ghoztty` out of a
+  repo build so the user got the day's fixes within hours. Asked directly, they
+  chose the other thing — *"the terminal should only ever run something that was
+  actually published"* — so the exception is gone. The in-app updater taking a
+  **published release** is the one path that writes those bytes; the way to get
+  today's work to the user is `scripts\publish-windows-release.ps1`, and their
+  terminal then offers the update like it does for every other user.
+
+  This is enforced, not merely documented: `scripts\install-ownership.ps1` holds
+  the rule, and `upgrade-ghoztty-windows.ps1` / `launch-upgrade.ps1` **refuse** a
+  user-install target (exit 3) rather than defaulting away from it. Those scripts
+  still work — pointed at the dev install, `%LOCALAPPDATA%\ghoztty\dev-install`,
+  which the loop owns. Acceptance, including the demonstration that the refusal
+  fires: `test\win32\install-ownership.ps1` (`-TeethCheck` for the negative
+  control). Why it needs a guard rather than a note: a swap that comes back
+  succeeds — the terminal keeps working, and the only symptom is a version
+  number describing bytes nobody ever released.
 - **A debug build announces itself** (T43): its whole caption/tab band is
   tinted warning amber and its title carries `" [DEBUG]"`, so a dev instance is
   never mistaken for the user's installed release. Gated on `Debug`/
@@ -187,9 +206,11 @@ zig build -Dapp-runtime=win32 -Doptimize=Debug      # -> zig-out\bin\ghoztty.exe
   ```
 
   `-Dstrip=false` is load-bearing: a stripped release build produces
-  undebuggable crash dumps. Delivery to the user's install locations goes
-  through `scripts/launch-upgrade.ps1` (never a hand-rolled `Start-Process`);
-  `go.md` has the full protocol and the staleness gates.
+  undebuggable crash dumps. What ships to the USER is a published release
+  (`scripts\publish-windows-release.ps1`, then the in-app updater — see the
+  install-ownership rule above). `scripts/launch-upgrade.ps1` (never a
+  hand-rolled `Start-Process`) still drives a delivery to the dev install and
+  the portable locations; `go.md` has the full protocol and the staleness gates.
 
 
 ## What is installed on this box, and how to clear it

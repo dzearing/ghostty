@@ -6555,11 +6555,14 @@ and is the only reason a restart keeps the user's shells. So:
 - The next launch sweeps the staging directory and any `.old-<stamp>`
   leftover whose holder has since restarted.
 
-**Where the scripts stand now.** `scripts\upgrade-ghoztty-windows.ps1` and
-`scripts\morning-refresh.ps1` are DEV tooling — they swap a `zig-out` build
-into the install for the loop's own morning delivery, which is not a release
-and has no MSI. They are no longer the user-facing upgrade path and are not
-documented as one.
+**Where the scripts stand now** (updated T1218, 2026-08-31).
+`scripts\morning-refresh.ps1` is GONE and `scripts\upgrade-ghoztty-windows.ps1`
+is DEV tooling that can no longer reach the user's install: it swaps a `zig-out`
+build into a dev install the loop owns (`%LOCALAPPDATA%\ghoztty\dev-install`)
+and REFUSES `%LOCALAPPDATA%\Programs\Ghoztty` outright. Per decision D85, the
+installed app is only ever replaced by this updater, taking a published release.
+Rule and refusal: `scripts\install-ownership.ps1`; acceptance:
+`test\win32\install-ownership.ps1`.
 
 *Validation:* `test\win32\update-apply.ps1` — canned `file://` feed and a
 canned package, so nothing publishes, downloads from GitHub or installs over
