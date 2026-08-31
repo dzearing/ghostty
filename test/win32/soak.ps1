@@ -31,7 +31,8 @@
 param(
     [int]$Minutes = 30,
     [string]$ExePath = 'D:\git\ghoztty\zig-out-release\bin\ghoztty.exe',
-    [switch]$Detach
+    [switch]$Detach,
+    [switch]$SelfTest
 )
 $ErrorActionPreference = 'Stop'
 
@@ -58,6 +59,125 @@ $script:fail = 0
 function Assert([bool]$cond, [string]$label) {
     if ($cond) { $script:pass++; Rep "PASS  $label" }
     else { $script:fail++; Rep "FAIL  $label" }
+}
+
+# --- Renderer telemetry grading (T1147) ---------------------------------------
+# The `perf` sampler reports once a SECOND PER PANE, and this window has four
+# panes of which one is a deliberately idle latency-probe target. An idle
+# unfocused pane legitimately redraws about once a second, so it emits `fps=1`
+# for essentially every window of the run - and there are more of those windows
+# than loaded ones. Every statistic taken over the pooled population therefore
+# describes HOW MANY PANES HAPPENED TO BE IDLE rather than how the renderer
+# coped: the original `median fps >= 20` read 1 and failed (T1147), and T1158's
+# `p90 >= 30` only avoided that by picking a percentile above the idle mass,
+# which is still an inference about the population rather than a measurement of
+# the panes under load.
+#
+# Since T1147 each sample NAMES ITS PANE (`perf pane=<uuid> fps=...`), so the
+# grading is done where the load actually is: group by pane, map the ids back to
+# the names this script gave them, and grade the panes it deliberately loaded.
+# The idle probe pane is reported - which is what turns "the fps=1 population is
+# idle panes" from an inference into a measurement - and graded by nothing.
+function Measure-PaneFps {
+    param([System.Collections.IDictionary]$ByPane)
+    $rows = @()
+    foreach ($k in @($ByPane.Keys)) {
+        $v = @($ByPane[$k] | Sort-Object)
+        if ($v.Count -eq 0) { continue }
+        $p90i = [Math]::Min([int]($v.Count * 0.90), $v.Count - 1)
+        $rows += [pscustomobject]@{
+            Pane      = $k
+            Samples   = $v.Count
+            Min       = $v[0]
+            Median    = $v[[Math]::Min([int]($v.Count / 2), $v.Count - 1)]
+            P90       = $v[$p90i]
+            Max       = $v[-1]
+            IdleShare = [Math]::Round(@($v | Where-Object { $_ -le 1 }).Count / $v.Count, 2)
+        }
+    }
+    return @($rows | Sort-Object -Property Pane)
+}
+
+# Grade one pane per key of $Floors (name -> the fps floor that pane must
+# reach). A loaded pane that produced no telemetry at all FAILS (it was told to
+# render and never did); one with too few samples to say anything is reported
+# and not graded, so a short -Minutes smoke cannot manufacture a verdict out of
+# six windows.
+#
+# The floor is PER PANE because the three load generators do not ask the same
+# thing of the renderer, and one floor for all of them is a flake waiting to
+# happen. Measured 2026-08-31 over a 5-minute run: `soak-stream` (an endless
+# `type` of an 8MB file) sits at the 60 cap, min 59; `soak-altscr` sits at
+# median 27 / p90 30 / max 32, because its script SLEEPS 150ms twice per
+# iteration - it is paced by its own load, not by the renderer, and grading it
+# at 30 puts the bar exactly on its ceiling. Each floor is set where a real
+# renderer regression shows up and this run's own margin does not.
+function Test-LoadedPaneFps {
+    param(
+        [object[]]$Rows,
+        [System.Collections.IDictionary]$Floors,
+        [int]$MinSamples = 60
+    )
+    $out = @()
+    foreach ($name in @($Floors.Keys | Sort-Object)) {
+        $floor = [int]$Floors[$name]
+        $r = @($Rows | Where-Object { $_.Pane -eq $name })[0]
+        if (-not $r) {
+            $out += [pscustomobject]@{ Pane = $name; Floor = $floor; Graded = $true; Pass = $false; Why = 'no telemetry from this pane' }
+        } elseif ($r.Samples -lt $MinSamples) {
+            $out += [pscustomobject]@{ Pane = $name; Floor = $floor; Graded = $false; Pass = $true; Why = "only $($r.Samples) samples (< $MinSamples)" }
+        } else {
+            $out += [pscustomobject]@{ Pane = $name; Floor = $floor; Graded = $true; Pass = ($r.P90 -ge $floor); Why = "p90 $($r.P90) fps over $($r.Samples) samples" }
+        }
+    }
+    return @($out)
+}
+
+# What each load generator is expected to sustain. Used by the run and by
+# -SelfTest, so the negative control grades against the same numbers the real
+# verdict does.
+$script:PaneFpsFloors = @{
+    'soak-stream' = 30
+    'soak-altscr' = 15
+    'soak-grow'   = 30
+}
+
+# Negative control for the grader (T1147): `soak.ps1 -SelfTest` proves the
+# assertion can score red, in seconds, without a 30-minute run. A gate nobody
+# has watched fail is indistinguishable from a gate that cannot fail.
+if ($SelfTest) {
+    $idle = @(1) * 400
+    $fast = @(60) * 300 + @(1) * 100      # stream/grow, with idle stretches
+    $paced = @(27) * 280 + @(30) * 20 + @(1) * 100   # altscr, as measured
+    $slow = @(8) * 300 + @(1) * 100       # loaded, renderer cannot keep up
+    $floors = $script:PaneFpsFloors
+
+    $healthy = Measure-PaneFps @{ 'soak-stream' = $fast; 'soak-altscr' = $paced; 'soak-grow' = $fast; 'probe' = $idle }
+    $hv = Test-LoadedPaneFps -Rows $healthy -Floors $floors
+    Assert (@($hv | Where-Object { -not $_.Pass }).Count -eq 0) 'selftest: healthy build passes with 400 idle-pane fps=1 samples present'
+    Assert ((@($healthy | Where-Object { $_.Pane -eq 'probe' })[0]).IdleShare -eq 1) 'selftest: the idle probe pane is reported as 100% fps<=1'
+
+    $regressed = Measure-PaneFps @{ 'soak-stream' = $fast; 'soak-altscr' = $slow; 'soak-grow' = $fast; 'probe' = $idle }
+    $rv = Test-LoadedPaneFps -Rows $regressed -Floors $floors
+    Assert (@($rv | Where-Object { -not $_.Pass }).Count -eq 1) 'selftest: a loaded pane dropping to 8 fps turns the verdict RED'
+    Assert ((@($rv | Where-Object { $_.Pane -eq 'soak-altscr' })[0]).Pass -eq $false) 'selftest: the red verdict names the pane that dropped'
+
+    $streamDrop = Measure-PaneFps @{ 'soak-stream' = (@(25) * 300 + @(1) * 100); 'soak-altscr' = $paced; 'soak-grow' = $fast; 'probe' = $idle }
+    $sv = Test-LoadedPaneFps -Rows $streamDrop -Floors $floors
+    Assert ((@($sv | Where-Object { $_.Pane -eq 'soak-stream' })[0]).Pass -eq $false) 'selftest: the 60fps stream pane falling to 25 is RED even though 25 clears altscr floor'
+
+    $missing = Measure-PaneFps @{ 'soak-stream' = $fast; 'soak-grow' = $fast; 'probe' = $idle }
+    $mv = Test-LoadedPaneFps -Rows $missing -Floors $floors
+    Assert ((@($mv | Where-Object { $_.Pane -eq 'soak-altscr' })[0]).Pass -eq $false) 'selftest: a loaded pane that rendered nothing at all is a failure'
+
+    $short = Test-LoadedPaneFps -Rows (Measure-PaneFps @{ 'soak-stream' = @(60) * 10; 'soak-altscr' = @(60) * 10; 'soak-grow' = @(60) * 10 }) -Floors $floors
+    Assert (@($short | Where-Object { $_.Graded }).Count -eq 0) 'selftest: too few samples is reported, not graded'
+
+    Rep ""
+    Rep "=== selftest: $($script:pass) passed, $($script:fail) failed"
+    if ($script:fail -gt 0) { Rep "$($script:fail) FAILURE(S)"; exit 1 }
+    Rep 'ALL PASS'
+    exit 0
 }
 
 Add-Type @'
@@ -151,6 +271,20 @@ $gui = @(Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
 $gui = @($gui | Where-Object {
     $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
     $p -and $p.MainWindowHandle -ne 0 })
+# An ABORT after the GUI exists used to `exit 1` straight past the teardown at
+# the bottom of this script, leaving the three load generators pinning the box
+# and the sandbox agent running. On 2026-08-31 that turned one aborted setup
+# into a machine that was still at full tilt five minutes later, which is
+# exactly the state that makes the NEXT attempt abort too. Every abort from
+# here down goes through this instead.
+function Abort-Soak([string]$why) {
+    Rep "ABORT: $why"
+    & $exe +close --target=soak 2>$null | Out-Null
+    Start-Sleep -Seconds 1
+    try { [void](Stop-RepoGhoztty -Exe $exe -SettleMs 1500) } catch { Rep "  (teardown: $_)" }
+    exit 1
+}
+
 if ($gui.Count -ne 1) { Rep "ABORT: expected 1 soak GUI process, got $($gui.Count)"; exit 1 }
 $proc = Get-Process -Id $gui[0].ProcessId
 Rep "gui pid: $($proc.Id)"
@@ -167,19 +301,53 @@ Start-Sleep -Seconds 2
 
 # The window's original (unnamed) pane is the latency-probe target: it is
 # the leaf whose name we did not choose.
-$listJson = & $exe +list --json | ConvertFrom-Json
+#
+# This `+list` runs two seconds after three load generators were turned on, so
+# it asks the app its busiest question at its busiest moment. The default 30s
+# IPC budget is not enough there: on 2026-08-31 it timed out and the run
+# ABORTED at minute one, throwing away a 30-minute soak before a single sample
+# was taken. This is SETUP, not a measurement - the `+list` that is actually
+# graded is the one at the end of the run, which keeps the default budget - so
+# it gets a wider one rather than a verdict.
+#
+# And the OUTPUT is captured through cmd redirection, then sanitised before it
+# is parsed. When the app does not answer immediately the client prints
+# "Waiting for Ghoztty to answer '+list' ..." on its way to SUCCEEDING - a
+# progress message, not a failure - and it cost this run twice on 2026-08-31.
+# Once as JSON: `& $exe +list --json | ConvertFrom-Json` fed that line to the
+# parser, the parse threw, and the run aborted with "soak window not in +list"
+# while the window was right there. And once as an exception: rewriting it as
+# `& $exe ... 2>&1` turned the same message into a NativeCommandError, which
+# `$ErrorActionPreference = 'Stop'` at the top of this file makes TERMINATING -
+# the script died with no ABORT line at all. `Get-GhozttyListRaw` (Isolation.ps1)
+# redirects inside cmd, so neither hazard exists; everything from the first `{`
+# is the JSON.
+$prevIpcTimeout = $env:GHOZTTY_IPC_TIMEOUT_MS
+$env:GHOZTTY_IPC_TIMEOUT_MS = '120000'
+try {
+    $listRaw = Get-GhozttyListRaw -Exe $exe
+} finally { $env:GHOZTTY_IPC_TIMEOUT_MS = $prevIpcTimeout }
+$brace = $listRaw.IndexOf('{')
+if ($brace -lt 0) { Abort-Soak "+list --json produced no JSON: $listRaw" }
+$listJson = $listRaw.Substring($brace) | ConvertFrom-Json
 $leaves = @()
 function Walk($node) {
     if ($null -ne $node.terminal) { $script:leaves += $node.terminal }
     if ($null -ne $node.left) { Walk $node.left; Walk $node.right }
 }
 $win = $listJson.data.windows | Where-Object { $_.target -eq 'soak' }
-if (-not $win) { Rep 'ABORT: soak window not in +list'; exit 1 }
+if (-not $win) { Abort-Soak 'soak window not in +list' }
 $win.tabs | ForEach-Object { Walk $_.splits }
 $named = @('soak-stream', 'soak-altscr', 'soak-grow')
 $probe = @($leaves | Where-Object { $named -notcontains $_.name })
-if ($probe.Count -ne 1) { Rep "ABORT: expected 1 probe pane, got $($probe.Count) of $($leaves.Count) leaves"; exit 1 }
+if ($probe.Count -ne 1) { Abort-Soak "expected 1 probe pane, got $($probe.Count) of $($leaves.Count) leaves" }
 $probePane = $probe[0].name
+# T1147: the `perf pane=<uuid>` telemetry names panes by their pane id; this is
+# how the ids become the names this script gave them, so the report and the
+# assertions read in the harness's own vocabulary.
+$paneNames = @{}
+foreach ($l in $leaves) { if ($l.id) { $paneNames[[string]$l.id] = [string]$l.name } }
+$loadedPanes = $named
 Assert ($leaves.Count -eq 4) "layout: 4 leaves in soak window (probe pane: $probePane)"
 
 # Baseline +read latency on the (still small) grow pane, for the end-of-run
@@ -266,6 +434,8 @@ if ($procAlive) {
 # GHOZTTY_PERF set, so 'perf ' lines in the increment are ours).
 $fpsVals = @()
 $gapVals = @()
+$fpsByPane = @{}
+$anonSamples = 0
 $slowMutex = 0
 if ((Test-Path $appLog) -and (Get-Item $appLog).Length -gt $logStart) {
     $fs = [System.IO.FileStream]::new($appLog, 'Open', 'Read', 'ReadWrite')
@@ -275,9 +445,19 @@ if ((Test-Path $appLog) -and (Get-Item $appLog).Length -gt $logStart) {
         $sliceWriter = [System.IO.StreamWriter]::new($logSlice, $false)
         while ($null -ne ($line = $sr.ReadLine())) {
             if ($line -match 'perf |slow') { $sliceWriter.WriteLine($line) }
-            if ($line -match 'perf fps=(\d+) max_gap_ms=(\d+)') {
-                $fpsVals += [int]$Matches[1]
-                $gapVals += [int]$Matches[2]
+            # `pane=` is optional so this harness still reads an exe built
+            # before T1147 - it falls back to the pooled assertion below and
+            # says so, instead of silently grading nothing.
+            if ($line -match 'perf (?:pane=(\S+) )?fps=(\d+) max_gap_ms=(\d+)') {
+                $fps = [int]$Matches[2]
+                $fpsVals += $fps
+                $gapVals += [int]$Matches[3]
+                $pane = $Matches[1]
+                if ($pane) {
+                    $key = if ($paneNames.ContainsKey($pane)) { $paneNames[$pane] } else { $pane }
+                    if (-not $fpsByPane.ContainsKey($key)) { $fpsByPane[$key] = @() }
+                    $fpsByPane[$key] += $fps
+                } else { $anonSamples++ }
             }
             if ($line -match 'slow.*mutex|mutex.*slow') { $slowMutex++ }
         }
@@ -299,29 +479,49 @@ if ($procAlive) {
         # max_gap is informational only: an IDLE unfocused pane legitimately
         # reports gaps equal to the time between its redraws (e.g. ~60s
         # between latency probes), so a global stall assertion false-fails.
-        # Stall detection comes from Responding, fps-under-load, and the
-        # latency probes instead.
-        # T1158: the assertion here used to be `median fps >= 20`, and it was
-        # measuring the wrong process. $appLog was the USER'S ghoztty.log -
-        # LOCALAPPDATA was not isolated - so this slice mixed the soak's app
-        # with the terminal the user was actually working in, whose busy frames
-        # floated the median over the bar. With the sandbox in place the slice
-        # is purely this run's app, and the population turns out to be BIMODAL:
-        # the sampler reports per WINDOW, most windows are idle between load
-        # bursts and report fps=1, while the ones actually rendering sit at the
-        # 60 cap. Measured 2026-08-23 over 534 samples: min 1, median 1, p75 31,
-        # p90 60, max 60. A median over that population is not a statement about
-        # rendering under load at all - it is a statement about how many panes
-        # happened to be idle.
-        #
-        # So the claim is made where the load is: the top decile of sampled
-        # windows must sustain at least half the 60 fps cap. That is a real
-        # floor with real margin (p90 measured at the cap), and it goes red for
-        # the thing this assertion exists to catch - a renderer that cannot keep
-        # up ANYWHERE under the soak's load.
+        # Stall detection comes from Responding, the per-pane fps grading
+        # below, and the latency probes instead.
         $p90Fps = $sortedFps[[int]($sortedFps.Count * 0.90)]
-        Rep "renderer telemetry: $($fpsVals.Count) samples, median fps $medianFps, p90 fps $p90Fps, worst frame gap ${maxGap}ms (idle panes inflate both), slow-mutex warns $slowMutex"
-        Assert ($p90Fps -ge 30) "the rendering windows sustain >= 30 fps (p90 $p90Fps)"
+        Rep "renderer telemetry: $($fpsVals.Count) samples across $($fpsByPane.Count) panes, pooled median fps $medianFps, pooled p90 $p90Fps, worst frame gap ${maxGap}ms, slow-mutex warns $slowMutex"
+
+        # Per-pane breakdown FIRST, because it is the evidence the pooled
+        # numbers above cannot be read without: it shows, from the telemetry
+        # rather than by inference, that the fps=1 mass belongs to the idle
+        # probe pane.
+        $paneRows = Measure-PaneFps $fpsByPane
+        foreach ($r in $paneRows) {
+            $tag = if ($loadedPanes -contains $r.Pane) { 'LOADED' } elseif ($r.Pane -eq $probePane) { 'idle probe' } else { 'other' }
+            Rep ("  pane {0,-14} {1,-11} samples {2,5}  min {3,3}  median {4,3}  p90 {5,3}  max {6,3}  fps<=1 share {7}" -f `
+                $r.Pane, $tag, $r.Samples, $r.Min, $r.Median, $r.P90, $r.Max, $r.IdleShare)
+        }
+
+        if ($fpsByPane.Count -gt 0) {
+            # `soak-grow` finishes its 150k lines and then goes idle, at which
+            # point its own samples become idle samples like the probe's. Grade
+            # it only while it is still loading at the end of the run; the same
+            # cannot happen to stream/altscr, which are endless loops by
+            # construction.
+            $grade = @{}
+            foreach ($k in $script:PaneFpsFloors.Keys) { $grade[$k] = $script:PaneFpsFloors[$k] }
+            if ($growDone) {
+                $grade.Remove('soak-grow')
+                Rep '  (soak-grow finished its 150k lines and went idle - not graded)'
+            }
+
+            $verdicts = Test-LoadedPaneFps -Rows $paneRows -Floors $grade
+            foreach ($v in $verdicts) {
+                if ($v.Graded) { Assert $v.Pass "loaded pane $($v.Pane) sustains >= $($v.Floor) fps ($($v.Why))" }
+                else { Rep "  WARN  $($v.Pane) not graded: $($v.Why)" }
+            }
+            if ($anonSamples -gt 0) {
+                Rep "  WARN  $anonSamples perf samples carried no pane= (pre-T1147 exe?) and were pooled only"
+            }
+        } else {
+            # Pre-T1147 exe: no sample says which pane it came from, so the
+            # best available claim is the pooled one T1158 left behind.
+            Rep 'WARN  no perf sample carried pane= - grading the pooled population (pre-T1147 exe)'
+            Assert ($p90Fps -ge 30) "the rendering windows sustain >= 30 fps (pooled p90 $p90Fps)"
+        }
     } else {
         Rep "WARN  too few perf log windows ($($fpsVals.Count)) - telemetry assertions skipped"
     }

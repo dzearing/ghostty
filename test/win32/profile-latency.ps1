@@ -247,7 +247,7 @@ function MedianOf($arr) {
     return $v[[int]($v.Count / 2)]
 }
 
-# Parse 'perf fps= max_gap_ms=' lines appended to the isolated log since
+# Parse 'perf [pane=] fps= max_gap_ms=' lines appended to the isolated log since
 # byte offset $from. Returns @{Fps=..; Gaps=..; NewLen=..}.
 function PerfSlice([long]$from) {
     $fps = @(); $gaps = @(); $len = $from
@@ -259,7 +259,11 @@ function PerfSlice([long]$from) {
                 $fs.Seek($from, 'Begin') | Out-Null
                 $sr = [System.IO.StreamReader]::new($fs)
                 while ($null -ne ($line = $sr.ReadLine())) {
-                    if ($line -match 'perf fps=(\d+) max_gap_ms=(\d+)') {
+                    # `pane=` is optional: T1147 added it to every sample, and
+                    # keeping the group optional means this profile still reads
+                    # an older exe. It is not used here - this harness runs one
+                    # pane, so the population and the pane are the same thing.
+                    if ($line -match 'perf (?:pane=\S+ )?fps=(\d+) max_gap_ms=(\d+)') {
                         $fps += [int]$Matches[1]
                         $gaps += [int]$Matches[2]
                     }

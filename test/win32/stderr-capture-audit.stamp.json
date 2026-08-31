@@ -1,8 +1,8 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-31T09:37:19-07:00",
-    "commit":  "e7c56a982",
+    "generated":  "2026-08-31T11:08:44-07:00",
+    "commit":  "a81f6c190",
     "files":  {
                   "docs/claude/testing.md":  "1b503c70c1fc424dc7a2583a8ef10a7216f91586d06e0983bfb9ecc7f139f5c3",
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -198,7 +198,7 @@
                   "test/win32/persistence-flag.ps1":  "5c9e111014296ec7d652199dfa837b4c597b4eea1c868e33fb233812039c198b",
                   "test/win32/printclient-audit.ps1":  "876bc3a0a69619bc34e41ba6ed41897107a314628c858d371da3559050087c1b",
                   "test/win32/probe-topmost-restore.ps1":  "b2e3afe3d1e5db7cd3555160771e966e8e7c7d5260e1ca4f9fe2c304fd53540a",
-                  "test/win32/profile-latency.ps1":  "23fb9aa7fd03b8eba2d4b31c2462d68e523bb136fea2b9228b6fbf722bb2c8ee",
+                  "test/win32/profile-latency.ps1":  "1a7892f8121a0aab717f21026c5dfdeb7c477f8549e58ac1659986faad60191f",
                   "test/win32/pty-holder.ps1":  "fb439d3945ab88b58031e421c65aa0e088ea9144bf5637195a1871ae68b84473",
                   "test/win32/pty-host.ps1":  "0f55c91a5950ac27a78bf29b90e3ea613948a586da2ca66dba17a5d8aa220333",
                   "test/win32/readonly-badge.ps1":  "b35e31283126676ccaafc9253a6816fe4b21dc454a27b1e8eea999316f27c12c",
@@ -235,7 +235,7 @@
                   "test/win32/ship-workflow.ps1":  "8e3a1a7cdc228cd8b9add1b7fc07e95e325f9f346067d119acc8b91ffa9dd818",
                   "test/win32/single-instance-join.ps1":  "f60cd3dace224521956cc5fc1274fac3bb2dd6b151fde169dc9fd414ab25c37d",
                   "test/win32/skip-visibility.ps1":  "c757621d0e3bb387d615cc74968e708190720f712eb6484d8438180c8ee870e2",
-                  "test/win32/soak.ps1":  "b6712c287e81b7ff00bbc3621fc028386d81cffb3bf910188ad8be831c77e7b5",
+                  "test/win32/soak.ps1":  "cb2f78b5924867df371136dee4e9d990ecc8b2c702b172d6a861d1fb7b388045",
                   "test/win32/split-dim.ps1":  "8dca0d4edece5d126077f409fcf4e32eb8e6f1440b3cfa7348b0013a8daeb1b3",
                   "test/win32/split-dim-viewer.ps1":  "b557b55f71b6471c6b6691c2ab6474be8b86bad64e6a3df0a4ac9ef5c4516595",
                   "test/win32/split-divider.ps1":  "cf4eeef4cc31b15427bd2be83bb97e5edd88a0b055687312a3e17e4d66e16fcf",

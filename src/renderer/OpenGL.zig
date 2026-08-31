@@ -59,6 +59,14 @@ alloc: std.mem.Allocator,
 /// Alpha blending mode
 blending: configpkg.Config.AlphaBlending,
 
+/// The surface this renderer draws, kept only so the once-a-second frame
+/// telemetry can name its pane (T1147). Deliberately NOT threadlocal state:
+/// the first cut of this hung the pane id off `threadEnter`'s thread and
+/// every sample logged `pane=-`, because the thread that enters the context
+/// is not reliably the thread `drawFrameEnd` runs on. `drawFrameEnd` has
+/// `self`, so `self` is where the answer belongs.
+rt_surface: *apprt.Surface,
+
 /// The most recently presented target, in case we need to present it again.
 last_target: ?Target = null,
 
@@ -77,6 +85,7 @@ pub fn init(alloc: Allocator, opts: rendererpkg.Options) error{}!OpenGL {
     return .{
         .alloc = alloc,
         .blending = opts.config.blending,
+        .rt_surface = opts.rt_surface,
     };
 }
 
@@ -339,12 +348,17 @@ pub fn drawFrameStart(self: *OpenGL) void {
 /// On Win32 with double-buffered WGL, swap the front/back buffers
 /// so the rendered frame appears on screen.
 pub fn drawFrameEnd(self: *OpenGL) void {
-    _ = self;
-    if (comptime apprt.runtime == apprt.win32) {
-        const hdc = wgl.wglGetCurrentDC();
-        if (hdc != null) _ = wgl.SwapBuffers(hdc);
-        perf.frame();
+    if (comptime apprt.runtime != apprt.win32) {
+        // `_ = &self` rather than `_ = self`: on win32 `self` IS used below,
+        // and a plain discard of a parameter that the function also uses is a
+        // "pointless discard" compile error.
+        _ = &self;
+        return;
     }
+
+    const hdc = wgl.wglGetCurrentDC();
+    if (hdc != null) _ = wgl.SwapBuffers(hdc);
+    perf.frame(self.rt_surface);
 }
 
 /// Win32 frame-pacing telemetry (T40/T48): when GHOZTTY_PERF is set in
@@ -353,6 +367,15 @@ pub fn drawFrameEnd(self: *OpenGL) void {
 /// one branch per frame when disabled. Renderer-thread only (each
 /// surface has its own renderer thread; state is threadlocal so panes
 /// don't interleave).
+///
+/// Every sample names its pane (T1147). Without that the log was a bag of
+/// anonymous per-window numbers, and a grader could only reason about the
+/// POPULATION: the soak's `median fps` assertion read a bimodal mix of idle
+/// panes at 1 fps and loaded panes at the 60 cap, and answered a question
+/// about how many panes happened to be idle. `pane=<uuid>` lets a harness
+/// group by pane and grade the panes it actually loaded, and lets a reader
+/// confirm from the log itself - rather than infer - that the fps=1
+/// population is the idle pane.
 const perf = struct {
     threadlocal var enabled: ?bool = null;
     threadlocal var window_start: ?std.time.Instant = null;
@@ -360,7 +383,7 @@ const perf = struct {
     threadlocal var frames: u32 = 0;
     threadlocal var max_gap_ns: u64 = 0;
 
-    fn frame() void {
+    fn frame(surface: *apprt.Surface) void {
         const on = enabled orelse on: {
             const on = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_PERF");
             enabled = on;
@@ -384,8 +407,8 @@ const perf = struct {
         if (elapsed >= std.time.ns_per_s) {
             const fps = @as(u64, frames) * std.time.ns_per_s / @max(elapsed, 1);
             log.info(
-                "perf fps={d} max_gap_ms={d}",
-                .{ fps, max_gap_ns / std.time.ns_per_ms },
+                "perf pane={s} fps={d} max_gap_ms={d}",
+                .{ surface.paneId(), fps, max_gap_ns / std.time.ns_per_ms },
             );
             window_start = now;
             frames = 0;
