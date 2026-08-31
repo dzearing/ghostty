@@ -71,10 +71,17 @@ pub fn run(alloc: Allocator) !u8 {
     try stdout.print("  - version: {s}\n", .{build_config.version_string});
     try stdout.print("  - channel: {t}\n", .{build_config.release_channel});
     if (comptime build_config.app_runtime == .win32) {
-        // Whether THIS exe checks the win-v update channel (T24): on for
-        // MSI release-pipeline builds, off for dev/portable builds.
+        // Whether THIS exe checks the win-v update channel: on for MSI
+        // release-pipeline builds (T24) and for a non-Debug build running
+        // from the installed-release folder (T1217), off for dev and
+        // portable copies. The same predicate the app's own gate uses, so
+        // this line cannot say one thing while the app does another.
+        const install_location = @import("../apprt/win32/install_location.zig");
+        var uc_arena = std.heap.ArenaAllocator.init(alloc);
+        defer uc_arena.deinit();
+        const uc_on = install_location.autoUpdateCheckEnabled(uc_arena.allocator());
         try stdout.print("  - update check: {s}\n", .{
-            if (build_config.windows_update_check) "on (win-v channel)" else "off (dev build)",
+            if (uc_on) "on (win-v channel)" else "off (not the installed release)",
         });
     }
 

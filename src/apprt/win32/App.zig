@@ -48,6 +48,7 @@ const clipboard_open = @import("clipboard_open.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const update_check = @import("update_check.zig");
+const install_location = @import("install_location.zig");
 const update_apply = @import("update_apply.zig");
 const update_install = @import("update_install.zig");
 const install_prepare = @import("install_prepare.zig");
@@ -7536,17 +7537,29 @@ fn updatePolicy(self: *const App) update_apply.Policy {
 /// Start a background thread to check for updates (T24, extended by T1178
 /// from notify-only to notify-download-install).
 ///
-/// Automatic checks run ONLY in builds stamped with -Dwindows-update-check
-/// (the MSI release pipeline sets it) so dev/portable/script-refreshed
-/// builds never phone home or nag, honor `auto-update = off`, and are
-/// throttled to one fetch per UPDATE_CHECK_INTERVAL_SECS. The
-/// GHOZTTY_UPDATE_URL env override (acceptance-test hook) force-enables
-/// the automatic check and bypasses the throttle. Manual checks skip all
-/// gates: an explicit user action deserves an answer.
+/// Automatic checks run only where an update is the right thing to offer:
+/// a build stamped with -Dwindows-update-check (the MSI release pipeline
+/// sets it), OR any non-Debug build RUNNING FROM the installed-release
+/// folder. Portable unpacks and `zig-out` dev builds still never phone home
+/// or nag. Checks honor `auto-update = off` and are throttled to one fetch
+/// per UPDATE_CHECK_INTERVAL_SECS. The GHOZTTY_UPDATE_URL env override
+/// (acceptance-test hook) force-enables the automatic check and bypasses the
+/// throttle. Manual checks skip all gates: an explicit user action deserves
+/// an answer.
+///
+/// The location clause is T1217. The build flag alone answers "did the MSI
+/// pipeline make these bytes?", and that stopped being the same question as
+/// "is this the user's installed terminal" the day the loop's morning refresh
+/// started writing a script-built exe over the install: on 2026-08-31 a
+/// terminal installed from the website at 07:08 could no longer find updates
+/// at 07:49, with nothing on screen to say so. The same staging bytes go to
+/// the portable copies too, so the answer could not be moved into the build —
+/// it has to be about where the exe is, which is what `install_location`
+/// answers.
 fn startUpdateCheck(self: *App, trigger: UpdateTrigger) void {
     if (trigger == .automatic) {
         const overridden = envUpdateUrlIsSet(self.core_app.alloc);
-        if (!build_config.windows_update_check and !overridden) return;
+        if (!self.autoUpdateCheckAllowed() and !overridden) return;
         if (self.updatePolicy() == .off) {
             log.info("update check disabled (auto-update = off)", .{});
             return;
@@ -7559,6 +7572,18 @@ fn startUpdateCheck(self: *App, trigger: UpdateTrigger) void {
     _ = std.Thread.spawn(.{}, updateCheckThread, .{ self, trigger }) catch |err| {
         log.warn("failed to start update check thread: {}", .{err});
     };
+}
+
+/// Whether THIS exe may run an automatic update check (T1217).
+///
+/// Debug builds are excluded outright even from the location clause: a debug
+/// build derives its own endpoints and state dir on purpose, and one that
+/// happened to be copied into the install folder must not start acting like
+/// the user's product.
+fn autoUpdateCheckAllowed(self: *const App) bool {
+    var arena = std.heap.ArenaAllocator.init(self.core_app.alloc);
+    defer arena.deinit();
+    return install_location.autoUpdateCheckEnabled(arena.allocator());
 }
 
 /// True if the GHOZTTY_UPDATE_URL test/debug override is present.

@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 const windows = std.os.windows;
 const build_config = @import("../../build_config.zig");
 const image_freshness = @import("image_freshness.zig");
+const install_location = @import("install_location.zig");
 
 /// Comptime provenance: baked into the binary by build.zig/GitVersion.
 pub const version: []const u8 = build_config.version_string;
@@ -19,16 +20,24 @@ pub const mode: []const u8 = mode: {
 };
 pub const runtime: []const u8 = @tagName(build_config.app_runtime);
 
-/// Whether this build checks the win-v update channel (T24): true only
-/// for MSI release-pipeline builds (-Dwindows-update-check).
-pub const update_check: bool = build_config.windows_update_check;
+/// Whether this build checks the win-v update channel (T24): true for MSI
+/// release-pipeline builds (-Dwindows-update-check).
+///
+/// **Not the whole answer since T1217** — a non-Debug build running from the
+/// installed-release folder checks too, however it got there. `collect()`
+/// fills the runtime field from `install_location.autoUpdateCheckEnabled`;
+/// this constant is only the build half, kept for callers that have no
+/// allocator.
+pub const update_check_build_flag: bool = build_config.windows_update_check;
 
 pub const Provenance = struct {
     version: []const u8 = version,
     commit: []const u8 = commit,
     mode: []const u8 = mode,
     runtime: []const u8 = runtime,
-    update_check: bool = update_check,
+    /// Whether this instance runs the automatic update check. Computed at
+    /// runtime (T1217): the build flag OR the installed-release location.
+    update_check: bool = update_check_build_flag,
     /// Absolute path of the running executable.
     exe: []const u8,
     /// Last-write time of the executable ("YYYY-MM-DD HH:MM:SS UTC") —
@@ -67,6 +76,7 @@ pub fn collect(alloc: Allocator) Allocator.Error!Provenance {
     const started_ns = processStartNs();
     return .{
         .exe = exe,
+        .update_check = install_location.autoUpdateCheckEnabled(alloc),
         .exe_modified = if (on_disk_ns > 0)
             try formatUtc(alloc, on_disk_ns)
         else

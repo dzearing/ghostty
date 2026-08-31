@@ -851,6 +851,7 @@ $GuardTable = @(
             'src\apprt\win32\update_apply.zig',
             'src\apprt\win32\update_install.zig',
             'src\apprt\win32\update_check.zig',
+            'src\apprt\win32\install_location.zig',
             'test\win32\update-apply.ps1'
         )
     },

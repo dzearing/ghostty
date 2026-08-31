@@ -293,6 +293,34 @@ Assert (Test-Path $exe) 'applier(inside): the terminal is still where it was'
 Assert ($log9 -match 'relaunched .*ghoztty\.exe as pid \d+') 'applier(inside): still gave the user their terminal back'
 Kill-RepoInstances
 
+# -- 10. WHO gets the automatic check (T1217) -----------------------------
+# The automatic check used to be gated on the build flag alone, which answers
+# "did the MSI pipeline make these bytes?" - a different question from "is this
+# the user's installed terminal". The loop's morning refresh writes a
+# script-built exe over the install, so on 2026-08-31 a terminal installed from
+# the website at 07:08 was reporting "update check: off (dev build)" by 07:49.
+# The predicate now reads the exe's LOCATION, and it lives in one place so the
+# app's gate, the provenance payload and `+version` cannot disagree. Its own
+# table (installed dir vs portable vs zig-out vs a child of the install) is
+# covered by the zig unit tests in install_location.zig; these arms hold the
+# WIRING, which no compiler checks.
+$appSrc = [IO.File]::ReadAllText((Join-Path $repo 'src\apprt\win32\App.zig'))
+$provSrc = [IO.File]::ReadAllText((Join-Path $repo 'src\apprt\win32\provenance.zig'))
+$verSrc = [IO.File]::ReadAllText((Join-Path $repo 'src\cli\version.zig'))
+$locSrc = [IO.File]::ReadAllText((Join-Path $repo 'src\apprt\win32\install_location.zig'))
+Assert ($appSrc -match 'if \(!self\.autoUpdateCheckAllowed\(\) and !overridden\) return;') `
+    'gate: the automatic check asks the predicate, not the build flag'
+Assert ($appSrc -notmatch 'if \(!build_config\.windows_update_check and !overridden\) return;') `
+    'gate: the old build-flag-only gate is gone'
+Assert ($locSrc -match 'if \(builtin\.mode == \.Debug\) return false;') `
+    'gate: a Debug build never auto-checks, wherever it is running from'
+Assert ($locSrc -match 'if \(build_config\.windows_update_check\) return true;') `
+    'gate: an MSI-pipeline build still auto-checks, wherever it is running from'
+Assert ($provSrc -match 'install_location\.autoUpdateCheckEnabled\(alloc\)') `
+    'gate: provenance reports the same answer the app acts on'
+Assert ($verSrc -match 'install_location\.autoUpdateCheckEnabled\(uc_arena\.allocator\(\)\)') `
+    'gate: +version reports the same answer too'
+
 Clear-Staging
 Write-Host ''
 # The captured stderr IS the evidence for most of these assertions, so it only

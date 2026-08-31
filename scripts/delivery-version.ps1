@@ -431,7 +431,13 @@ function Get-ZigGlobalCacheDir {
     $root = ''
     try { $root = [IO.Path]::GetPathRoot($Repo) } catch { $root = '' }
     if (-not $root) { return '' }
-    return (Join-Path $root 'zig-cache')
+    # String concatenation, NOT Join-Path: Join-Path resolves the drive and
+    # THROWS for one this session has no PSDrive for ("Cannot find drive. A
+    # drive with the name 'E' does not exist"), which returned '' and would
+    # have put the zig cache on C: while the repo sat on the missing drive -
+    # the exact cross-drive panic this helper exists to prevent. Naming a path
+    # is not the same as visiting it.
+    return ($root.TrimEnd('\', '/') + '\zig-cache')
 }
 
 # `git rev-parse --short HEAD` in $Repo, or '' if git or the repo is unavailable.
@@ -443,4 +449,52 @@ function Get-RepoHeadCommit {
         if ($sha -match '^[0-9a-fA-F]{7,40}$') { return $sha.ToLowerInvariant() }
         return ''
     } catch { return '' }
+}
+
+# The newest PUBLISHED Windows release version, from the repo's `win-v*` tags
+# (T1217). '' when there is no such tag or git is unavailable.
+#
+# Why the loop's own delivery needs this: a script-built staging exe carries the
+# repo's `build.zig.zon` version (1.4.0), and that exe is delivered OVER the
+# user's installed release. The MSI pipeline stamps a real semver
+# (`-Dversion-string=<semver>+<hash>`); the script path did not, so the user's
+# terminal reported 1.4.0 and - once the update check became location-aware -
+# would have compared 1.4.0 against `win-v1.35.0` and offered a DOWNGRADE.
+# Stamping the newest published version keeps the delivered build "up to date"
+# against what is on the site, and it takes the NEXT release the moment one is
+# published. The `+<hash>` half stays HEAD's, so the staleness gate above still
+# reads the commit these bytes were built from.
+#
+# Ordering is by semver, not by tag creation date or string sort: `win-v1.9.0`
+# must not outrank `win-v1.10.0`.
+# The pure half: pick the newest X.Y.Z out of a list of tag names. '' when the
+# list holds no `win-v<X.Y.Z>` tag at all. Anything else in the list - a `v*`
+# release tag, `win-v1.4.1-rc1`, a branch name that wandered in - is ignored
+# rather than guessed at.
+function Select-NewestWindowsVersion {
+    param([AllowNull()][object[]]$Tags)
+    if (-not $Tags) { return '' }
+    $best = $null
+    $bestText = ''
+    foreach ($t in $Tags) {
+        $name = "$t".Trim()
+        if ($name -notmatch '^win-v(\d+)\.(\d+)\.(\d+)$') { continue }
+        # PS 5.1: [version] with three parts compares numerically (Build = 3rd),
+        # which is the whole point - a string sort puts 1.9.0 above 1.10.0.
+        $v = [version]::new([int]$Matches[1], [int]$Matches[2], [int]$Matches[3])
+        if ($null -eq $best -or $v -gt $best) {
+            $best = $v
+            $bestText = "$($v.Major).$($v.Minor).$($v.Build)"
+        }
+    }
+    return $bestText
+}
+
+function Get-PublishedWindowsVersion {
+    param([Parameter(Mandatory = $true)][string]$Repo)
+    try {
+        $tags = @(& git -C $Repo tag --list 'win-v*' 2>$null)
+        if ($LASTEXITCODE -ne 0) { return '' }
+    } catch { return '' }
+    return (Select-NewestWindowsVersion -Tags $tags)
 }

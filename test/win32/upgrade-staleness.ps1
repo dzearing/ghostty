@@ -273,7 +273,46 @@ Assert "A46 an UNKNOWN bake never matches anything, including itself" `
 AssertEq "A47 the log phrasing names the id when there is one" 'configured (734-abc.apps.googleusercontent.com)' (Format-SignInBake $bakeYes)
 AssertEq "A48 and shouts when there is not" 'NOT configured' (Format-SignInBake $bakeNo)
 
+# --- A49-A57: the delivered build's VERSION IDENTITY (T1217) ----------------
+#
+# The launcher's staging build carried no -Dversion-string, so the exe written
+# over the user's installed release reported build.zig.zon's 1.4.0. Measured
+# 2026-08-31: a terminal installed from the website at 07:08 was answering
+# "1.4.0 ... update check: off (dev build)" at 11:15, because the morning
+# refresh had replaced it at 07:49. The stamp is what makes a delivered build
+# say which published release it is a refresh OF, and the update check compares
+# that number - so an unstamped 1.4.0 would offer win-v1.35.0 as an "update",
+# which is a downgrade to older code.
+AssertEq "A49 the newest win-v tag wins" '1.35.0' `
+    (Select-NewestWindowsVersion -Tags @('win-v1.33.0', 'win-v1.35.0', 'win-v1.34.0'))
+# The reason this is a semver compare and not a sort: string order puts 1.9.0
+# above 1.10.0, which would peg every delivery to a year-old release.
+AssertEq "A50 ordering is numeric, not lexical" '1.10.0' `
+    (Select-NewestWindowsVersion -Tags @('win-v1.9.0', 'win-v1.10.0'))
+AssertEq "A51 a macOS release tag is not a Windows release" '' `
+    (Select-NewestWindowsVersion -Tags @('v1.34.0', 'v2.0.0'))
+AssertEq "A52 a pre-release tag is not published" '' `
+    (Select-NewestWindowsVersion -Tags @('win-v1.4.1-rc1'))
+AssertEq "A53 no tags at all is empty, not an error" '' (Select-NewestWindowsVersion -Tags @())
+AssertEq "A54 and so is a null list" '' (Select-NewestWindowsVersion -Tags $null)
+# Against the real repo, which is the value the launcher actually stamps with.
+$publishedNow = Get-PublishedWindowsVersion -Repo $Repo
+Assert "A55 the repo reports a published Windows version ($publishedNow)" `
+    ($publishedNow -match '^\d+\.\d+\.\d+$')
+$launcherSrc = Get-Content -LiteralPath (Join-Path $Repo 'scripts\launch-upgrade.ps1') -Raw
+Assert "A56 the launcher stamps the staging build with it" `
+    ($launcherSrc -match '-Dversion-string=\$baseline\+\$headShort')
+# The '+<hash>' half must stay HEAD's, or the staleness gate this whole harness
+# is about would start comparing the baseline's commit instead of the built one.
+Assert "A57 the stamp's build metadata is HEAD, not the baseline tag's commit" `
+    ($launcherSrc -match '\$headShort = Get-RepoHeadCommit')
+
 if ($PureOnly) {
+    # The pure run has reached the end of the body it set out to run, so say so
+    # (T1039). Without this the scorer read every green -PureOnly sweep as "the
+    # body unwound" and refused to call it a pass - which only became visible
+    # once the run stopped having a failure to report instead.
+    Complete-TestBody
     ""
     Write-TestVerdict -Pass $script:passes -Fail $script:failures -Skipped $script:skipped -Label 'pure only'
 }

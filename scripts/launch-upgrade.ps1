@@ -154,6 +154,26 @@ if (-not $SkipBuild) {
         'build', '-Dapp-runtime=win32', '-Doptimize=ReleaseFast',
         '-Dtarget=x86_64-windows-gnu', '-Dstrip=false', '--prefix', $Staging
     )
+    # T1217: stamp the delivered build with the newest PUBLISHED Windows
+    # version. Without it the exe carries build.zig.zon's 1.4.0, and that exe
+    # is written over the user's installed release - so the terminal they
+    # installed from the website this morning reports 1.4.0 by lunchtime, and
+    # the (now location-aware) update check would compare 1.4.0 against
+    # win-v1.35.0 and offer them a DOWNGRADE. The '+<hash>' half stays HEAD's
+    # short sha, which is what the staleness gate below reads back, so this
+    # changes the semver and nothing else.
+    $baseline = Get-PublishedWindowsVersion -Repo $Repo
+    $headShort = Get-RepoHeadCommit -Repo $Repo
+    if ($baseline -and $headShort) {
+        $buildArgs += "-Dversion-string=$baseline+$headShort"
+        Write-Host "stamping the staging build as $baseline+$headShort (newest published win-v)"
+    } else {
+        # Never fatal: a shallow clone or a tagless mirror still gets today's
+        # fixes, it just keeps the old unstamped identity. Say so, because a
+        # silent fallback here is how the original defect stayed invisible.
+        Write-Host ("WARNING: no version stamp (published win-v version='$baseline', " +
+            "HEAD short='$headShort'); the delivered build will report build.zig.zon's version")
+    }
     # cmd.exe redirection, not PowerShell's: zig writes a lot and this keeps the
     # transcript out of the caller's stdout while still capturing everything.
     $bp = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
