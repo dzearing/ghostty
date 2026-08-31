@@ -166,6 +166,23 @@ Assert "A18 no Select-Object -First on a native pipeline" ($ps1Code -notmatch 'S
 # while the guard row that watches it went on being stamped.
 Assert "A19 on-box script asks for the FILEVERSION rule instead of restating it" ($ps1 -match '--print-file-version')
 
+# A20-A22: what Apps & Features SHOWS is the marketing version, not the
+# yy.m.dNN sequencing number (T1205). The user installed Ghoztty-1.35.0-x64.msi
+# and Apps & Features read "26.8.3108" - a number that matches neither the file
+# they downloaded, the website, nor the release tag, so "am I on the new build?"
+# had no answer anywhere. ARPDISPLAYVERSION is the one property that separates
+# the two: Windows displays it, and upgrade sequencing never looks at it.
+# Static because the live proof is the package read-back inside build-msi.sh
+# itself (section B), which needs Docker; these three keep the wiring from
+# being deleted on a Docker-less box.
+Assert "A20 MSI derives a display version from the release semver" `
+    ($msiSh -match 'DISPLAY_VERSION="\$\{SEMVER:-\$PRODUCT_VERSION\}"')
+Assert "A21 MSI sets ARPDISPLAYVERSION from it" `
+    (($msiSh -match 'Property Id="ARPDISPLAYVERSION" Value="@DISPLAY_VERSION@"') -and
+     ($msiSh -match 's/@DISPLAY_VERSION@/\$DISPLAY_VERSION/g'))
+Assert "A22 MSI reads the display version back out of the compiled package" `
+    ($msiSh -match 'ARPDISPLAYVERSION" not in props')
+
 # ============================================================================
 "== B: packaging (the artifacts are really built and read back)"
 # ============================================================================

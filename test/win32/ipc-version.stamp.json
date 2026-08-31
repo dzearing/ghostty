@@ -1,0 +1,13 @@
+{
+    "guard":  "build-identity",
+    "script":  "test/win32/ipc-version.ps1",
+    "generated":  "2026-08-31T08:22:00-07:00",
+    "commit":  "db68549df",
+    "files":  {
+                  "src/apprt/win32/image_freshness.zig":  "8edb6d86781716200a50df3157f8a1a396da5f2f265db20f470aa72f0f177f1c",
+                  "src/apprt/win32/provenance.zig":  "eb4f269dbeaa1e15d9124a2fe174526d339b97c55f427786865cec645afc3753",
+                  "src/apprt/win32/tray_notify.zig":  "ec34084d33a80b8d031deb7c95ccc813d0605023c1e7c4ea3a514b3f1d0257c4",
+                  "src/cli/version.zig":  "4816633bea4061edef052d4ae3ace62df917205b1b6755f767150b367ffe8dc2",
+                  "test/win32/ipc-version.ps1":  "667c0a021051a0d94922d9573a1c27e6aee85bd3c1fe8e6c7dbfb00354449cd6"
+              }
+}

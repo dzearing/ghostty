@@ -7,6 +7,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const windows = std.os.windows;
 const build_config = @import("../../build_config.zig");
+const image_freshness = @import("image_freshness.zig");
 
 /// Comptime provenance: baked into the binary by build.zig/GitVersion.
 pub const version: []const u8 = build_config.version_string;
@@ -33,7 +34,20 @@ pub const Provenance = struct {
     /// Last-write time of the executable ("YYYY-MM-DD HH:MM:SS UTC") —
     /// the runtime stand-in for a build/install date. "unknown" if the
     /// exe cannot be statted.
+    ///
+    /// **This describes the FILE, not this process** (T1205). When
+    /// `newer_build_installed` is true the two are different builds, and
+    /// anything shown to a person must say which is which — a stale window
+    /// showing today's date beside yesterday's version is the exact defect
+    /// this field caused.
     exe_modified: []const u8,
+    /// When THIS process started ("YYYY-MM-DD HH:MM:SS UTC"), or "unknown".
+    /// The honest answer to "how old is the build I am looking at".
+    started: []const u8,
+    /// True when the executable on disk was written after this process
+    /// started: a newer build is installed and this window is still running
+    /// the old one. Restarting is what picks it up.
+    newer_build_installed: bool = false,
     pid: u32,
 };
 
@@ -44,19 +58,51 @@ pub fn collect(alloc: Allocator) Allocator.Error!Provenance {
         error.OutOfMemory => return error.OutOfMemory,
         else => try alloc.dupe(u8, "unknown"),
     };
-    const modified: []const u8 = modified: {
-        const f = std.fs.openFileAbsolute(exe, .{}) catch
-            break :modified try alloc.dupe(u8, "unknown");
+    const on_disk_ns: i128 = on_disk: {
+        const f = std.fs.openFileAbsolute(exe, .{}) catch break :on_disk 0;
         defer f.close();
-        const st = f.stat() catch break :modified try alloc.dupe(u8, "unknown");
-        break :modified try formatUtc(alloc, st.mtime);
+        const st = f.stat() catch break :on_disk 0;
+        break :on_disk st.mtime;
     };
+    const started_ns = processStartNs();
     return .{
         .exe = exe,
-        .exe_modified = modified,
+        .exe_modified = if (on_disk_ns > 0)
+            try formatUtc(alloc, on_disk_ns)
+        else
+            try alloc.dupe(u8, "unknown"),
+        .started = if (started_ns > 0)
+            try formatUtc(alloc, started_ns)
+        else
+            try alloc.dupe(u8, "unknown"),
+        .newer_build_installed = image_freshness.isStale(on_disk_ns, started_ns),
         .pid = windows.GetCurrentProcessId(),
     };
 }
+
+/// When this process started, in nanoseconds since the Unix epoch; 0 when
+/// Windows will not say. Deliberately the process's OWN creation time rather
+/// than an app-startup `std.time.nanoTimestamp()`: the question is how old
+/// the running IMAGE is, and a value captured by app code is one more thing
+/// that can be captured in the wrong place.
+pub fn processStartNs() i128 {
+    var creation: windows.FILETIME = undefined;
+    var exit: windows.FILETIME = undefined;
+    var kernel: windows.FILETIME = undefined;
+    var user: windows.FILETIME = undefined;
+    if (GetProcessTimes(windows.GetCurrentProcess(), &creation, &exit, &kernel, &user) == 0) return 0;
+    const ticks = (@as(u64, creation.dwHighDateTime) << 32) | @as(u64, creation.dwLowDateTime);
+    if (ticks == 0) return 0;
+    return image_freshness.filetimeToUnixNs(ticks);
+}
+
+extern "kernel32" fn GetProcessTimes(
+    hProcess: windows.HANDLE,
+    lpCreationTime: *windows.FILETIME,
+    lpExitTime: *windows.FILETIME,
+    lpKernelTime: *windows.FILETIME,
+    lpUserTime: *windows.FILETIME,
+) callconv(.winapi) windows.BOOL;
 
 /// Format nanoseconds-since-epoch as "YYYY-MM-DD HH:MM:SS UTC".
 fn formatUtc(alloc: Allocator, ns: i128) Allocator.Error![]const u8 {

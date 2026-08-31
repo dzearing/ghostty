@@ -2914,20 +2914,57 @@ pub fn showAboutDialog(self: *Surface) void {
     const arena = arena_state.allocator();
 
     const prov = provenance.collect(arena) catch return;
+
+    // Every line here is a fact about THIS process (T1205). The old box put
+    // the running build's version next to the ON-DISK file's mtime, so a
+    // window running yesterday's build read as freshly updated — the user
+    // checked About to confirm an install had worked and it told them the
+    // opposite of the truth. The file's date is still shown, but only inside
+    // the stale-build paragraph, where it is labelled as the other build's.
     const text = std.fmt.allocPrint(
         arena,
-        "Ghoztty {s}\n\nCommit: {s}\nMode: {s}\nRuntime: {s}\nPID: {d}\n\nExecutable:\n{s}\nModified: {s}",
+        "Ghoztty {s}\n\nCommit: {s}\nMode: {s}\nRuntime: {s}\nPID: {d}\nStarted: {s}\n\nExecutable:\n{s}{s}",
         .{
             prov.version,
             prov.commit,
             prov.mode,
             prov.runtime,
             prov.pid,
+            prov.started,
             prov.exe,
-            prov.exe_modified,
+            if (prov.newer_build_installed) stale: {
+                break :stale std.fmt.allocPrint(
+                    arena,
+                    "\n\nA newer build was installed {s}.\nThis window is still running the older one — Windows cannot replace a running program.\n\nRestart Ghoztty to use the new build. Your sessions come back.",
+                    .{prov.exe_modified},
+                ) catch "";
+            } else "",
         },
     ) catch return;
     const text_w = std.unicode.utf8ToUtf16LeAllocZ(arena, text) catch return;
+
+    // Stale: the box stops being an FYI and becomes the offer. Nothing about
+    // "restart to pick it up" is discoverable otherwise, and this is the
+    // surface the user opened precisely to ask the question.
+    if (prov.newer_build_installed) {
+        const r = ConfirmDialog.show(
+            self.app,
+            self.parent_window.hwnd,
+            self.parent_window.scale,
+            self.hwnd,
+            .{
+                .title = std.unicode.utf8ToUtf16LeStringLiteral("About Ghoztty"),
+                .text = text_w,
+                .style = .ok_cancel,
+                .icon = .warning,
+                .ok_label = std.unicode.utf8ToUtf16LeStringLiteral("Restart Now"),
+                .cancel_label = std.unicode.utf8ToUtf16LeStringLiteral("Later"),
+            },
+        );
+        if (r == .ok) self.app.restartIntoInstalledBuild();
+        return;
+    }
+
     _ = ConfirmDialog.show(
         self.app,
         self.parent_window.hwnd,

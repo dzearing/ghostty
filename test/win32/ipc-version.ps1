@@ -25,6 +25,11 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
+# Initialised, not implied: `$null -eq 0` is FALSE in PowerShell, so an
+# uninitialised counter makes the "no skips" stamp condition below silently
+# unsatisfiable and the guard never re-stamps (caught in T1205).
+$script:skipped = 0
+$script:reachedEnd = $false
 $tmp = Join-Path $env:TEMP "ghoztty-ipc-version-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
 # Isolate the IPC endpoint: the app inherits this through CreateProcessW and
@@ -76,7 +81,64 @@ Assert "mode is Debug" ($vtxt -match 'mode\s*:\s*Debug')
 Assert "runtime is win32" ($vtxt -match 'runtime\s*:\s*win32')
 Assert "exe is the zig-out exe" ($vtxt -match [regex]::Escape($Exe))
 Assert "pid matches server" ($vtxt -match "pid\s*:\s*$($app.Pid)")
-Assert "modified stamp shape" ($vtxt -match 'modified:\s*\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC')
+Assert "exe-on-disk stamp shape" ($vtxt -match 'exe on disk modified:\s*\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC')
+# T1205: the process's OWN start time, reported separately and labelled, so
+# the file's date can never again be read as the running build's age.
+Assert "started stamp shape" ($vtxt -match 'started\s*:\s*\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC')
+Assert "no stale-build note for a window running the file it launched from" ($vtxt -notmatch 'newer build is installed')
+
+"== 2b: a newer build on disk is REPORTED by the window still running the old one (T1205)"
+# The defect: Windows cannot replace a running image, so an upgrade leaves
+# every open window on the old exe - and nothing said so. The user installed
+# 1.35.0, read an older version in About next to today's date, and could not
+# answer "did my update take?".
+#
+# Reproduced the way an upgrade actually does it: RENAME the running image
+# aside and put a fresh file at its path. Windows refuses to write - or even to
+# re-stamp - a file that is mapped for execution (setting LastWriteTimeUtc on it
+# fails with "used by another process"), but it has always allowed the rename,
+# and the handle follows the file. That is precisely the move msiexec and
+# `update_install.sidelineName` make, so this is the real state rather than a
+# simulation of it: same path, newer file, process still on the old bytes.
+#
+# The bytes are identical, so nothing about the app changes - only the answer
+# to "was this file written after I started?". The finally puts the original
+# file back at its original path, mtime included, so zig's build cache is not
+# disturbed.
+$staleOld = "$Exe.t1205-old"
+$staleSwapped = $false
+try {
+    Remove-Item -Force $staleOld -ErrorAction SilentlyContinue
+    Rename-Item -Path $Exe -NewName (Split-Path -Leaf $staleOld) -ErrorAction Stop
+    $staleSwapped = $true
+    Copy-Item -Path $staleOld -Destination $Exe -ErrorAction Stop
+    # Copy-Item preserves the source's LastWriteTime, which is the whole point
+    # of the test being defeated - stamp it to now, the way a real installer's
+    # freshly-extracted file is stamped.
+    (Get-Item $Exe).LastWriteTimeUtc = (Get-Date).ToUniversalTime()
+
+    cmd /c "`"$Exe`" +version > `"$tmp\version-stale.txt`" 2>&1"
+    Assert "exit 0 with a newer build on disk" ($LASTEXITCODE -eq 0)
+    $stxt = Get-Content "$tmp\version-stale.txt" -Raw
+    Assert "says a newer build is installed" ($stxt -match 'newer build is installed on disk')
+    Assert "says this instance is running the older one" ($stxt -match 'still running the older one')
+    Assert "tells the user what to do about it" ($stxt -match 'Restart Ghoztty')
+    # The identity lines must still describe the RUNNING build, not the file:
+    # this is the mixing the task exists to end.
+    Assert "still reports the running commit" ($stxt -match "commit\s*:\s*$([regex]::Escape($expectCommit))")
+    Assert "still reports the running pid" ($stxt -match "pid\s*:\s*$($app.Pid)")
+} catch {
+    "  FAIL stale-build setup: $($_.Exception.Message)"
+    $script:failures++
+} finally {
+    if ($staleSwapped) {
+        Remove-Item -Force $Exe -ErrorAction SilentlyContinue
+        Rename-Item -Path $staleOld -NewName (Split-Path -Leaf $Exe) -ErrorAction SilentlyContinue
+    }
+}
+cmd /c "`"$Exe`" +version > `"$tmp\version-fresh.txt`" 2>&1"
+Assert "the note goes away once the file is no longer newer (negative control)" `
+    ((Get-Content "$tmp\version-fresh.txt" -Raw) -notmatch 'newer build is installed')
 
 "== 2: +list --json carries build metadata"
 cmd /c "`"$Exe`" +list --json > `"$tmp\list.json`" 2>&1"
@@ -148,6 +210,13 @@ cmd /c "`"$Exe`" +version > `"$tmp\version2.txt`" 2>&1"
 Assert "exit 0 without instance" ($LASTEXITCODE -eq 0)
 Assert "none detected" ((Get-Content "$tmp\version2.txt" -Raw) -match 'none detected')
 
+# The whole body ran. Without this, a terminating error anywhere above unwinds
+# straight to the finally and the script still prints ALL PASS over the
+# sections it never reached - which is exactly what a first cut of section 2b
+# did (T1205), and a green run that skipped half its checks is worse than a
+# red one.
+$script:reachedEnd = $true
+
 } finally {
     Remove-TestDesktop
     Stop-DebugGhoztty
@@ -161,6 +230,16 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
     Assert "the foreground watcher actually sampled (negative control)" ($fgSeen.Count -gt 0)
     $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
     Assert "no test-desktop app ever became foreground on the interactive desktop" ($leaked.Count -eq 0)
+}
+
+Assert "the script ran to the end (no section was skipped by an error)" $script:reachedEnd
+
+# A clean green run stamps the files this harness covers (T783/T1205). A run
+# with a SKIP did not cover everything, so it does not stamp; the negative
+# control is meant to score red, so it never stamps either.
+if ($script:failures -eq 0 -and $script:skipped -eq 0 -and -not $NegativeControl) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
+        update -Guard build-identity -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
 }
 
 ""

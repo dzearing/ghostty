@@ -774,6 +774,27 @@ $GuardTable = @(
             'test\win32\install-restart.ps1'
         )
     },
+    # "Which Ghoztty am I running?" has ONE answer per surface (T1205). Windows
+    # cannot replace a running image, so the file on disk and the process in
+    # front of the user are routinely different builds - and the About box used
+    # to print one's version beside the other's date, which is worse than
+    # printing nothing. Nothing here fails to compile when it drifts: a lost
+    # field, a renamed label, a comparison that quietly always answers "fresh"
+    # all leave a green build and an unanswerable question. `Surface.zig` and
+    # `App.zig` are deliberately not listed - every task touches them, and a
+    # permanently-due row is a row nobody reads.
+    [pscustomobject]@{
+        Name   = 'build-identity'
+        Script = 'test\win32\ipc-version.ps1'
+        Stamp  = 'test\win32\ipc-version.stamp.json'
+        Covers = @(
+            'src\apprt\win32\provenance.zig',
+            'src\apprt\win32\image_freshness.zig',
+            'src\apprt\win32\tray_notify.zig',
+            'src\cli\version.zig',
+            'test\win32\ipc-version.ps1'
+        )
+    },
     # A startup failure is VISIBLE (T1177). The whole point of this code is a
     # dialog that appears when nothing else can, so an edit to any link in that
     # chain - the reporter, the dialog it builds on, the message text, or the

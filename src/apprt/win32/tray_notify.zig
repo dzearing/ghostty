@@ -34,6 +34,11 @@ pub const desktop_uid: u32 = 1;
 pub const update_uid: u32 = 2;
 /// The long-unattached-session ("forgotten session") balloon, T534.
 pub const orphan_uid: u32 = 3;
+/// The "a newer build is installed, this window is running the old one"
+/// balloon, T1205. Its own icon so it cannot be cleaned up by, or mistaken
+/// for, the update-available balloon next door: that one offers to FETCH a
+/// release, this one offers to restart into a build already on the disk.
+pub const stale_build_uid: u32 = 4;
 
 /// What the app should do about a callback message. `null` from `classify`
 /// means "nothing" — the overwhelmingly common case, since the shell also
@@ -48,6 +53,9 @@ pub const Action = enum {
     /// A forgotten-session balloon (T534) was dismissed by a click: open the
     /// machine chooser, where the marked session's Resume and Kill live.
     review_orphan_sessions,
+    /// A stale-build balloon (T1205) was dismissed by a click: restart into
+    /// the newer build already sitting on disk.
+    restart_into_new_build,
 };
 
 /// Decode one `WM_APP_TRAY` (`uCallbackMessage`) delivery under
@@ -66,6 +74,7 @@ pub fn classify(wparam: usize, lparam: isize) ?Action {
         desktop_uid => .focus_notifying_surface,
         update_uid => .open_release_page,
         orphan_uid => .review_orphan_sessions,
+        stale_build_uid => .restart_into_new_build,
         else => null,
     };
 }
@@ -84,6 +93,10 @@ test "classify: a balloon click routes by icon id" {
     try testing.expectEqual(
         Action.review_orphan_sessions,
         classify(orphan_uid, click).?,
+    );
+    try testing.expectEqual(
+        Action.restart_into_new_build,
+        classify(stale_build_uid, click).?,
     );
 }
 
@@ -119,6 +132,12 @@ test "classify: only a click acts, never a timeout or a hover" {
         try testing.expectEqual(
             @as(?Action, null),
             classify(orphan_uid, @intCast(event)),
+        );
+        // T1205: a timed-out stale-build balloon must never restart the
+        // user's terminal. This is the one action here that ENDS a process.
+        try testing.expectEqual(
+            @as(?Action, null),
+            classify(stale_build_uid, @intCast(event)),
         );
     }
 }

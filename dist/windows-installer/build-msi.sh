@@ -175,8 +175,20 @@ if [[ -z "$OUT" ]]; then
   fi
 fi
 
+# What a PERSON reads in Apps & Features (T1205). ProductVersion above is the
+# date-derived yy.m.dNN number that guarantees MSI upgrade sequencing; it is
+# load-bearing and it is also not a version anybody publishes. On 2026-08-31
+# the user installed Ghoztty-1.35.0-x64.msi, looked at Apps & Features, and
+# read "26.8.3108" - a number that matches neither the file they downloaded,
+# the website, nor the release tag. ARPDISPLAYVERSION is exactly the property
+# for this: Windows shows it instead of ProductVersion, and upgrade logic
+# never looks at it. Without --semver there is no marketing version to show,
+# so it falls back to the number Windows would have shown anyway.
+DISPLAY_VERSION="${SEMVER:-$PRODUCT_VERSION}"
+
 echo "==> stamp:          $VERSION"
 echo "==> ProductVersion: $PRODUCT_VERSION"
+echo "==> DisplayVersion: $DISPLAY_VERSION"
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
@@ -300,6 +312,9 @@ template = """<?xml version="1.0" encoding="utf-8"?>
 
     <Property Id="MSIINSTALLPERUSER" Value="1"/>
     <Property Id="ARPCOMMENTS" Value="Build @STAMP@"/>
+    <!-- T1205: what Apps & Features SHOWS, which is not what the installer
+         SEQUENCES on. See DISPLAY_VERSION in build-msi.sh. -->
+    <Property Id="ARPDISPLAYVERSION" Value="@DISPLAY_VERSION@"/>
     <Property Id="ARPNOMODIFY" Value="1"/>
 
     <!-- T1204: a per-user terminal NEVER asks for a reboot.
@@ -460,7 +475,8 @@ print(f"generated {out}: {len(comp_refs)} file components{tag}")
 PYEOF
 
 # Substitute version/stamp placeholders (portable across BSD/GNU sed).
-sed -e "s/@PRODUCT_VERSION@/$PRODUCT_VERSION/g" -e "s/@STAMP@/$VERSION/g" "$WXS" > "$WXS.tmp"
+sed -e "s/@PRODUCT_VERSION@/$PRODUCT_VERSION/g" -e "s/@STAMP@/$VERSION/g" \
+    -e "s/@DISPLAY_VERSION@/$DISPLAY_VERSION/g" "$WXS" > "$WXS.tmp"
 mv "$WXS.tmp" "$WXS"
 
 echo "==> wixl compile (x64)"
@@ -606,7 +622,7 @@ PYEOF
 echo "==> verify no-reboot + restart-manager wiring (Property table)"
 msiinfo export "$OUT" Property > "$WORK/Property.idt" || {
   echo "error: the MSI has no Property table" >&2; exit 1; }
-python3 - "$WORK/Property.idt" <<'PYEOF'
+python3 - "$WORK/Property.idt" "$DISPLAY_VERSION" <<'PYEOF'
 import sys
 
 def rows(path):
@@ -643,11 +659,31 @@ if props.get("MSIDISABLERMRESTART", "0") not in ("0", ""):
         "value closes the running terminal for the install and never brings it back"
     )
 
+# T1205: what a person reads in Apps & Features. The package must carry the
+# marketing version, not the yy.m.dNN sequencing number - four surfaces
+# disagreed about "which Ghoztty is this?" and this was the one nobody could
+# even map back to a download.
+want_display = sys.argv[2] if len(sys.argv) > 2 else ""
+if want_display:
+    if "ARPDISPLAYVERSION" not in props:
+        errs.append(
+            "Property table has no ARPDISPLAYVERSION row - Apps & Features would "
+            "show the date-derived ProductVersion, which matches nothing the user "
+            "downloaded"
+        )
+    elif props["ARPDISPLAYVERSION"] != want_display:
+        errs.append(
+            f"ARPDISPLAYVERSION is {props['ARPDISPLAYVERSION']!r}, expected "
+            f"{want_display!r}"
+        )
+
 if errs:
     for e in errs:
         print(f"error: {e}", file=sys.stderr)
     sys.exit(1)
 print("no-reboot ok: REBOOT=ReallySuppress, Restart Manager left enabled")
+if want_display:
+    print(f"display version ok: Apps & Features will show {want_display}")
 PYEOF
 
 echo "==> validate"

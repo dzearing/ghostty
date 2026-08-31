@@ -1683,6 +1683,13 @@ fn handleVersion(ctx: Context) Allocator.Error!?[]u8 {
         jws.write(prov.exe) catch break :write;
         jws.objectField("exe_modified") catch break :write;
         jws.write(prov.exe_modified) catch break :write;
+        // T1205: `exe_modified` describes the FILE. These two describe the
+        // PROCESS and the relationship between them, so a reader can never
+        // again mistake a fresh file for a fresh window.
+        jws.objectField("started") catch break :write;
+        jws.write(prov.started) catch break :write;
+        jws.objectField("newer_build_installed") catch break :write;
+        jws.write(prov.newer_build_installed) catch break :write;
         jws.objectField("pid") catch break :write;
         jws.write(prov.pid) catch break :write;
         jws.endObject() catch break :write;

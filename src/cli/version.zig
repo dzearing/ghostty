@@ -199,6 +199,8 @@ fn printRunningInstance(alloc: Allocator, stdout: *std.Io.Writer) !void {
                 update_check: ?bool = null,
                 exe: []const u8 = "",
                 exe_modified: []const u8 = "",
+                started: []const u8 = "",
+                newer_build_installed: bool = false,
                 pid: i64 = 0,
             } = null,
         },
@@ -225,6 +227,19 @@ fn printRunningInstance(alloc: Allocator, stdout: *std.Io.Writer) !void {
         try stdout.print("  - update check: {s}\n", .{if (uc) "on (win-v channel)" else "off (dev build)"});
     }
     try stdout.print("  - exe     : {s}\n", .{data.exe});
-    try stdout.print("  - modified: {s}\n", .{data.exe_modified});
+    // T1205: `exe modified` is a fact about the FILE. Labelled as such, and
+    // followed by when the process itself started, so the two can never be
+    // read as one date describing one build. When they disagree the section
+    // says so outright — that sentence is the answer to "did my update take?"
+    if (data.started.len > 0) {
+        try stdout.print("  - started : {s}\n", .{data.started});
+    }
+    try stdout.print("  - exe on disk modified: {s}\n", .{data.exe_modified});
     try stdout.print("  - pid     : {d}\n", .{data.pid});
+    if (data.newer_build_installed) {
+        try stdout.print(
+            "  - NOTE    : a newer build is installed on disk; this instance is still running the older one. Restart Ghoztty to use it.\n",
+            .{},
+        );
+    }
 }

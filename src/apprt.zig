@@ -148,6 +148,12 @@ test {
     // and "does this URL belong to this release" are answered.
     _ = @import("apprt/win32/update_apply.zig");
 
+    // Pure win32 "is this window running the build that is on disk?" (T1205):
+    // the FILETIME conversion and the started-vs-written comparison behind
+    // About's stale-build line and its restart offer. Every lane, same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/image_freshness.zig");
+
     // Pure win32 window-placement memory parse/format/clamp (T85), same
     // no-OS-imports deal.
     _ = @import("apprt/win32/window_memory.zig");

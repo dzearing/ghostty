@@ -1,14 +1,14 @@
 {
     "guard":  "morning-refresh",
     "script":  "test/win32/morning-refresh.ps1",
-    "generated":  "2026-08-31T07:41:25-07:00",
-    "commit":  "2403c51b7",
+    "generated":  "2026-08-31T08:24:20-07:00",
+    "commit":  "db68549df",
     "files":  {
                   "scripts/morning-refresh.ps1":  "ca64dd7a0eb0505c2ac7abddde05ed08fb88051a69ce32a07b4bafedae0af2de",
                   "scripts/upgrade-ghoztty-windows.ps1":  "2bbd6e4d44fc73b90482140f24e0b0f2abe589c0762bac3d5813ddd5609f1917",
                   "src/apprt/win32/agent_upgrade.zig":  "b05ef0541351c66c68048bfaa98b4c0e39c767ff9489d612a9dfccf214823178",
                   "src/apprt/win32/AgentIntegration.zig":  "ce4bbfbbf2bc5159eab352bda4d83b4039616b94fc14f938274e3a97efdb945d",
-                  "src/apprt/win32/App.zig":  "3e46af04f95878401f2b5107742b74701d30891ab715aed5f18bde0453034402",
+                  "src/apprt/win32/App.zig":  "46946828cf26df69cdac717b202109b59a3d006770187d2ffea0d2fc4b0610c8",
                   "test/win32/morning-refresh.ps1":  "e0551f73edda29af9e36294b9d897e1c13cc5c8f237f84c2f69389730aeb72e4"
               }
 }

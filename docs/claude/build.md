@@ -230,3 +230,48 @@ Three things about it are load-bearing:
 Acceptance: `test\win32\ghoztty-cleanup.ps1` (guard `ghoztty-cleanup`);
 `-NegativeControl` drops the ghost from the protected list and proves it then IS
 offered, which is the demonstration that the refusal is real.
+
+## "Which Ghoztty am I running?" — the four version surfaces (T1205)
+
+A Windows upgrade cannot replace a running image, so after an install the FILE
+on disk and the PROCESS in front of the user are routinely different builds.
+That is normal; the defect was that nothing said so, and four surfaces gave
+four different answers. They now mean four distinct things, and each says which
+it is:
+
+| Surface | Answers | Where it comes from |
+|---|---|---|
+| `ghoztty +version` "Running Instance", and the About box | the build THIS window is running | `provenance.collect` over the running process |
+| `ghoztty --version` (no instance) | the build of the exe you just invoked | `build_config.version_string` |
+| Apps & Features | the release the user downloaded (`1.35.0`) | the MSI's `ARPDISPLAYVERSION` |
+| MSI `ProductVersion` (`26.8.3108`) | upgrade sequencing only, never shown | `build-msi.sh`'s `yy.m.dNN` |
+
+Rules that keep them from drifting back together into one lie:
+
+- **Nothing in About may be sourced from a build other than the running one.**
+  The original box printed the running process's version beside the ON-DISK
+  file's mtime, so a window from yesterday read as freshly updated — the user
+  opened About specifically to confirm an install and it told them the
+  opposite. The file's date now appears only inside the stale-build paragraph,
+  labelled as the other build's.
+- **Staleness is two runtime facts, not two version strings**
+  (`image_freshness.zig`): the process's creation time versus the exe's
+  last-write time. An equal version string does not mean an equal build — this
+  branch ships many builds per version — and a version resource is stamped by
+  the packaging pipeline rather than by whatever replaced the file.
+- **The app volunteers it.** A one-minute timer asks the question and a tray
+  balloon says it once per build that appears on disk; clicking it spawns the
+  new exe (escaping the job object) and quits this one. Nobody opens About
+  unless they already suspect something, so a surface that only answers when
+  asked does not close the gap.
+- **`ARPDISPLAYVERSION` is what Apps & Features shows; `ProductVersion` is
+  what the installer sequences on.** Never make the second one readable by
+  changing it — the date-derived number is what guarantees a newer package
+  compares greater.
+
+Acceptance: `test\win32\ipc-version.ps1` section 2b moves the on-disk exe's
+timestamp past the running process's start and asserts the notice appears, then
+restores it and asserts the notice goes away (its own negative control).
+Sections A20–A22 of `test\win32\release-artifacts.ps1` hold the ARP wiring
+statically; the live proof is the package read-back inside `build-msi.sh`,
+which needs Docker.

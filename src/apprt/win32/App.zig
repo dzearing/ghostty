@@ -64,6 +64,7 @@ const RemoteReconnect = @import("RemoteReconnect.zig");
 const agent_upgrade = @import("agent_upgrade.zig");
 const job_escape = @import("job_escape.zig");
 const relaunch_guard = @import("relaunch_guard.zig");
+const job_spawn = @import("job_spawn.zig");
 const restart_manager = @import("restart_manager.zig");
 const url_scheme = @import("url_scheme.zig");
 const provenance = @import("provenance.zig");
@@ -216,6 +217,26 @@ const ORPHAN_CHECK_TIMER_ID: usize = 9;
 /// moment the carried set is empty or the schedule in `restore_retry.zig` runs
 /// out. (Timer 10 is the layout refresh, defined above.)
 const RESTORE_RETRY_TIMER_ID: usize = 11;
+
+/// Timer ID 12: the periodic "am I still the build that is on disk?" check
+/// (T1205). Repeating. Windows cannot replace a running image, so an upgrade
+/// leaves every open window running the OLD exe — normal, expected, and until
+/// this timer completely invisible: the user installed 1.35.0, kept typing
+/// into a window from the day before, and had no way to find out. (Timer 13 is
+/// this notification's icon-cleanup timer, beside the other NOTIF_* ids.)
+const STALE_BUILD_CHECK_TIMER_ID: usize = 12;
+
+/// How often to re-ask. A minute is far below the granularity a person cares
+/// about ("did my update take?") and far above anything that costs: one
+/// `stat` of a file already in the OS cache.
+const STALE_BUILD_CHECK_MS: u32 = 60_000;
+
+/// How soon after launch to ask the first time. An MSI that closes and
+/// restarts us through the Restart Manager (T1204) lands here with a file
+/// newer than the process by a hair — inside `image_freshness.tolerance_ns`,
+/// so it is correctly NOT stale — while a script that swapped the exe under a
+/// long-lived window is caught on the first tick.
+const STALE_BUILD_FIRST_MS: u32 = 15_000;
 
 /// Window class for the top-level container (GDI painting, no CS_OWNDC).
 pub const WINDOW_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyWindow");
@@ -389,6 +410,14 @@ update_staged_msi: ?[]u8 = null,
 /// second click while the first is still fetching must not start a second
 /// 40MB transfer into the same staged path.
 update_download_inflight: bool = false,
+
+/// True once the stale-build balloon (T1205) has been shown for the build
+/// currently on disk. Notify ONCE and then be quiet: the condition is
+/// permanent until the user restarts, and a notification that reappears every
+/// minute is not a notice, it is nagging. About still says so every time it
+/// is opened, and a NEWER build landing on disk re-arms this (the file's
+/// mtime is what is remembered, not merely "we told them once").
+stale_build_notified_ns: i128 = 0,
 
 /// Whether CoInitializeEx has been called on the main thread.
 com_initialized: bool = false,
@@ -755,6 +784,14 @@ pub fn init(
     if (self.msg_hwnd) |mh| {
         const first = @min(self.orphanCheckIntervalMs(), 60_000);
         _ = w32.SetTimer(mh, ORPHAN_CHECK_TIMER_ID, first, null);
+    }
+
+    // "Is a newer build sitting on disk?" (T1205). Repeating, so it needs no
+    // re-arm; the first fire is deliberately soon after launch, because the
+    // window most likely to be stale is one that has been open a long time
+    // and the answer must not wait a full cadence to arrive.
+    if (self.msg_hwnd) |mh| {
+        _ = w32.SetTimer(mh, STALE_BUILD_CHECK_TIMER_ID, STALE_BUILD_FIRST_MS, null);
     }
 
     // Keep each pane's persisted SCREEN current (T922). Repeating, so it needs
@@ -7448,6 +7485,8 @@ const NOTIF_UPDATE_UID: u32 = tray_notify.update_uid;
 const NOTIF_UPDATE_TIMER_ID: usize = 3;
 const NOTIF_ORPHAN_UID: u32 = tray_notify.orphan_uid;
 const NOTIF_ORPHAN_TIMER_ID: usize = 8;
+const NOTIF_STALE_UID: u32 = tray_notify.stale_build_uid;
+const NOTIF_STALE_TIMER_ID: usize = 13;
 
 /// Register a notification-area icon's behavior version, which is what turns
 /// the `NIN_*` balloon notifications on. Without it the icon keeps the
@@ -7835,6 +7874,99 @@ fn applyStagedUpdate(self: *App) void {
         return;
     }
     log.warn("update: applier armed, quitting to install", .{});
+    self.quit_requested = true;
+    w32.PostQuitMessage(0);
+}
+
+/// Ask whether a newer build is on disk, and say so once when it is (T1205).
+///
+/// This is the "unprompted" half of the answer to *"I think I'm on the newest
+/// build but I'm not sure."* About tells anyone who opens it; nobody opens it
+/// unless they already suspect something. So the app volunteers it — once per
+/// build that appears on disk, on the same tray-balloon surface an available
+/// update already uses, and with the same click-to-act contract.
+fn checkStaleBuild(self: *App) void {
+    var arena_state = std.heap.ArenaAllocator.init(self.core_app.alloc);
+    defer arena_state.deinit();
+    const prov = provenance.collect(arena_state.allocator()) catch return;
+    if (!prov.newer_build_installed) return;
+
+    // Remember the FILE's timestamp, not a bool: a second upgrade landing
+    // while the window is still open is a new fact and deserves to be said
+    // again, while the same file must never be announced twice.
+    const on_disk_ns = staleBuildOnDiskNs(prov.exe);
+    if (on_disk_ns == 0 or on_disk_ns == self.stale_build_notified_ns) return;
+    self.stale_build_notified_ns = on_disk_ns;
+
+    log.info(
+        "newer build installed on disk (running build started {s}, exe written {s})",
+        .{ prov.started, prov.exe_modified },
+    );
+    self.showTrayBalloon(
+        NOTIF_STALE_UID,
+        NOTIF_STALE_TIMER_ID,
+        "Ghoztty Was Updated",
+        "This window is still running the older build.\nClick to restart into the new one.",
+    );
+}
+
+/// The on-disk mtime of `exe` in nanoseconds, or 0 when it cannot be read.
+/// Separate from `provenance.collect` because the balloon needs the raw
+/// number to dedupe on, and provenance hands back the formatted string a
+/// human reads.
+fn staleBuildOnDiskNs(exe: []const u8) i128 {
+    const f = std.fs.openFileAbsolute(exe, .{}) catch return 0;
+    defer f.close();
+    const st = f.stat() catch return 0;
+    return st.mtime;
+}
+
+/// Start the newer build and quit this one (T1205).
+///
+/// The order is deliberate: SPAWN FIRST, and only quit if the spawn worked.
+/// A failure here must leave the user with the terminal they already have —
+/// the same rule `applyStagedUpdate` follows, for the same reason. The new
+/// process is detached and escapes this app's job object, or the job teardown
+/// that follows our exit would kill the replacement along with us (T524).
+///
+/// Sessions survive: the agent owns the PTYs, and the relaunched app
+/// re-attaches them exactly as it does after a logoff or a Restart Manager
+/// close.
+pub fn restartIntoInstalledBuild(self: *App) void {
+    var arena_state = std.heap.ArenaAllocator.init(self.core_app.alloc);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    const exe = std.fs.selfExePathAlloc(arena) catch |err| {
+        log.err("restart into new build: cannot resolve own exe: {}", .{err});
+        return;
+    };
+    const cmd = std.fmt.allocPrint(arena, "\"{s}\"", .{exe}) catch return;
+    const cmd_w = std.unicode.utf8ToUtf16LeAllocZ(arena, cmd) catch return;
+
+    const spawned = job_spawn.spawnEscapingJob(
+        arena,
+        cmd_w.ptr,
+        job_spawn.DETACHED_PROCESS,
+        "restart into new build",
+    ) catch |err| {
+        log.err("restart into new build: spawn of {s} FAILED: {}", .{ exe, err });
+        self.showTrayBalloon(
+            NOTIF_STALE_UID,
+            NOTIF_STALE_TIMER_ID,
+            "Ghoztty",
+            "Could not restart automatically.\nQuit and reopen Ghoztty to use the new build.",
+        );
+        return;
+    };
+    const pid = w32.GetProcessId(spawned.pi.hProcess);
+    std.os.windows.CloseHandle(spawned.pi.hProcess);
+    std.os.windows.CloseHandle(spawned.pi.hThread);
+    log.warn("restart into new build: launched pid {d} (escape={s}), quitting", .{
+        pid,
+        spawned.tier.name(),
+    });
+
     self.quit_requested = true;
     w32.PostQuitMessage(0);
 }
@@ -9187,6 +9319,14 @@ fn msgWndProc(
                     MachineChooser.open(w);
                 }
             },
+            .restart_into_new_build => {
+                // T1205: the newer build is already on disk — nothing to
+                // fetch, nothing to install. Restarting IS the whole action,
+                // and the user asked for it by clicking a balloon that says
+                // so, which is the consent `applyStagedUpdate` gets from its
+                // dialog.
+                app.restartIntoInstalledBuild();
+            },
             .open_release_page => {
                 // T1178: when there is something installable, a click INSTALLS
                 // it — that is the whole point of the notification now, and
@@ -9275,6 +9415,14 @@ fn msgWndProc(
         return 0;
     }
 
+    // Timer ID 12: "is a newer build on disk?" (T1205). Repeating; the launch
+    // arm fires sooner, so the first tick re-arms at the full cadence.
+    if (msg == w32.WM_TIMER and wparam == STALE_BUILD_CHECK_TIMER_ID) {
+        _ = w32.SetTimer(hwnd, STALE_BUILD_CHECK_TIMER_ID, STALE_BUILD_CHECK_MS, null);
+        app.checkStaleBuild();
+        return 0;
+    }
+
     // Timer ID 11: the deferred launch restore (T976). Armed only when the
     // launch restore had to carry windows forward for want of an agent;
     // one-shot per attempt.
@@ -9302,11 +9450,12 @@ fn msgWndProc(
     // an unrelated timeout.
     if (msg == w32.WM_TIMER and
         (wparam == NOTIF_DESKTOP_TIMER_ID or wparam == NOTIF_UPDATE_TIMER_ID or
-            wparam == NOTIF_ORPHAN_TIMER_ID))
+            wparam == NOTIF_ORPHAN_TIMER_ID or wparam == NOTIF_STALE_TIMER_ID))
     {
         const uid: u32 = switch (wparam) {
             NOTIF_DESKTOP_TIMER_ID => NOTIF_DESKTOP_UID,
             NOTIF_UPDATE_TIMER_ID => NOTIF_UPDATE_UID,
+            NOTIF_STALE_TIMER_ID => NOTIF_STALE_UID,
             else => NOTIF_ORPHAN_UID,
         };
         _ = w32.KillTimer(hwnd, wparam);
