@@ -1,8 +1,8 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-08-31T08:22:47-07:00",
-    "commit":  "db68549df",
+    "generated":  "2026-08-31T09:00:10-07:00",
+    "commit":  "955e46add",
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
@@ -109,7 +109,8 @@
                   "test/win32/hook-json.ps1":  "6ffe9bffa095bdeeb1d524990d3a7e695aa3d185596df39a7aeca44f7ed82119",
                   "test/win32/host-settings.ps1":  "4bc5045b4017d45d664d2f715b14e538022cb9ff87e40cedbdeecd4a1216ccb5",
                   "test/win32/hover-capture.ps1":  "0a8055d036ef8aa5ef83d91851c418f52dfdc09ea29d63f5eae9af87a9ee92a1",
-                  "test/win32/install-launch.ps1":  "902445a9bd03556321f294284c2d3d7e81db009bc9b9eeca39d0582577c6e2d2",
+                  "test/win32/install-launch.ps1":  "a4ffeece18fd6409c71581b61632df08620e4d63cf3fd3676147f3d7b395d62e",
+                  "test/win32/install-prepare.ps1":  "6d8277dab8e947ddd944dbd1ce556f711cbb8e345703f06d32b17dec8995bc06",
                   "test/win32/install-restart.ps1":  "c41b5d41f9a6f3aadcbdde6f99989c35e77ddfe412b4968deb0baf956e5af1b2",
                   "test/win32/ipc-child-exited.ps1":  "d976a5172b4773f582972eedc3fa1b00bb1c03f5c33eeb5efc06e5d52542112b",
                   "test/win32/ipc-command-keepalive.ps1":  "3e16597ad1d157d43c6581b946f35aada744b80f52ca38d52f678095975c2b14",

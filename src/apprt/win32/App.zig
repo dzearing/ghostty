@@ -50,6 +50,7 @@ const SplitTree = @import("../../datastruct/split_tree.zig").SplitTree;
 const update_check = @import("update_check.zig");
 const update_apply = @import("update_apply.zig");
 const update_install = @import("update_install.zig");
+const install_prepare = @import("install_prepare.zig");
 const utf16_text = @import("utf16_text.zig");
 const tray_notify = @import("tray_notify.zig");
 const orphan_notify = @import("orphan_notify.zig");
@@ -8139,6 +8140,17 @@ pub fn runRelaunchGuard(alloc: Allocator) ?u8 {
 /// A DECL on the apprt for the same reason `runRelaunchGuard` is one.
 pub fn runUpdateApplier(alloc: Allocator) ?u8 {
     return update_install.runFromEnv(alloc);
+}
+
+/// Was this process started as an installer prepare step (T1207)? If so, run
+/// it and hand `main` the exit code — a prepare step never becomes a terminal.
+/// msiexec runs it out of INSTALLDIR immediately before the Restart Manager is
+/// asked who holds the files being replaced, so that the answer does not
+/// include the processes owning the user's live shells.
+///
+/// A DECL on the apprt for the same reason `runRelaunchGuard` is one.
+pub fn runInstallPrepare(alloc: Allocator) ?u8 {
+    return install_prepare.runFromArgs(alloc);
 }
 
 /// T675: is this process inside a kill-on-close job it does not own — the

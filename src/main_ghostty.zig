@@ -91,6 +91,23 @@ pub fn main() !MainReturn {
         }
     }
 
+    // T1207: this process may be an installer PREPARE step — msiexec running
+    // `[INSTALLDIR]ghoztty.exe --install-prepare` just before it asks the
+    // Restart Manager who is holding the files it is about to write. It renames
+    // the session agent's image aside so the windowless holders that own the
+    // user's shells are never chosen for termination. Asked beside the applier
+    // above and for the same reason: it must never look like a second instance
+    // of the terminal the user is running.
+    //
+    // Gated on there being no `+action` like its neighbours, so a pane that
+    // somehow carries the flag stays whatever verb it asked for.
+    if (@hasDecl(apprt.App, "runInstallPrepare") and state.action == null) {
+        if (apprt.App.runInstallPrepare(alloc)) |code| {
+            posix.exit(code);
+            return;
+        }
+    }
+
     // T695: this process may be a `ghoztty://` URL activation — the shell
     // launching our registered protocol handler with a clicked link as argv.
     // Asked before the single-instance bind, because an activation must never

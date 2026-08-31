@@ -774,6 +774,25 @@ $GuardTable = @(
             'test\win32\install-restart.ps1'
         )
     },
+    # An upgrade must not kill the sessions it exists to preserve (T1207). The
+    # agent and its `--pty-host` holders are windowless, so the Restart
+    # Manager's only move on them is termination - and the whole defence is one
+    # custom action scheduled before InstallValidate plus a small module that
+    # renames one image aside. Every part of that is invisible until an
+    # installer meets a live session, which is the worst possible moment to
+    # discover it missing. `App.zig` and `main_ghostty.zig` are deliberately not
+    # listed: they are touched by nearly every task, and a row that is
+    # permanently due is a row nobody reads.
+    [pscustomobject]@{
+        Name   = 'install-prepare'
+        Script = 'test\win32\install-prepare.ps1'
+        Stamp  = 'test\win32\install-prepare.stamp.json'
+        Covers = @(
+            'srcpprt\win32\install_prepare.zig',
+            'dist\windows-installeruild-msi.sh',
+            'test\win32\install-prepare.ps1'
+        )
+    },
     # "Which Ghoztty am I running?" has ONE answer per surface (T1205). Windows
     # cannot replace a running image, so the file on disk and the process in
     # front of the user are routinely different builds - and the About box used

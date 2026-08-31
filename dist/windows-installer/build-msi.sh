@@ -442,6 +442,50 @@ template = """<?xml version="1.0" encoding="utf-8"?>
            LAUNCHAPP = "1"        — the escape hatch: LAUNCHAPP=0 on the
                                     msiexec command line suppresses the
                                     launch without suppressing the UI. -->
+    <!-- T1207: make room for the installer BEFORE it asks who is in its way.
+
+         Session persistence means `ghoztty-agent.exe` and one
+         `--pty-host` holder per live session keep the user's shells running
+         after the terminal closes. Those processes have no windows, and the
+         Restart Manager only offers a graceful close to processes that do -
+         its only move on a windowless holder is to terminate it. So a
+         double-clicked MSI over a running Ghoztty would end every restored
+         session, which is precisely what the feature exists to prevent.
+
+         This runs `ghoztty.exe --install-prepare` out of the OLD install,
+         immediately before InstallValidate - the action where Windows
+         Installer asks the Restart Manager which processes hold the files it
+         is about to write. It renames `ghoztty-agent.exe` aside (Windows
+         refuses to delete a running image but will happily rename one; the
+         open handles follow the file), so by the time that question is asked
+         nothing holds the package's own agent path and there is nothing to
+         shut down. The holders keep running the code they already mapped
+         until they are next restarted, which is the situation the app-agent
+         handshake already exists to handle.
+
+         Deliberately NOT the app's own exe: ghoztty.exe is the one image the
+         Restart Manager CAN close and reopen, and T1204 made it do so.
+
+         Return="ignore" and immediate execution: this is politeness, not a
+         prerequisite. If it cannot run, the install proceeds exactly as it did
+         before this existed - an installer that refuses to run because an
+         optional step broke would be strictly worse. Immediate (not deferred)
+         because deferred actions run after InstallValidate, which is too late
+         to change the answer, and because a per-user install under
+         %LOCALAPPDATA% needs no elevation to rename its own file.
+
+         Condition: only when there is an existing install in the way.
+         Installed covers repair, uninstall and maintenance; OLDERVERSIONFOUND
+         covers the major upgrade, which is the path the user takes. -->
+    <CustomAction Id="SetPrepareInstallDirCmd"
+                  Property="PREPAREINSTALLDIRCMD"
+                  Value="[INSTALLDIR]ghoztty.exe"/>
+    <CustomAction Id="PrepareInstallDir"
+                  Property="PREPAREINSTALLDIRCMD"
+                  ExeCommand="--install-prepare"
+                  Execute="immediate"
+                  Return="ignore"/>
+
     <Property Id="LAUNCHAPP" Value="1"/>
     <CustomAction Id="SetLaunchAppCmd"
                   Property="LAUNCHAPPCMD"
@@ -454,6 +498,8 @@ template = """<?xml version="1.0" encoding="utf-8"?>
 
     <InstallExecuteSequence>
       <RemoveExistingProducts After="InstallValidate"/>
+      <Custom Action="SetPrepareInstallDirCmd" Before="PrepareInstallDir"/>
+      <Custom Action="PrepareInstallDir" Before="InstallValidate">Installed OR OLDERVERSIONFOUND</Custom>
       <Custom Action="SetLaunchAppCmd" Before="LaunchApp"/>
       <Custom Action="LaunchApp" After="InstallFinalize">NOT Installed AND NOT OLDERVERSIONFOUND AND UILevel &gt; 3 AND LAUNCHAPP = "1"</Custom>
     </InstallExecuteSequence>
@@ -607,11 +653,54 @@ if not errs:
         if want not in cond:
             errs.append(f"LaunchApp condition {cond!r} does not gate on {want}")
 
+# T1207: the prepare step that keeps an upgrade from killing the user's live
+# sessions. Same read-back argument as the launch pair above, and a sharper
+# consequence: a PrepareInstallDir row that is missing, deferred, or sequenced
+# after InstallValidate is indistinguishable from one that works right up until
+# somebody upgrades with sessions open.
+if "PrepareInstallDir" not in ca:
+    errs.append("CustomAction table has no PrepareInstallDir row - an upgrade would let the Restart Manager terminate the session agent and its PTY holders")
+else:
+    t = int(ca["PrepareInstallDir"][1])
+    if t & 0x3F != 50:
+        errs.append(f"PrepareInstallDir base type is {t & 0x3F}, expected 50 (exe from property)")
+    if not (t & 64):
+        errs.append(f"PrepareInstallDir type {t} does not ignore its exit code - an optional politeness step must never fail the install")
+    if t & 128:
+        errs.append(f"PrepareInstallDir type {t} is asynchronous - it must finish before InstallValidate asks who holds the files")
+    if t & 0x400:
+        errs.append(f"PrepareInstallDir type {t} is deferred - a deferred action runs after InstallValidate, which is too late to change the answer")
+    if ca["PrepareInstallDir"][2] != "PREPAREINSTALLDIRCMD":
+        errs.append(f"PrepareInstallDir source is {ca['PrepareInstallDir'][2]!r}, expected PREPAREINSTALLDIRCMD")
+    if ca["PrepareInstallDir"][3] != "--install-prepare":
+        errs.append(f"PrepareInstallDir arguments are {ca['PrepareInstallDir'][3]!r}, expected '--install-prepare'")
+
+if "SetPrepareInstallDirCmd" not in ca:
+    errs.append("CustomAction table has no SetPrepareInstallDirCmd row - PREPAREINSTALLDIRCMD would be empty and nothing would run")
+elif ca["SetPrepareInstallDirCmd"][3] != "[INSTALLDIR]ghoztty.exe":
+    errs.append(f"SetPrepareInstallDirCmd target is {ca['SetPrepareInstallDirCmd'][3]!r}, expected [INSTALLDIR]ghoztty.exe")
+
+for action in ("PrepareInstallDir", "SetPrepareInstallDirCmd", "InstallValidate"):
+    if action not in seq:
+        errs.append(f"InstallExecuteSequence has no {action} row")
+if not errs:
+    n_prep = int(seq["PrepareInstallDir"][2])
+    n_prep_set = int(seq["SetPrepareInstallDirCmd"][2])
+    n_validate = int(seq["InstallValidate"][2])
+    if n_prep >= n_validate:
+        errs.append(f"PrepareInstallDir is sequenced at {n_prep}, not before InstallValidate at {n_validate} - the Restart Manager would already have chosen the holders")
+    if n_prep_set >= n_prep:
+        errs.append(f"SetPrepareInstallDirCmd is sequenced at {n_prep_set}, not before PrepareInstallDir at {n_prep}")
+    prep_cond = seq["PrepareInstallDir"][1]
+    if "Installed" not in prep_cond or "OLDERVERSIONFOUND" not in prep_cond:
+        errs.append(f"PrepareInstallDir condition {prep_cond!r} does not gate on an existing install (Installed OR OLDERVERSIONFOUND)")
+
 if errs:
     for e in errs:
         print(f"error: {e}", file=sys.stderr)
     sys.exit(1)
 print("launch-on-finish ok: SetLaunchAppCmd -> LaunchApp (asyncNoWait) after InstallFinalize")
+print("session-safe upgrade ok: PrepareInstallDir (immediate, ignore) before InstallValidate")
 PYEOF
 
 # Read the no-reboot / Restart-Manager wiring back out of the compiled package

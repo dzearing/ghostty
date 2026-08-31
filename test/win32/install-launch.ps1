@@ -219,13 +219,23 @@ if (-not $TeethCheck) {
                     "s72${t}i2${t}S72${t}S255",
                     "CustomAction${t}Action",
                     "SetLaunchAppCmd${t}51${t}LAUNCHAPPCMD${t}[INSTALLDIR]ghoztty.exe",
-                    "LaunchApp${t}242${t}LAUNCHAPPCMD${t}"
+                    "LaunchApp${t}242${t}LAUNCHAPPCMD${t}",
+                    # T1207 added a second pair to the same verifier - the
+                    # prepare step that keeps an upgrade from killing live
+                    # sessions. A "correctly wired MSI" has to carry it, or E1
+                    # is asserting that a package this build would REFUSE is
+                    # fine. Its own negatives live in install-prepare.ps1.
+                    "SetPrepareInstallDirCmd${t}51${t}PREPAREINSTALLDIRCMD${t}[INSTALLDIR]ghoztty.exe",
+                    "PrepareInstallDir${t}114${t}PREPAREINSTALLDIRCMD${t}--install-prepare"
                 ) -join "`r`n"
                 $cond = 'NOT Installed AND NOT OLDERVERSIONFOUND AND UILevel > 3 AND LAUNCHAPP = "1"'
                 $goodSeq = @(
                     "Action${t}Condition${t}Sequence",
                     "s72${t}S255${t}I2",
                     "InstallExecuteSequence${t}Action",
+                    "SetPrepareInstallDirCmd${t}${t}1398",
+                    "PrepareInstallDir${t}Installed OR OLDERVERSIONFOUND${t}1399",
+                    "InstallValidate${t}${t}1400",
                     "InstallFinalize${t}${t}6600",
                     "SetLaunchAppCmd${t}${t}6700",
                     "LaunchApp${t}$cond${t}6710"
@@ -249,8 +259,11 @@ if (-not $TeethCheck) {
                     ((RunVerifier $goodCa ($goodSeq -replace ' AND NOT OLDERVERSIONFOUND', '')) -ne 0)
                 Assert 'E6 a SetLaunchAppCmd that sets nothing is rejected' `
                     ((RunVerifier ($goodCa -replace "${t}51${t}", "${t}19${t}") $goodSeq) -ne 0)
+                # Row-scoped: two rows now name [INSTALLDIR]ghoztty.exe, and a
+                # blanket replace would move BOTH, so the rejection could no
+                # longer be attributed to the launch pair.
                 Assert 'E7 a launch pointed at the wrong exe is rejected' `
-                    ((RunVerifier ($goodCa -replace '\[INSTALLDIR\]ghoztty\.exe', '[INSTALLDIR]ghoztty-agent.exe') $goodSeq) -ne 0)
+                    ((RunVerifier ($goodCa -replace "SetLaunchAppCmd\${t}51\${t}LAUNCHAPPCMD\${t}\[INSTALLDIR\]ghoztty\.exe", "SetLaunchAppCmd${t}51${t}LAUNCHAPPCMD${t}[INSTALLDIR]ghoztty-agent.exe") $goodSeq) -ne 0)
             } finally {
                 Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
             }

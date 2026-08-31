@@ -60,6 +60,12 @@ test {
     // and telling an installer's close from a logoff — is decided by constants
     // that a lane can check and a running install cannot be asked to repeat.
     _ = @import("win32/restart_manager.zig");
+    // The installer prepare step (T1207). Its command-line parser decides
+    // whether a normal `ghoztty.exe` start is quietly turned into a
+    // non-terminal, and its image list is what stands between an MSI and the
+    // user's live sessions — both are constants and pure logic a lane can
+    // check, and neither can be asked of a running install.
+    _ = @import("win32/install_prepare.zig");
     // Escaping the app's job object, and measuring who is in it (T524, T426).
     // Both are what stands between a daemon/supervisor and dying with the
     // process it exists to outlive, so the lane compiles and checks them in

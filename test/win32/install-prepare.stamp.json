@@ -1,0 +1,9 @@
+{
+    "guard":  "install-prepare",
+    "script":  "test/win32/install-prepare.ps1",
+    "generated":  "2026-08-31T08:57:40-07:00",
+    "commit":  "955e46add",
+    "files":  {
+                  "test/win32/install-prepare.ps1":  "6d8277dab8e947ddd944dbd1ce556f711cbb8e345703f06d32b17dec8995bc06"
+              }
+}
