@@ -1,12 +1,14 @@
 # T1179 handoff checkpoint - the clean-machine install proof
 
-**Written 2026-08-30 by the go-loop, immediately before it stopped.**
+**Rewritten 2026-08-31 by the go-loop for the SECOND walk, immediately before
+it stopped. The first walk (1.35.0, 2026-08-31 07:08) is summarised at the
+bottom.**
 
 This file exists because the next step kills every terminal on the box. The
 go-loop, the controller chat and the task dashboard all run inside Ghoztty
-panes, and you are about to close Ghoztty to install over it. Nothing can be
-waiting for you when you come back, so everything you need is here rather than
-in a pane's scrollback.
+panes, and the installer is about to close Ghoztty. Nothing can be waiting for
+you when you come back, so everything you need is here rather than in a pane's
+scrollback.
 
 ---
 
@@ -25,91 +27,59 @@ may not self-certify it - you install, you confirm.
 
 | | |
 |---|---|
-| Version | **1.35.0** |
-| Release | https://github.com/dzearing/ghoztty/releases/tag/win-v1.35.0 |
-| Installer | `Ghoztty-1.35.0-x64.msi` |
+| Version | **1.36.0** |
+| Release | https://github.com/dzearing/ghoztty/releases/tag/win-v1.36.0 |
+| Installer | `Ghoztty-1.36.0-x64.msi` |
 | Website | https://dzearing.github.io/ghoztty/ |
 
 **Go to the website and click the Windows download** - that is the path being
 tested. The direct release link above is only for checking what you got.
 
-1.35.0 is the first published build that carries the whole install epic:
-one installer (T1175), the installer launching Ghoztty when it finishes
-(T1176), a startup failure raising a dialog instead of exiting silently
-(T1177), and in-app update (T1178). Everything on the site before today
-pointed at win-v1.34.0, published 2026-08-21, which predates all four.
+1.36.0 is the first published build that carries the fixes your last install
+turned up:
 
-## Before you install: clear the box
+- **T1204/T1207** - installing over a running Ghoztty. The installer now asks
+  the app to close, replaces the files and opens it again, and it does that
+  *without* killing the session agent or the per-session PTY holders, so your
+  open shells survive the upgrade. Last time this path died with a silent
+  "configuring" dialog and then demanded a reboot it did not need.
+- **T1205** - About and `--version` now agree with each other, with Apps &
+  Features and with the website.
+- **T1217** - a build delivered into the installed-release folder keeps a
+  truthful version number and can still find updates.
 
-There are copies of Ghoztty all over this machine, and "no prior Ghoztty" has
-to be true rather than assumed. From a Ghoztty pane (or any PowerShell), in
-`D:\git\ghoztty`:
+## Install it OVER the running Ghoztty - do not close it first
 
-```
-powershell -NoProfile -File scripts\ghoztty-cleanup.ps1 clean
-```
+This is the opposite of last time's instruction, and it is deliberate: the
+install-over-running path is the thing that broke, so the walk has to exercise
+it. Leave your windows open, including the loop's and the controller's, and
+double-click the MSI.
 
-It asks before each item and removes nothing on its own; an unanswered item is
-kept. At the time this was written it found **26 artifacts - 25 removable, 1
-protected**:
+What should happen:
 
-- **Installs (8)**: the installed release at
-  `%LOCALAPPDATA%\Programs\Ghoztty`, two portable copies (Desktop and the
-  `\\homeassistant\share` copy), and five `zig-out*` dev prefixes in the repo.
-- **Registry**: the `Ghoztty Remote Agent 1.12.1` Apps & Features entry,
-  four `GhozttyAgent*` autostart entries, two settings keys.
-- **PATH**, **two Start Menu shortcuts**, **two scheduled tasks**, and the
-  state directory `%LOCALAPPDATA%\ghoztty` (1271 files, 750 MB - relay
-  sign-in, saved sessions, agent logs).
-- **Protected, never offered**: the ghost `Ghoztty 26.7.502` registration
-  `{A10466B5-...}`, whose uninstall would delete the live install's files.
-
-Things worth thinking about before you answer yes to them:
-
-- The **installed release is in use by the running Ghoztty** - it cannot be
-  removed until you close every window, which you are about to do anyway.
-- **`\\homeassistant\share\...`** and the **`zig-out*` dev prefixes** are not
-  part of the product and removing them costs nothing but rebuild time.
-- The **state directory** holds your relay sign-in and saved sessions.
-  Removing it is the honest "new machine" answer; keeping it is a legitimate
-  choice - say so with
-  `scripts\ghoztty-cleanup.ps1 keep state-dir -Reason "..."` so the verdict
-  records it as deliberate rather than counting it dirty.
-- The **`GhozttyGoLoopWatchdog` scheduled task** is the loop's own supervisor.
-  Removing it means the loop will not revive itself; you will start it by
-  hand (below). Either answer is fine - just know which you gave.
-
-Then:
-
-```
-powershell -NoProfile -File scripts\ghoztty-cleanup.ps1 verdict
-```
-
-Exit 0 means clean (everything gone, kept on purpose, or protected). Keep that
-output - it is the evidence T1179 records.
-
-## The install
-
-1. **Close every Ghoztty window.** All of them, including the one running the
-   loop and the one running the controller chat.
-2. Download the Windows installer **from the website** and run it. Per-user,
-   no admin password.
-3. **Ghoztty should launch itself when the installer finishes** (T1176). Note
-   whether it did.
+1. The installer notices Ghoztty is running and closes it politely (you may
+   see a "the following applications should be closed" step - let it).
+2. It installs. **No reboot prompt.** No dialog that flashes and vanishes.
+3. **Ghoztty opens again by itself** when the installer finishes (T1176).
+4. Your restored sessions are still there - the agent was not killed.
 
 ## What to check when it comes up
 
 - [ ] The website offered exactly **one** Windows installer.
-- [ ] A window opened, with a working shell in it.
-- [ ] It launched **by itself** when the installer finished.
-- [ ] **No error dialog** and no silent failure on first run.
+- [ ] The installer closed the running Ghoztty on its own rather than failing.
+- [ ] **No error dialog**, no vanishing window, and **no reboot demand**.
+- [ ] It **launched by itself** when the installer finished. *(This is the one
+      criterion nobody has ever observed - the first walk had a reboot in
+      between. Please watch for it specifically.)*
+- [ ] A window opened with a working shell in it.
+- [ ] The **About box** says **1.36.0** - and so does `ghoztty --version`.
 - [ ] `ghoztty +list` works from inside it - the CLI is on PATH.
-- [ ] Sessions work: the session agent is alive, splits and tabs behave.
-- [ ] `ghoztty --version` (or the About box) says **1.35.0**.
+- [ ] Sessions survived: `ghoztty +sessions` shows the agent alive, and your
+      previously open shells came back.
 
 Anything that is not true is the finding - it is more valuable than a pass.
 
-## Resuming the loop
+## Then: resume the loop
 
 From the new Ghoztty, in `D:\git\ghoztty`:
 
@@ -123,15 +93,62 @@ Then start Claude in a pane and give it:
 read go.md and go
 ```
 
-It will pick T1179 back up as a `RESUME:`, read this file, record what you
-report, and then do the **second half**: publish 1.36.0 and take it through
-the app's own update - no script, no file copying - which is the last
-criterion on the task.
+It picks T1179 back up as a `RESUME:`, reads this file, records what you
+report, and then does the **last** step: publish **1.37.0** and leave it for
+the app's own updater to find. You will get an update notification in the
+running terminal; taking it - with no script and no file copying - is the
+final criterion on the gate.
+
+## If you would rather clean the box first
+
+Optional, and not required for this walk. `scripts\ghoztty-cleanup.ps1
+inventory` currently finds **23 unaccounted artifacts**: the installed release
+itself, two portable copies (Desktop and `\\homeassistant\share`), five
+`zig-out*` dev prefixes in the repo, the `Ghoztty Remote Agent 1.12.1` Apps &
+Features entry, four `GhozttyAgent*` autostart entries, two settings keys, the
+user PATH entry, the Start Menu shortcut, the `GhozttyGoLoopWatchdog` and
+`GhozttyTaskDashboard` scheduled tasks, and the 744 MB state directory at
+`%LOCALAPPDATA%\ghoztty` (relay sign-in, saved sessions, agent logs).
+
+```
+powershell -NoProfile -File scripts\ghoztty-cleanup.ps1 clean
+powershell -NoProfile -File scripts\ghoztty-cleanup.ps1 verdict
+```
+
+`clean` asks before each item and removes nothing on its own. Two of them are
+worth a thought: the **state directory** holds your relay sign-in and saved
+sessions (keeping it is legitimate - say so with `ghoztty-cleanup.ps1 keep
+state-dir -Reason "..."` so the verdict records it as deliberate), and the
+**`GhozttyGoLoopWatchdog`** task is the loop's own supervisor, so removing it
+means the loop will not revive itself.
+
+Note that cleaning removes the running install, which means closing every
+window - and that would skip the install-over-running path this walk is here
+to test. If you want both, do this walk first.
 
 ## Where things stand on disk
 
-- Task: `docs/design/windows-parity-tasks/T1179.md` (in-progress, P0, M1)
+- Task: `docs/design/windows-parity-tasks/T1179.md` (blocked on you, P0, M1)
 - The loop is **stopped by request**, so the watchdog will not revive it into
   a machine mid-install. `resume` above is what clears that.
-- The site mirror in this repo is already retargeted at 1.35.0; CI retargets
-  the live gh-pages page in the same run that publishes the release.
+- The morning refresh will not overwrite what you install while the loop is
+  stopped. When it does run again it now delivers a build that reports the
+  right version and can still find updates (T1217); whether it should keep
+  running at all is **D85**, waiting on your answer in the dashboard.
+
+---
+
+## The first walk, for reference (1.35.0, 2026-08-31 07:08)
+
+**Passed:** the site offered exactly one Windows installer; the install
+completed; About and `--version` both reported `1.35.0+890207079`; `ghoztty`
+resolved on PATH; `+list` worked; `+sessions` showed the agent alive with an
+attached pinned session; the Start Menu shortcut targeted the installed exe.
+
+**Failed:** "no silent failure" - installing over the running Ghoztty said
+"configuring" and vanished (Error 1500 / status 1602 from a collided msiexec),
+then demanded a reboot it did not need. Fixed by T1204/T1207, which is what
+this walk re-tests.
+
+**Never observed:** whether the installer launched Ghoztty itself - the reboot
+happened in between.
