@@ -296,35 +296,25 @@ ghoztty +split --target=ide --name=logs \
   <section class="remote" id="remote">
     <div class="section-inner">
       <div class="section-header">
-        <h2>Remote Agent<br /><span class="gradient-text">for Windows.</span></h2>
-        <p>Lets Ghoztty on your Mac open terminals on a Windows machine, from anywhere. The agent connects outbound over WSS and keeps itself up to date.</p>
+        <h2>Remote Agent<br /><span class="gradient-text">already included.</span></h2>
+        <p>Ghoztty can open terminals on another machine, from anywhere. There is nothing extra to download &mdash; the installer above carries the agent, which connects outbound over WSS.</p>
       </div>
       <div class="remote-card">
         <div class="install-card-header">
           <span class="install-badge">Windows</span>
-          <h3>Install the agent</h3>
+          <h3>Share a machine</h3>
         </div>
-        <a class="dl-btn" id="agent-msi-link" href="https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/ghoztty-agent.msi"><span aria-hidden="true">&#8595;</span> Download the installer (.msi)</a>
+        <a class="dl-btn" id="remote-download-link" href="#download"><span aria-hidden="true">&#8595;</span> Get the Windows installer</a>
         <ol class="remote-steps">
-          <li>Run the downloaded <code>Ghoztty-Agent-&lt;version&gt;-x64.msi</code>. Per-user install, no admin required.</li>
-          <li>Click <b>Ghoztty Agent</b> in the Start Menu.</li>
-          <li>Sign in with Google in the browser that opens to link the machine to your account.</li>
+          <li>Install Ghoztty on that machine with the installer above. Per-user install, no admin required.</li>
+          <li>Open the machine chooser with <b>Ctrl+Shift+N</b> and sign in with Google.</li>
+          <li>Turn on <b>Share this machine</b>. It comes back at every logon.</li>
         </ol>
         <p class="install-alt">
-          The agent keeps itself up to date automatically and starts at logon.
-          Uninstall any time from Settings &rarr; Apps.<span id="agent-version"></span>
+          The agent ships and updates with Ghoztty itself, so there is no second
+          thing to keep current. Sharing stays off until you turn it on, and the
+          same switch turns it off again.
         </p>
-        <details class="remote-advanced">
-          <summary>Advanced: headless install (PowerShell)</summary>
-          <p>Paste into PowerShell on the Windows machine to install and enroll without the MSI.</p>
-          <div class="code-block code-block-copy">
-            <code id="agent-install-cmd">irm https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/install.ps1 | iex</code>
-            <button class="copy-btn" type="button" data-copy-target="agent-install-cmd" aria-label="Copy install command">Copy</button>
-          </div>
-          <p class="install-alt">
-            Or <a href="https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/ghoztty-agent.exe">download ghoztty-agent.exe</a> directly.
-          </p>
-        </details>
       </div>
     </div>
   </section>

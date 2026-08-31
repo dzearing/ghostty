@@ -40,59 +40,11 @@ window.addEventListener("scroll", () => {
     : "rgba(10, 10, 12, 0.7)";
 }, { passive: true });
 
-// Copy buttons (Remote Agent install one-liner)
-document.querySelectorAll(".copy-btn[data-copy-target]").forEach((btn) => {
-  btn.addEventListener("click", () => {
-    const src = document.getElementById(btn.dataset.copyTarget);
-    if (!src) return;
-    const text = src.textContent.trim();
-    const done = () => {
-      btn.textContent = "Copied!";
-      btn.classList.add("copied");
-      setTimeout(() => {
-        btn.textContent = "Copy";
-        btn.classList.remove("copied");
-      }, 1600);
-    };
-    const fallback = () => {
-      const ta = document.createElement("textarea");
-      ta.value = text;
-      ta.style.position = "fixed";
-      ta.style.opacity = "0";
-      document.body.appendChild(ta);
-      ta.select();
-      try { document.execCommand("copy"); done(); } catch (e) { /* ignore */ }
-      document.body.removeChild(ta);
-    };
-    if (navigator.clipboard && navigator.clipboard.writeText) {
-      navigator.clipboard.writeText(text).then(done, fallback);
-    } else {
-      fallback();
-    }
-  });
-});
+// The copy-button handler that lived here served exactly one thing, the
+// Remote Agent install one-liner, and went with it (T1175). Nothing on the
+// page carries data-copy-target any more.
 
-// Current Windows agent version — best-effort; silent if unreachable.
-// (Relay serves /dl/version.json with Access-Control-Allow-Origin: *.)
-(() => {
-  const el = document.getElementById("agent-version");
-  if (!el) return;
-  fetch("https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/version.json", { cache: "no-store" })
-    .then((r) => (r.ok ? r.json() : null))
-    .then((v) => {
-      const win = v && v["windows-x86_64"];
-      if (win && win.version) {
-        el.textContent = win.semver
-          ? ` Current version: ${win.semver} (build ${win.version}).`
-          : " Current version: " + win.version + ".";
-      }
-      // Point the download button at the versioned installer filename
-      // (Ghoztty-Agent-X.Y.Z-x64.msi); the static href stays a working
-      // stable-URL fallback when version.json is unavailable.
-      const link = document.getElementById("agent-msi-link");
-      if (link && win && win.msi) {
-        link.setAttribute("href", "https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com" + win.msi);
-      }
-    })
-    .catch(() => { /* version info unavailable */ });
-})();
+// The Remote Agent section used to fetch the relay's published agent manifest
+// to show a standalone agent version and retarget a second download button.
+// There is one Windows installer now (T1175) and it carries the agent, so the
+// section links at #download and there is no separate version to report.
