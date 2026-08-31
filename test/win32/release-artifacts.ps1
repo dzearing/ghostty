@@ -368,12 +368,12 @@ if (-not $genMatch.Success) {
     [IO.File]::WriteAllText($goodPy, $gen, $enc)
     $genArgs = @('exe.exe', 'com.com', 'agent.exe', 'share')
     Push-Location $wxsWork
-    $goodOut = & $pyExe $goodPy @genArgs 'good.wxs' 2>&1 | Out-String
+    $goodOut = & $pyExe $goodPy @genArgs 'good.wxs' 2>&1 | ForEach-Object { "$_" } | Out-String
     $goodRc = $LASTEXITCODE
     # The negative control: reintroduce the exact 2026-08-31 defect.
     $badPy = Join-Path $wxsWork 'gen-bad.py'
     [IO.File]::WriteAllText($badPy, ($gen -replace '`pty-host`', '`--pty-host`'), $enc)
-    $badOut = & $pyExe $badPy @genArgs 'bad.wxs' 2>&1 | Out-String
+    $badOut = & $pyExe $badPy @genArgs 'bad.wxs' 2>&1 | ForEach-Object { "$_" } | Out-String
     $badRc = $LASTEXITCODE
     Pop-Location
     $wellFormed = $false
