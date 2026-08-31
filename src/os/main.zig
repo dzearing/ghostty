@@ -34,6 +34,7 @@ pub const path = @import("path.zig");
 pub const path_env = @import("path_env.zig");
 pub const process_cwd = @import("process_cwd.zig");
 pub const self_exe = @import("self_exe.zig");
+pub const source_checkout = @import("source_checkout.zig");
 pub const passwd = @import("passwd.zig");
 pub const user_env = @import("user_env.zig");
 pub const xdg = @import("xdg.zig");
@@ -90,6 +91,7 @@ test {
     _ = path_env;
     _ = process_cwd;
     _ = self_exe;
+    _ = source_checkout;
     _ = uri;
     _ = shell;
     _ = user_env;

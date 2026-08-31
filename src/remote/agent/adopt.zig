@@ -154,6 +154,13 @@ pub const Gate = enum {
     /// Debug build without both test overrides: the global install/registry
     /// surface belongs to the RELEASE lineage; a dev agent must not touch it.
     debug_needs_overrides,
+    /// This agent exe lives inside a source checkout (T1151). Build mode does
+    /// not catch that on its own: the staging release we package deliveries
+    /// from is a RELEASE build sitting at `zig-out-release\bin` in the repo,
+    /// so without this gate one start of it would uninstall the user's real
+    /// standalone MSI product and point `HKCU\...\Run\GhozttyAgent` at a
+    /// scratch directory that development rebuilds and deletes.
+    source_checkout,
 };
 
 pub fn gate(
@@ -161,10 +168,26 @@ pub fn gate(
     disable_set: bool,
     have_dir_override: bool,
     have_cmd_override: bool,
+    in_source_checkout: bool,
 ) Gate {
     if (disable_set) return .disabled;
-    if (is_debug and !(have_dir_override and have_cmd_override)) return .debug_needs_overrides;
+    // Both overrides together are the acceptance harness's signature — it
+    // points the adoption at a scratch install dir and a recorder script, and
+    // a real box never sets either. They are what lets the test run from
+    // `zig-out`, which IS a source checkout.
+    const overridden = have_dir_override and have_cmd_override;
+    if (is_debug and !overridden) return .debug_needs_overrides;
+    if (in_source_checkout and !overridden) return .source_checkout;
     return .run;
+}
+
+/// Does the RUNNING agent exe sit in build output? Fails CLOSED: an exe path
+/// we cannot read is a location we cannot clear, and everything behind this
+/// gate outlives the process.
+fn runningFromSourceCheckout(alloc: Allocator) bool {
+    const exe_dir = std.fs.selfExeDirPathAlloc(alloc) catch return true;
+    defer alloc.free(exe_dir);
+    return internal_os.source_checkout.inSourceCheckout(alloc, exe_dir);
 }
 
 // -----------------------------------------------------------------------------
@@ -310,9 +333,15 @@ pub fn maybeStart(alloc: Allocator, sessions_file: ?[]const u8) void {
         if (cmd_override) |c| alloc.free(c);
     };
 
-    switch (gate(is_debug, disable, dir_override != null, cmd_override != null)) {
+    switch (gate(
+        is_debug,
+        disable,
+        dir_override != null,
+        cmd_override != null,
+        runningFromSourceCheckout(alloc),
+    )) {
         .run => {},
-        .disabled, .debug_needs_overrides => return,
+        .disabled, .debug_needs_overrides, .source_checkout => return,
     }
 
     const state_path = pathFor(alloc, sessions_file) orelse return;
@@ -853,20 +882,38 @@ const win = if (builtin.os.tag == .windows) struct {
 const testing = std.testing;
 
 test "gate: disabled wins over everything" {
-    try testing.expectEqual(Gate.disabled, gate(false, true, true, true));
-    try testing.expectEqual(Gate.disabled, gate(true, true, true, true));
+    try testing.expectEqual(Gate.disabled, gate(false, true, true, true, false));
+    try testing.expectEqual(Gate.disabled, gate(true, true, true, true, true));
 }
 
 test "gate: a debug build needs BOTH overrides" {
-    try testing.expectEqual(Gate.debug_needs_overrides, gate(true, false, false, false));
-    try testing.expectEqual(Gate.debug_needs_overrides, gate(true, false, true, false));
-    try testing.expectEqual(Gate.debug_needs_overrides, gate(true, false, false, true));
-    try testing.expectEqual(Gate.run, gate(true, false, true, true));
+    try testing.expectEqual(Gate.debug_needs_overrides, gate(true, false, false, false, false));
+    try testing.expectEqual(Gate.debug_needs_overrides, gate(true, false, true, false, false));
+    try testing.expectEqual(Gate.debug_needs_overrides, gate(true, false, false, true, false));
+    try testing.expectEqual(Gate.run, gate(true, false, true, true, false));
 }
 
 test "gate: a release build runs with no overrides" {
-    try testing.expectEqual(Gate.run, gate(false, false, false, false));
-    try testing.expectEqual(Gate.run, gate(false, false, true, true));
+    try testing.expectEqual(Gate.run, gate(false, false, false, false, false));
+    try testing.expectEqual(Gate.run, gate(false, false, true, true, false));
+}
+
+test "gate: a release build INSIDE a source checkout adopts nothing (T1151)" {
+    // The staging release is the real shape: release build, repo location, no
+    // overrides. Before T1151 this returned .run and would have uninstalled
+    // the user's standalone MSI product from a scratch directory.
+    try testing.expectEqual(Gate.source_checkout, gate(false, false, false, false, true));
+    try testing.expectEqual(Gate.source_checkout, gate(false, false, true, false, true));
+    try testing.expectEqual(Gate.source_checkout, gate(false, false, false, true, true));
+
+    // The acceptance harness's signature — both overrides — still runs from
+    // `zig-out`, which is build output like any other.
+    try testing.expectEqual(Gate.run, gate(false, false, true, true, true));
+    try testing.expectEqual(Gate.run, gate(true, false, true, true, true));
+
+    // And the two stronger refusals still win over it.
+    try testing.expectEqual(Gate.disabled, gate(false, true, false, false, true));
+    try testing.expectEqual(Gate.debug_needs_overrides, gate(true, false, false, false, true));
 }
 
 test "state: parse round-trips and tolerates junk" {

@@ -185,7 +185,30 @@ $GuardTable = @(
             'test\win32\url-scheme.ps1',
             'src\apprt\win32\url_scheme.zig',
             'src\apprt\win32\source_checkout.zig',
+            'src\os\source_checkout.zig',
             'src\apprt\ipc\url_scheme.zig'
+        )
+    },
+    # The REGISTRATION CLASS (T1151): every write a build makes outside its own
+    # checkout and state dir - the ghoztty:// handler, the agent Run key, the
+    # user PATH, the home hook scripts, the standalone-MSI adoption - and the
+    # inventory that names them. The per-site harnesses each prove ONE gate;
+    # this one proves the SET is complete, so a new registration added without a
+    # gate goes red instead of waiting for a third incident (T1124, T1146).
+    [pscustomobject]@{
+        Name   = 'registration-sites'
+        Script = 'test\win32\registration-sites.ps1'
+        Stamp  = 'test\win32\registration-sites.stamp.json'
+        Covers = @(
+            'test\win32\registration-sites.ps1',
+            'docs\design\windows-registration-sites.md',
+            'src\os\source_checkout.zig',
+            'src\apprt\win32\source_checkout.zig',
+            'src\apprt\win32\url_scheme.zig',
+            'src\apprt\win32\LocalAgent.zig',
+            'src\apprt\win32\PathInstaller.zig',
+            'src\apprt\win32\AgentIntegration.zig',
+            'src\remote\agent\adopt.zig'
         )
     },
     # The startup job self-escape (T675): the only harness that proves a
@@ -338,6 +361,7 @@ $GuardTable = @(
             'test\win32\agent-autostart.ps1',
             'src\apprt\win32\LocalAgent.zig',
             'src\apprt\win32\source_checkout.zig',
+            'src\os\source_checkout.zig',
             'src\remote\agent\session_meta.zig'
         )
     },
