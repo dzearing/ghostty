@@ -1399,6 +1399,7 @@ $GuardTable = @(
         Covers = @(
             'scripts\parity-tasks.ps1',
             'scripts\go-loop-exec.ps1',
+            'scripts\ci-status.ps1',
             'test\win32\gate-negatives.ps1'
         )
     },

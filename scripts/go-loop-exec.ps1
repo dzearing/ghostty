@@ -419,6 +419,22 @@ switch ($Action) {
             foreach ($line in ($pushOut -split "`r?`n")) { if ($line.Trim()) { "  $line" } }
         }
 
+        # T1219: what did the build machine say about the commit this branch is
+        # sitting on? Every push this loop makes starts a build and, until this
+        # line, nothing in the turn ever read the answer - fork-ci's
+        # windows-cross job was red for ten hours on 2026-08-31 with the exact
+        # failure that later killed the win-v1.36.0 release run, and the release
+        # was the first thing to notice. Same two-ended arrangement as stranded
+        # and unpushed work above: REPORTED here (never fatal - a claim that can
+        # exit nonzero over a build machine's mood would wedge the loop) and
+        # FAILED ON by `parity-tasks.ps1 validate`. An in-progress run is
+        # reported, not failed: this turn's own push is usually still building.
+        $ciScript = Join-Path $PSScriptRoot 'ci-status.ps1'
+        if (Test-Path -LiteralPath $ciScript) {
+            $ciOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $ciScript check -Repo $Repo 2>&1 | Out-String
+            foreach ($line in ($ciOut -split "`r?`n")) { if ($line.Trim()) { "  $line" } }
+        }
+
         $dupes = @()
         foreach ($w in $windows) {
             if ($mine -and $w.Id -eq $mine.Id) { continue }

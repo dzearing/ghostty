@@ -45,6 +45,19 @@ Concretely, in order, with no stops in between:
      open, so the gate cannot wedge the loop). Never sweep them silently into
      your task's commit, and never keep working past the report as if the tree
      were clean.
+   - **It also reports the CI VERDICT** (T1219): every push this loop makes
+     starts a build, and until this line nothing in the turn ever read the
+     answer — fork-ci sat red for ten hours on 2026-08-31 with the exact
+     failure that later killed the win-v1.36.0 release run. The claim names
+     what the build machine concluded about the commit this branch is sitting
+     on (`CI RED` names the workflow, the failing job and the run url), and
+     step 6's `validate` FAILS on a red one. An **in-progress run is not a
+     failure** — this turn's own push is still building at that point — and
+     neither is `CI UNKNOWN` (no run yet, no `gh`, no network). The
+     `-NoCiCheck` hatch is for a run that is red for a reason that is not this
+     turn's, and it prints that it was used. Ask directly with
+     `scripts\ci-status.ps1 check`; acceptance is section E of
+     `test\win32\gate-negatives.ps1`.
    - **It also reports a BOOT OUTAGE** (T829): after a restart with nobody at
      the keyboard, no process of ours can run at all — Windows creates no
      session, so both the Run entry and the supervisor's scheduled task are
@@ -523,6 +536,12 @@ Concretely, in order, with no stops in between:
    task cannot be narrated over a commit that never left the machine. The
    `-NoPushCheck` hatch is for a box with no network and prints that it was
    used. Acceptance: section W of `test\win32\go-loop-guard.ps1`.
+
+   Since T1219 `validate` also FAILS when the build machine says the branch head
+   does not build. Same two-ended arrangement as the push check above: step 0's
+   claim reports the verdict, this gate refuses the commit, and an in-progress
+   run passes so the loop is never stopped by its own in-flight build. Fix the
+   build, or take `-NoCiCheck` when the red belongs to somebody else's commit.
 
    Since T783 `validate` is also the gate with TEETH for harness staleness: it
    fails when `scripts\guard-due.ps1` reports an acceptance harness that has not

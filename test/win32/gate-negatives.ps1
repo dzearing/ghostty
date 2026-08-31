@@ -148,6 +148,17 @@ $Registry = @(
     [pscustomobject]@{ Label = 'build cache over limit'; Kind = 'gate'; Demo = 'test\win32\build-cache.ps1'
         Marker = 'build cache over limit'; Via = 'scripts\build-cache.ps1'
     }
+    # T1219. The build machine's verdict on the commit this branch sits on.
+    # CI RED is the gate; the other four verdicts are informational BY DESIGN -
+    # an in-progress run is this turn's own push still building, and "nobody has
+    # built it yet" is not evidence of breakage.
+    [pscustomobject]@{ Label = 'CI RED'; Kind = 'gate'; Demo = $Self
+        Marker = 'CI RED'; Via = 'scripts\ci-status.ps1'
+    }
+    [pscustomobject]@{ Label = 'CI IN PROGRESS'; Kind = 'status'; Via = 'scripts\ci-status.ps1' }
+    [pscustomobject]@{ Label = 'CI OK'; Kind = 'status'; Via = 'scripts\ci-status.ps1' }
+    [pscustomobject]@{ Label = 'CI UNKNOWN'; Kind = 'status'; Via = 'scripts\ci-status.ps1' }
+    [pscustomobject]@{ Label = 'CI NO VERDICT'; Kind = 'status'; Via = 'scripts\ci-status.ps1' }
 
     # --- parity-tasks.ps1 validate -----------------------------------------
     [pscustomobject]@{ Label = 'BAD FRONTMATTER'; Kind = 'gate'; Demo = $Self; Marker = 'BAD FRONTMATTER' }
@@ -165,6 +176,7 @@ $Registry = @(
         Marker = 'GUARD DUE CHECK SKIPPED'
     }
     [pscustomobject]@{ Label = 'PUSH CHECK SKIPPED'; Kind = 'hatch'; Demo = $Self; Marker = 'PUSH CHECK SKIPPED' }
+    [pscustomobject]@{ Label = 'CI CHECK SKIPPED'; Kind = 'hatch'; Demo = $Self; Marker = 'CI CHECK SKIPPED' }
     # Informational by design. SPLIT DEP is a legitimate queue state (a task
     # waiting on a split parent), STRANDED WORK ACKNOWLEDGED is the ack path
     # succeeding, and the rest belong to other verbs entirely.
@@ -515,6 +527,109 @@ try {
     Check 'C7 a pushed branch claims push clean' ($r.Text -match 'push clean') $r.Text
     Check 'C8 ...and neither red line appears over a healthy repo' `
         ($r.Text -notmatch 'STRANDED WORK' -and $r.Text -notmatch 'UNPUSHED WORK') $r.Text
+
+    # =======================================================================
+    Say ''
+    Say 'E. the CI verdict (T1219): reported by claim, FAILED ON by validate'
+    # =======================================================================
+
+    # The payloads are `gh run list --json ...` shaped, so the parsing and the
+    # verdict below are the script's real ones - only the transport is replaced.
+    # This is the whole reason a red CI can be demonstrated on a box whose CI is
+    # green: the alternative is pushing a broken commit to find out.
+    $CiScript = Join-Path $Repo 'scripts\ci-status.ps1'
+    $ciDir = Join-Path $Sandbox 'ci'
+    New-Item -ItemType Directory -Force -Path $ciDir | Out-Null
+    function New-CiPayload {
+        param([string]$Name, [string[]]$Lines)
+        $path = Join-Path $ciDir "$Name.json"
+        Write-Ascii $path $Lines
+        return $path
+    }
+    function Invoke-Ci {
+        param([string]$Payload, [string[]]$Extra = @())
+        return Invoke-Ps (@('-File', $CiScript, 'check', '-Sha', 'fixture01',
+                '-Branch', 'fixture-branch', '-RunsJsonFile', $Payload) + $Extra)
+    }
+
+    $ciRed = New-CiPayload 'red' @(
+        '[{"conclusion":"skipped","databaseId":1,"headSha":"fixture01","status":"completed",',
+        '  "url":"u1","workflowName":"Nix"},',
+        ' {"conclusion":"failure","databaseId":2,"headSha":"fixture01","status":"completed",',
+        '  "url":"https://example.invalid/runs/2","workflowName":"Fork CI",',
+        '  "jobs":[{"name":"windows-cross","conclusion":"failure"},',
+        '          {"name":"lint","conclusion":"success"}]}]')
+    $ciProg = New-CiPayload 'in-progress' @(
+        '[{"conclusion":"","databaseId":3,"headSha":"fixture01","status":"in_progress",',
+        '  "url":"u3","workflowName":"Fork CI"}]')
+    $ciOk = New-CiPayload 'ok' @(
+        '[{"conclusion":"success","databaseId":4,"headSha":"fixture01","status":"completed",',
+        '  "url":"u4","workflowName":"Fork CI"}]')
+    $ciOther = New-CiPayload 'other-sha' @(
+        '[{"conclusion":"failure","databaseId":5,"headSha":"someoneelse","status":"completed",',
+        '  "url":"u5","workflowName":"Fork CI"}]')
+
+    $r = Invoke-Ci $ciRed
+    Check 'E0 a failing run scores CI RED, naming the workflow and the run' `
+        ($r.Code -eq 8 -and $r.Text -match 'CI RED' -and $r.Text -match 'Fork CI' -and
+        $r.Text -match 'runs/2') "exit=$($r.Code): $($r.Text)"
+    Check 'E1 ...and names the job that failed, not just the run' `
+        ($r.Text -match 'failing job: windows-cross') $r.Text
+    Check 'E2 ...and does not name a job that passed' ($r.Text -notmatch 'failing job: lint') $r.Text
+
+    $r = Invoke-Ci $ciRed @('-Quiet')
+    Check 'E3 -Quiet still speaks when the verdict is red' `
+        ($r.Code -eq 8 -and $r.Text -match 'CI RED') "exit=$($r.Code): $($r.Text)"
+
+    # The three verdicts that must NOT fail, or the gate stops the loop at every
+    # boundary over its own in-flight build.
+    $r = Invoke-Ci $ciProg
+    Check 'E4 a run still going is reported and does NOT fail' `
+        ($r.Code -eq 0 -and $r.Text -match 'CI IN PROGRESS') "exit=$($r.Code): $($r.Text)"
+    $r = Invoke-Ci $ciOther
+    Check 'E5 a red run for a DIFFERENT commit is not this branch head verdict' `
+        ($r.Code -eq 0 -and $r.Text -match 'CI UNKNOWN') "exit=$($r.Code): $($r.Text)"
+    $r = Invoke-Ci $ciOk @('-Quiet')
+    Check 'E6 a green run is silent under -Quiet and exits 0' `
+        ($r.Code -eq 0 -and -not ($r.Text -match 'CI ')) "exit=$($r.Code): $($r.Text)"
+
+    # The teeth: what the script concludes, VALIDATE must fail on - the same
+    # two-ended arrangement measured for stranded work in C5.
+    $env:GHOZTTY_CI_RUNS_JSON = $ciRed
+    $env:GHOZTTY_CI_SHA = 'fixture01'
+    try {
+        $r = Invoke-Validate (New-CaseDir 'ci-red')
+        $rHatch = Invoke-Validate (New-CaseDir 'ci-hatch') @('-NoCiCheck')
+        $env:GHOZTTY_CI_RUNS_JSON = $ciProg
+        $rProg = Invoke-Validate (New-CaseDir 'ci-prog')
+    }
+    finally {
+        Remove-Item Env:GHOZTTY_CI_RUNS_JSON -ErrorAction SilentlyContinue
+        Remove-Item Env:GHOZTTY_CI_SHA -ErrorAction SilentlyContinue
+    }
+    Check 'E7 validate FAILS on a red run, and says which workflow and run' `
+        ($r.Code -ne 0 -and $r.Text -match 'CI RED' -and $r.Text -match 'runs/2') `
+        "exit=$($r.Code): $($r.Text)"
+    Check 'E8 the hatch is a hatch: -NoCiCheck passes and ANNOUNCES itself' `
+        ($rHatch.Code -eq 0 -and $rHatch.Text -match 'CI CHECK SKIPPED') `
+        "exit=$($rHatch.Code): $($rHatch.Text)"
+    Check 'E9 an in-progress run does not fail validate' `
+        ($rProg.Code -eq 0 -and $rProg.Text -notmatch 'CI RED') "exit=$($rProg.Code): $($rProg.Text)"
+
+    # And the report side, end to end: claim surfaces the verdict at the top of
+    # the turn. A7 proves claim still runs the delegate; this proves the text a
+    # human reads actually carries the bad news.
+    $env:GHOZTTY_CI_RUNS_JSON = $ciRed
+    $env:GHOZTTY_CI_SHA = 'fixture01'
+    try { $rClaim = Invoke-Claim $green 'GATE-NEG-GREEN-0001' }
+    finally {
+        Remove-Item Env:GHOZTTY_CI_RUNS_JSON -ErrorAction SilentlyContinue
+        Remove-Item Env:GHOZTTY_CI_SHA -ErrorAction SilentlyContinue
+    }
+    Check 'E10 claim REPORTS CI RED at the top of the turn' `
+        ($rClaim.Text -match 'CI RED') $rClaim.Text
+    Check 'E11 ...and still exits 0, because a claim must never wedge the loop' `
+        ($rClaim.Code -eq 0) "exit=$($rClaim.Code)"
 
     # =======================================================================
     Say ''

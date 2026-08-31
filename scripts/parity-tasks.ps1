@@ -136,7 +136,15 @@ param(
     # invisible to the other seat and dies with the box. Same hatch shape as
     # -NoGuardDue, for the genuinely stuck case (no network), and it PRINTS
     # that it was used.
-    [switch]$NoPushCheck
+    [switch]$NoPushCheck,
+
+    # `validate` also asks scripts\ci-status.ps1 what the build machine
+    # concluded about the commit this branch is sitting on (T1219) - the loop
+    # pushes every turn and, until this gate, never read the answer. Same hatch
+    # shape as the two above, and it exists because a run can be red for a
+    # reason that is not this turn's (a flaky runner, a red commit somebody
+    # else pushed, no network); it PRINTS that it was used.
+    [switch]$NoCiCheck
 )
 
 $ErrorActionPreference = 'Stop'
@@ -1116,6 +1124,34 @@ switch ($Command) {
             $pushOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $pushScript unpushed -Repo $pushRepo -Quiet 2>&1 | Out-String
             if ($LASTEXITCODE -ne 0) {
                 foreach ($line in ($pushOut -split "`r?`n")) { if ($line.Trim()) { Write-Host $line } }
+                $problems++
+            }
+        }
+
+        # T1219: is the branch this commit is landing on actually building?
+        # The loop pushes on every turn (the gate above makes sure of it) and a
+        # build machine answers within minutes; nothing read that answer until
+        # this line, so fork-ci sat red for ten hours on 2026-08-31 with the
+        # failure that later killed a release. Reported by
+        # go-loop-exec.ps1's claim at the top of the turn, FAILED ON here - the
+        # same division of labour as stranded and unpushed work above. An
+        # in-progress run is not a failure: every turn's own push is still
+        # building at this point, and gating on it would stop the loop dead at
+        # each boundary for no information. GHOZTTY_CI_RUNS_JSON /
+        # GHOZTTY_CI_SHA point the question at a fixture payload for the
+        # acceptance harness; unset in every real run.
+        $ciScript = Join-Path $PSScriptRoot 'ci-status.ps1'
+        if ($TaskDirGiven -and -not $env:GHOZTTY_CI_RUNS_JSON) {
+            # A fixture run is somebody testing the tracker, not the loop's
+            # pre-commit gate (same reason as the guard-due check above).
+        }
+        elseif ($NoCiCheck) {
+            Write-Host "CI CHECK SKIPPED (-NoCiCheck): nobody checked whether the build machine is green on this branch"
+        }
+        elseif (Test-Path -LiteralPath $ciScript) {
+            $ciOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $ciScript check -Repo $RepoRoot -Quiet 2>&1 | Out-String
+            if ($LASTEXITCODE -ne 0) {
+                foreach ($line in ($ciOut -split "`r?`n")) { if ($line.Trim()) { Write-Host $line } }
                 $problems++
             }
         }
