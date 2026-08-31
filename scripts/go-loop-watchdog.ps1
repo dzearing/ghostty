@@ -194,7 +194,21 @@ if ($ResumePromptFile) {
 # does not, measured on the box. So a session appearing revives the watchdog
 # immediately instead of up to -ReviveMinutes later, and this loop stays
 # installable from an ordinary session.
+#
+# The command itself is wscript.exe on a generated launcher, not powershell.exe
+# (T1192): a Run entry firing powershell at sign-in gets a console before it can
+# read -WindowStyle Hidden, and with Windows Terminal as the default terminal
+# application that console is a real window that takes focus. go-loop-boot.ps1
+# owns the launcher, so the Run entry and the revive task cannot end up with two
+# different launch shapes; it prints the command line to use.
 function Get-RunCommand {
+    $bootScript = Join-Path $PSScriptRoot 'go-loop-boot.ps1'
+    $out = (& powershell -NoProfile -ExecutionPolicy Bypass -File $bootScript launcher `
+        -Repo $Repo -WatchdogScript $PSCommandPath 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -eq 0 -and $out -match '^wscript') { return $out }
+    # Loud rather than silent: a Run entry is only read at sign-in, so a quiet
+    # fallback here would not be noticed until the next reboot.
+    Log "WARNING: could not build the windowless launcher ($out); falling back to powershell"
     return "powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Repo `"$Repo`""
 }
 

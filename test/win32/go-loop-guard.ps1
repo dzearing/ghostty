@@ -1002,7 +1002,29 @@ Assert 'P10 -Status reports both autostart hooks' `
 $taskQuery = (& schtasks /query /tn 'GhozttyGoLoopWatchdog' /fo LIST /v 2>&1 |
     ForEach-Object { $_.ToString() } | Out-String)
 Assert 'P11 the revive task is registered (run -Install if this fails)' ($LASTEXITCODE -eq 0)
-Assert 'P12 the revive task launches the watchdog' ($taskQuery -match 'go-loop-watchdog\.ps1')
+
+# P12 follows the chain rather than grepping the /TR line for the script name
+# (T1172/T1192). Since the launch went windowless the action is wscript.exe on a
+# generated launcher, so "go-loop-watchdog.ps1 appears in the task" is no longer
+# true of a correctly registered task - it was red for a day on exactly that.
+# What must stay true is that the task ENDS UP running the watchdog, whichever
+# host it goes through.
+$realAction = $null
+try { $realAction = @((Get-ScheduledTask -TaskName 'GhozttyGoLoopWatchdog' -ErrorAction Stop).Actions)[0] } catch { }
+$realExec = if ($realAction) { [string]$realAction.Execute } else { '' }
+$realArgs = if ($realAction) { [string]$realAction.Arguments } else { '' }
+$launched = "$realExec $realArgs"
+if ($realArgs -match '"([^"]+\.vbs)"') {
+    $vbsPath = $Matches[1]
+    if (Test-Path -LiteralPath $vbsPath) { $launched += "`n" + (Get-Content -LiteralPath $vbsPath -Raw) }
+}
+Assert 'P12 the revive task ends up launching the watchdog' ($launched -match 'go-loop-watchdog\.ps1')
+# T1192: powershell.exe under an Interactive principal is handed a console
+# before it can read -WindowStyle Hidden, and with Windows Terminal as the
+# default terminal application that console is a real window that takes focus.
+# wscript.exe is GUI-subsystem and is given none.
+Assert 'P12b the revive task launches windowless, so a revival cannot steal focus' `
+    ($realExec -match '(^|\\)wscript(\.exe)?$')
 
 # The READ side of the same beacon: the dashboard's own rule, asserted by the
 # dashboard's own code (a rule re-implemented here would drift from it).
@@ -1205,6 +1227,24 @@ Assert 'V12 install registers the revive task' ($r.Code -eq 0 -and $r.Out -match
 Assert 'V13 install verifies the shape it just wrote' `
     ($r.Out -match 'atLogon=True' -and $r.Out -match 'repeats=True' -and
      $r.Out -match 'batteryGate=False' -and $r.Out -match 'timeLimited=False')
+# T1192, on the fixture rather than the live supervisor: the shape the INSTALLER
+# writes, not the shape this box happens to be carrying. P12/P12b assert the
+# real task; these assert that a fresh install produces it, which is the half
+# that regressed - the live task was fixed by hand and the installer was not,
+# so the next -Install would have put the focus-stealing console back.
+$fixtureVbs = Join-Path (Split-Path -Parent $dogScript) `
+    ("$([System.IO.Path]::GetFileNameWithoutExtension($dogScript))-launch.vbs")
+Assert 'V13a install writes a launcher next to the watchdog it was given' (Test-Path -LiteralPath $fixtureVbs)
+$fixtureVbsText = if (Test-Path -LiteralPath $fixtureVbs) { Get-Content -LiteralPath $fixtureVbs -Raw } else { '' }
+Assert 'V13b the launcher points at THAT watchdog, not this box''s' `
+    ($fixtureVbsText -match [regex]::Escape($dogScript))
+Assert 'V13c the launcher gives it no console' ($fixtureVbsText -match '(?m),\s*0\s*,\s*False\s*$')
+$fixtureAction = $null
+try { $fixtureAction = @((Get-ScheduledTask -TaskName $fixtureTask -ErrorAction Stop).Actions)[0] } catch { }
+Assert 'V13d install registers wscript.exe, not powershell.exe' `
+    ($null -ne $fixtureAction -and ([string]$fixtureAction.Execute) -match '(^|\\)wscript(\.exe)?$')
+Assert 'V13e install reads the launch shape back and says so' ($r.Out -match 'windowless=True')
+
 $r = Boot-Run @('install', '-TaskName', $fixtureTask, '-WatchdogScript', $dogScript)
 Assert 'V14 install is idempotent' ($r.Code -eq 0 -and $r.Out -match 'atLogon=True')
 $r = Boot-Run @('check', '-Json', '-TaskName', $fixtureTask)

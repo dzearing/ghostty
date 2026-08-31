@@ -67,3 +67,8 @@ sprite_face_test-*.png
 # manual msiinfo run from the repo root still would — and one such dump got
 # committed once already.
 /Binary/
+
+# Generated windowless launchers for the go-loop supervisor (T1192).
+# scripts\go-loop-boot.ps1 writes these next to the script they launch, with
+# this clone's paths baked in; a committed copy would hardcode one box.
+scripts/*-launch.vbs
