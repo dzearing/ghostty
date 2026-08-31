@@ -191,3 +191,42 @@ zig build -Dapp-runtime=win32 -Doptimize=Debug      # -> zig-out\bin\ghoztty.exe
   through `scripts/launch-upgrade.ps1` (never a hand-rolled `Start-Process`);
   `go.md` has the full protocol and the staleness gates.
 
+
+## What is installed on this box, and how to clear it
+
+`scripts\ghoztty-cleanup.ps1` (T1188) is the inventory. Run it before any claim
+that this machine is "clean", and read its verdict rather than a memory of which
+folders somebody deleted:
+
+```powershell
+powershell -NoProfile -File scripts\ghoztty-cleanup.ps1 inventory   # read-only
+powershell -NoProfile -File scripts\ghoztty-cleanup.ps1 clean       # proposes, per item
+powershell -NoProfile -File scripts\ghoztty-cleanup.ps1 verdict     # exit 0 = accounted for
+```
+
+It enumerates every artifact class with its provenance: the four install
+locations above, every `zig-out*` prefix in the repo, Apps & Features
+registrations, HKCU Run values, the settings key, the user PATH entry, Start
+Menu and Startup drops, scheduled tasks, the state directory
+(`%LOCALAPPDATA%\ghoztty`, which holds `relay.env` and the DPAPI account store),
+live named pipes and running processes.
+
+Three things about it are load-bearing:
+
+- **It never offers `msiexec /x` on a protected product code.** The registered
+  "Ghoztty 26.7.502" `{A10466B5-D625-4A80-95D2-8AA648F5086C}` is a ghost whose
+  uninstall would delete the LIVE install's files. Protected entries are
+  reported with the refusal and never with a command string.
+- **Nothing is removed without a per-item yes.** There is no `-Force` and no
+  "remove all"; unanswered means keep. `-Answer id=y,id2=n` is the scripted form
+  the harness uses.
+- **The verdict is about accounting, not emptiness.** An item is accounted for
+  when it is gone, permanently protected, or explicitly kept with
+  `keep <id> -Reason "<why>"` (recorded in `temp\ghoztty-cleanup-keep.json`, so
+  it survives the pane it was printed in). An unaccounted removable artifact is
+  the only thing that makes the box dirty. That verdict is the evidence T1179
+  records for "no prior Ghoztty".
+
+Acceptance: `test\win32\ghoztty-cleanup.ps1` (guard `ghoztty-cleanup`);
+`-NegativeControl` drops the ghost from the protected list and proves it then IS
+offered, which is the demonstration that the refusal is real.

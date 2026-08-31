@@ -138,6 +138,23 @@ $GuardTable = @(
             'docs\design\windows-parity-upstream-pull-plan.md'
         )
     },
+    # The cleanup screen (T1188). It DELETES things on the user's primary
+    # machine on the strength of a classification it makes itself, and the two
+    # behaviours that keep that safe - the ghost-registration refusal and
+    # per-item confirmation - are invisible when broken: a screen that offered
+    # `msiexec /x` on {A10466B5-...} would look completely normal right up to
+    # the moment it deleted the live install, and an "are you sure" that ignores
+    # the answer produces a run that reads as successful. Nothing in the P1-P3
+    # floor launches it, so this row is what ties an edit to its harness.
+    [pscustomobject]@{
+        Name   = 'ghoztty-cleanup'
+        Script = 'test\win32\ghoztty-cleanup.ps1'
+        Stamp  = 'test\win32\ghoztty-cleanup.stamp.json'
+        Covers = @(
+            'test\win32\ghoztty-cleanup.ps1',
+            'scripts\ghoztty-cleanup.ps1'
+        )
+    },
     # The other half of Stage 0 (T956): the fork-identity overlay. Same argument
     # as above and one more - this one WRITES to a tree, so the failure mode is
     # not "a merge stage is harder than expected" but "52 upstream files were
