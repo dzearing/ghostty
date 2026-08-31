@@ -47,6 +47,7 @@ const agent_upgrade = @import("agent_upgrade.zig");
 const gui_pump = @import("gui_pump.zig");
 const job_object = @import("job_object.zig");
 const job_spawn = @import("job_spawn.zig");
+const source_checkout = @import("source_checkout.zig");
 const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32_local_agent);
@@ -774,10 +775,25 @@ extern "kernel32" fn QueryFullProcessImageNameW(
 ///
 /// Runs only after persistence actually ENGAGED (a successful agent resolve),
 /// once per app run, and refreshes the command in place so the entry tracks
-/// the install the user actually runs. Debug builds never write the release
-/// entry: they use a lineage-suffixed value name and only under the explicit
-/// `GHOZTTY_AGENT_AUTOSTART=force` test hook (mirroring PathInstaller's
-/// gating pattern). `GHOZTTY_AGENT_AUTOSTART=0`/`off` disables entirely.
+/// the install the user actually runs. Two gates decide whether anything is
+/// written, and both have to pass:
+///
+///  * **Build mode.** Debug builds never write the release entry: they use a
+///    lineage-suffixed value name and only under an explicit test hook
+///    (mirroring PathInstaller's gating pattern).
+///  * **Location** (T1146). A build whose exe sits inside a source checkout
+///    writes nothing, even in release. The staging release we build to package
+///    a delivery lives at `zig-out-release\bin` in this very checkout and IS a
+///    release build, so without this a single GUI launch of it would have
+///    Windows start the agent that owns the user's live sessions out of a
+///    scratch directory that development rebuilds and deletes — and unlike the
+///    `ghoztty://` registration T1124 fixed, this entry survives a reboot. Same
+///    question, same answer: `source_checkout.inSourceCheckout`.
+///
+/// `GHOZTTY_AGENT_AUTOSTART` spells the hatches: `0`/`off` disables entirely,
+/// `force` skips both gates, and `gate` skips only the build-mode gate — the
+/// seam the acceptance script needs to prove the location gate refuses without
+/// asking anyone to launch a release build at the user's endpoints (T350).
 /// Best-effort: a registry failure logs and never affects the session.
 fn ensureAutostart(self: *LocalAgent) void {
     if (comptime builtin.os.tag != .windows) return;
@@ -788,13 +804,28 @@ fn ensureAutostart(self: *LocalAgent) void {
     defer arena_state.deinit();
     const arena = arena_state.allocator();
 
-    const gate: ?[]const u8 =
-        std.process.getEnvVarOwned(arena, "GHOZTTY_AGENT_AUTOSTART") catch null;
-    if (gate) |v| {
-        if (std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off")) return;
+    const mode: AutostartMode = if (std.process.getEnvVarOwned(
+        arena,
+        "GHOZTTY_AGENT_AUTOSTART",
+    )) |v| parseAutostartMode(v) else |_| .default;
+    if (mode == .off) return;
+    if (build_config.is_debug and mode != .force and mode != .gate) return;
+
+    if (mode != .force) {
+        // Fail CLOSED: an exe path we could not read is a location we cannot
+        // clear, and this entry outlives the process that writes it.
+        const exe_dir = std.fs.selfExeDirPathAlloc(arena) catch |err| {
+            log.warn("agent autostart: exe path unreadable, not writing Run key err={}", .{err});
+            return;
+        };
+        if (source_checkout.inSourceCheckout(arena, exe_dir)) {
+            log.info(
+                "agent autostart: no Run key written from a source checkout ({s})",
+                .{exe_dir},
+            );
+            return;
+        }
     }
-    const force = if (gate) |v| std.ascii.eqlIgnoreCase(v, "force") else false;
-    if (build_config.is_debug and !force) return;
 
     self.writeAutostart(arena) catch |err| {
         log.warn("agent autostart Run-key write failed err={}", .{err});
@@ -802,6 +833,20 @@ fn ensureAutostart(self: *LocalAgent) void {
     };
     var name_buf: [64]u8 = undefined;
     log.info("agent autostart Run key refreshed ({s})", .{autostartValueName(&name_buf)});
+}
+
+/// What `GHOZTTY_AGENT_AUTOSTART` asks of the Run-key write. Deliberately the
+/// same vocabulary as `GHOZTTY_URL_SCHEME` and `GHOZTTY_PATH_SELFHEAL`, so the
+/// three launch-time self-heals are spelled the same way.
+pub const AutostartMode = enum { default, off, force, gate };
+
+pub fn parseAutostartMode(v: []const u8) AutostartMode {
+    if (std.mem.eql(u8, v, "0") or std.ascii.eqlIgnoreCase(v, "off")) return .off;
+    if (std.ascii.eqlIgnoreCase(v, "force")) return .force;
+    if (std.ascii.eqlIgnoreCase(v, "gate")) return .gate;
+    // Anything else is the ordinary launch, not an error: an unrecognised value
+    // must never turn autostart off by accident.
+    return .default;
 }
 
 /// `GhozttyAgent` for release, `GhozttyAgent-debug` for the debug lineage, plus
@@ -1155,6 +1200,19 @@ fn agentBinary(self: *LocalAgent, arena: Allocator) ![]const u8 {
     } else |_| {}
     const exe_dir = try std.fs.selfExeDirPathAlloc(arena);
     return std.fmt.allocPrint(arena, "{s}\\ghoztty-agent.exe", .{exe_dir});
+}
+
+test "T1146: GHOZTTY_AGENT_AUTOSTART spells out off, force and gate" {
+    try std.testing.expectEqual(AutostartMode.off, parseAutostartMode("0"));
+    try std.testing.expectEqual(AutostartMode.off, parseAutostartMode("off"));
+    try std.testing.expectEqual(AutostartMode.off, parseAutostartMode("OFF"));
+    try std.testing.expectEqual(AutostartMode.force, parseAutostartMode("force"));
+    // `gate` is the seam that lets a debug build exercise the LOCATION gate:
+    // it skips the build-mode refusal and keeps the checkout refusal.
+    try std.testing.expectEqual(AutostartMode.gate, parseAutostartMode("gate"));
+    try std.testing.expectEqual(AutostartMode.default, parseAutostartMode(""));
+    try std.testing.expectEqual(AutostartMode.default, parseAutostartMode("1"));
+    try std.testing.expectEqual(AutostartMode.default, parseAutostartMode("yes please"));
 }
 
 test "agentCommandLine quotes every token and pins the daemon flags" {

@@ -55,6 +55,7 @@ const internal_os = @import("../../os/main.zig");
 const App = @import("App.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
+const source_checkout = @import("source_checkout.zig");
 
 /// The shared grammar: `handles`, `parse`, and the failure wording.
 pub const grammar = apprt.ipc.url_scheme;
@@ -214,36 +215,10 @@ fn envMode(arena: std.mem.Allocator) Mode {
     return parseMode(v);
 }
 
-/// How far up the tree the checkout marker is looked for. A build output
-/// directory sits a couple of levels under the repo root (`zig-out\bin`); the
-/// bound exists so a pathological path cannot turn a launch into a long walk.
-const max_checkout_depth: usize = 16;
-
-/// Does `dir` sit inside a source checkout — i.e. does it, or any ancestor,
-/// hold a `build.zig`?
-///
-/// This is what tells build OUTPUT apart from an install (T1124). Both
-/// `zig-out\bin` and `zig-out-release\bin` answer yes; `%LOCALAPPDATA%\Programs\
-/// Ghoztty` and a portable unpack on the Desktop answer no, so neither of the
-/// two real install shapes loses its registration. The marker is the build file
-/// rather than `.git`, because a checkout with no git dir (an archive, a
-/// worktree's copy) still builds and still must not claim the scheme.
-pub fn inSourceCheckout(alloc: std.mem.Allocator, dir: []const u8) bool {
-    var cur: []const u8 = dir;
-    var depth: usize = 0;
-    while (depth < max_checkout_depth) : (depth += 1) {
-        const marker = std.fs.path.join(alloc, &.{ cur, "build.zig" }) catch return false;
-        defer alloc.free(marker);
-        if (std.fs.accessAbsolute(marker, .{})) |_| return true else |_| {}
-
-        const parent = std.fs.path.dirname(cur) orelse return false;
-        // `dirname` of a root ("D:\\", "\\\\host\\share") returns the root or
-        // null; either way there is nowhere further up to look.
-        if (parent.len >= cur.len) return false;
-        cur = parent;
-    }
-    return false;
-}
+/// Does this exe sit inside a source checkout? Shared with the agent autostart
+/// gate (T1146), which asks the identical question about the identical hazard —
+/// see `source_checkout.zig`.
+pub const inSourceCheckout = source_checkout.inSourceCheckout;
 
 fn createKey(arena: std.mem.Allocator, path: []const u8, out: *w32.HKEY) !void {
     const path_w = try std.unicode.utf8ToUtf16LeAllocZ(arena, path);
@@ -572,55 +547,6 @@ test "GHOZTTY_URL_SCHEME spells out off, force and gate" {
     try testing.expectEqual(Mode.default, parseMode(""));
     try testing.expectEqual(Mode.default, parseMode("1"));
     try testing.expectEqual(Mode.default, parseMode("yes please"));
-}
-
-test "build output is recognised as a source checkout, an install is not" {
-    const alloc = testing.allocator;
-
-    // Deliberately NOT `testing.tmpDir`: that lands under `.zig-cache` INSIDE
-    // this checkout, where every path in the test has THIS repo's `build.zig`
-    // as an ancestor and the negative cases could not fail. The OS temp dir is
-    // the only place on the box guaranteed to be outside a source tree.
-    const tmp_root = std.process.getEnvVarOwned(alloc, "TEMP") catch return error.SkipZigTest;
-    defer alloc.free(tmp_root);
-    const root = try std.fmt.allocPrint(alloc, "{s}{c}ghoztty-urlscheme-test", .{
-        tmp_root,
-        std.fs.path.sep,
-    });
-    defer alloc.free(root);
-    std.fs.deleteTreeAbsolute(root) catch {};
-    defer std.fs.deleteTreeAbsolute(root) catch {};
-
-    var dir = try std.fs.cwd().makeOpenPath(root, .{});
-    defer dir.close();
-
-    // A checkout: build.zig at the root, build output a couple of levels down.
-    try dir.makePath("repo" ++ std.fs.path.sep_str ++ "zig-out-release" ++ std.fs.path.sep_str ++ "bin");
-    try dir.writeFile(.{
-        .sub_path = "repo" ++ std.fs.path.sep_str ++ "build.zig",
-        .data = "// marker\n",
-    });
-    const staging = try std.fs.path.join(alloc, &.{ root, "repo", "zig-out-release", "bin" });
-    defer alloc.free(staging);
-    try testing.expect(inSourceCheckout(alloc, staging));
-
-    // The repo root itself, and the debug output beside it, answer the same.
-    const repo = try std.fs.path.join(alloc, &.{ root, "repo" });
-    defer alloc.free(repo);
-    try testing.expect(inSourceCheckout(alloc, repo));
-
-    // An install: same tree, no build.zig above it. This is the shape of both
-    // %LOCALAPPDATA%\Programs\Ghoztty and a portable unpack, and both must keep
-    // registering.
-    try dir.makePath("Programs" ++ std.fs.path.sep_str ++ "Ghoztty");
-    const install = try std.fs.path.join(alloc, &.{ root, "Programs", "Ghoztty" });
-    defer alloc.free(install);
-    try testing.expect(!inSourceCheckout(alloc, install));
-
-    // A directory that does not exist is not a checkout, and does not error.
-    const missing = try std.fs.path.join(alloc, &.{ root, "nope", "bin" });
-    defer alloc.free(missing);
-    try testing.expect(!inSourceCheckout(alloc, missing));
 }
 
 test "exit codes tell the two failures apart" {

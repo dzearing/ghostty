@@ -184,6 +184,7 @@ $GuardTable = @(
         Covers = @(
             'test\win32\url-scheme.ps1',
             'src\apprt\win32\url_scheme.zig',
+            'src\apprt\win32\source_checkout.zig',
             'src\apprt\ipc\url_scheme.zig'
         )
     },
@@ -336,6 +337,7 @@ $GuardTable = @(
         Covers = @(
             'test\win32\agent-autostart.ps1',
             'src\apprt\win32\LocalAgent.zig',
+            'src\apprt\win32\source_checkout.zig',
             'src\remote\agent\session_meta.zig'
         )
     },

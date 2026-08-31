@@ -18,6 +18,15 @@
 #      pre-kill session as a DEAD tombstone (alive=false) materialized from
 #      sessions.json.
 #   C. Debug gate: without the force hook a debug GUI writes NO Run value.
+#   D. Location gate (T1146): with GHOZTTY_AGENT_AUTOSTART=gate - which skips
+#      the build-mode refusal and keeps the checkout refusal - a build whose
+#      exe sits inside a source checkout writes NO Run value, even though
+#      persistence engaged. Section A is its positive control: same exe, same
+#      directory, same launch, and under `force` the value WAS written.
+#   E. Gate-mode positive control: a COPY of the same debug exe placed outside
+#      any checkout, launched the same way with `gate`, DOES write the value.
+#      Location is the only variable between D and E, and it flips the
+#      outcome - which is what makes D3 a demonstration rather than a silence.
 #
 # Hermetic: per-run $env:LOCALAPPDATA + GHOSTTY_LOCAL_AGENT_BIN; only ever
 # kills ghoztty/ghoztty-agent processes launched from zig-out; saves and
@@ -261,6 +270,98 @@ Assert "C2 persistence engaged (agent session exists)" ($null -ne $rowsC -and @(
 # ...but a debug build without the hook must not write the Run key.
 Start-Sleep -Seconds 2
 Assert "C3 no Run value written by a debug build" ($null -eq (Get-RunValue))
+
+# ============================================================================
+"== D: location gate -> no Run value from a build inside a source checkout"
+# ============================================================================
+# T1146. The build-mode gate (section C) is not enough on its own: the staging
+# release we build to package a delivery lives at zig-out-releasein INSIDE
+# this checkout and IS a release build, so it would have written the real
+# `GhozttyAgent` value and had Windows start the user's session agent out of a
+# scratch directory at every sign-in. `gate` is the seam that lets this debug
+# build exercise the LOCATION gate: it skips the build-mode refusal (so the
+# write is reached) and keeps the checkout refusal.
+#
+# Section A is this section's positive control, and it is why D3 is not
+# vacuous: the same exe, in the same directory, with the same launch, DID write
+# the value under `force`. The only thing that differs here is the location
+# gate.
+Stop-TestProcs
+Remove-ItemProperty -Path $runKey -Name $valueName -ErrorAction SilentlyContinue
+$env:GHOZTTY_AGENT_AUTOSTART = 'gate'
+$d = Start-Gui 'd'
+$paneD = Wait-FirstPane $d.Tmp
+Assert "D1 GUI opened a pane" ($null -ne $paneD)
+$code = Run-Cli '+sessions --json' "$($d.Tmp)\sess.json"
+$rowsD = $null
+try { $rowsD = Out-Text "$($d.Tmp)\sess.json" | ConvertFrom-Json } catch {}
+Assert "D2 persistence engaged (agent session exists, so the write was reached)" ($null -ne $rowsD -and @($rowsD).Count -ge 1)
+Start-Sleep -Seconds 2
+Assert "D3 no Run value written from inside the checkout" ($null -eq (Get-RunValue))
+# And the release value name is untouched too - the hazard is the user's own
+# `GhozttyAgent` entry, which no debug lineage should ever be able to reach.
+$releaseVal = $null
+try { $releaseVal = (Get-ItemProperty -Path $runKey -Name 'GhozttyAgent' -ErrorAction Stop).'GhozttyAgent' } catch {}
+Assert "D4 the release value name names no zig-out path" ($null -eq $releaseVal -or $releaseVal -notlike '*zig-out*')
+
+# ============================================================================
+"== E: gate mode positive control -> the SAME build outside a checkout writes"
+# ============================================================================
+# T1146. D3 on its own could pass for the wrong reason: if `gate` were not
+# understood, a debug build would stop at the build-mode refusal and write
+# nothing either way. So run the identical launch from a copy of this exe that
+# sits OUTSIDE any checkout (%TEMP%, which has no build.zig above it). Same
+# bits, same mode, same everything - only the location differs - and here the
+# value MUST appear. Together with D that is the demonstration the gate can
+# fail: the location is the only variable, and it flips the outcome.
+Stop-TestProcs
+Remove-ItemProperty -Path $runKey -Name $valueName -ErrorAction SilentlyContinue
+$outsideDir = Join-Path $root 'outside\Ghoztty'
+New-Item -ItemType Directory -Force $outsideDir | Out-Null
+$outsideExe = Join-Path $outsideDir 'ghoztty.exe'
+$outsideAgent = Join-Path $outsideDir 'ghoztty-agent.exe'
+Copy-Item $Exe $outsideExe -Force
+Copy-Item $AgentExe $outsideAgent -Force
+Assert "E1 copy is outside any checkout (no build.zig above it)" (
+    -not (Test-Path (Join-Path $root 'build.zig')) -and -not (Test-Path (Join-Path $env:TEMP 'build.zig'))
+)
+
+function Stop-OutsideProcs {
+    # cleanslate-exempt: the shared kill is path-exact AND refuses an exe outside
+    # the repo by design, and this section's whole subject is a copy deliberately
+    # placed outside it. Matched on THIS RUN's temp directory, so it can never
+    # reach zig-out or an installed Ghoztty.
+    foreach ($n in @('ghoztty.exe', 'ghoztty-agent.exe')) {
+        Get-CimInstance Win32_Process -Filter "Name='$n'" |
+            Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($outsideDir, 'OrdinalIgnoreCase') } |
+            ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+    }
+    Start-Sleep -Milliseconds 700
+}
+Stop-OutsideProcs
+
+$env:GHOSTTY_LOCAL_AGENT_BIN = $outsideAgent
+$env:GHOZTTY_AGENT_AUTOSTART = 'gate'
+$tmpE = Join-Path $root 'e'
+New-Item -ItemType Directory -Force (Join-Path $tmpE 'ghoztty\local-agent-debug') | Out-Null
+$env:LOCALAPPDATA = $tmpE
+$pe = Start-Process -FilePath $outsideExe -PassThru -WindowStyle Minimized `
+    -ArgumentList @('--title=t1146-outside')
+$runCmdE = $null
+$deadline = (Get-Date).AddSeconds(25)
+while ((Get-Date) -lt $deadline) {
+    $runCmdE = Get-RunValue
+    if ($runCmdE) { break }
+    Start-Sleep -Milliseconds 500
+}
+Assert "E2 Run value written by the same build from outside a checkout" ($null -ne $runCmdE)
+"  run command: $runCmdE"
+Assert "E3 ...naming the outside copy of the agent, not zig-out" (
+    $null -ne $runCmdE -and $runCmdE -like "`"$outsideAgent`"*"
+)
+
+Stop-OutsideProcs
+$env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 
 # ============================================================================
 # Cleanup
