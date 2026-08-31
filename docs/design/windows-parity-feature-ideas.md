@@ -177,3 +177,14 @@ as the digest that showed them.
 - A shortlist of docs you keep opening in side panes (pinned quick-open)
 - Zoom the viewer's content, and remember it per pane
 - A viewer pane that survives its renderer crashing (reload card, keeps address and history)
+
+## 2026-08-31
+
+- Tell me plainly which build I am running, everywhere (one version string across About, --version, Apps and Features, and the update notification)
+- A first-run welcome that proves the install worked
+- Install without the scary warning (signed installer, no SmartScreen wall)
+- Update quietly while I work, apply when I close
+- Show me what changed in this version (human release note from the update notification and About)
+- The installer asks the running Ghoztty to step aside (Restart Manager)
+- A scripted clean-machine rehearsal (install, re-install over a running copy, read the version back everywhere)
+- Let CI MSI build clear the packaging guard
