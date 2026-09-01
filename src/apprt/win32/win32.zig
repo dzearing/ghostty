@@ -1222,6 +1222,10 @@ pub const EM_SETCUEBANNER: u32 = 0x1501;
 /// a seeded value.
 pub const EM_GETSEL: u32 = 0x00B0;
 pub const EM_SETSEL: u32 = 0x00B1;
+/// Cap what an EDIT will accept, in characters — the control's own bound, so a
+/// paste is truncated by the control rather than silently overrunning whatever
+/// buffer reads it back (T1184's find field).
+pub const EM_LIMITTEXT: u32 = 0x00C5;
 
 // COMBOBOX control styles and messages (T174's Host Settings shell field —
 // Mac's editable NSComboBox with the shell presets).

@@ -588,10 +588,11 @@ pub fn handleEditChord(self: *ViewerNavBar, vk: u16) bool {
             w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0,
     };
     const chord = viewer_accel.paneChord(vk, mods) orelse return false;
-    switch (chord) {
-        .reload => self.pane.reloadContent(.chrome),
-        .focus_address => _ = self.pane.focusAddressBar(),
-    }
+    // Dispatched by the PANE rather than switched on here, so a chord added to
+    // the table reaches this control for free — the exhaustive switch this used
+    // to be made every new chord a compile error in three files that have
+    // nothing to say about it (T1184 added three).
+    self.pane.handlePaneChord(chord);
     return true;
 }
 

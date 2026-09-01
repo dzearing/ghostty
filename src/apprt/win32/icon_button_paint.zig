@@ -54,6 +54,7 @@ fn codepoint(which: icon_button.Glyph) u16 {
         .contents => 0xE700, // GlobalNavButton — Windows' own nav-pane toggle
         .feedback => 0xED15, // Feedback — Windows' own "tell us about this"
         .send => 0xE74A, // Up — the composer's submit arrow
+        .search => 0xE721, // Search - Windows' own magnifier
     };
 }
 
@@ -73,6 +74,11 @@ fn fontDip(which: icon_button.Glyph) f32 {
         // The composer's in-pill actions render at the same 12 as the
         // toolbar marks: they sit in the same 28 DIP square.
         .send => 12.0,
+        // The find card's leading mark sits in a 16 DIP box beside a text
+        // field rather than in a 28 DIP button, so it renders a step down from
+        // the toolbar cluster - the same optical relationship the caption
+        // glyphs have to the strip's.
+        .search => 11.0,
     };
 }
 

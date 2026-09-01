@@ -407,6 +407,12 @@
 
   const diff = window.__viewerDiff.init({ root: content, post: post });
 
+  /* Find-in-page asks the page what it is hiding (see find.js). Only a diff
+   * has an answer — one file's patch at a time, capped — and `findScope`
+   * returns null whenever this page is showing anything else, so a markdown
+   * or code viewer contributes no note. */
+  window.__ghozttyFindScope = diff.findScope;
+
   function setDiffListing(payload) {
     clearHeadingIndex();
     leaveImageMode();

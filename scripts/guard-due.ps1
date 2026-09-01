@@ -276,6 +276,23 @@ $GuardTable = @(
             'src\viewer\viewer.js'
         )
     },
+    # Find-in-page (T1184): the search is shared JavaScript and the card is a
+    # native window, so what nothing else can check is that the two agree — a
+    # chord posted into the page reaching the card, and the card's query
+    # reaching the page's counter. Covers the engine, the pure half, the card,
+    # and the pane that carries messages between them.
+    [pscustomobject]@{
+        Name   = 'viewer-find'
+        Script = 'test\win32\viewer-find.ps1'
+        Stamp  = 'test\win32\viewer-find.stamp.json'
+        Covers = @(
+            'test\win32\viewer-find.ps1',
+            'src\viewer\find.js',
+            'src\apprt\win32\viewer_find.zig',
+            'src\apprt\win32\ViewerFindBar.zig',
+            'src\apprt\win32\viewer_accel.zig'
+        )
+    },
     # The viewer nav-bar PIN (T1131): which viewer flavors keep their address
     # bar on screen and which peek on hover. The unit lanes assert the policy
     # table and the pane's own record of it; only this script proves that a

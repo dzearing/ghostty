@@ -272,6 +272,16 @@ pub const PaneChord = enum {
     reload,
     /// ctrl+d / ctrl+l / alt+d — focus and select the address field.
     focus_address,
+    /// ctrl+f — open the find card and put the caret in it (T1184). Mac's
+    /// Cmd+F, respelled the way every Windows application spells "find".
+    find,
+    /// ctrl+g / F3 — step to the next match without reaching for the card.
+    /// Mac has only Cmd+G; Windows has both spellings and answers to both,
+    /// because F3 is the one a Windows user reaches for without thinking and
+    /// ctrl+g is the one a browser trained them on.
+    find_next,
+    /// ctrl+shift+g / shift+F3 — step to the previous match.
+    find_previous,
 };
 
 /// Classify a chord as one of the viewer's pane-scoped chords, or null if it
@@ -287,10 +297,21 @@ pub fn paneChord(vk: u16, mods: input.Mods) ?PaneChord {
     if (mods.super) return null;
     const ctrl_only = mods.ctrl and !mods.shift and !mods.alt;
     const alt_only = mods.alt and !mods.shift and !mods.ctrl;
+    const ctrl_shift = mods.ctrl and mods.shift and !mods.alt;
+    const shift_only = mods.shift and !mods.ctrl and !mods.alt;
+    const bare = !mods.ctrl and !mods.shift and !mods.alt;
     return switch (vk) {
         0x52 => if (ctrl_only) .reload else null, // 'R'
         0x44 => if (ctrl_only or alt_only) .focus_address else null, // 'D'
         0x4C => if (ctrl_only) .focus_address else null, // 'L'
+        0x46 => if (ctrl_only) .find else null, // 'F'
+        // ctrl+g steps forward and ctrl+shift+g back — the browser pair, and
+        // the same shape as Mac's Cmd+G / Cmd+Shift+G.
+        0x47 => if (ctrl_only) .find_next else if (ctrl_shift) .find_previous else null, // 'G'
+        // F3 / shift+F3, the Windows-native spelling of the same pair. BARE
+        // F3 on purpose: a function key with no modifier is the whole point of
+        // it, and a viewer pane has no other meaning for the key.
+        0x72 => if (bare) .find_next else if (shift_only) .find_previous else null, // VK_F3
         else => null,
     };
 }
@@ -466,6 +487,28 @@ test "paneChord: exact-modifier chords only" {
     try testing.expect(paneChord(0x52, alt) == null); // alt+r is nothing
     try testing.expect(paneChord(0x52, .{}) == null); // bare 'r' is typing
     try testing.expect(paneChord(0x52, .{ .ctrl = true, .super = true }) == null);
+}
+
+test "T1184: the find chords, in both spellings Windows knows" {
+    const ctrl: input.Mods = .{ .ctrl = true };
+    const ctrl_shift: input.Mods = .{ .ctrl = true, .shift = true };
+    const shift: input.Mods = .{ .shift = true };
+    try testing.expectEqual(PaneChord.find, paneChord(0x46, ctrl).?); // ctrl+f
+    try testing.expectEqual(PaneChord.find_next, paneChord(0x47, ctrl).?); // ctrl+g
+    try testing.expectEqual(PaneChord.find_previous, paneChord(0x47, ctrl_shift).?);
+    // F3 / shift+F3 — the pair a Windows user reaches for without thinking.
+    try testing.expectEqual(PaneChord.find_next, paneChord(0x72, .{}).?);
+    try testing.expectEqual(PaneChord.find_previous, paneChord(0x72, shift).?);
+
+    // Exactness, the same rule the rest of the table follows. ctrl+shift+f is
+    // nobody's here, bare 'f' and bare 'g' are typing, and ctrl+F3 is not a
+    // spelling of anything.
+    try testing.expect(paneChord(0x46, ctrl_shift) == null);
+    try testing.expect(paneChord(0x46, .{}) == null);
+    try testing.expect(paneChord(0x47, .{}) == null);
+    try testing.expect(paneChord(0x47, .{ .alt = true }) == null);
+    try testing.expect(paneChord(0x72, ctrl) == null);
+    try testing.expect(paneChord(0x46, .{ .ctrl = true, .super = true }) == null);
 }
 
 test "composerChord: ctrl+enter sends, plain enter does not" {

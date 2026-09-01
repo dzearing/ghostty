@@ -307,6 +307,40 @@ ghoztty +close --target=doc
 - File → Open (or dragging onto the dock icon, or `open -a Ghoztty file.md`)
   opens `.md`-family files as a viewer window.
 
+### Find in page
+
+`Ctrl+F` opens a small find card at the pane's top-trailing corner, in every
+viewer mode — markdown, code, a local HTML page, a website, and a git diff.
+The behaviour is the browser one people already have:
+
+- Typing highlights every match (yellow, current one orange) and shows a live
+  count: `3/17`. The count stays live while the page changes underneath an
+  open search, so a diff still streaming its rows keeps counting up.
+- `Enter` / `Shift+Enter`, the card's chevrons, and `Ctrl+G` / `Ctrl+Shift+G`
+  step through matches, wrapping. `F3` / `Shift+F3` are the Windows spelling of
+  the same pair and do the same thing; Mac has only `Cmd+G` / `Cmd+Shift+G`.
+- `Escape` closes the card and clears the highlights but KEEPS the query, so
+  the next-match chord resumes it and `Ctrl+F` comes back to it selected.
+- The card FLOATS over the document rather than adding a band under the nav
+  bar: a markdown pane hides its nav bar until you reach for it, so a band
+  would make `Ctrl+F` reflow the very text you are about to search. Matches
+  scroll to the middle of the pane, so the card is never over the match it
+  just found.
+- It is honest about what it is not searching: unlaid-out text is excluded, a
+  page with a visible frame says `frames not searched`, past 5000 matches the
+  count reads `12/5000+`, and a diff pane names the file it is searching (a
+  diff pane holds one file's patch at a time) plus whether its row cap is in
+  force.
+
+The search itself is shared JavaScript — `src/viewer/find.js`, one file for
+both platforms — injected into every document rather than loaded from
+`viewer.js`, which never reaches a real web page. It paints with the CSS
+Custom Highlight API and mutates no DOM, so a find on a live dev server cannot
+corrupt its rendering. The win32 half is the card (`ViewerFindBar.zig`), its
+geometry and the Escape/Return precedence across the pane's text fields
+(`viewer_find.zig`, unit-tested in the `none` lane), and the chords
+(`viewer_accel.paneChord`). Acceptance: `test/win32/viewer-find.ps1`.
+
 ### Git diff panes
 
 `--view=git-status:` / `--view=git-diff:<revspec>` opens a pane that renders a

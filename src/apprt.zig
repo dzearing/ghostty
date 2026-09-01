@@ -265,6 +265,11 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/viewer_nav_layout.zig");
 
+    // Pure win32 find-in-page — how the count reads, the Escape/Return
+    // precedence across the pane's text fields, the JavaScript the card
+    // evaluates, and the card's geometry (T1184), same no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_find.zig");
+
     // Pure win32 viewer worktree provenance — strategy D's classification and
     // the 15s resolution cache (T633), same no-OS-imports deal.
     _ = @import("apprt/win32/viewer_worktree.zig");

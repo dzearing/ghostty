@@ -35,6 +35,7 @@ const Surface = @import("Surface.zig");
 const ViewerPane = @import("ViewerPane.zig");
 const ViewerNavBar = @import("ViewerNavBar.zig");
 const ViewerFeedbackBar = @import("ViewerFeedbackBar.zig");
+const ViewerFindBar = @import("ViewerFindBar.zig");
 const webview2 = @import("webview2.zig");
 const Window = @import("Window.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
@@ -1561,6 +1562,15 @@ pub fn run(self: *App) !void {
                     if (bar.handleKey(vk)) continue :loop;
                     if (bar.handleChord(vk)) continue :loop;
                 }
+                // A viewer pane's find field (T1184): Enter/Shift-Enter step
+                // matches and Escape closes the card, none of which an EDIT
+                // delivers itself. The pane-scoped chords are live in the field
+                // too, for the same reason they are in the address bar — they
+                // belong to the PANE, and the card is inside the pane.
+                if (ViewerFindBar.owningEdit(msg.hwnd.?)) |bar| {
+                    if (bar.handleEditKey(vk)) continue :loop;
+                    if (bar.handleEditChord(vk)) continue :loop;
+                }
                 // Check if this edit is a tab rename edit
                 if (vk == w32.VK_RETURN or vk == w32.VK_ESCAPE) {
                     for (self.windows.items) |win| {
@@ -1637,6 +1647,9 @@ pub fn run(self: *App) !void {
             if (ViewerFeedbackBar.owningEdit(msg.hwnd.?)) |bar| {
                 if (bar.handleChord(@intCast(msg.wParam & 0xFFFF))) continue :loop;
             }
+            if (ViewerFindBar.owningEdit(msg.hwnd.?)) |bar| {
+                if (bar.handleEditChord(@intCast(msg.wParam & 0xFFFF))) continue :loop;
+            }
         }
 
         // A click landing on a viewer address field (T159): the browser
@@ -1652,6 +1665,9 @@ pub fn run(self: *App) !void {
         {
             if (ViewerNavBar.owningEdit(msg.hwnd.?)) |nav| {
                 if (msg.message == w32.WM_LBUTTONDOWN) nav.noteClickDown() else nav.noteClickUp();
+            }
+            if (ViewerFindBar.owningEdit(msg.hwnd.?)) |bar| {
+                if (msg.message == w32.WM_LBUTTONDOWN) bar.noteClickDown() else bar.noteClickUp();
             }
         }
 

@@ -73,6 +73,8 @@ const gdiplus_decode = @import("gdiplus_decode.zig");
 const view_arg = @import("../../cli/view_arg.zig");
 const ViewerNavBar = @import("ViewerNavBar.zig");
 const ViewerFeedbackBar = @import("ViewerFeedbackBar.zig");
+const ViewerFindBar = @import("ViewerFindBar.zig");
+const viewer_find = @import("viewer_find.zig");
 const feedback_doc = @import("viewer_feedback_doc.zig");
 const feedback_report = @import("viewer_feedback_report.zig");
 const feedback_images_mod = @import("viewer_feedback_images.zig");
@@ -573,6 +575,22 @@ feedback_text: std.ArrayListUnmanaged(u8) = .empty,
 /// notice the deletion.
 feedback_quotes: feedback_doc.Registry = .{},
 
+/// The find-in-page card (T1184). Created hidden alongside the nav bar and the
+/// composer, in `ensureNav`, for the same reason they are: that is the one
+/// place with both halves a child window needs.
+find_bar: ?*ViewerFindBar = null,
+
+/// Whether the card is up. Ephemeral like `feedback_open`: a restored pane
+/// comes back with no card, because the highlights it would be counting died
+/// with the page state.
+find_open: bool = false,
+
+/// What the user has typed. On the PANE, not on the card, and it OUTLIVES the
+/// card being closed — that is what makes ctrl+G resume the last search the
+/// way every browser does, and what makes ctrl+F come back to it selected.
+find_query: [viewer_find.max_query]u8 = undefined,
+find_query_len: usize = 0,
+
 /// Where the live quote BLOCKS are, as the composer's page last reported them
 /// (T935). Null until a snapshot arrives, and dropped again by every write to
 /// `feedback_text` that did not come from the page.
@@ -824,6 +842,14 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
         bar.destroy();
         self.feedback = null;
     }
+    // The find card is their sibling and goes on the same terms. Its QUERY is
+    // a plain array on the pane, so nothing outlives this.
+    if (self.find_bar) |bar| {
+        bar.destroy();
+        self.find_bar = null;
+    }
+    self.find_open = false;
+    self.find_query_len = 0;
     self.feedback_text.deinit(alloc);
     self.feedback_quotes.deinit(alloc);
     if (self.feedback_quote_spans) |spans| alloc.free(spans);
@@ -1040,6 +1066,15 @@ fn ensureNav(self: *ViewerPane, alloc: Allocator, hinstance: ?w32.HINSTANCE, hwn
         self.feedback = ViewerFeedbackBar.create(alloc, self, hinstance, hwnd);
         if (self.feedback == null) {
             log.warn("viewer feedback composer could not be created", .{});
+        }
+    }
+    // The find card (T1184), on the same terms and for the same reason: it
+    // carries an EDIT whose keys are routed from the main message loop, which
+    // needs the window to exist before the first ctrl+F rather than during it.
+    if (self.find_bar == null) {
+        self.find_bar = ViewerFindBar.create(alloc, self, hinstance, hwnd);
+        if (self.find_bar == null) {
+            log.warn("viewer find card could not be created; ctrl+F does nothing", .{});
         }
     }
     // Last, once there IS a bar to pin: a pane opened on a live page reserves
@@ -2377,6 +2412,7 @@ fn applyMessage(self: *ViewerPane, alloc: Allocator, message: bridge.Message) vo
         .selection => |text| self.setPageSelection(alloc, text),
         .link_menu => |href| self.armLinkMenu(alloc, href),
         .image => |img| self.applyImageMessage(alloc, img),
+        .find => |f| self.applyFindMessage(f),
     }
 }
 
@@ -2950,6 +2986,14 @@ fn onNavigationCompleted(
     // factor so following a link or reloading keeps the chosen zoom — the
     // same re-apply Mac does after `didFinish`.
     if (self.zoom_factor != 1.0) self.pushZoom();
+    // So does an open search (T1184). The find script is re-injected into the
+    // new document with NO state, so a card left open would be showing a count
+    // for a page that is gone. Before the mode-specific returns below: a
+    // website navigation needs this most, since it is the one that changes the
+    // document out from under a search — and ahead of the content injection
+    // too, since the page's own mutation observer picks the rendered content up
+    // 200ms later anyway.
+    self.refreshFindAfterLoad();
     // A rendered `.html` file has nothing to inject either — the web view
     // loaded the page, and the page is the content (T601). The one exception is
     // the fallback, where the template is on screen precisely so the pane can
@@ -4233,6 +4277,17 @@ pub fn syncBounds(self: *ViewerPane) void {
         });
     }
 
+    // The find card follows the pane's width live too, and it is placed against
+    // the CONTENT's top rather than the pane's — so a nav bar sliding in moves
+    // the card down with the text instead of leaving it under the bar. A pane
+    // dragged too narrow to hold a legible card hides it rather than shrinking
+    // it past legibility; widening brings it straight back.
+    if (self.find_open) {
+        if (self.find_bar) |bar| {
+            if (bar.place(top, width, self.scale)) bar.show() else bar.hide();
+        }
+    }
+
     // The TOC card follows the pane's width LIVE — dragging a split divider
     // across 720 DIP flips it between its gutter and overlay layouts here.
     if (self.pending) |p| self.updateTOC(p.alloc);
@@ -4599,11 +4654,226 @@ fn handleZoom(self: *ViewerPane, action: viewer_accel.ZoomAction) void {
 }
 
 /// Perform a pane-scoped chord (T161) — Mac's `handle(_:)`.
-fn handlePaneChord(self: *ViewerPane, chord: viewer_accel.PaneChord) void {
+pub fn handlePaneChord(self: *ViewerPane, chord: viewer_accel.PaneChord) void {
     switch (chord) {
         .reload => self.reloadContent(.chrome),
         .focus_address => _ = self.focusAddressBar(),
+        .find => _ = self.openFind(),
+        .find_next => _ = self.stepFindFromKeyboard(1),
+        .find_previous => _ = self.stepFindFromKeyboard(-1),
     }
+}
+
+// -------------------------------------------------------------------------
+// Find in page (T1184)
+// -------------------------------------------------------------------------
+
+/// The query currently in the field, as the pane remembers it.
+fn findQuery(self: *const ViewerPane) []const u8 {
+    return self.find_query[0..self.find_query_len];
+}
+
+/// Open the card and put the caret in it, selecting whatever query is already
+/// there so the next keystroke replaces it — the browser rule, and the same one
+/// `focusAddressBar` follows.
+///
+/// Returns false when this pane could never show a card (no window, or a pane
+/// too narrow to hold a legible one), so ctrl+F falls through rather than being
+/// silently swallowed.
+pub fn openFind(self: *ViewerPane) bool {
+    const bar = self.find_bar orelse return false;
+    if (!self.placeFind()) return false;
+    if (!self.find_open) {
+        self.find_open = true;
+        bar.clearResult();
+        bar.show();
+        // Re-place now that the card is visible: `placeFind` above measured a
+        // hidden card, and the note line may have changed the height.
+        _ = self.placeFind();
+    }
+    bar.focusField();
+    // Re-running the search on open is what makes ctrl+F, Escape, ctrl+F come
+    // back to the same highlights instead of to an empty page with a query
+    // still sitting in the field.
+    if (self.find_query_len > 0) self.pushFindQuery();
+    // The acceptance script's oracle (T1184): a viewer pane is a browser
+    // surface on a background test desktop, so nothing out there can read a
+    // highlight off the screen. The pane states what it did instead.
+    log.info("viewer find pane={s} state=open query={s}", .{ self.paneId(), self.findQuery() });
+    return true;
+}
+
+/// Close the card, clear the page's highlights, and hand focus back to the
+/// page.
+///
+/// Closing CLEARS rather than hides: highlights painted over a document nobody
+/// is searching any more are just noise, and a browser's Escape does the same.
+/// The QUERY is kept, which is why the page is told to clear explicitly rather
+/// than by pushing an empty string.
+pub fn closeFind(self: *ViewerPane) void {
+    // The page is cleared unconditionally, ahead of the open check: the
+    // highlights are the PAGE's state, and "close" must never be able to leave
+    // them painted on a pane with no card to remove them with.
+    if (self.pending) |p| self.executeScript(p.alloc, viewer_find.clear_call);
+    if (!self.find_open) return;
+    self.find_open = false;
+    if (self.find_bar) |bar| {
+        bar.clearResult();
+        bar.hide();
+    }
+    log.info("viewer find pane={s} state=closed query={s}", .{ self.paneId(), self.findQuery() });
+    // Focus back to the page, the same thing the composer does when it closes.
+    if (self.controller) |c| _ = c.moveFocus(.programmatic);
+}
+
+pub fn toggleFind(self: *ViewerPane) void {
+    if (self.find_open) self.closeFind() else _ = self.openFind();
+}
+
+/// Step to the next (+1) or previous (-1) match, wrapping.
+pub fn stepFind(self: *ViewerPane, delta: i32) void {
+    if (self.find_query_len == 0) return;
+    const p = self.pending orelse return;
+    self.executeScript(p.alloc, if (delta < 0)
+        viewer_find.step_previous_call
+    else
+        viewer_find.step_next_call);
+}
+
+/// ctrl+G / F3 and their shifted twins: step the last search, re-opening the
+/// card if it was closed. Returns false when there is nothing to step, so the
+/// chord falls through instead of being eaten.
+pub fn stepFindFromKeyboard(self: *ViewerPane, delta: i32) bool {
+    if (self.find_query_len == 0) return false;
+    if (!self.find_open) {
+        if (!self.openFind()) return false;
+    }
+    self.stepFind(delta);
+    return true;
+}
+
+/// The user typed in the card's field. Read the field, remember it, and push.
+///
+/// No debounce, deliberately: the page caches its text index between
+/// keystrokes and rebuilds it only when the DOM actually moves, so a keystroke
+/// costs a scan of a buffer that is already built. Mac's `setFindQuery` pushes
+/// straight through for the same reason.
+pub fn findQueryChanged(self: *ViewerPane) void {
+    const bar = self.find_bar orelse return;
+    var buf: [ViewerFindBar.query_utf8_cap]u8 = undefined;
+    const text = viewer_find.truncateUtf8(bar.queryText(&buf), viewer_find.max_query);
+    if (text.len == self.find_query_len and
+        std.mem.eql(u8, self.findQuery(), text)) return;
+    @memcpy(self.find_query[0..text.len], text);
+    self.find_query_len = text.len;
+    // An emptied field takes the count with it before the page answers: a
+    // "3/17" hanging over an empty field is a claim about a search nobody is
+    // running.
+    if (text.len == 0) bar.clearResult();
+    self.pushFindQuery();
+}
+
+fn pushFindQuery(self: *ViewerPane) void {
+    const p = self.pending orelse return;
+    var buf: [viewer_find.search_call_cap]u8 = undefined;
+    self.executeScript(p.alloc, viewer_find.searchCall(&buf, self.findQuery()));
+}
+
+/// `find.js` reported a count (see its `post`).
+fn applyFindMessage(self: *ViewerPane, msg: bridge.Find) void {
+    const bar = self.find_bar orelse return;
+    // A result for a query the user has already typed past is stale; the push
+    // for the current one is already on its way.
+    if (!std.mem.eql(u8, msg.query, self.findQuery())) return;
+    const grew = bar.setResult(.{
+        .total = msg.total,
+        .index = msg.index,
+        .truncated = msg.truncated,
+    }, msg.note);
+    // The honesty note is a whole extra LINE, so its arrival or departure
+    // changes the card's height — a repaint alone would clip it.
+    if (grew and self.find_open) _ = self.placeFind();
+    log.info(
+        "viewer find pane={s} state=count query={s} total={d} index={d} truncated={} note={s}",
+        .{
+            self.paneId(),
+            msg.query,
+            msg.total,
+            msg.index,
+            msg.truncated,
+            msg.note orelse "-",
+        },
+    );
+}
+
+/// Re-arm the search after a navigation: the user script is re-injected into
+/// the new document with no state, so an open card would be showing a count for
+/// a page that is gone.
+fn refreshFindAfterLoad(self: *ViewerPane) void {
+    if (!self.find_open or self.find_query_len == 0) return;
+    if (self.find_bar) |bar| bar.clearResult();
+    self.pushFindQuery();
+}
+
+/// Position the card in the pane's content rect. Returns false when the pane is
+/// too narrow to hold a legible one — the same "either it is readable or it is
+/// absent" rule the nav bar's address field follows.
+fn placeFind(self: *ViewerPane) bool {
+    const bar = self.find_bar orelse return false;
+    const h = self.hwnd orelse return false;
+    var r: w32.RECT = undefined;
+    if (w32.GetClientRect(h, &r) == 0) return false;
+    const width = @max(r.right - r.left, 0);
+    return bar.place(self.contentTop(width), width, self.scale);
+}
+
+/// Where the page starts: below the nav bar's band and the composer's while
+/// those are showing. The card hangs off the CONTENT's top edge rather than the
+/// pane's, so a revealing nav bar moves it down with the text instead of
+/// sliding under it (Mac anchors it to the web view for the same reason).
+fn contentTop(self: *ViewerPane, width: i32) i32 {
+    var top: i32 = 0;
+    if (self.nav_visible) {
+        if (self.nav) |nav| {
+            top += nav_layout.Layout.init(self.scale, width, nav.shown()).bar_h;
+        }
+    }
+    if (self.feedback_open) {
+        if (self.feedback) |bar| top += bar.barHeight(width, self.scale);
+    }
+    return top;
+}
+
+/// Whether the card's own field currently holds the caret — the input to
+/// `viewer_find.Focus`.
+fn findFieldFocused(self: *const ViewerPane) bool {
+    const bar = self.find_bar orelse return false;
+    return bar.fieldFocused();
+}
+
+/// Does this chord, arriving from the PAGE, mean "close find"?
+///
+/// Routed through the one precedence table rather than answered with an
+/// `if (vk == VK_ESCAPE)`: the address field can hold the caret while the page
+/// still has the accelerator hop, and in that case Escape belongs to the
+/// abandoned address edit, not to find. `viewer_find.fieldKeyAction` is where
+/// that order is written down and asserted.
+fn findEscapeAction(
+    self: *ViewerPane,
+    vk: u16,
+    mods: inputpkg.Mods,
+) ?viewer_find.FieldKeyAction {
+    const action = viewer_find.fieldKeyAction(vk, .{
+        .ctrl = mods.ctrl,
+        .shift = mods.shift,
+        .alt = mods.alt,
+        .super = mods.super,
+    }, .{
+        .address = if (self.nav) |nav| w32.GetFocus() == @as(?w32.HWND, nav.edit) else false,
+        .find = self.findFieldFocused(),
+        .find_open = self.find_open,
+    }) orelse return null;
+    return if (action == .close_find) action else null;
 }
 
 /// Whether a chord is claimed by THIS pane while its content holds focus
@@ -4613,6 +4883,13 @@ fn handlePaneChord(self: *ViewerPane, chord: viewer_accel.PaneChord) void {
 fn claimsChord(self: *ViewerPane, vk: u16, extended: bool, mods: inputpkg.Mods) bool {
     if (viewer_accel.zoomAction(vk, mods) != null) return true;
     if (viewer_accel.paneChord(vk, mods) != null) return true;
+    // Escape closes find from the PAGE, not only from the card's field
+    // (T1184): the highlights are the page's state and a browser's Escape
+    // clears them from wherever the caret is. Claimed ONLY while the card is
+    // up — the page keeps its own Escape the rest of the time, which is why
+    // this is a live-state question that `viewer_accel`'s pure table cannot
+    // answer.
+    if (self.findEscapeAction(vk, mods) != null) return true;
     // Window-scoped chords that are not binding actions (T746). Checked BEFORE
     // the keybind table on purpose: ctrl+shift+n is still bound to the
     // cross-platform `new_window` default in the core set, so consulting the
@@ -5437,6 +5714,10 @@ pub fn wndProc(
             }
             if (viewer_accel.paneChord(vk, mods)) |chord| {
                 self.handlePaneChord(chord);
+                return 0;
+            }
+            if (self.findEscapeAction(vk, mods)) |_| {
+                self.closeFind();
                 return 0;
             }
             // Window chords, same order as the claim above and for the same

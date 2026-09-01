@@ -395,6 +395,16 @@ pub const Glyph = enum {
     /// composer reads as "collapse this", which is the one thing the button
     /// must not be mistaken for.
     send,
+    /// "🔍" — the find card's leading mark (T1184, Fluent Search; Mac uses
+    /// `magnifyingglass`). Not a button on either platform: it labels the
+    /// field beside it, which is how Windows' own search boxes are built.
+    ///
+    /// The FALLBACK is a square lens with a diagonal handle rather than a
+    /// round one — a circle cannot be built out of this set's axis-aligned
+    /// quads, and a coarse polygon circle at 11 DIP reads as a blob. A square
+    /// lens with a handle still reads unmistakably as "search", which is a
+    /// fallback's whole bar (see the header of `icon_button_paint`).
+    search,
 };
 
 /// The maximum quads any glyph needs, so callers can size a stack buffer.
@@ -779,6 +789,39 @@ pub fn glyphQuads(m: Metrics, target: Rect, glyph: Glyph, out: []Quad) []const Q
                 .bottom = b.bottom,
             });
             return out[0..3];
+        },
+        .search => {
+            // A lens and a handle. The LENS owns the mark box's top edge and
+            // both flanks minus the handle's reach, and the handle drops into
+            // the bottom-trailing corner, so the union is exactly the centered
+            // mark box — the handle cannot drag the glyph off center the way
+            // an appended shape would.
+            //
+            // Outlined at `stroke_outline` by the closed-mark rule the
+            // maximize box follows: in a closed shape the eye reads the
+            // enclosed area, and a 2 DIP stroke on an 11 DIP lens reads as a
+            // filled slab.
+            const b = centered(target, m.mark_close, m.mark_close);
+            const so = m.stroke_outline;
+            // The handle takes the bottom-trailing third; the lens is the
+            // square that remains.
+            const reach = @max(@divTrunc(b.width(), 3), so + 1);
+            const lens: Rect = .{
+                .left = b.left,
+                .top = b.top,
+                .right = b.right - reach,
+                .bottom = b.bottom - reach,
+            };
+            const ring = squareOutline(lens, so, out);
+            // A diagonal bar from the lens's bottom-trailing corner to the
+            // mark box's, `t` thick across its own axis.
+            out[ring.len] = .{ .pts = .{
+                .{ .x = lens.right - so, .y = lens.bottom },
+                .{ .x = lens.right, .y = lens.bottom - so },
+                .{ .x = b.right, .y = b.bottom - so },
+                .{ .x = b.right - so, .y = b.bottom },
+            } };
+            return out[0 .. ring.len + 1];
         },
         .overflow => {
             // Three square dots on the mark box's center line, spanning the

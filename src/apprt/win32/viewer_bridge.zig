@@ -84,6 +84,20 @@ pub const selection_js = @embedFile("../../viewer/selection.js");
 /// frame plumbing lands (T928).
 pub const links_js = @embedFile("../../viewer/links.js");
 
+/// The shared find-in-page engine (T1184), verbatim for the same P1 reason
+/// `selection.js` and `links.js` are. It owns the whole search — the text
+/// index, the match list, the CSS Custom Highlight painting and the live
+/// re-scan — and reports a count up this bridge; the win32 side owns only the
+/// card that shows "3/17" and the chords that drive it.
+///
+/// It rides the main-frame blob for the same reason the rest of it does, and
+/// that is not a compromise here: highlighting, counting and stepping all live
+/// in ONE document's offset space, so a subframe copy would be a second
+/// independent search with its own count. `find.js` says so itself rather than
+/// pretending otherwise (its `scopeNote` adds "frames not searched" when a
+/// laid-out frame is on the page).
+pub const find_js = @embedFile("../../viewer/find.js");
+
 const prologue =
     "(function () {\n" ++
     "  \"use strict\";\n" ++
@@ -144,7 +158,8 @@ const epilogue = "\n})();\n";
 /// two-button toolbar Mac does. The flag itself still exists in the shared
 /// `selection.js`; nobody sets it.
 pub const injected_js =
-    prologue ++ shim_js ++ selection_js ++ selection_tracker_js ++ links_js ++ epilogue;
+    prologue ++ shim_js ++ selection_js ++ selection_tracker_js ++ links_js ++
+    find_js ++ epilogue;
 
 // -------------------------------------------------------------------------
 // Messages coming back up
@@ -214,6 +229,28 @@ pub const Image = struct {
     };
 };
 
+/// What `find.js` reports for the query it was last given (T1184) — Mac's
+/// `ViewerFindResult`, arriving over the same bridge.
+///
+/// `query` is echoed back deliberately: the push is asynchronous, so a result
+/// can land for a query the user has already typed past, and the pane drops a
+/// report whose query is not the one in its field rather than showing a count
+/// for a search nobody is running.
+pub const Find = struct {
+    /// The query this count belongs to.
+    query: []const u8,
+    /// Matches on the page, capped by `find.js`'s own MAX_MATCHES.
+    total: u32 = 0,
+    /// 1-based position of the current match; 0 when there is none.
+    index: u32 = 0,
+    /// The scan stopped at the cap, so `total` is a floor rather than a count.
+    truncated: bool = false,
+    /// What the page is NOT searching, in the page's own words (a diff pane
+    /// holds one file's patch at a time; a laid-out frame is a second
+    /// document). Null when the page has nothing to disclose.
+    note: ?[]const u8 = null,
+};
+
 /// The messages the injected blob posts. The first three are the shared JS's,
 /// which Mac's `handleTOCMessage` switches on by the same strings; the fourth
 /// is `selection_tracker_js`'s, which only win32 has (see its doc comment).
@@ -239,6 +276,10 @@ pub const Message = union(enum) {
     /// DOM's absolute resolution of the attribute, so a relative link arrives
     /// resolved against the page's base.
     link_menu: []const u8,
+    /// `find.js` counted the matches for a query (T1184). Sent on every search,
+    /// every step, and every re-scan after the page changed underneath an open
+    /// search — so the card's "3/17" is live without the pane polling anything.
+    find: Find,
 };
 
 /// A parsed message and the arena its strings live in.
@@ -302,6 +343,22 @@ fn parseMessage(aa: Allocator, json_text: []const u8) ?Message {
     }
     if (std.mem.eql(u8, kind, "image")) {
         return .{ .image = parseImage(obj) orelse return null };
+    }
+    if (std.mem.eql(u8, kind, "find")) {
+        // A `find` with no query field is not a find report: the query is what
+        // the pane matches the count against, and a report it cannot attribute
+        // is one it must not show. `total`/`index` default to zero, which is
+        // the honest reading of a payload that omitted them.
+        return .{ .find = .{
+            .query = stringField(obj, "query") orelse return null,
+            .total = countField(obj, "total"),
+            .index = countField(obj, "index"),
+            .truncated = switch (obj.get("truncated") orelse std.json.Value{ .bool = false }) {
+                .bool => |b| b,
+                else => false,
+            },
+            .note = nonEmpty(stringField(obj, "note")),
+        } };
     }
     if (std.mem.eql(u8, kind, "linkMenu")) {
         // No href is no link: the page suppressed its own menu for nothing, and
@@ -387,6 +444,18 @@ fn parseImage(obj: std.json.ObjectMap) ?Image {
     };
 }
 
+/// A JSON count field as a `u32`, 0 when absent, negative, of the wrong type,
+/// or larger than a count could sanely be. `find.js` sends whole numbers, and
+/// anything else on this bridge came from a page rather than from us.
+fn countField(obj: std.json.ObjectMap, name: []const u8) u32 {
+    const n = switch (obj.get(name) orelse return 0) {
+        .integer => |i| i,
+        else => return 0,
+    };
+    if (n < 0 or n > std.math.maxInt(u32)) return 0;
+    return @intCast(n);
+}
+
 /// A JSON number field as an `f64`, 0 when absent or of the wrong type. JS
 /// hands whole values across as integers, so both cases have to be read.
 fn numberField(obj: std.json.ObjectMap, name: []const u8) f64 {
@@ -433,7 +502,7 @@ test "selection.js is embedded VERBATIM — P1's whole point" {
     try testing.expect(std.mem.indexOf(u8, injected_js, selection_js) != null);
     try testing.expectEqual(
         prologue.len + shim_js.len + selection_js.len +
-            selection_tracker_js.len + links_js.len + epilogue.len,
+            selection_tracker_js.len + links_js.len + find_js.len + epilogue.len,
         injected_js.len,
     );
     // And the shared file is the one on disk, not a copy under apprt/win32 —
@@ -852,4 +921,75 @@ test "parse: the result outlives the JSON it was parsed from" {
     @memset(source, 'X');
     testing.allocator.free(source);
     try testing.expectEqualStrings("section-two", parsed.message.active.?);
+}
+
+test "T1184: find.js is embedded VERBATIM, and it is the shared file" {
+    // Same claim as the selection toolbar's and the link decider's, for the
+    // same reason: the search — the index, the block rule, the cap, the
+    // honesty note — is ONE file for both platforms, so a Mac fix to a match
+    // that straddled a paragraph arrives here without a translation.
+    try testing.expect(std.mem.indexOf(u8, injected_js, find_js) != null);
+    try testing.expect(std.mem.indexOf(u8, find_js, "window.__ghozttyFind") != null);
+    // The three calls the pane drives it with, and the message it answers on.
+    try testing.expect(std.mem.indexOf(u8, find_js, "search: search") != null);
+    try testing.expect(std.mem.indexOf(u8, find_js, "step: step") != null);
+    try testing.expect(std.mem.indexOf(u8, find_js, "type: \"find\"") != null);
+    try testing.expect(std.mem.indexOf(u8, find_js, "messageHandlers." ++ handler_name) != null);
+}
+
+test "T1184: the find script runs AFTER the shim installed the bridge" {
+    // It reports through `window.webkit.messageHandlers` at every search, so a
+    // blob that ran it first would leave the very first count unreported — and
+    // the card showing nothing for a search that actually found matches.
+    const shim_at = std.mem.indexOf(u8, injected_js, shim_js).?;
+    const find_at = std.mem.indexOf(u8, injected_js, find_js).?;
+    try testing.expect(shim_at < find_at);
+}
+
+test "T1184: a find report parses into its count, ordinal and note" {
+    const alloc = testing.allocator;
+    const parsed = parse(alloc,
+        \\{"type":"find","query":"needle","total":17,"index":3,
+        \\ "truncated":false,"note":"in diff.js"}
+    ).?;
+    defer parsed.deinit();
+    const f = parsed.message.find;
+    try testing.expectEqualStrings("needle", f.query);
+    try testing.expectEqual(@as(u32, 17), f.total);
+    try testing.expectEqual(@as(u32, 3), f.index);
+    try testing.expect(!f.truncated);
+    try testing.expectEqualStrings("in diff.js", f.note.?);
+}
+
+test "T1184: a capped scan arrives flagged, and an empty note is no note" {
+    const alloc = testing.allocator;
+    const parsed = parse(alloc,
+        \\{"type":"find","query":"e","total":5000,"index":12,"truncated":true,"note":""}
+    ).?;
+    defer parsed.deinit();
+    const f = parsed.message.find;
+    try testing.expect(f.truncated);
+    try testing.expectEqual(@as(u32, 5000), f.total);
+    // An empty string is the page saying "nothing to disclose", and it must not
+    // become a blank second line on the card.
+    try testing.expect(f.note == null);
+}
+
+test "T1184: a find report with no query is dropped" {
+    // The pane attributes every count to the query in its field; a report it
+    // cannot attribute would show a stale number under a new search.
+    const alloc = testing.allocator;
+    try testing.expect(parse(alloc, "{\"type\":\"find\",\"total\":4}") == null);
+}
+
+test "T1184: nonsense counts read as zero rather than as a number" {
+    // The bridge is open to any page, so a site can post whatever it likes
+    // through it. A negative or non-numeric count is not a count.
+    const alloc = testing.allocator;
+    const parsed = parse(alloc,
+        \\{"type":"find","query":"x","total":-3,"index":"seven"}
+    ).?;
+    defer parsed.deinit();
+    try testing.expectEqual(@as(u32, 0), parsed.message.find.total);
+    try testing.expectEqual(@as(u32, 0), parsed.message.find.index);
 }
