@@ -824,8 +824,8 @@ $GuardTable = @(
         Script = 'test\win32\install-prepare.ps1'
         Stamp  = 'test\win32\install-prepare.stamp.json'
         Covers = @(
-            'srcpprt\win32\install_prepare.zig',
-            'dist\windows-installeruild-msi.sh',
+            'src\apprt\win32\install_prepare.zig',
+            'dist\windows-installer\build-msi.sh',
             'test\win32\install-prepare.ps1'
         )
     },
@@ -1135,6 +1135,21 @@ $GuardTable = @(
         Covers = @(
             'scripts\lib\CacheHeal.ps1',
             'test\win32\floor-lane-cache-heal.ps1'
+        )
+    },
+    # The solo confirm pass (T1170) only speaks on a day already going badly --
+    # a red lane -- and a parser that has quietly stopped matching reports the
+    # same "the log names no failing test" as a lane that crashed. Same rule as
+    # the rows around it: the library and this harness are covered,
+    # scripts\floor-lane.ps1 is not, so a stall-detector edit does not gate on
+    # it; the wiring arms prove the wiring instead.
+    [pscustomobject]@{
+        Name   = 'lane-solo-confirm'
+        Script = 'test\win32\floor-lane-solo-confirm.ps1'
+        Stamp  = 'test\win32\floor-lane-solo-confirm.stamp.json'
+        Covers = @(
+            'scripts\lib\LaneSolo.ps1',
+            'test\win32\floor-lane-solo-confirm.ps1'
         )
     },
     # The leaked-test-binary sweep (T837) is measurement first: its whole job is

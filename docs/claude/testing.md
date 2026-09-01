@@ -47,6 +47,29 @@ WebView2 hosts, log tail) instead of hanging forever with nothing to read. Exit
 0 pass / 1 fail / 2 wedged / 3 wall-clock cap; `-Lane <one>`, `-Repeat N`,
 `-Filter <test-filter>`, `-SelfTest` to prove the detector itself.
 
+**And a red lane says whether it is the code or the box** (T1170). A lane that
+fails is re-run immediately, narrowed to the tests it blamed, and the summary
+carries the answer: `agent#1=FAIL [alone: PASS alone - NOT reproduced ->
+harness/timing, not the product]`. This is the T1137 rule applied to lanes
+instead of to the acceptance suite, and it exists because a whole task went on
+establishing by hand that three reds and one green differed only in how loaded
+the box was. **The answer never changes the verdict** - red stays red and the
+exit code stays non-zero; "passes alone" is a diagnosis, not a pass. The
+narrowed re-run is cheap (measured: 414 s loaded, 36 s narrowed). It is skipped
+when the log names no failing test (a build break or a crash), when more than
+three tests failed (a lane-wide break, not one slow wait), when `-Filter` is
+already narrowing the run, and under `-NoSoloConfirm`. Acceptance:
+`test\win32\floor-lane-solo-confirm.ps1`.
+
+A related bound worth knowing, on the other side of the same problem: the
+`waitFor` helper the win32 viewer tests pump through measures **stillness, not
+wall clock**. Its `timeout_s` is how long the pane may sit completely unchanged;
+any observable change starts the count again, up to a hard ceiling of eight
+times the bound. A wedged pane still fails as fast as it ever did, and a slow
+box no longer fails a wait that two worker round trips were plainly still
+satisfying. A timeout prints the whole observable pane state, so the next one is
+diagnosable from the log rather than from a re-run.
+
 **A red lane never ends on a bare exit code** (T444). `std.process.Child`
 truncates a Windows exit code to a byte, so a *crashed* child reaches `zig build`
 as `NTSTATUS & 0xFF` — `0xC0000005` (access violation) arrives as
@@ -531,7 +554,7 @@ launder as green). Four properties are the ones that matter in practice:
   moves is reading state a neighbour left behind.
 
 **It is serial, and that is a measured decision, not an omission.** Every script
-here resolves the app as `<repo>\zig-outin\ghoztty.exe` — 91 of them compute
+here resolves the app as `<repo>\zig-out\bin\ghoztty.exe` — 91 of them compute
 that path internally and ignore any `-Exe` a caller passes — and `CleanSlate`
 kills the app under test by exact ExecutablePath. Two workers out of one
 `zig-out` therefore kill each other's app mid-assertion, with no error either

@@ -1,17 +1,14 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-31T20:16:06-07:00",
-    "commit":  "bb2ab5eb6",
+    "generated":  "2026-08-31T21:11:04-07:00",
+    "commit":  "8055c330d",
     "uncommitted":  [
-                        "test/win32/cleanslate-audit.ps1",
-                        "test/win32/harness-process-leak.ps1",
-                        "test/win32/lib/CleanSlate.ps1",
-                        "test/win32/lib/HarnessLeak.ps1",
-                        "test/win32/lib/Isolation.ps1"
+                        "docs/claude/testing.md",
+                        "test/win32/floor-lane-solo-confirm.ps1"
                     ],
     "files":  {
-                  "docs/claude/testing.md":  "1b503c70c1fc424dc7a2583a8ef10a7216f91586d06e0983bfb9ecc7f139f5c3",
+                  "docs/claude/testing.md":  "544d3988d268edac01803d163de5a49d52906fd2ed03169c380569179b8c4887",
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
                   "test/win32/activity-monitor-probe-fail.ps1":  "3ca33b2b1d163db1fe2b2f8d0cb573c0f9d7decd435f61d64bb5906e71dc6aa4",
@@ -93,6 +90,7 @@
                   "test/win32/float-on-top.ps1":  "1d6c2fb69c3f28f0fbbeb99a8d37634b09784ecf0e14f4c5bcc97383fe31e538",
                   "test/win32/floor-lane-cache-heal.ps1":  "d40d1a377c30e9861010bacb09a810fb848ade4cbc54ed38ecc9980d4f13d740",
                   "test/win32/floor-lane-leak-sweep.ps1":  "c339c10d3445889e7107e6158a32c593bad1ce2454b107551561b39e9f1fd24d",
+                  "test/win32/floor-lane-solo-confirm.ps1":  "2e7b8705867fd366ef614013d2cdd8e9e213136a4f8e9347ac049215944c0a50",
                   "test/win32/focus-defer.ps1":  "6d4e301b38488b345e9c5397844420e69a8f49c6abea26a632af531974c7358f",
                   "test/win32/focus-follows-mouse.ps1":  "09c5f9884b9c51bdb0d91321a12c0e8b8c554552434fd78f7b6267826caaa4e1",
                   "test/win32/font-inherit.ps1":  "f303affd8f1c72da77f48f09a10b18d0c7c72af845a4602455bf013662d8c257",

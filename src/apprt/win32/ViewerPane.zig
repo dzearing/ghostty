@@ -294,6 +294,14 @@ state: State = .idle,
 /// a first load (T390).
 page_loaded: bool = false,
 
+/// Counts every callback WebView2 makes into this pane: a navigation
+/// completing, a resource being requested, a page message arriving, a popup
+/// being offered, a controller being adopted. Nothing reads it in production -
+/// it exists so a test's `waitFor` can tell "this pane is still being served,
+/// just slowly" from "this pane is wedged" (T1170). A monotonic counter, and
+/// deliberately not a timestamp: what matters is that it MOVED.
+wait_progress: u64 = 0,
+
 /// Why there will be no content. Set with `.failed`, and the error card's text.
 failure: ?webview2.Failure = null,
 
@@ -2322,6 +2330,7 @@ fn onWebMessageReceived(
     const a = args orelse return com.S_OK;
     // A pane that is already gone does not get to act on its page's messages.
     const self = p.pane orelse return com.S_OK;
+    self.wait_progress +%= 1;
 
     const raw = a.jsonRaw() orelse return com.S_OK;
     // The runtime allocated it on the COM heap; we free it on ours.
@@ -2898,6 +2907,7 @@ fn onNavigationCompleted(
 ) com.HRESULT {
     _ = sender;
     const self = p.pane orelse return com.S_OK;
+    self.wait_progress +%= 1;
     // A failed load has no `window.__viewer` to call, and injecting into
     // Chromium's own error page would throw in someone else's document. It is
     // also not a page `+reload` may re-render into, which is why the flag is
@@ -3566,6 +3576,7 @@ fn onWebResourceRequested(
     _ = sender;
     const a = args orelse return com.S_OK;
     const self = p.pane orelse return com.S_OK;
+    self.wait_progress +%= 1;
     const env = self.env orelse return com.S_OK;
     const alloc = p.alloc;
 
@@ -7987,20 +7998,114 @@ const ClipboardTestLock = struct {
 /// happened to follow it — T860's live popup flake surfaced as `expected 1,
 /// found 0` on a length, thirty seconds and one silent timeout away from the
 /// thing that actually went wrong, and three tasks in a row could not read it.
+/// A cheap fold of everything a `waitFor` predicate reads off the pane, plus
+/// `wait_progress`, so a wait can tell "still working, just slowly" from
+/// "wedged" (T1170). The counter is what carries a SINGLE-step wait: a
+/// navigation moves no other observable field until the moment it completes,
+/// so without it the stillness bound would be a wall-clock bound again for
+/// precisely the wait that is hardest to bound.
+fn waitSignature(p: *const ViewerPane) u64 {
+    var h = std.hash.Wyhash.init(0);
+    h.update(&[_]u8{
+        @intFromEnum(p.state),
+        @intFromEnum(p.mode),
+        @intFromBool(p.page_loaded),
+        @intFromBool(p.diff_pushed),
+        @intFromBool(p.visible),
+        @intFromBool(p.focused),
+        @intFromBool(p.controller != null),
+        @intFromBool(p.failure != null),
+    });
+    h.update(std.mem.asBytes(&p.wait_progress));
+    h.update(std.mem.asBytes(&p.zoom_factor));
+    if (p.title) |t| h.update(t);
+    if (p.location) |l| h.update(l);
+    if (p.file_path) |f| h.update(f);
+    if (p.diff_probe) |*d| {
+        const files = d.files.items.len;
+        h.update(std.mem.asBytes(&files));
+        h.update(&[_]u8{
+            @intFromBool(d.patch_path != null),
+            @intFromBool(d.busy()),
+        });
+        if (d.patch_path) |pp| h.update(pp);
+    }
+    return h.final();
+}
+
+/// Everything `waitSignature` folds, spelled out, for the one moment it
+/// matters: the line a timeout prints. A predicate is a closure and cannot be
+/// decomposed, but every value one of them can read is here, so "which part of
+/// the wait was unsatisfied" is answerable from the log rather than from a
+/// re-run (T1170).
+fn logWaitState(p: *const ViewerPane) void {
+    if (p.diff_probe) |*d| {
+        log.warn(
+            "waitFor: state={s} mode={s} page_loaded={} diff_pushed={} controller={} failure={} " ++
+                "callbacks={d} title={?s} location={?s} diff{{repo={?s} files={d} patch={} busy={}}}",
+            .{
+                @tagName(p.state),    @tagName(p.mode),  p.page_loaded, p.diff_pushed,
+                p.controller != null, p.failure != null, p.wait_progress,
+                p.title,              p.location,
+                d.repo,               d.files.items.len, d.patch_path != null, d.busy(),
+            },
+        );
+    } else {
+        log.warn(
+            "waitFor: state={s} mode={s} page_loaded={} diff_pushed={} controller={} failure={} " ++
+                "callbacks={d} title={?s} location={?s} diff=none",
+            .{
+                @tagName(p.state),    @tagName(p.mode),  p.page_loaded,   p.diff_pushed,
+                p.controller != null, p.failure != null, p.wait_progress, p.title,
+                p.location,
+            },
+        );
+    }
+}
+
 /// A wait that ran out is a failure with a name.
+///
+/// The diagnostic is a `warn`, not an `err`, on purpose: the FAILURE is the
+/// returned `error.WaitForTimeout`, and an `err` from the same event makes the
+/// zig test runner report "logged errors" as a second, differently-worded
+/// failure for the same thing — the sort of extra top line T1170 says sends the
+/// reader chasing the wrong name. It also lets the negative tests below
+/// exercise the timeout path without failing the lane they run in.
+///
+/// The deadline is IDLE time, not wall clock (T1170). `timeout_s` is how long
+/// the pane may sit completely still; every observable change to it starts the
+/// count again, up to a hard ceiling of `timeout_s * stall_ceiling_factor`. The
+/// old wall-clock bound measured the wrong thing: this test binary runs 5000+
+/// tests beside a live WebView2, so a wait on two worker round trips could run
+/// out of seconds while both round trips were plainly still arriving, and the
+/// lane went red for load rather than for a defect. Waiting on stillness fails
+/// a wedge just as fast — a wedged pane is still from the first tick — without
+/// failing a slow box.
 fn waitFor(
     msg: *w32.MSG,
     timeout_s: u64,
     ready: *const fn (*ViewerPane) bool,
     pane: *ViewerPane,
 ) !void {
-    var timer = try std.time.Timer.start();
-    while (timer.read() < timeout_s * std.time.ns_per_s) {
+    const stall_ceiling_factor = 8;
+    const stall_ns = timeout_s * std.time.ns_per_s;
+    const ceiling_ns = stall_ns * stall_ceiling_factor;
+
+    var total = try std.time.Timer.start();
+    var still = try std.time.Timer.start();
+    var signature = waitSignature(pane);
+
+    while (still.read() < stall_ns and total.read() < ceiling_ns) {
         while (w32.PeekMessageW(msg, null, 0, 0, w32.PM_REMOVE) != 0) {
             _ = w32.TranslateMessage(msg);
             _ = w32.DispatchMessageW(msg);
         }
         if (ready(pane)) return;
+        const now = waitSignature(pane);
+        if (now != signature) {
+            signature = now;
+            still.reset();
+        }
         std.Thread.sleep(10 * std.time.ns_per_ms);
     }
     // One last look after the deadline: a predicate that came true inside the
@@ -8011,10 +8116,18 @@ fn waitFor(
         _ = w32.DispatchMessageW(msg);
     }
     if (ready(pane)) return;
-    log.err("waitFor: nothing satisfied the wait within {d}s (pane state {s})", .{
-        timeout_s,
-        @tagName(pane.state),
-    });
+    const elapsed_ms = total.read() / std.time.ns_per_ms;
+    const still_ms = still.read() / std.time.ns_per_ms;
+    log.warn(
+        "waitFor: nothing satisfied the wait; pane still for {d}ms (bound {d}s), {d}ms total{s}",
+        .{
+            still_ms,
+            timeout_s,
+            elapsed_ms,
+            if (total.read() >= ceiling_ns) " - HIT THE CEILING, the pane kept changing but never satisfied the predicate" else "",
+        },
+    );
+    logWaitState(pane);
     return error.WaitForTimeout;
 }
 
@@ -8469,6 +8582,105 @@ test "a page message that arrives after the pane is gone is dropped" {
     // No args object either, which is the other null this path has to tolerate.
     try testing.expectEqual(com.S_OK, onWebMessageReceived(p, null, null));
     p.release();
+}
+
+test "T1170: waitFor's deadline is stillness, not wall clock" {
+    // The bound this test defends: a wait must fail a WEDGED pane as fast as
+    // the old wall-clock one did, and must NOT fail a pane that is plainly
+    // still moving. Those are the two halves the agent lane got wrong — 5000+
+    // tests and a live WebView2 beside it meant 30s of clock was not 30s of
+    // progress, and the lane went red for load rather than for a defect.
+    var msg: w32.MSG = undefined;
+
+    // A pane nothing touches is still from the first tick, so a 1s bound
+    // gives up in about a second — nowhere near the 8s ceiling.
+    {
+        var pane: ViewerPane = .{};
+        var timer = try std.time.Timer.start();
+        try testing.expectError(error.WaitForTimeout, waitFor(&msg, 1, struct {
+            fn ready(_: *ViewerPane) bool {
+                return false;
+            }
+        }.ready, &pane));
+        const ms = timer.read() / std.time.ns_per_ms;
+        try testing.expect(ms >= 900);
+        try testing.expect(ms < 5_000);
+    }
+
+    // A pane that keeps changing keeps its wait alive PAST the bound: this one
+    // needs ~2.5s of wall clock against a 1s bound, which is exactly the case
+    // the old code failed.
+    {
+        var pane: ViewerPane = .{};
+        const Changing = struct {
+            var ticks: u32 = 0;
+            fn ready(p: *ViewerPane) bool {
+                ticks += 1;
+                // Any observable change resets the stall clock; zoom is the
+                // cheapest one to move.
+                p.zoom_factor += 1.0;
+                return ticks > 250;
+            }
+        };
+        Changing.ticks = 0;
+        var timer = try std.time.Timer.start();
+        try waitFor(&msg, 1, Changing.ready, &pane);
+        try testing.expect(timer.read() / std.time.ns_per_ms > 1_000);
+    }
+
+    // ...but not forever. A pane that changes and changes and never satisfies
+    // the predicate is a livelock, and the ceiling (8x the bound) is what
+    // stops the stall clock from being reset indefinitely.
+    {
+        var pane: ViewerPane = .{};
+        var timer = try std.time.Timer.start();
+        try testing.expectError(error.WaitForTimeout, waitFor(&msg, 1, struct {
+            fn ready(p: *ViewerPane) bool {
+                p.zoom_factor += 1.0;
+                return false;
+            }
+        }.ready, &pane));
+        const ms = timer.read() / std.time.ns_per_ms;
+        try testing.expect(ms >= 7_500);
+        try testing.expect(ms < 20_000);
+    }
+}
+
+test "T1170: the wait signature moves for every value a predicate can read" {
+    // The signature IS the progress detector, so a field a predicate waits on
+    // that the signature cannot see would silently restore the old wall-clock
+    // behavior for that wait.
+    var pane: ViewerPane = .{};
+    const base = waitSignature(&pane);
+
+    pane.page_loaded = true;
+    const after_load = waitSignature(&pane);
+    try testing.expect(after_load != base);
+
+    pane.diff_pushed = true;
+    const after_push = waitSignature(&pane);
+    try testing.expect(after_push != after_load);
+
+    pane.state = .ready;
+    const after_state = waitSignature(&pane);
+    try testing.expect(after_state != after_push);
+
+    // The callback counter is the one that carries a single-step wait. A
+    // navigation moves nothing else on the pane until it completes, so without
+    // this the stillness bound would collapse back to a wall-clock one for
+    // exactly the wait that failed the lane on 2026-08-31.
+    pane.wait_progress += 1;
+    try testing.expect(waitSignature(&pane) != after_state);
+
+    // And the diff probe's two round trips, which is the wait that started
+    // this: an empty probe already reads differently from no probe at all, so
+    // the listing landing and the patch landing both move the signature.
+    var probe = ViewerDiffProbe.init(testing.allocator);
+    defer probe.deinit();
+    const without_probe = waitSignature(&pane);
+    pane.diff_probe = probe;
+    try testing.expect(waitSignature(&pane) != without_probe);
+    pane.diff_probe = null;
 }
 
 test "visibility is recorded even before a controller exists" {

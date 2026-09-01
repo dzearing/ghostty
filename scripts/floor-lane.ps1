@@ -123,6 +123,11 @@ param(
     # produces the same unreadable `error: Unexpected` as one that starts at
     # zero. -MinFreeGB 0 disables the gate.
     [double]$MinFreeGB = 10,
+    # Skip the solo confirm pass a red lane triggers (T1170). It costs one
+    # narrowed re-run of an already-red lane, and it is on by default for the
+    # same reason -NoCatch is: "remember to pass a flag next time" means the
+    # answer is gone until the flake comes back.
+    [switch]$NoSoloConfirm,
     [switch]$SelfTest
 )
 
@@ -150,6 +155,9 @@ $ErrorActionPreference = 'Stop'
 # possibly build says "the drive is full" instead of relaying zig's
 # `error: Unexpected`.
 . "$PSScriptRoot\lib\BuildCache.ps1"
+# Names the tests a red lane blamed, and words the verdict of the narrowed
+# re-run that follows (T1170) -- the pure half of the solo confirm pass below.
+. "$PSScriptRoot\lib\LaneSolo.ps1"
 
 # Exit codes, named so a caller does not have to guess.
 $EXIT_PASS = 0
@@ -360,7 +368,11 @@ function Invoke-WebViewSweep {
 # ------------------------------------------------------------------- runner
 
 function Invoke-Lane {
-    param([string]$Name, [int]$Iteration, [string]$RawCommand)
+    # $OverrideFilter replaces -Filter for ONE call, which is what the solo
+    # confirm pass below needs: the same lane, narrowed to the tests that just
+    # went red (T1170). One element per -Dtest-filter, since build.zig declares
+    # the option as a list.
+    param([string]$Name, [int]$Iteration, [string]$RawCommand, [string[]]$OverrideFilter)
 
     $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
     $log = Join-Path $env:TEMP "floor-lane-$Name-$stamp.log"
@@ -378,7 +390,9 @@ function Invoke-Lane {
         $buildArgs = Get-LaneArgs -Name $Name
         # `lib` runs no tests, so a test filter would only mislead the log line
         # into claiming a filtered run happened.
-        if ($Filter -and $Name -ne 'lib') { $buildArgs = "$buildArgs -Dtest-filter=`"$Filter`"" }
+        $filters = if ($OverrideFilter) { @($OverrideFilter) } elseif ($Filter) { @($Filter) } else { @() }
+        if ($Name -eq 'lib') { $filters = @() }
+        foreach ($f in $filters) { $buildArgs = "$buildArgs -Dtest-filter=`"$f`"" }
 
         # `set "VAR=value"` -- the quotes are load-bearing: without them cmd folds
         # the space before && into the value and the link step then fails on a path
@@ -532,6 +546,57 @@ function Invoke-Lane {
         if (-not $NoCatch) { Invoke-LaneCrashCatch -Since $started -LaneLog $log }
     }
     return $result
+}
+
+# ------------------------------------------------- solo confirm pass (T1170)
+
+<#
+.SYNOPSIS
+Re-runs a red lane narrowed to the tests it blamed, and says whether they
+reproduce on their own.
+
+.DESCRIPTION
+The T1137 rule, applied to lanes instead of to the acceptance suite. A lane
+that is red because 5000+ tests and a live WebView2 were competing for the box
+is NOT the same event as a lane that is red because the code is broken, and
+until this ran every turn had to discover the difference by hand - which is
+what T1170 cost. The verdict is unchanged either way: red is still red and the
+exit code is still non-zero. What changes is that the answer is IN the run.
+#>
+function Invoke-SoloConfirm {
+    param([string]$Name, [string]$LogPath, [int]$MaxTests = 3)
+
+    $names = @(Get-FailedTestName -LogPath $LogPath)
+    if ($names.Count -eq 0) {
+        Write-Host "  solo confirm: skipped - the log names no failing test (a build error, a crash, or a shape this parser does not know)"
+        return 'unknown: no test named in the log'
+    }
+    if ($names.Count -gt $MaxTests) {
+        Write-Host "  solo confirm: skipped - $($names.Count) tests failed, which is a lane-wide break rather than one slow wait"
+        return "unknown: $($names.Count) tests failed"
+    }
+
+    Write-Host "  solo confirm: re-running $($names.Count) failing test(s) alone -> $($names -join ' | ')"
+    $laneLogBefore = $script:LastLaneLog
+    $r = Invoke-Lane -Name $Name -Iteration 1 -OverrideFilter $names
+    $soloLog = $script:LastLaneLog
+    # The FIRST log is the evidence; the caller's cache-heal check reads
+    # $script:LastLaneLog and must not be handed the confirm run's.
+    $script:LastLaneLog = $laneLogBefore
+
+    if ($r -eq 'PASS') {
+        Write-Host ""
+        Write-Host "LANE $Name FAILED UNDER LOAD, PASSES ALONE - not reproduced on its own."
+        Write-Host "  This is a harness/timing failure, not a defect in the code under test."
+        Write-Host "  failing test(s): $($names -join ' | ')"
+        Write-Host "  loaded run: $laneLogBefore"
+        Write-Host "  solo run:   $soloLog"
+        Write-Host "  The lane is still RED and this run still exits non-zero: 'passes alone' is"
+        Write-Host "  a diagnosis, not a pass. File it as a harness defect, not as broken code."
+        return (Get-SoloVerdictNote -SoloResult $r)
+    }
+    Write-Host "  solo confirm: $r alone - REPRODUCED. This is the code, not the box. ($soloLog)"
+    return (Get-SoloVerdictNote -SoloResult $r)
 }
 
 function Invoke-LaneCrashCatch {
@@ -711,7 +776,16 @@ foreach ($l in $lanes) {
                 $r = Invoke-Lane -Name $l -Iteration $i
             }
         }
-        $summary += "$l#${i}=$r"
+        # A red lane is re-run narrowed to the tests it blamed, so the run
+        # itself answers "is this the code or the box?" (T1170, the T1137 rule
+        # applied to lanes). The verdict is NOT changed by the answer.
+        if ($r -eq 'FAIL' -and -not $NoSoloConfirm -and -not $Filter -and $l -ne 'lib') {
+            $alone = Invoke-SoloConfirm -Name $l -LogPath $script:LastLaneLog
+            $summary += "$l#${i}=$r [alone: $alone]"
+        }
+        else {
+            $summary += "$l#${i}=$r"
+        }
         switch ($r) {
             'FAIL' { if ($worst -lt $EXIT_FAIL) { $worst = $EXIT_FAIL } }
             'STALL' { if ($worst -lt $EXIT_STALL) { $worst = $EXIT_STALL } }
