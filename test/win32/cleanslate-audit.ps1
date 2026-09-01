@@ -211,6 +211,19 @@ Assert 'C4 the shared kill offers the app-only scope the copies had' ($params.Co
 Assert 'C5 and the agent-only scope agent-pipe needed' ($params.ContainsKey('AgentOnly'))
 Assert 'C6 -SettleMs is a caller''s choice, not eight hardcoded sleeps' ($params.ContainsKey('SettleMs'))
 
+# C7/C8 (T1168): the clean slate reaches the REGISTRY too. A run that is killed
+# mid-way never reaches its own exit handler, so a leaked
+# `HKCU\...\Run\GhozttyAgent-<instance>` startup program outlives it and every
+# reboot after it - and the next run's reset is the only thing left that can
+# finish the job. Read off the function rather than exercised: this script kills
+# nothing and plants nothing, and test\win32\harness-process-leak.ps1 section R
+# is where the sweep is on trial against real values.
+$resetSrc = (Get-Command Reset-GhozttyTestState).Definition
+Assert 'C7 the reset sweeps leaked agent autostart entries' `
+    ($resetSrc -match 'Remove-LeakedAgentRunValue')
+Assert 'C8 and reports how many it swept, so a silent no-op is visible' `
+    ($resetSrc -match 'RunValuesSwept')
+
 # A clean green run stamps the covered files (T783) so scripts\guard-due.ps1 can
 # answer "has this sweep been run against the suite as it now stands?" - which is
 # the whole point of putting a corpus rule behind a guard rather than a memory.

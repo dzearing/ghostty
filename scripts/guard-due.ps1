@@ -2009,7 +2009,14 @@ $GuardTable = @(
         Stamp  = 'test\win32\harness-process-leak.stamp.json'
         Covers = @(
             'test\win32\lib\HarnessLeak.ps1',
-            'test\win32\harness-process-leak.ps1'
+            'test\win32\harness-process-leak.ps1',
+            # T1168: the autostart half of the same leak is ARMED in
+            # Isolation.ps1 (where the instance suffix is minted) and SWEPT in
+            # CleanSlate.ps1 (the backstop for a killed run). Section R is the
+            # only thing that exercises either, so an edit to them has to make
+            # this guard due - their own guards audit the corpus, not this.
+            'test\win32\lib\Isolation.ps1',
+            'test\win32\lib\CleanSlate.ps1'
         )
     },
     # The honesty of every OTHER row in this table (T1039). A harness whose body

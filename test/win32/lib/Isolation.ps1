@@ -53,6 +53,15 @@
 # never loads CleanSlate.ps1.
 . (Join-Path $PSScriptRoot 'BuildMode.ps1')
 
+# T1168: minting a GHOZTTY_AGENT_INSTANCE is what makes the agent write its own
+# `HKCU\...\Run\GhozttyAgent-<instance>` autostart value instead of clobbering
+# the user's - which is the whole point - but nothing removed it when the run
+# ended, so every isolated run left a permanent startup program behind pointed
+# at a dead sandbox. The teardown is armed HERE, at the one place the suffix is
+# minted, rather than at the bottom of each script that uses one: the bottom of
+# the script is exactly what does not run when a run dies half way through.
+. (Join-Path $PSScriptRoot 'HarnessLeak.ps1')
+
 Set-Variable -Name GhozttyIsolationTag -Scope Script -Value $null -ErrorAction SilentlyContinue
 
 <#
@@ -97,6 +106,11 @@ function Set-GhozttyTestIsolation {
         $tagPart = if ($Tag.Length -gt $tagRoom) { $Tag.Substring(0, [Math]::Max(1, $tagRoom)) } else { $Tag }
         $instance = "$tagPart-$pidPart"
         $env:GHOZTTY_AGENT_INSTANCE = $instance
+
+        # T1168: and arm its removal in the same breath. The value the agent is
+        # now free to write is a permanent HKCU startup program; this is the
+        # only line that makes it as temporary as the sandbox it names.
+        [void](Register-AgentRunKeyTeardown -Instance $instance)
 
         $root = if ($SandboxRoot) { $SandboxRoot } else { Join-Path $env:TEMP "ghoztty-sandbox-$Tag$PID" }
         New-Item -ItemType Directory -Force (Join-Path $root 'ghoztty') | Out-Null

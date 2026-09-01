@@ -62,6 +62,13 @@ Remove-Item Env:GHOZTTY_IPC_SOCKET -ErrorAction SilentlyContinue
 # `Assert-GhozttyIsolatedBuild` reads the exe itself, so it speaks first.
 . (Join-Path $PSScriptRoot 'BuildMode.ps1')
 
+# T1168: the clean slate now includes the REGISTRY. A run that is killed
+# mid-way - taskkill, a bluescreen, Ctrl-Break - never reaches its own exit
+# handler, and a leaked `HKCU\...\Run\GhozttyAgent-<instance>` value survives
+# every reboot afterwards, launching an agent for a sandbox that is long gone.
+# A crash is exactly when this leaks, so the next run's reset is the backstop.
+. (Join-Path $PSScriptRoot 'HarnessLeak.ps1')
+
 # Repo root, derived from this file's location (test\win32\lib -> repo).
 $script:CleanSlateRepo = (Resolve-Path (Join-Path $PSScriptRoot '..\..\..')).Path
 
@@ -269,9 +276,18 @@ function Reset-GhozttyTestState {
     $killed = Stop-RepoGhoztty -Exe $Exe -AppOnly:$AppOnly -SettleMs $SettleMs
     $cleared = Clear-DebugSessionLayout
     $layoutsCleared = if ($AppOnly) { $false } else { Clear-DebugAgentLayouts }
+
+    # T1168: sweep autostart entries a KILLED run left behind. Only
+    # lineage-suffixed names are candidates, so the user's `GhozttyAgent` and
+    # the dev install's `GhozttyAgent-debug` are out of reach by construction -
+    # Remove-LeakedAgentRunValue throws rather than touching either.
+    $runValuesSwept = 0
+    try { $runValuesSwept = [int](Remove-LeakedAgentRunValue) } catch {}
+
     return [pscustomobject]@{
         Killed          = $killed
         ManifestCleared = $cleared
         LayoutsCleared  = $layoutsCleared
+        RunValuesSwept  = $runValuesSwept
     }
 }

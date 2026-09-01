@@ -332,3 +332,175 @@ function Get-LeakedGhozttyProcess {
     }
     return @($found)
 }
+
+# ---------------------------------------------------------------------------
+# THE REGISTRY HALF OF THE SAME LEAK (T1168)
+#
+# A process leak is loud - it holds a window, a pipe, a PTY - and every helper
+# above hunts one. The quiet twin is an AUTOSTART leak: an isolated run that
+# forces the agent's Run-key write leaves a permanent
+# `HKCU\...\Run\GhozttyAgent-<instance>` value behind, pointed at a throwaway
+# sandbox, and nothing above can see it. Four of them were sitting in the
+# user's own sign-in list on 2026-08-23 from four soak runs in one morning,
+# each one queued to launch a background agent for a sandbox that had stopped
+# meaning anything hours earlier. Nothing about a test run should still be
+# running tomorrow morning.
+#
+# WHY THE NAME IS A SAFE CLASSIFIER. The suffix comes from
+# `GHOZTTY_AGENT_INSTANCE` (src/remote/agent_lineage.zig), which is unset in
+# every production run and set only by `lib\Isolation.ps1 -ReleaseSandbox`. So
+# a suffixed value name cannot have been written by anything but a harness -
+# while the two UNsuffixed names are the real installs and are protected by
+# construction here: `GhozttyAgent` is the user's terminal, `GhozttyAgent-debug`
+# is the dev install. Removing either is the T116 mistake wearing a registry
+# hat, so the remover THROWS on them rather than declining quietly.
+
+$script:HarnessAgentRunSubkey = 'Software\Microsoft\Windows\CurrentVersion\Run'
+$script:HarnessAgentRunPath = "HKCU:\$script:HarnessAgentRunSubkey"
+
+# The two names a real install owns. Never a leak, never removable from here.
+$script:HarnessAgentRunProtected = @('GhozttyAgent', 'GhozttyAgent-debug')
+
+function Test-AgentRunValueLeaked {
+    <#
+    .SYNOPSIS
+    Is this Run VALUE NAME a harness artifact? True only for a lineage-suffixed
+    agent entry - never for the user's install, never for the dev install, and
+    never for a value that is not ours at all.
+    #>
+    param([string]$Name)
+    if (-not $Name) { return $false }
+    if (-not $Name.StartsWith('GhozttyAgent', [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    foreach ($p in $script:HarnessAgentRunProtected) {
+        if ([string]::Equals($Name, $p, [StringComparison]::OrdinalIgnoreCase)) { return $false }
+    }
+    return $true
+}
+
+function Get-LeakedAgentRunValue {
+    <#
+    .SYNOPSIS
+    Every lineage-suffixed agent autostart entry currently in HKCU's Run key -
+    i.e. every autostart a harness has leaked onto this box.
+
+    .DESCRIPTION
+    The registry counterpart of Get-LeakedGhozttyProcess, and a hard zero for
+    the same reason: nobody sets GHOZTTY_AGENT_INSTANCE outside this suite, so
+    anything here was put here by a test run. Returns Name + Command so a
+    failure can NAME the offender instead of counting it.
+    #>
+    $key = $null
+    try { $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($script:HarnessAgentRunSubkey, $false) } catch {}
+    if ($null -eq $key) { return @() }
+    try {
+        $found = @()
+        foreach ($name in $key.GetValueNames()) {
+            if (-not (Test-AgentRunValueLeaked $name)) { continue }
+            $found += [pscustomobject]@{
+                Name    = $name
+                Command = [string]$key.GetValue($name)
+            }
+        }
+        return @($found)
+    } finally { $key.Close() }
+}
+
+function Remove-LeakedAgentRunValue {
+    <#
+    .SYNOPSIS
+    Delete leaked agent autostart entries. -Name removes exactly one; with no
+    -Name it sweeps every leaked value. Returns the count removed.
+
+    .DESCRIPTION
+    THROWS on a protected name. A sweep that silently declined to remove
+    `GhozttyAgent` would be indistinguishable from one that quietly removed it,
+    and only one of those is safe to keep believing - so the refusal is loud,
+    and test\win32\harness-process-leak.ps1 section G proves it fires.
+    #>
+    param([string]$Name)
+
+    if ($Name -and -not (Test-AgentRunValueLeaked $Name)) {
+        throw ("Remove-LeakedAgentRunValue refuses '$Name': that is a real install's " +
+               'autostart entry, not a harness leak.')
+    }
+
+    $targets = if ($Name) { @($Name) } else { @(Get-LeakedAgentRunValue | ForEach-Object { $_.Name }) }
+    if ($targets.Count -eq 0) { return 0 }
+
+    $key = $null
+    try { $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($script:HarnessAgentRunSubkey, $true) } catch {}
+    if ($null -eq $key) { return 0 }
+    $removed = 0
+    try {
+        foreach ($t in $targets) {
+            try { $key.DeleteValue($t, $false); $removed++ } catch {}
+        }
+    } finally { $key.Close() }
+    return [int]$removed
+}
+
+function Get-AgentRunKeyTeardownBlock {
+    <#
+    .SYNOPSIS
+    The autostart delete, as a scriptblock with the instance suffix BAKED IN as
+    a literal. Emits the number of values removed.
+
+    .DESCRIPTION
+    Same two rules as Get-HarnessTeardownBlock, and for the same measured
+    reasons: literals only (an exit-time action cannot resolve the registering
+    scope's variables), and nothing that needs module auto-loading - so this
+    goes through [Microsoft.Win32.Registry] rather than Remove-ItemProperty.
+
+    Both lineages are removed, because which one a run writes depends on the
+    build it drove: a release sandbox leaves `GhozttyAgent-<instance>`, a debug
+    one `GhozttyAgent-debug-<instance>`. Deleting a value that was never written
+    is a no-op, so covering both costs nothing and forgetting one leaks.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Instance)
+
+    $inst = $Instance.Replace("'", "''")
+    $lines = @(
+        '$removed = 0'
+        '$k = $null'
+        "try { `$k = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('$script:HarnessAgentRunSubkey', `$true) } catch {}"
+        'if ($null -ne $k) {'
+        "  foreach (`$n in @('GhozttyAgent-$inst', 'GhozttyAgent-debug-$inst')) {"
+        '    try { $k.DeleteValue($n, $false); $removed++ } catch {}'
+        '  }'
+        '  $k.Close()'
+        '}'
+        '$removed'
+    )
+    return [scriptblock]::Create($lines -join "`n")
+}
+
+function Register-AgentRunKeyTeardown {
+    <#
+    .SYNOPSIS
+    Remove this run's lineage-suffixed autostart entries when this PowerShell
+    exits - failure path included.
+
+    .DESCRIPTION
+    Armed by lib\Isolation.ps1 the moment it mints a GHOZTTY_AGENT_INSTANCE, so
+    a sandbox cannot leave an autostart behind whether it finishes, throws or
+    exits 1. A HARD kill of the host is not covered by anything - the
+    clean-slate sweep in Reset-GhozttyTestState is the backstop for that, which
+    is why the leak is answered at both ends rather than only here.
+
+    Idempotent: arming the same instance twice arms one handler.
+    #>
+    param([Parameter(Mandatory = $true)][string]$Instance)
+
+    if (-not $Instance) { throw 'Register-AgentRunKeyTeardown needs an instance suffix.' }
+
+    if (-not $global:GhozttyHarnessRunInstances) {
+        $global:GhozttyHarnessRunInstances = New-Object System.Collections.ArrayList
+    }
+    $already = @($global:GhozttyHarnessRunInstances | Where-Object { $_ -eq $Instance })
+    if ($already.Count -gt 0) { return $Instance }
+    [void]$global:GhozttyHarnessRunInstances.Add($Instance)
+
+    Register-EngineEvent -SourceIdentifier PowerShell.Exiting `
+        -Action (Get-AgentRunKeyTeardownBlock -Instance $Instance) | Out-Null
+    return $Instance
+}
