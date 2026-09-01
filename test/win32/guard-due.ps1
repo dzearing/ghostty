@@ -641,6 +641,114 @@ try {
     Check 'K10 a row with no CI evidence cannot be stamped from CI' `
         ($rk5.Exit -eq 2 -and $rk5.Text -match 'no selected guard declares CiEvidence') "exit=$($rk5.Exit): $($rk5.Text)"
 
+    # --- L. the table's own integrity ---------------------------------------
+    # T1227. Every arm above measures what the table SAYS about the tree; these
+    # measure whether the table can say anything at all. A `Covers` entry that
+    # matches no file contributes nothing and says nothing: Get-CoveredFiles
+    # asks with -ErrorAction SilentlyContinue and moves on, so a row with one
+    # good pattern and one broken one reads CURRENT while watching one file
+    # fewer than it claims. The task that produced this section was filed
+    # against two rows believed to hold control characters; they did not (the
+    # bytes came from a tool that mangles backslashes on the way to a terminal),
+    # and the check below is what makes that answerable in a second instead of
+    # by reading a file's bytes by hand.
+    #
+    # Each arm drives a COPY of the real script whose table has been spliced out
+    # for a fixture-sized one - so the fault logic under test is the shipped
+    # code path, and the copy's own repo is the fixture, which is what arms the
+    # check (it is deliberately inert against a foreign tree).
+    Write-Host "`n-- L. the coverage table itself --"
+
+    $TabFixture = Join-Path $env:TEMP ("ghoztty-guard-tab-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Force -Path (Join-Path $TabFixture 'scripts') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $TabFixture 'test\win32') | Out-Null
+    foreach ($n in @('good-one.ps1', 'good-two.ps1')) {
+        [System.IO.File]::WriteAllText((Join-Path $TabFixture "scripts\$n"), "# fixture`n",
+            (New-Object System.Text.UTF8Encoding($false)))
+    }
+
+    $realDue = [System.IO.File]::ReadAllText($Due, [System.Text.Encoding]::UTF8)
+    $tabStart = $realDue.IndexOf('$GuardTable = @(')
+    $tabEnd = $realDue.IndexOf("function Get-RepoRelative")
+    Check 'L0 the real script still has the two anchors this section splices between' `
+        ($tabStart -ge 0 -and $tabEnd -gt $tabStart) "start=$tabStart end=$tabEnd"
+
+    function Set-FixtureTable([string[]]$patterns) {
+        # The copy, with a one-row table naming exactly $patterns.
+        $rows = ($patterns | ForEach-Object { "            '" + $_ + "'" }) -join ",`n"
+        $table = @"
+`$GuardTable = @(
+    [pscustomobject]@{
+        Name   = 'fixture-row'
+        Script = 'test\win32\fixture-row.ps1'
+        Stamp  = 'test\win32\fixture-row.stamp.json'
+        Covers = @(
+$rows
+        )
+    }
+)
+
+"@
+        $text = $realDue.Substring(0, $tabStart) + $table + $realDue.Substring($tabEnd)
+        [System.IO.File]::WriteAllText((Join-Path $TabFixture 'scripts\guard-due.ps1'), $text,
+            (New-Object System.Text.UTF8Encoding($false)))
+    }
+
+    function Invoke-TabDue([string]$Action = 'check') {
+        $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+            (Join-Path $TabFixture 'scripts\guard-due.ps1'), $Action, '-Repo', $TabFixture)
+        if ($Action -eq 'update') { $a += '-IgnoreRunState' }
+        $out = & powershell.exe @a 2>&1
+        return [pscustomobject]@{ Exit = $LASTEXITCODE; Text = (@($out) -join "`n") }
+    }
+
+    # L1: the negative control. A table whose every path resolves is silent, and
+    # a check that is silent for a table with a hole would prove nothing.
+    Set-FixtureTable @('scripts\good-one.ps1', 'scripts\good-two.ps1')
+    Invoke-TabDue update | Out-Null
+    $rl = Invoke-TabDue
+    Check 'L1 a table whose paths all resolve reports no fault' `
+        ($rl.Exit -eq 0 -and $rl.Text -notmatch 'GUARD TABLE FAULT' -and $rl.Text -match 'GUARD CURRENT') `
+        "exit=$($rl.Exit): $($rl.Text)"
+
+    # L2: the fault itself - one good pattern, one that names a file that is not
+    # there. This is the state T1227 was filed about.
+    Set-FixtureTable @('scripts\good-one.ps1', 'scripts\gone-missing.ps1')
+    $rl = Invoke-TabDue
+    Check 'L2 a pattern matching nothing beside one that matches is a FAULT' `
+        ($rl.Text -match "GUARD TABLE FAULT fixture-row: covers 'scripts\\gone-missing\.ps1'") $rl.Text
+    Check 'L2b and it FAILS the check, so the pre-commit gate refuses it' `
+        ($rl.Exit -ne 0) "exit=$($rl.Exit): $($rl.Text)"
+    Check 'L2c and the fault names the remedy' `
+        ($rl.Text -match 'fix the path in scripts\\guard-due\.ps1') $rl.Text
+
+    # L3: the exact byte shape the task described - a backslash eaten by a shell
+    # heredoc, leaving 0x07 behind. Named by code, because "a path that looks
+    # right and is not" is unreadable without one.
+    $bel = [string][char]7
+    Set-FixtureTable @('scripts\good-one.ps1', ("scripts" + $bel + "pprt.ps1"))
+    $rl = Invoke-TabDue
+    Check 'L3 a Covers path carrying a control character is a FAULT' `
+        ($rl.Exit -ne 0 -and $rl.Text -match 'GUARD TABLE FAULT fixture-row' -and $rl.Text -match 'contains 0x07') $rl.Text
+
+    # L4: scope. A row that matches nothing AT ALL is a foreign tree, not a
+    # typo, and already has its own sentence; faulting it would make this check
+    # fire on every fixture run in this file and be turned off within a day.
+    Set-FixtureTable @('scripts\nope-one.ps1', 'scripts\nope-two.ps1')
+    # Without L1's stamp: an unmatched row that HAS one is a row whose files
+    # vanished, which is a different (and correctly due) sentence.
+    Remove-Item -LiteralPath (Join-Path $TabFixture 'test\win32\fixture-row.stamp.json') -Force -ErrorAction SilentlyContinue
+    $rl = Invoke-TabDue
+    Check 'L4 a row that matches nothing at all is N/A, not a fault' `
+        ($rl.Text -match 'GUARD N/A fixture-row' -and $rl.Text -notmatch 'GUARD TABLE FAULT') $rl.Text
+
+    # L5: and the live table, which is the answer T1227 actually wanted. The
+    # real script, the real repo, no fixture: every one of its rows names paths
+    # that exist.
+    $out5 = & powershell.exe @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Due, 'check', '-Repo', $Repo) 2>&1
+    Check 'L5 the shipped coverage table has no unmatched or corrupt path' `
+        ((@($out5) -join "`n") -notmatch 'GUARD TABLE FAULT') (@($out5 | Select-String 'FAULT') -join "`n")
+
     Complete-TestBody  # T1039: the run reached the end of its body
 }
 finally {
@@ -648,7 +756,8 @@ finally {
     if ($RelFixture) { Remove-Item -LiteralPath $RelFixture -Recurse -Force -ErrorAction SilentlyContinue }
     if ($ProvFixture) { Remove-Item -LiteralPath $ProvFixture -Recurse -Force -ErrorAction SilentlyContinue }
     if ($CiFixture) { Remove-Item -LiteralPath $CiFixture -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($TabFixture) { Remove-Item -LiteralPath $TabFixture -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 Write-Host ''
-Write-TestVerdict -Pass $script:passes -Fail $script:failures -MinPass 46
+Write-TestVerdict -Pass $script:passes -Fail $script:failures -MinPass 54

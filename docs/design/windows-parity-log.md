@@ -9,6 +9,41 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-01: T1227 - **The staleness gate now checks its own watch list, after a bug report about that list turned out to be a bug in the report.** T1227 was filed saying two `Covers` entries in `scripts\guard-due.ps1` held control characters where a backslash belongs (`src<BEL>pprt\win32\install_prepare.zig`, `dist\windows-installer<BS>uild-msi.sh`), which would make those guards unable to ever go due. Checked first, and it is false: the HEAD blob and the worktree copy both contain zero characters below 0x20, and all 118 rows' patterns resolve to at least one file today. The bytes came from a tool that halves backslashes on the way to a terminal - the report was mangled, not the file.
+  What was real is why that took a byte scan to answer. `Get-CoveredFiles` asks
+  `Get-ChildItem` with `-ErrorAction SilentlyContinue`, so a pattern matching
+  nothing contributes nothing and says nothing. A row where EVERY pattern misses
+  is reported (`GUARD N/A`); a row with one good pattern and one broken one is
+  not - it keeps printing `GUARD CURRENT` while watching one file fewer than it
+  claims, and the only way to find out was to read the table by hand. A control
+  byte, a typo, or a file that moved all produce the same silence.
+  So `check` now audits the table before it reports any verdict, and a
+  `GUARD TABLE FAULT` fails it the way a due harness does - which means it fails
+  `parity-tasks.ps1 validate`, the gate with teeth. Two conditions, deliberately
+  asymmetric: a path carrying a control character is a fault in ANY tree, since
+  no file can be named that; a pattern matching nothing is a fault only when a
+  sibling pattern in the same row DOES match. That sibling is what separates a
+  typo from a foreign tree, and it is why the fixture repos this repo's own
+  harnesses drive (which match almost nothing) stay silent instead of turning the
+  new check into noise that gets switched off within a day.
+  Section L of `test\win32\guard-due.ps1` is the demonstration, and it drives the
+  shipped code path rather than a re-implementation: it splices a fixture-sized
+  table into a copy of the real script and asserts the fault fires on a missing
+  path (L2) and on a 0x07 (L3), that it FAILS the check so the pre-commit gate
+  refuses it (L2b), that a wholly-unmatched row stays N/A (L4), and that the real
+  table on the real repo is clean (L5) - which is the arm that answers the
+  question T1227 asked, in a second, forever. 88 assertions, ALL PASS.
+  `ship-readiness.ps1` learned to name a FAULT in its guards criterion; without
+  that it would have failed the criterion with an empty reason.
+  Floor: all four lanes PASS, ipc-p1/p2/p3 ALL PASS, plus the nine harnesses the
+  edits made due (ship-workflow, isolation-meta, launch-preflight, verdict-exit,
+  cleanslate, stderr-capture, merge-terminology, body-complete, desktop-launch)
+  and gate-negatives - all green, guard-due back to exit 0 with only the two
+  standing advisory rows.
+  Worth carrying forward: **check a filed premise before building on it.** This
+  task's fix would have been two characters and would have changed nothing, and
+  the turn's whole value came from the five minutes spent proving the report
+  wrong first.
 - 2026-09-01: T1209 (+T1258, T1259, T1260 filed) - **"click update and my terminal comes back with my shells still in it" is now one measured sequence instead of three halves.** The in-app updater and the installer's Restart Manager handling landed separately (T1178, T1204, T1207) and each had a harness that stopped exactly where the other one started: `update-apply` runs the applier against a package msiexec rejects; `update-real-msi` gets a real msiexec to succeed but KILLS the app first and hands the applier a pid that has already exited; `install-restart` measures the app agreeing to a Restart Manager close with no installer behind the messages. Nobody had watched a running terminal be closed, replaced and reopened in one go.
   `test\win32\update-graceful.ps1` is that run: the app is up with a live pane
   when the applier is armed on its pid, it is closed with the two messages the

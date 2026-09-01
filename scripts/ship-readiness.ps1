@@ -318,7 +318,10 @@ else {
         Add-Criterion 'guards' 'PASS' 'no acceptance harness is due'
     }
     else {
-        $due = @($guardOut | Out-String) -split "`r?`n" | Where-Object { $_ -match 'DUE' } | Select-Object -First 3
+        # FAULT as well as DUE (T1227): a coverage path that cannot match is a
+        # guard that can never fire, and it fails the check the same way. Left
+        # out of this filter it would fail the criterion with an empty reason.
+        $due = @($guardOut | Out-String) -split "`r?`n" | Where-Object { $_ -match 'DUE|FAULT' } | Select-Object -First 3
         Add-Criterion 'guards' 'FAIL' ("guard-due reports DUE: {0}" -f (($due -join '; ').Trim())) `
             'run the named harness until it is clean, which re-stamps it'
     }

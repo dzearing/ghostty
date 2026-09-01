@@ -120,6 +120,12 @@ if (-not $Repo) { $Repo = Split-Path -Parent $PSScriptRoot }
 # reached transitively from here and is deliberately NOT covered - it has its
 # own acceptance (test\win32\cli-argv-fidelity.ps1), which is the same argument
 # in the other direction.
+#
+# Every pattern here must MATCH SOMETHING in this repo (T1227). One that does
+# not is not an error you will see: it contributes no files and the row goes on
+# reporting CURRENT over the ones that are left, so the guard quietly watches
+# less code than it claims to. `check` audits the table for that before it
+# reports any verdict; move a file and its entry moves with it.
 # ---------------------------------------------------------------------------
 $GuardTable = @(
     [pscustomobject]@{
@@ -2366,6 +2372,84 @@ function Get-CoveredFiles($row) {
     return @($found.ToArray() | Sort-Object -CaseSensitive)
 }
 
+# Is this run auditing the repo the script itself lives in? The table's paths
+# are FACTS ABOUT THIS REPOSITORY, so "that pattern matches nothing" only means
+# something here; against a fixture or a foreign tree it is the normal case and
+# already has its own sentence (`GUARD N/A`). Compared by resolved path rather
+# than by "was -Repo passed", because the real pre-commit gate passes -Repo
+# explicitly with the repo root in it (parity-tasks.ps1) - keying on the flag
+# would have switched the check off in exactly the run that needs it.
+$AuditingOwnRepo = $false
+try {
+    $ownRepo = Split-Path -Parent $PSScriptRoot
+    $AuditingOwnRepo = ((Resolve-Path -LiteralPath $Repo).Path.TrimEnd('\', '/') -eq
+        (Resolve-Path -LiteralPath $ownRepo).Path.TrimEnd('\', '/'))
+} catch { $AuditingOwnRepo = $false }
+
+function Get-TableFaults($rowsToAudit) {
+    <#
+      T1227. A `Covers` entry that matches NOTHING contributes nothing, silently:
+      Get-CoveredFiles asks Get-ChildItem with -ErrorAction SilentlyContinue and
+      moves on. A whole row that matches nothing is reported (`GUARD N/A`), but a
+      row with one good pattern and one broken one is not - it looks CURRENT
+      while quietly watching one file fewer than it claims. That is a check that
+      cannot fire, which go.md says a gate must never be.
+
+      Two faults, and they answer different questions:
+
+        * control-char - a path carrying a byte below 0x20. Always checked, in
+          any tree: no file can have such a name, so the entry is a typo
+          wherever it is read. This is the shape a shell heredoc leaves behind
+          when it halves a backslash (`\a` -> 0x07, `\b` -> 0x08).
+
+        * matches-nothing - a pattern that matches no file while ANOTHER pattern
+          in the same row does. The sibling is what makes it a typo rather than
+          a foreign tree, and it is why this needs no allow-list: a row that is
+          wholly inapplicable stays silent.
+    #>
+    $faults = @()
+    foreach ($row in @($rowsToAudit)) {
+        $matched = @{}
+        foreach ($pattern in $row.Covers) {
+            $n = @(Get-ChildItem -Path (Join-Path $Repo $pattern) -File -ErrorAction SilentlyContinue).Count
+            $matched[$pattern] = $n
+            if ($pattern -match '[\x00-\x1f\x7f]') {
+                $shown = ($pattern -replace '[\x00-\x1f\x7f]', '?')
+                $codes = @()
+                foreach ($ch in $pattern.ToCharArray()) {
+                    if ([int]$ch -lt 0x20 -or [int]$ch -eq 0x7f) { $codes += ('0x{0:x2}' -f [int]$ch) }
+                }
+                $faults += [pscustomobject]@{
+                    Guard = $row.Name; Pattern = $shown; Reason = 'control-char'
+                    Detail = ("contains {0} where a path separator belongs" -f ($codes -join ', '))
+                }
+            }
+        }
+        if (-not $AuditingOwnRepo) { continue }
+        $live = @($matched.Values | Where-Object { $_ -gt 0 }).Count
+        if ($live -eq 0) { continue }
+        foreach ($pattern in $row.Covers) {
+            if ($matched[$pattern] -eq 0 -and $pattern -notmatch '[\x00-\x1f\x7f]') {
+                $faults += [pscustomobject]@{
+                    Guard = $row.Name; Pattern = $pattern; Reason = 'matches-nothing'
+                    Detail = 'nothing in this tree matches it, though the row''s other patterns do'
+                }
+            }
+        }
+    }
+    return @($faults)
+}
+
+function Write-TableFaults($faults) {
+    foreach ($f in @($faults)) {
+        "GUARD TABLE FAULT {0}: covers '{1}' - {2}" -f $f.Guard, $f.Pattern, $f.Detail
+    }
+    if (@($faults).Count -gt 0) {
+        "  (a covered path that cannot match never changes, so its guard can never go due)"
+        "  fix the path in scripts\guard-due.ps1, or drop the entry if the file is gone"
+    }
+}
+
 function Get-NormalizedFileHash([string]$fullPath) {
     <#
       SHA-256 of the file's bytes with CRLF folded to LF and any UTF-8 BOM
@@ -2848,12 +2932,22 @@ switch ($Action) {
 
     'check' {
         $states = @(foreach ($row in $rows) { Get-GuardState $row })
+        # The table's own integrity, before its verdicts (T1227): a row whose
+        # coverage names a path that cannot match is reporting on less code than
+        # it says it does, and every CURRENT line it prints afterwards is worth
+        # correspondingly less.
+        $faults = @(Get-TableFaults $rows)
         if ($Json) {
             # An array, always - a single-row table must not collapse to an object.
             ConvertTo-Json -Depth 6 -InputObject @($states)
-            exit ([int](@($states | Where-Object { $_.Kind -eq 'due' }).Count -gt 0))
+            # The faults go to the error stream so the object stream stays valid
+            # JSON for whoever parses it, and still reach a caller that merges
+            # the two (2>&1, which is how the acceptance harness reads it).
+            foreach ($line in (Write-TableFaults $faults)) { [Console]::Error.WriteLine($line) }
+            exit ([int]((@($states | Where-Object { $_.Kind -eq 'due' }).Count + $faults.Count) -gt 0))
         }
-        $due = 0
+        Write-TableFaults $faults
+        $due = $faults.Count
         foreach ($s in $states) {
             if ($s.Kind -eq 'n/a') {
                 "GUARD N/A {0}: nothing in this tree matches its coverage" -f $s.Name

@@ -1,10 +1,10 @@
 {
     "guard":  "cleanslate",
     "script":  "test/win32/cleanslate-audit.ps1",
-    "generated":  "2026-09-01T15:20:00-07:00",
-    "commit":  "14c905732",
+    "generated":  "2026-09-01T15:55:22-07:00",
+    "commit":  "2989e258a",
     "uncommitted":  [
-                        "test/win32/go-loop-guard.ps1"
+                        "test/win32/guard-due.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -100,7 +100,7 @@
                   "test/win32/ghoztty-cleanup.ps1":  "81bfcb6cb5b018195e1056d6ce7203f18235763916bcec4cffcdafa811e73f76",
                   "test/win32/go-loop-guard.ps1":  "e8d29ccf1b2cc0a85843ae13cdfcf4ac8f7111942a8e5908434cb281e63b83cd",
                   "test/win32/go-loop-uptime.ps1":  "a97005d970a564088741646542ffaca3cb9ffe03d2eb30c55b96841607948b82",
-                  "test/win32/guard-due.ps1":  "95b2baa69d25835a2f648437d216e9a349c113a9eda1baabac8dc7230438c7ff",
+                  "test/win32/guard-due.ps1":  "7d19009608a80312171a80eb68f9324dc2ff0ff248990c8a3ab4b4f43398c743",
                   "test/win32/gui-launch-command.ps1":  "a8d4b110a16877255e0dbdb4b01a021a33cf1386462da9bf8a63f3cef4105be1",
                   "test/win32/harness-exitcode-audit.ps1":  "1fdbe9c4d70fd1e9fe80ac17257de1d346a3b5c07c7c69628578eba5ac45f033",
                   "test/win32/harness-process-leak.ps1":  "c62a0f43277632a1bd8506273912a0f73b13ed311d3f84e6a3763b425a9d14a9",
