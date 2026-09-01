@@ -1,11 +1,10 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-01T13:48:59-07:00",
-    "commit":  "2def60186",
+    "generated":  "2026-09-01T14:51:25-07:00",
+    "commit":  "95e3e0fd4",
     "uncommitted":  [
-                        "test/win32/update-graceful.ps1",
-                        "test/win32/update-real-msi.ps1"
+                        "test/win32/daily-publish.ps1"
                     ],
     "files":  {
                   "src/cli/ghostty.zig":  "ef54b501298cfda9306cfb958c1094db24ee30f355b25865656b3e2bc713bcd7",
@@ -83,6 +82,7 @@
                   "test/win32/crash-diagnostics.ps1":  "1d06d58b9b8b0155427126144e55599f3e2598408ff8a0b5af3d076bd9bc50c7",
                   "test/win32/crash-first-chance.ps1":  "f30c24b2753b983c7ec6533559e706ccc099a858d955958b914a92605ae26d8e",
                   "test/win32/crash-stacks.ps1":  "a0c6fa51f11530a9915fcb8477517a6757b48ced7a9aff89aaf5c1313c33e710",
+                  "test/win32/daily-publish.ps1":  "82638f45728f6feafe20544bc8295f15de7a0f4ff062b09a6f43fead2140951c",
                   "test/win32/dark-menus.ps1":  "ab97be43af44188040463ebf9c6ab7b4a96139a623445aeb145eec3e4c9f906f",
                   "test/win32/deliver-windows-build.ps1":  "e3bd97324b317cc164f69a9bb78514e21ef94be11c773186cbfe1f7e4ffab17d",
                   "test/win32/desktop-launch-audit.ps1":  "df0f8241a82fb625a5309378e3d96de7951876f8d2c394564e3f3326d8889a53",

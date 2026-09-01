@@ -19325,3 +19325,59 @@ Floor: lib/none/win32/agent ALL LANES PASS; ipc-p1/p2/p3 ALL PASS;
 `desktop-launch-audit` re-run and re-stamped. `asserted-nothing` and
 `skip-visibility` are red at HEAD for reasons that predate this work (T1257,
 T1043, T775).
+
+## 2026-09-01 - the day's fixes now publish themselves at the end of the day (T1220)
+
+Decision D85 settled that the user's terminal only ever runs something that was
+actually published, and T1218 removed the morning swap that used to push repo
+bits straight into the installed app. The trade that came with it was a promise:
+the loop publishes at the end of a day's work, so a fix that lands today still
+reaches them today. Until now nothing did that - the work landed on the branch
+and waited for somebody to type a publish command.
+
+`scripts\daily-publish.ps1` is that promise, kept. It fires from go.md step 6.5
+on every turn and decides three things:
+
+**When.** The first task-boundary push at or after 17:00 local, at most once a
+day, against a durable watermark in `%LOCALAPPDATA%\ghoztty\daily-publish`. The
+same shape as the retired morning refresh - a real signal that the tree is good
+rather than a clock firing into whatever happens to be checked out - moved to
+the other end of the day, because a morning publish always ships yesterday.
+
+**What version.** A Windows release tracks the newest Mac `vX.Y.Z` line and
+walks the PATCH from there: `v1.37.0` then `win-v1.37.0`, `win-v1.37.1`, ... one
+per publishing day, until the next Mac release pulls the base up. So the number
+the user sees names the Mac line their build corresponds to, the daily walk
+never squats on a minor the Mac seat has not released, and the version is
+derived from the releases that EXIST, so it cannot collide with one. That is a
+number the user reads off their own updater, so it went to them as **D88**; the
+patch walk shipped as the assumed answer meanwhile.
+
+**Whether it can run at all.** Docker Desktop down (wixl packages the MSI inside
+the msitools image, and starting Docker is the user's call) or `gh`
+unauthenticated is a **SKIP**: the reason is named in the log, the watermark is
+NOT consumed so a later push the same day still publishes, and the turn carries
+on. Exit 0 for not-due and skipped, 10 for published, 1 for a failed publish -
+and all three end the turn identically, because a publish must never be able to
+stall the loop.
+
+The morning refresh had a harness covering exactly these shapes and it retired
+with the swap it guarded. `test\win32\daily-publish.ps1` is its replacement:
+seven sections, hermetic (a sandbox watermark, a fake `docker`/`gh` ahead of
+PATH, a sentinel publish script that records whether it was ever run), no build
+and nothing released. `-NegativeControl` scores 57 failures and zero passes, so
+it can go red. New `daily-publish` row in `scripts\guard-due.ps1`.
+
+Confirmed live on this box rather than only in the harness: a real `-Check` at
+14:19 printed `NOT DUE: before 17:00 local`, and the same run with `-Now
+18:30` printed `SKIP: due (first task-boundary push at/after 17:00 today) but
+Docker Desktop is not running`. The morning digest now has to name what SHIPPED,
+not only what landed (go.md 0.5), read from that watermark.
+
+Also filed: [[T1261]], because the one criterion this box cannot answer is the
+one that matters most - nobody has yet watched an automatic publish go all the
+way from a finished task to an update offer on the installed terminal, since
+that needs Docker up.
+
+Floor: lib/none/win32/agent ALL LANES PASS; `daily-publish` and
+`install-ownership` green.

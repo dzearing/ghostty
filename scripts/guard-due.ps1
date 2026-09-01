@@ -637,6 +637,23 @@ $GuardTable = @(
             'test\win32\install-ownership.ps1'
         )
     },
+    # The OTHER half of D85 (T1220): the daily publish is now the only way the
+    # day's work reaches the user's terminal, and every part of it fails quietly.
+    # A due decision that goes shy ships nothing and looks identical to a quiet
+    # day; a version scheme that walks the wrong axis is only visible weeks
+    # later; a skip that became a failure stalls the loop. Nothing in the lanes
+    # or the P1-P3 floor touches any of it. This row is the replacement for
+    # `morning-refresh`'s, which retired with the swap it guarded.
+    [pscustomobject]@{
+        Name   = 'daily-publish'
+        Script = 'test\win32\daily-publish.ps1'
+        Stamp  = 'test\win32\daily-publish.stamp.json'
+        Covers = @(
+            'scripts\daily-publish.ps1',
+            'scripts\publish-windows-release.ps1',
+            'test\win32\daily-publish.ps1'
+        )
+    },
     # The MEASURED half of the delivery (T198), which had a harness but no row
     # here: `deliver-windows-build.ps1` is what proves the Desktop portable, the
     # network share, the loose agent and the portable ZIP actually received the

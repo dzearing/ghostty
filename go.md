@@ -97,6 +97,13 @@ Concretely, in order, with no stops in between:
      name a task id only when they might click it. `## Commentary` covers:
      - **Yesterday** — what actually landed (from the log and the tracker's
        activity), and what it means for the end goal, not a commit list.
+       **Name what SHIPPED**, not only what landed (T1220): the release the
+       end-of-day publish created, and whether it carries the work described
+       here — read it from `%LOCALAPPDATA%\ghoztty\daily-publish` (date, tag,
+       commit, outcome) or `gh release list --repo dzearing/ghoztty`. If nothing
+       was published, say so and why (a skip names its reason in
+       `%TEMP%\ghoztty-daily-publish.log`), because the morning question this
+       tab answers is "is what I am running the work I read about yesterday?".
      - **Today's focus** — what the queue says comes next and why that is the
        right next thing.
      - **Reflection** — a genuine step back: how the work has been going,
@@ -602,9 +609,18 @@ Concretely, in order, with no stops in between:
    manual refresh still matters as the fallback for a session whose transcript
    could not be resolved (`acquire` says which: `pulse=transcript` vs
    `pulse=heartbeat-only`).
-6.5. **The user's terminal is not yours to swap** (T1218; decision D85,
-   2026-08-31). There is no command at this step any more, and that absence is
-   the point.
+6.5. **The user's terminal is not yours to swap; publish to it instead**
+   (T1218/T1220; decision D85, 2026-08-31). One command at this step, and it is
+   a publish rather than a swap:
+
+   ```
+   powershell -NoProfile -File scripts\daily-publish.ps1
+   ```
+
+   Exit **0** = not due, or skipped with a named reason. Exit **10** = published
+   (the tag is in the line above it). Exit **1** = it was due and the publish
+   failed, and nothing was released. **All three end the turn the same way** -
+   carry on to step 7. A publish must never be able to stall the loop.
 
    Until 2026-08-31 this step ran a morning refresh that replaced the user's
    installed Ghoztty out of a repo build. D85 put the question to them and the
@@ -622,17 +638,30 @@ Concretely, in order, with no stops in between:
 
    What that changes for a turn:
 
-   - **To get today's work to the user, PUBLISH it.** At the end of a day's
-     work — not at every task boundary — one publish carries everything that
-     landed:
+   - **Getting today's work to the user is a PUBLISH, and it is automatic**
+     (T1220). `daily-publish.ps1` fires on the first task-boundary push at or
+     after **17:00 local** each day - a real signal that the day's work is good,
+     the way the retired morning refresh keyed on a push rather than a clock -
+     and runs `scripts\publish-windows-release.ps1` once, carrying everything
+     that landed since the last one. Their terminal then offers the update the
+     way it does for every other user, which is also the T1179
+     install-and-update walk being exercised continuously instead of once.
 
-     ```
-     powershell -NoProfile -File scripts\publish-windows-release.ps1
-     ```
+     **The version is decided, not defaulted.** A Windows release tracks the
+     newest Mac `vX.Y.Z` line and walks the PATCH from there:
+     `v1.37.0` -> `win-v1.37.0`, `win-v1.37.1`, `win-v1.37.2` ... one per
+     publishing day, until the next Mac release pulls the base up. So the number
+     the user sees names the Mac line their build corresponds to, the daily walk
+     never squats on a Mac minor that has not shipped, and the version is
+     derived from the releases that EXIST, so it cannot collide with one.
 
-     Their terminal then offers the update the way it does for every other
-     user, which is also the T1179 install-and-update walk being exercised
-     continuously instead of once.
+     **A publish that cannot run is a SKIP, never a failure.** Docker Desktop
+     down (wixl packages the MSI inside the msitools image, and starting Docker
+     is the user's call) or `gh` unauthenticated: the reason is named in the
+     log, the watermark is NOT consumed - so a later push the same day still
+     publishes - and the turn carries on. `-Check` asks the question without
+     doing anything; `-Force` publishes a second time in a day on purpose.
+     Acceptance: `test\win32\daily-publish.ps1`.
    - **To run what you just built, run what you just built.**
      `zig-out\bin\ghoztty.exe` directly, or point the upgrade script at the dev
      install (`%LOCALAPPDATA%\ghoztty\dev-install`), which the loop owns.
