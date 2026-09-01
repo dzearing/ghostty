@@ -18799,3 +18799,55 @@ ecord writes one row per boot to temp\go-loop-boots.jsonl, is idempotent on the 
   formats every line as a host-width ErrorRecord, and this sweep reads the file
   back as a text oracle - so the redirect goes through `cmd` (T883's
   proven-good shape) instead.
+
+- **2026-09-01 - the acceptance suite stops throwing terminal windows across
+  the user's screen on the floor run (T1193).**
+  `test\win32\lib\TestDesktop.ps1` has run the GUI suite on a background desktop
+  since T211, and the fleet-wide claim was that acceptance runs no longer steal
+  focus. 50 scripts were never covered by it - including `ipc-p1.ps1`,
+  `ipc-p2.ps1` and `ipc-p3.ps1`, the three CLAUDE.md names as the floor for
+  every change, so the loop did it on essentially every task. They were clean by
+  the T272/T276 rule, which asks which scripts CALL an input-desktop-only API;
+  none of them called one. They drove the app with `& $Exe +new-window` instead,
+  and a window lands on the desktop of whoever created the process.
+  That inheritance is also why the fix is small, and it was MEASURED rather than
+  assumed: a CLI started with `STARTUPINFO.lpDesktop` naming the test desktop
+  auto-launches the GUI onto that same desktop - both the startup window and the
+  named one, with no ghoztty process reporting a MainWindowHandle to the user's
+  session. So `Invoke-OnTestDesktop` is `& $Exe` with a desktop in the
+  STARTUPINFO: it runs the CLI there, waits, and hands back `{ ExitCode, Output,
+  Pid, TimedOut }`. The three floor scripts migrated to it with their assertions
+  untouched (25 / 20 / 16 ALL PASS), and the `cmd /c "... > file"` dance each
+  carried for the GUI-subsystem exe (T245) went away with them, since the
+  harness redirects both handles itself.
+  The sweep is `desktop-launch-audit.ps1` over `lib\DesktopLaunchAudit.ps1`,
+  the sibling of the foreground audit and deliberately the same shape: the
+  exceptions are DECLARED in the harness header, an undeclared launch is a
+  finding, and a declaration whose script no longer launches is a STALE one - so
+  a migration that forgets to delete its line fails the sweep, and the list can
+  only burn down. `-TeethCheck` plants a bare `Start-Process $exe` and a raw
+  `& $exe +new-window` in the swept directory and requires both to be found.
+  The count moved from the filed 62 to 50, and that is a correction to the rule
+  rather than to the arithmetic. `+split`, `+list` and every other verb answer
+  `error.NoRunningInstance` with "Start one with +new-window first" and return
+  1; only `.new_window` has an auto-launch arm in `App.zig`'s `performIpc`. So
+  a `+split` is not a launch, and reading it as one would have put 79 innocent
+  scripts on the exception list - the same rot from the other direction that
+  T272's original sweep produced. That list is a claim about
+  `src\cli\ghostty.zig`'s Action enum, so section C reads the enum and fails on
+  a verb the analyzer has never heard of instead of trusting the comment.
+  45 scripts stay declared as pending, each naming its task: T1238 (13
+  session/agent), T1239 (5 pty-holder), T1240 (18 CLI/IPC), T1241 (9
+  install/update/diagnostics). Three are permanent - `context-menu-real-input`
+  and `profile-latency` are already interactive-by-design in the sibling list,
+  and `go-loop-guard`'s single bare launch is the loudly-announced fallback for
+  a desktop that could not be created.
+  Floor: lib/none/win32/agent ALL LANES PASS; `desktop-launch-audit.ps1` ALL
+  PASS (29) and again with `-TeethCheck` (31); the seven audits this change made
+  due - body-complete, cleanslate, isolation-meta, launch-preflight,
+  stderr-capture, test-desktop, verdict-exit - re-run green, plus
+  `foreground-audit.ps1` for the header it shares. Two of them caught the new
+  file on the way through and both were right: it needed an `# isolation: none`
+  and a `# preflight: none` marker (its fixtures are string literals holding the
+  very launch sites it detects), and its section-E `try/finally` had an unwind
+  path to a green verdict.

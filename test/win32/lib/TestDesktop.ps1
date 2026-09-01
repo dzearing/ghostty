@@ -208,6 +208,71 @@
 # @input-desktop-exception: context-menu-real-input.ps1 -- (T240) the subject IS a real right-click: a script that synthesizes the trigger cannot validate the trigger.
 # @input-desktop-exception: profile-latency.ps1 -- (T53b) injection timing is the measurement, so a posted message would time the wrong path.
 # @input-desktop-exception: test-desktop-spike.ps1 -- (T207) the spike that measured what does and does not work off the input desktop; it has to reach both.
+#
+# LAUNCHES ON THE USER'S DESKTOP - the second list, and a different question
+# (T1193). The one above asks which scripts CALL an API that only works on the
+# input desktop. This one asks which scripts START THE APP from a process
+# sitting on the user's desktop, which no API name answers: `+new-window` is
+# the one verb that auto-launches, and the window it spawns lands wherever the
+# spawning process was. 50 scripts were doing that - including ipc-p1/p2/p3,
+# the floor CLAUDE.md names for every change - while the fleet-wide claim was
+# that the suite no longer steals focus. `lib\DesktopLaunchAudit.ps1` parses
+# these markers; `desktop-launch-audit.ps1` is the sweep.
+#
+# Migrate with `Invoke-OnTestDesktop` (the CLI half) and `Start-OnTestDesktop`
+# (the GUI half), then DELETE the entry - a migration that leaves its line
+# behind fails the sweep as a stale declaration, which is what makes this list
+# burn down instead of settling.
+#
+# @user-desktop-launch: context-menu-real-input.ps1 -- (T240) already interactive-by-design above: the subject IS a real right-click, so its app has to be on the input desktop too.
+# @user-desktop-launch: profile-latency.ps1 -- (T53b) already interactive-by-design above: injection timing is the measurement, and it can only be taken where input is injected.
+# @user-desktop-launch: go-loop-guard.ps1 -- (T1193) the ONE bare launch is the fallback taken when New-TestDesktop throws - a desktop we cannot create must not cost the whole suite, and the fallback says so loudly before it runs.
+#
+# @user-desktop-launch: agent-autostart.ps1 -- pending migration, T1238.
+# @user-desktop-launch: agent-handoff.ps1 -- pending migration, T1238.
+# @user-desktop-launch: agent-job-escape.ps1 -- pending migration, T1238.
+# @user-desktop-launch: agent-recovery.ps1 -- pending migration, T1238.
+# @user-desktop-launch: relaunch-guard.ps1 -- pending migration, T1238.
+# @user-desktop-launch: session-close.ps1 -- pending migration, T1238.
+# @user-desktop-launch: session-crash-recover.ps1 -- pending migration, T1238.
+# @user-desktop-launch: session-open.ps1 -- pending migration, T1238.
+# @user-desktop-launch: session-persistence.ps1 -- pending migration, T1238.
+# @user-desktop-launch: session-relaunch.ps1 -- pending migration, T1238.
+# @user-desktop-launch: session-vanished.ps1 -- pending migration, T1238.
+# @user-desktop-launch: sessions-agent-build.ps1 -- pending migration, T1238.
+# @user-desktop-launch: single-instance-join.ps1 -- pending migration, T1238.
+# @user-desktop-launch: holder-adopt.ps1 -- pending migration, T1239.
+# @user-desktop-launch: holder-durable.ps1 -- pending migration, T1239.
+# @user-desktop-launch: holder-soak.ps1 -- pending migration, T1239.
+# @user-desktop-launch: holder-volume.ps1 -- pending migration, T1239.
+# @user-desktop-launch: pty-holder.ps1 -- pending migration, T1239.
+# @user-desktop-launch: auto-launch-cwd.ps1 -- pending migration, T1240.
+# @user-desktop-launch: cli-argv-fidelity.ps1 -- pending migration, T1240.
+# @user-desktop-launch: cli-launch-cwd.ps1 -- pending migration, T1240.
+# @user-desktop-launch: conformance.ps1 -- pending migration, T1240.
+# @user-desktop-launch: gui-launch-command.ps1 -- pending migration, T1240.
+# @user-desktop-launch: ipc-list-session-id.ps1 -- pending migration, T1240.
+# @user-desktop-launch: ipc-remote.ps1 -- pending migration, T1240.
+# @user-desktop-launch: ipc-send-keys-fidelity.ps1 -- pending migration, T1240.
+# @user-desktop-launch: ipc-under-load.ps1 -- pending migration, T1240.
+# @user-desktop-launch: ipc-when-idle.ps1 -- pending migration, T1240.
+# @user-desktop-launch: layout-blobs.ps1 -- pending migration, T1240.
+# @user-desktop-launch: pane-id.ps1 -- pending migration, T1240.
+# @user-desktop-launch: rearrange-session-drop.ps1 -- pending migration, T1240.
+# @user-desktop-launch: registration-sites.ps1 -- pending migration, T1240.
+# @user-desktop-launch: send-keys-bracketed.ps1 -- pending migration, T1240.
+# @user-desktop-launch: send-keys-soak.ps1 -- pending migration, T1240.
+# @user-desktop-launch: target-staleness.ps1 -- pending migration, T1240.
+# @user-desktop-launch: window-name-env.ps1 -- pending migration, T1240.
+# @user-desktop-launch: clipboard-retry.ps1 -- pending migration, T1241.
+# @user-desktop-launch: crash-diagnostics.ps1 -- pending migration, T1241.
+# @user-desktop-launch: install-prepare.ps1 -- pending migration, T1241.
+# @user-desktop-launch: path-selfheal.ps1 -- pending migration, T1241.
+# @user-desktop-launch: reset-context.ps1 -- pending migration, T1241.
+# @user-desktop-launch: soak.ps1 -- pending migration, T1241.
+# @user-desktop-launch: update-apply.ps1 -- pending migration, T1241.
+# @user-desktop-launch: update-check.ps1 -- pending migration, T1241.
+# @user-desktop-launch: wheel-scroll.ps1 -- pending migration, T1241.
 
 # T118: never inherit an IPC endpoint. A script started from one of the user's
 # own panes inherits $GHOZTTY_IPC_SOCKET naming the USER'S app, and the CLI
@@ -245,6 +310,9 @@ public class GhozttyTestDesktop {
     [DllImport("kernel32.dll", SetLastError = true)] static extern int ResumeThread(IntPtr h);
     const uint THREAD_SUSPEND_RESUME = 0x0002;
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr h);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern uint WaitForSingleObject(IntPtr h, uint ms);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool GetExitCodeProcess(IntPtr h, out uint code);
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool TerminateProcess(IntPtr h, uint code);
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     struct STARTUPINFO {
@@ -480,6 +548,44 @@ public class GhozttyTestDesktop {
     // launch onto the interactive one and defeat the whole exercise.
     public int StartProcess(string exe, string args, string cwd, string stderrPath) {
         return (int)Run(delegate() {
+            IntPtr hProc;
+            int procId = SpawnCore(exe, args, cwd, stderrPath, out hProc);
+            if (hProc != IntPtr.Zero) CloseHandle(hProc);
+            return procId;
+        });
+    }
+
+    // Start on the test desktop and WAIT for the process to exit. For the CLI
+    // half of a migration (T1193): a script that drove the app with
+    // `& $Exe +new-window` needs the CLI process itself to sit on the test
+    // desktop, because `+new-window` from cold auto-launches the GUI and the
+    // window lands on the desktop of whoever created the process.
+    //
+    // Returns "<exitcode>:<pid>:<exit|timeout>", or "" when the spawn failed
+    // (LastError says why). A timeout terminates the child rather than leaking
+    // it onto a desktop nobody will look at again.
+    public string RunProcess(string exe, string args, string cwd, string outPath, int timeoutMs) {
+        return (string)Run(delegate() {
+            IntPtr hProc;
+            int procId = SpawnCore(exe, args, cwd, outPath, out hProc);
+            if (procId == 0) return "";
+            uint waited = WaitForSingleObject(hProc, (uint)timeoutMs);
+            uint code = 259;
+            bool exited = (waited == 0);
+            if (exited) {
+                GetExitCodeProcess(hProc, out code);
+            } else {
+                TerminateProcess(hProc, 258);
+                LastError = "RunProcess timed out after " + timeoutMs + " ms";
+            }
+            CloseHandle(hProc);
+            return ((int)code) + ":" + procId + ":" + (exited ? "exit" : "timeout");
+        });
+    }
+
+    int SpawnCore(string exe, string args, string cwd, string stderrPath, out IntPtr hProcess) {
+        hProcess = IntPtr.Zero;
+        {
             var si = new STARTUPINFO();
             si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
             if (!Interactive) si.lpDesktop = "WinSta0\\" + Name;
@@ -513,9 +619,9 @@ public class GhozttyTestDesktop {
             if (hNul != IntPtr.Zero && hNul != new IntPtr(-1)) CloseHandle(hNul);
             if (!ok) { LastError = "CreateProcessW failed: " + err; return 0; }
             CloseHandle(pi.hThread);
-            CloseHandle(pi.hProcess);
+            hProcess = pi.hProcess;
             return pi.dwProcessId;
-        });
+        }
     }
 
     // ================= window discovery =================
@@ -2125,6 +2231,79 @@ function Start-OnTestDesktop {
     $p = $null
     try { $p = [System.Diagnostics.Process]::GetProcessById($procId) } catch { }
     return [pscustomobject]@{ Pid = $procId; Process = $p }
+}
+
+<#
+Run a CLI invocation ON the test desktop and WAIT for it, the way `& $Exe +verb`
+runs one on the caller's. Returns { ExitCode, Output, Pid, TimedOut }.
+
+WHY THIS EXISTS (T1193). `Start-OnTestDesktop` covers the GUI half of a script -
+the app itself. It does not cover the other half, and for 50 scripts the other
+half WAS the script: they never launched a window handle at all, they drove the
+app with `& $Exe +new-window --target=...` and read `+list`. `+new-window` is
+the one verb that auto-launches (`performIpc` in `src\apprt\win32\App.zig`
+answers `error.NoRunningInstance` by spawning the app, and does it for no other
+verb), and the app it spawns inherits the desktop of the CLI process that
+spawned it. Run the CLI here and the window lands on the test desktop; run it
+with `&` and it lands on whatever the user is reading. Measured on box
+2026-09-01: a cold `+new-window` through this helper put both the startup window
+and the named one on the test desktop, and no ghoztty process reported a
+MainWindowHandle to the user's session.
+
+Output is stdout AND stderr, interleaved into one file the way the child wrote
+them - `StartProcess` points both handles at the same file - so a caller that
+used `2>&1` keeps what it had. It comes back as a single string, `''` when the
+child printed nothing.
+
+`-TimeoutSec` bounds a CLI that never returns; the child is terminated and
+`TimedOut` is $true, which a caller should assert on rather than reading an
+exit code that means nothing. The default is generous because a COLD auto-launch
+on a busy box is slow by design (`ipc_timeout.auto_launch_ms`).
+#>
+function Invoke-OnTestDesktop {
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [string[]]$Arguments = @(),
+        [string]$WorkingDirectory,
+        [int]$TimeoutSec = 60,
+        [switch]$KeepWindowPlacement,
+        [switch]$AllowReleaseBuild,
+        $Desktop
+    )
+    if ((Split-Path -Leaf $Exe) -ieq 'ghoztty.exe') {
+        Assert-GhozttyIsolatedBuild -Exe $Exe -Allow:$AllowReleaseBuild | Out-Null
+    }
+    $td = Resolve-TestDesktop $Desktop
+    if (-not $KeepWindowPlacement -and (Split-Path -Leaf $Exe) -ieq 'ghoztty.exe') {
+        Clear-TestWindowPlacement | Out-Null
+    }
+    $argLine = ($Arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
+    $out = Join-Path $env:TEMP ("ghoztty-testdesk-cli-$PID-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.txt')
+    try {
+        $res = $td.RunProcess($Exe, $argLine, $WorkingDirectory, $out, [int]($TimeoutSec * 1000))
+        if ([string]::IsNullOrEmpty($res)) { throw "Invoke-OnTestDesktop failed: $($td.LastError)" }
+        $parts = $res -split ':'
+        $text = ''
+        if (Test-Path -LiteralPath $out) {
+            $text = (Get-Content -LiteralPath $out -Raw -ErrorAction SilentlyContinue)
+            if ($null -eq $text) { $text = '' }
+        }
+        $procId = [int]$parts[1]
+        # A CLI that auto-launched the app leaves the GUI behind on purpose, and
+        # it is the GUI - not this CLI - that the desktop's leak check should
+        # see. Record the pid anyway: an auto-launch makes the app a CHILD of
+        # this process, so a script that only ever used this helper still has
+        # something to reap.
+        $script:GhozttyTestDesktopAllPids += $procId
+        return [pscustomobject]@{
+            ExitCode = [int]$parts[0]
+            Output   = $text
+            Pid      = $procId
+            TimedOut = ($parts[2] -eq 'timeout')
+        }
+    } finally {
+        Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue
+    }
 }
 
 # Wait for a top-level window of $Class owned by $ProcessId. Returns IntPtr::Zero

@@ -31,6 +31,14 @@ function Assert($name, $cond) {
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
 [void](Set-GhozttyTestIsolation -Tag 'ipcp1')
 
+# T1193: the CLI runs ON THE TEST DESKTOP, not on the user's. `+new-window` is
+# the one verb that auto-launches the app, and the window it spawns lands on the
+# desktop of the process that spawned it - so this floor, which CLAUDE.md names
+# for every change, threw a window across whatever the user was reading on
+# essentially every task the loop ran. `Invoke-OnTestDesktop` is `& $Exe` with a
+# desktop named in the STARTUPINFO; nothing else about the assertions changed.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
 # T248: one shared reset instead of a private copy. Exact-exe matching is still
 # the rule ('*zig-out*' also matched a detached soak instance running from
 # zig-out-release, T53b), and the reset now also kills the sibling agent and
@@ -41,11 +49,16 @@ function Stop-DebugGhoztty {
     Reset-GhozttyTestState -Exe $Exe -SettleMs 1000 | Out-Null
 }
 
+# Every CLI call in this file goes through here. It returns { ExitCode, Output,
+# Pid, TimedOut }; the child's stdout and stderr are captured to a file by the
+# harness, which is also what the old `cmd /c ... > file` dance was for - a
+# GUI-subsystem exe writes zero bytes to a PowerShell `>` redirect (T245).
+function Ghoz([string[]]$GhozArgs) {
+    return Invoke-OnTestDesktop -Exe $Exe -Arguments $GhozArgs
+}
+
 function Get-List {
-    # Route through cmd redirection: PowerShell's own capture can interleave
-    # and drop native stdout lines.
-    cmd /c "`"$Exe`" +list > `"$tmp\list.txt`" 2>&1" | Out-Null
-    Get-Content "$tmp\list.txt" -Raw
+    return (Ghoz @('+list')).Output
 }
 
 # T379: wait for a +list pattern instead of sleeping a fixed interval. The
@@ -70,29 +83,31 @@ function Wait-ListMatch([string]$Pattern, [int]$TimeoutSec = 20) {
 # now names this file, so the summary still points at the details.
 $transcript = Join-Path $env:TEMP 'ghoztty-ipc-p1-last.log'
 
+$td = New-TestDesktop
+
 & {
 
 Stop-DebugGhoztty
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== 1: +new-window auto-launch from cold, all basic flags"
-& $Exe +new-window --target=p1win --title=P1Title "--command=echo p1-marker" 2>&1 | Out-Null
-Assert "exit 0" ($LASTEXITCODE -eq 0)
+$r = Ghoz @('+new-window', '--target=p1win', '--title=P1Title', '--command=echo p1-marker')
+Assert "exit 0" ($r.ExitCode -eq 0)
 $list = Wait-ListMatch '\[target: p1win\]'
 Assert-GhozttyIsolated -Exe $Exe
 Assert "window registered under target" ($list -match '\[target: p1win\]')
 Assert "title override shows" ($list -match 'P1Title')
 
 "== 2: idempotent re-create focuses, no duplicate"
-& $Exe +new-window --target=p1win 2>&1 | Out-Null
-Assert "exit 0" ($LASTEXITCODE -eq 0)
+$r = Ghoz @('+new-window', '--target=p1win')
+Assert "exit 0" ($r.ExitCode -eq 0)
 Start-Sleep -Seconds 1
 $list = Get-List
 Assert "still exactly one p1win" (([regex]::Matches($list, '\[target: p1win\]')).Count -eq 1)
 
 "== 3: inline split + named pane + explicit cwd"
-& $Exe +new-window --target=p1ide --split=down "--split-command=echo split-pane" --name=p1term --working-directory=C:\Windows 2>&1 | Out-Null
-Assert "exit 0" ($LASTEXITCODE -eq 0)
+$r = Ghoz @('+new-window', '--target=p1ide', '--split=down', '--split-command=echo split-pane', '--name=p1term', '--working-directory=C:\Windows')
+Assert "exit 0" ($r.ExitCode -eq 0)
 # Wait on the cwd (the last field to settle: it is served from the pane's
 # cached pwd, T111b); when it shows, the window and pane rows are there too.
 $list = Wait-ListMatch ([regex]::Escape('C:\Windows'))
@@ -101,15 +116,14 @@ Assert "named pane registered" ($list -match '\[name: p1term\]')
 Assert "cwd honored" ($list -match [regex]::Escape('C:\Windows'))
 
 "== 4: -e direct exec"
-& $Exe +new-window --target=p1exec -e cmd /K echo p1-direct 2>&1 | Out-Null
-Assert "exit 0" ($LASTEXITCODE -eq 0)
+$r = Ghoz @('+new-window', '--target=p1exec', '-e', 'cmd', '/K', 'echo', 'p1-direct')
+Assert "exit 0" ($r.ExitCode -eq 0)
 $list = Wait-ListMatch '\[target: p1exec\]'
 Assert "exec window registered" ($list -match '\[target: p1exec\]')
 
 "== 5: json shape"
-cmd /c "`"$Exe`" +list --json > `"$tmp\list.json`" 2>&1" | Out-Null
 $json = $null
-try { $json = Get-Content "$tmp\list.json" -Raw | ConvertFrom-Json } catch {}
+try { $json = (Ghoz @('+list', '--json')).Output | ConvertFrom-Json } catch {}
 Assert "json parses" ($null -ne $json)
 Assert "success true" ($json.success -eq $true)
 Assert "windows array present" ($null -ne $json.data.windows)
@@ -126,33 +140,31 @@ Assert "leaf reports working_directory" (
     $null -ne $p1leaf -and $p1leaf.working_directory -match 'Windows')
 
 "== 6: +close named pane"
-& $Exe +close --target=p1term 2>&1 | Out-Null
-Assert "exit 0" ($LASTEXITCODE -eq 0)
+$r = Ghoz @('+close', '--target=p1term')
+Assert "exit 0" ($r.ExitCode -eq 0)
 Start-Sleep -Seconds 1
 $list = Get-List
 Assert "pane gone" (-not ($list -match '\[name: p1term\]'))
 Assert "window still there" ($list -match '\[target: p1ide\]')
 
 "== 7: +close windows"
-& $Exe +close --target=p1ide 2>&1 | Out-Null
-Assert "close window exit 0" ($LASTEXITCODE -eq 0)
-& $Exe +close --target=p1exec 2>&1 | Out-Null
+$r = Ghoz @('+close', '--target=p1ide')
+Assert "close window exit 0" ($r.ExitCode -eq 0)
+[void](Ghoz @('+close', '--target=p1exec'))
 Start-Sleep -Seconds 1
 $list = Get-List
 Assert "p1ide gone" (-not ($list -match '\[target: p1ide\]'))
 
 "== 8: +close missing target is silent success"
-& $Exe +close --target=does-not-exist 2>&1 | Out-Null
-Assert "exit 0" ($LASTEXITCODE -eq 0)
+$r = Ghoz @('+close', '--target=does-not-exist')
+Assert "exit 0" ($r.ExitCode -eq 0)
 
 "== 9: second GUI launch forwards new-window and exits"
 $before = ([regex]::Matches((Get-List), '(?m)^Window:')).Count
 # persistence: n/a - this launch forwards its new-window to the live instance and exits; it restores nothing.
-$second = Start-Process $Exe -PassThru
-$null = $second.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
-$exited = $second.WaitForExit(15000)
-Assert "second instance exited" $exited
-if ($exited) { Assert "exit code 0" ($second.ExitCode -eq 0) }
+$second = Invoke-OnTestDesktop -Exe $Exe -TimeoutSec 15
+Assert "second instance exited" (-not $second.TimedOut)
+if (-not $second.TimedOut) { Assert "exit code 0" ($second.ExitCode -eq 0) }
 Start-Sleep -Seconds 2
 $after = ([regex]::Matches((Get-List), '(?m)^Window:')).Count
 Assert "window count grew" ($after -eq ($before + 1))
@@ -160,6 +172,7 @@ Assert "window count grew" ($after -eq ($before + 1))
 "== teardown"
 Stop-DebugGhoztty
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+Remove-TestDesktop | Out-Null
 
 } 2>&1 | Tee-Object -FilePath $transcript
 

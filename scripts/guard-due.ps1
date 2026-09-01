@@ -2201,6 +2201,24 @@ $GuardTable = @(
             'src\apprt\win32\*.zig'
         )
     }
+
+    # T1193 - the user-desktop launch sweep. It covers the whole acceptance
+    # directory on purpose: the case it exists for is a NEW script that starts
+    # the app outside the harness, and a row that watched only the analyzer
+    # would go green on the day that script lands. It also covers
+    # `src\cli\ghostty.zig`, because the "these verbs cannot create a process"
+    # list is a claim about that enum and section C is what re-checks it.
+    [pscustomobject]@{
+        Name   = 'desktop-launch'
+        Script = 'test\win32\desktop-launch-audit.ps1'
+        Stamp  = 'test\win32\desktop-launch-audit.stamp.json'
+        Covers = @(
+            'test\win32\*.ps1',
+            'test\win32\lib\DesktopLaunchAudit.ps1',
+            'test\win32\lib\TestDesktop.ps1',
+            'src\cli\ghostty.zig'
+        )
+    }
 )
 
 function Get-RepoRelative([string]$full) {

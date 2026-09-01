@@ -1,10 +1,13 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-09-01T03:42:05-07:00",
-    "commit":  "cf68bc87c",
+    "generated":  "2026-09-01T04:41:44-07:00",
+    "commit":  "ef6c9002a",
     "uncommitted":  [
-                        "test/win32/test-reach-audit.ps1"
+                        "test/win32/desktop-launch-audit.ps1",
+                        "test/win32/ipc-p1.ps1",
+                        "test/win32/ipc-p2.ps1",
+                        "test/win32/ipc-p3.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -83,6 +86,7 @@
                   "test/win32/crash-stacks.ps1":  "a0c6fa51f11530a9915fcb8477517a6757b48ced7a9aff89aaf5c1313c33e710",
                   "test/win32/dark-menus.ps1":  "ab97be43af44188040463ebf9c6ab7b4a96139a623445aeb145eec3e4c9f906f",
                   "test/win32/deliver-windows-build.ps1":  "e3bd97324b317cc164f69a9bb78514e21ef94be11c773186cbfe1f7e4ffab17d",
+                  "test/win32/desktop-launch-audit.ps1":  "df0f8241a82fb625a5309378e3d96de7951876f8d2c394564e3f3326d8889a53",
                   "test/win32/divergence-inventory.ps1":  "829edd00d4ed65595adf6d9a837414af1f212b18f4cbfff9f4ce4568e43b7c09",
                   "test/win32/docs-routing.ps1":  "a41cfb788e2bece0a400d8214b6149d9e97a6dd823c3924a1ea098ce738dec76",
                   "test/win32/float-on-top.ps1":  "1d6c2fb69c3f28f0fbbeb99a8d37634b09784ecf0e14f4c5bcc97383fe31e538",
@@ -123,9 +127,9 @@
                   "test/win32/ipc-instance-addressability.ps1":  "c79c3315cb528318e4ba8532854be31dbba60b2bcef48e5995b3063970a57c30",
                   "test/win32/ipc-list-session-id.ps1":  "07655b865933d453ecb4e76b365c3234dd839f152c3aa973414b1cbeea063530",
                   "test/win32/ipc-machine-chooser.ps1":  "29e2d0e11798d558abee6cec752b534687e7d8acc189b430f9ee5cae7d84a0b3",
-                  "test/win32/ipc-p1.ps1":  "7087e18d10ddb8504ad70691266aeb776bae9c565a3e42d319562d9283e65359",
-                  "test/win32/ipc-p2.ps1":  "be369b5da1b2bedb360273fa15b9dbb21e59dc70dbd8add8b251643c88c3b707",
-                  "test/win32/ipc-p3.ps1":  "91f5cd1bcbd5fee8dcad7bd41f79ee7813d568eaf597fc8a918ba83fe5c9608c",
+                  "test/win32/ipc-p1.ps1":  "f69edf5ba00f32e148853cc028cd3c51d1bf1a39da1ee5f0361f2654d210d2b5",
+                  "test/win32/ipc-p2.ps1":  "53fbae7e13398dd72417d4eadaba0357bcad893e86fcef82c7a951acdd185448",
+                  "test/win32/ipc-p3.ps1":  "86a607dd5edd0407a87a5615ebb37958dd2ab77aa16874f5e34c53315f300b25",
                   "test/win32/ipc-read-race.ps1":  "ff6f89cab2e92dae0fa13e1ea2f9a89f2579175ddcc2b8b55c53b8b7f330bee6",
                   "test/win32/ipc-relay.ps1":  "5f51afab95cc71404e236a0358359f410d68d852d187f5f189dd5e99bcabbe10",
                   "test/win32/ipc-remote.ps1":  "02f87b8c3678e65a41fadb65795d3a11c24e41a9de5a85fae2a8a188843ad99c",
