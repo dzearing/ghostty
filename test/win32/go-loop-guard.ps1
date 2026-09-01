@@ -1642,6 +1642,59 @@ foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -
 }
 Remove-Item -LiteralPath $xRoot -Recurse -Force -ErrorAction SilentlyContinue
 
+# --- Y. the daily digest is enforced, not remembered (T1223) ---------------
+#
+# go.md step 0.5 asks for one digest a day. It had no check of any kind, so the
+# 2026-09-01 miss was invisible until the user asked for it, and 08-24..08-29
+# went the same way with nobody noticing at all. These arms score the field
+# that makes a miss visible - and, because a check nobody has watched go red is
+# indistinguishable from a check that cannot (T1133), the FIRST arm is the
+# missing case, not the happy one.
+$yRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("gz-digest-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$yRepo = Join-Path $yRoot 'repo'
+$yDigests = Join-Path $yRepo 'docs\design\windows-parity-digests'
+New-Item -ItemType Directory -Force -Path $yDigests | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $yRepo 'temp') | Out-Null
+$yHist = Join-Path $yRepo 'temp\go-loop-history.jsonl'
+$yHealth = Join-Path $Repo 'scripts\go-loop-health.ps1'
+$yToday = (Get-Date).ToString('yyyy-MM-dd')
+$yFile = Join-Path $yDigests "$yToday.md"
+
+function YHealth([string]$asOf) {
+    $out = & powershell -NoProfile -ExecutionPolicy Bypass -File $yHealth `
+        -Repo $yRepo -DigestAsOf $asOf 2>&1 | ForEach-Object { $_.ToString() } | Out-String
+    return $out
+}
+
+# The loop turned at 06:00 today and there is no file: that is the miss.
+Set-Content -LiteralPath $yHist -Encoding ascii -Value ('{"at":"' + $yToday + 'T06:00:00-07:00","event":"heartbeat","turn":1}')
+$y = YHealth "${yToday}T09:00:00"
+Assert 'Y1 a skipped digest reads missing on the plain line, with no -Postmortem' ($y -match 'digest=missing')
+Assert 'Y2 and the line says which step owes it and where the file goes' `
+    ($y -match 'go\.md step 0\.5' -and $y -match [regex]::Escape("windows-parity-digests\$yToday.md"))
+Assert 'Y3 the check reports the miss and never writes one (backfill stays forbidden)' `
+    (-not (Test-Path -LiteralPath $yFile))
+
+# Same fixture, file present: the positive control for Y1.
+Set-Content -LiteralPath $yFile -Encoding ascii -Value @('---', "date: `"$yToday`"", '---', '## Commentary', 'x')
+$y = YHealth "${yToday}T09:00:00"
+Assert 'Y4 a written digest reads present, and stops nagging' `
+    ($y -match 'digest=present' -and $y -notmatch 'digest is missing')
+
+# A day the loop never turned owes nothing - a box that was off overnight, or a
+# loop stopped on purpose, must not be reported as delinquent.
+Remove-Item -LiteralPath $yFile -Force
+Set-Content -LiteralPath $yHist -Encoding ascii -Value ('{"at":"' + (Get-Date).AddDays(-3).ToString('yyyy-MM-dd') + 'T06:00:00-07:00","event":"heartbeat","turn":1}')
+$y = YHealth "${yToday}T09:00:00"
+Assert 'Y5 a day the loop spent stopped is not-due, not missing' ($y -match 'digest=not-due')
+
+# And before 05:00 nothing is owed yet, however busy the loop has been.
+Set-Content -LiteralPath $yHist -Encoding ascii -Value ('{"at":"' + $yToday + 'T03:30:00-07:00","event":"heartbeat","turn":1}')
+$y = YHealth "${yToday}T04:30:00"
+Assert 'Y6 before 05:00 the digest is not-due even with the loop turning' ($y -match 'digest=not-due')
+
+Remove-Item -LiteralPath $yRoot -Recurse -Force -ErrorAction SilentlyContinue
+
 # --- cleanup --------------------------------------------------------------
 Kill-Sleepers
 Stop-DebugGhoztty

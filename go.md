@@ -83,6 +83,13 @@ Concretely, in order, with no stops in between:
    **5am or later** and today's file does not exist, write it now; then carry
    on with the turn. Rules:
 
+   - **The check that says whether you owe one** (T1223) is the `digest=`
+     field on `scripts\go-loop-health.ps1`: `present`, `missing` (past 05:00,
+     the loop turned today, no file — and the run reads DEGRADED), or
+     `not-due`. It never writes one, because a generated digest would turn the
+     light green and destroy the only thing the light measures. Before this
+     the step had no enforcement at all: the 2026-09-01 miss surfaced because
+     the user asked for it, and 08-24 → 08-29 surfaced never.
    - **One file per day, today only — never backfill.** If the loop was down
      for three days, the next turn writes today's digest and nobody writes the
      missing two: a digest is a morning read, not a ledger, and a backfilled

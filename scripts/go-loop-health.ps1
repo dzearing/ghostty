@@ -16,6 +16,10 @@
 #   powershell -NoProfile -File scripts\go-loop-health.ps1 -Json
 #   powershell -NoProfile -File scripts\go-loop-health.ps1 -Postmortem
 #
+# It also answers "did today's digest get written?" (`digest=` on the line,
+# T1223) - go.md step 0.5 had no enforcement at all, so a skipped morning was
+# invisible until somebody asked for it.
+#
 # Exit codes are the verdict, so a caller can branch without parsing:
 #   0 healthy      - a live owner, recent activity, a marked window
 #   1 degraded     - running, but something is off (no marked window, no
@@ -36,6 +40,10 @@ param(
     # process is alive. Deliberately generous: a build-and-test task legitimately
     # runs long, and a false "stalled" is worse than a late one.
     [int]$StaleMinutes = 45,
+    # The instant the daily-digest window is judged against. Defaults to now;
+    # the harness passes an explicit one so "before 05:00" and "after 05:00"
+    # are both reachable without waiting for a particular hour of the day.
+    [datetime]$DigestAsOf = [datetime]::MinValue,
     [switch]$Json,
     # Gather the evidence a death leaves behind, for dissecting WHY.
     [switch]$Postmortem
@@ -43,6 +51,7 @@ param(
 
 $ErrorActionPreference = 'Continue'
 if (-not $Repo) { $Repo = Split-Path -Parent $PSScriptRoot }
+if ($DigestAsOf -eq [datetime]::MinValue) { $DigestAsOf = Get-Date }
 # Get-LoopStop. loop-session.ps1 is documented as free of load-time side effects.
 . (Join-Path $PSScriptRoot 'loop-session.ps1')
 $IsoFmt = 'yyyy-MM-ddTHH:mm:ssK'
@@ -120,6 +129,51 @@ try {
         Where-Object { (Get-Content $_.FullName -TotalCount 20 -ErrorAction SilentlyContinue) -match '^status:\s*"?open"?' }).Count
 } catch { }
 
+# --- the daily digest (T1223) ----------------------------------------------
+#
+# go.md step 0.5 asks for one digest a day, written for the user to read over
+# coffee. On 2026-09-01 the loop simply did not write one, and nothing anywhere
+# said so - the user found out by asking at 05:18. Before that, 08-24 through
+# 08-29 went missing the same silent way. A step whose omission produces no
+# signal is a step that eventually stops happening, so the omission gets a
+# field here, beside the dead-lock and dead-watchdog lines somebody already
+# reads.
+#
+# This never WRITES one, and must not: a generated placeholder turns the light
+# green while destroying the thing the light measures. The digest is worth
+# reading because somebody looked at the day and thought about it.
+#
+# Three states, and the middle one is why this is not a one-liner:
+#   present  - today's file is on disk
+#   missing  - past 05:00, the loop was turning today, and there is no file
+#   not-due  - before 05:00, or the loop did not turn today at all (a box that
+#              was off overnight, or a loop stopped on purpose, owes nothing;
+#              and the standing rule is never to backfill a missed day)
+$digestDate = $DigestAsOf.ToString('yyyy-MM-dd')
+$digestRel = "docs\design\windows-parity-digests\$digestDate.md"
+$digestState = 'not-due'
+if (Test-Path -LiteralPath (Join-Path $Repo $digestRel)) {
+    $digestState = 'present'
+} else {
+    $dueAt = $DigestAsOf.Date.AddHours(5)
+    if ($DigestAsOf -ge $dueAt) {
+        # "Did the loop turn today?" is answered from the lock history, not the
+        # live lock: the lock says who holds it NOW, and a loop that ran this
+        # morning and then died would read as owing nothing.
+        $aliveToday = $false
+        $histPath = Join-Path $Repo 'temp\go-loop-history.jsonl'
+        if (Test-Path -LiteralPath $histPath) {
+            foreach ($line in @(Get-Content -LiteralPath $histPath -Tail 500 -ErrorAction SilentlyContinue)) {
+                if (-not $line) { continue }
+                $at = $null
+                try { $at = [datetime]::Parse([string](($line | ConvertFrom-Json).at)) } catch { continue }
+                if ($at -ge $dueAt -and $at -le $DigestAsOf) { $aliveToday = $true; break }
+            }
+        }
+        if ($aliveToday) { $digestState = 'missing' }
+    }
+}
+
 # --- verdict ----------------------------------------------------------------
 
 $alive = ($state -eq 'held')
@@ -131,6 +185,9 @@ if ($alive -and $ageMin -gt $StaleMinutes) { $notes += "no activity for $([math]
 if (-not $watchdog) { $notes += 'watchdog is not running' }
 if (-not $dashboard) { $notes += "dashboard is not listening on $Port" }
 if ($inProgress.Count -gt 1) { $notes += "$($inProgress.Count) tasks claimed in-progress" }
+if ($digestState -eq 'missing') {
+    $notes += "today's digest is missing - go.md step 0.5, write $digestRel (never backfill an older day)"
+}
 
 $verdict = 'healthy'
 $code = 0
@@ -167,13 +224,15 @@ if ($Json) {
         dashboard      = $dashboard
         in_progress    = $inProgress
         open_decisions = $openDecisions
+        digest         = $digestState
+        digest_path    = $digestRel
         stopped        = [bool]$stopReq
         notes          = $notes
     } | ConvertTo-Json -Depth 4
 } else {
     $task = if ($inProgress.Count) { $inProgress -join ',' } else { 'none' }
     "$(Now-Iso) $($verdict.ToUpper()) uptime=$uptime turn=$turn state=$state pane=$pane pid=$loopPid " +
-    "task=$task decisions_open=$openDecisions windows=$marked watchdog=$watchdog dashboard=$dashboard"
+    "task=$task decisions_open=$openDecisions digest=$digestState windows=$marked watchdog=$watchdog dashboard=$dashboard"
     foreach ($n in $notes) { "  - $n" }
 }
 

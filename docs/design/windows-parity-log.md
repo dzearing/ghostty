@@ -19381,3 +19381,47 @@ that needs Docker up.
 
 Floor: lib/none/win32/agent ALL LANES PASS; `daily-publish` and
 `install-ownership` green.
+
+## 2026-09-01 - a skipped daily digest now says so instead of going unnoticed (T1223)
+
+go.md step 0.5 asks the loop to write one short digest a day for the user to
+read over coffee. Nothing anywhere checked that it happened. On 2026-09-01 the
+loop went straight from finishing T1193 to claiming T1194 and never wrote one;
+the user found out by asking at 05:18. Looking back, 08-24 through 08-29 went
+the same way and nobody caught it at all - and since the standing rule is never
+to backfill, noticing on the day is the only chance to have a digest at all.
+
+`scripts\go-loop-health.ps1` now carries a `digest=` field on its one-line
+answer, next to the dead-lock and dead-watchdog signals somebody already reads:
+
+- `present` - today's file is on disk.
+- `missing` - past 05:00, the loop turned today, and there is no file. The run
+  reads DEGRADED and the note names the step that owes it and the exact path.
+- `not-due` - before 05:00, or the loop did not turn today at all. A box that
+  was off overnight, or a loop stopped on purpose, owes no commentary.
+
+"Did the loop turn today?" is answered from `temp\go-loop-history.jsonl` rather
+than the live lock, because a loop that ran this morning and then died would
+otherwise read as owing nothing - which is exactly the case worth catching.
+
+What it deliberately does NOT do is write one. A generated placeholder would
+turn the light green while destroying the only thing the light measures: the
+digest is worth reading because a reader looked at the day and thought about
+it.
+
+Section Y of `test\win32\go-loop-guard.ps1` is the demonstration, and it leads
+with the failing case rather than the happy one (T1133): a fixture repo with a
+06:00 heartbeat and no file reads `missing`, names go.md step 0.5, and leaves
+the file absent; writing the file flips it to `present`; a history with no event
+in today's window reads `not-due`; and 04:30 reads `not-due` however busy the
+loop has been. The new `-DigestAsOf` parameter is what makes both sides of the
+05:00 boundary reachable without waiting for a particular hour.
+
+Also filed: [[T1262]] - the signal lives where a human or the supervisor looks,
+and the turn that owes the digest still reads only `go-loop-exec.ps1 claim`,
+which says nothing about it.
+
+Floor: lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS;
+`go-loop-guard` ALL PASS (263 assertions) plus the audits its edit made due -
+isolation-meta, launch-preflight, verdict-exit, cleanslate, stderr-capture,
+merge-terminology, desktop-launch - all green.
