@@ -39,6 +39,12 @@
 #      with. Arm E and arm F are the two endings of the same condition, and
 #      neither is safe to ship without the other: E alone permits a build that
 #      never falls back, F alone permits a build that never refuses.
+#   8. And the thing it tries is the one we SHIP (T1252). Arm F names a stand-in
+#      fallback through a debug seam, which proves the selection but says
+#      nothing about whether an installed Ghoztty has anything to select. Arm H
+#      removes the seam entirely: the only fallback in reach is the vendored
+#      Mesa at `<dir holding ghoztty.exe>\gl\opengl32.dll` that `zig build`
+#      installs, and the terminal has to come up drawing with it.
 #
 # The state in arm 1-4 is built with `GHOZTTY_STARTUP_FAIL=no-window`, a
 # DEBUG-ONLY seam in `App.run` that suppresses the startup window. It is the
@@ -274,6 +280,15 @@ try {
     $env:LOCALAPPDATA = $tmpE
     Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue
     $env:GHOZTTY_GL_FORCE_VERSION = '1.1'
+    # Since T1252 every build SHIPS a fallback, so forcing 1.1 on its own now
+    # produces arm F's ending instead of this one. The no-fallback state is
+    # built by pointing the debug seam at a file that is not there: the override
+    # REPLACES the shipped location rather than being tried ahead of it, so this
+    # is a machine with nothing left to try - which is the only state in which
+    # the refusal below is the right answer.
+    $env:GHOZTTY_GL_FALLBACK_DLL = Join-Path $tmpE 'no-such-opengl32.dll'
+    Assert "E0 the state under test really has no fallback in reach" `
+        (-not (Test-Path $env:GHOZTTY_GL_FALLBACK_DLL))
 
     $appE = Start-OnTestDesktop -Exe $Exe -Arguments @('--title=t1224-e')
     $procE = $appE.Process
@@ -310,6 +325,7 @@ try {
         ($exitedE -and ($exitCodeE -is [int]) -and $exitCodeE -ne 0)
 
     Remove-Item env:GHOZTTY_GL_FORCE_VERSION -ErrorAction SilentlyContinue
+    Remove-Item env:GHOZTTY_GL_FALLBACK_DLL -ErrorAction SilentlyContinue
 
     # ========================================================================
     "== F: a display below the floor falls back to a second GL instead of refusing"
@@ -386,6 +402,53 @@ try {
 
     [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 600)
     Remove-Item env:GHOZTTY_GL_FALLBACK_DLL -ErrorAction SilentlyContinue
+    Remove-Item env:GHOZTTY_GL_FORCE_VERSION -ErrorAction SilentlyContinue
+
+    # ========================================================================
+    "== H: the fallback it falls back TO is the one this build ships"
+    # ========================================================================
+    # T1252. Arm F proves the SELECTION with a stand-in named through a debug
+    # seam; on its own that is compatible with a shipped product that has
+    # nothing to select, which is exactly the state the user's remote machine
+    # was in. So this arm sets NO `GHOZTTY_GL_FALLBACK_DLL`: the only fallback
+    # in reach is `<dir holding ghoztty.exe>\gl\opengl32.dll`, the vendored Mesa
+    # that `zig build` installs and that the MSI and the portable ZIP carry.
+    #
+    # It is also the only place anything checks that the vendored bytes are a
+    # WORKING OpenGL 4.3+ implementation rather than a plausible-looking DLL:
+    # if Mesa loaded but measured below the floor too, the retry would end in
+    # arm E's dialog and H1/H2 would fail.
+    [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 600)
+    $shippedGl = Join-Path (Split-Path -Parent $Exe) 'gl\opengl32.dll'
+    Assert "H0 the build installed a fallback GL beside the exe" (Test-Path $shippedGl)
+    Assert "H0b and its licence with it" `
+        (Test-Path (Join-Path (Split-Path -Parent $Exe) 'gl\LICENSE-Mesa.txt'))
+
+    $tmpH = Join-Path $root 'h'
+    New-Item -ItemType Directory -Force $tmpH | Out-Null
+    $env:LOCALAPPDATA = $tmpH
+    $env:GHOZTTY_GL_FORCE_VERSION = '1.1'
+    Remove-Item env:GHOZTTY_GL_FALLBACK_DLL -ErrorAction SilentlyContinue
+
+    $errH = Join-Path $tmpH 'stderr.txt'
+    $appH = Start-OnTestDesktop -Exe $Exe -Arguments @('--title=t1252-h') -StdErr $errH
+    $winH = Wait-TestWindow -ProcessId $appH.Pid -Class 'GhozttyWindow' -TimeoutMs 45000
+    Assert "H1 the terminal opened on the SHIPPED fallback, with no seam pointing at one" `
+        ($winH -ne [IntPtr]::Zero)
+    Assert "H2 and raised no startup-failure dialog" `
+        (@(Get-TestWindows -ProcessId $appH.Pid -Class $DIALOG_CLASS -AllowHidden).Count -eq 0)
+
+    Start-Sleep -Milliseconds 500
+    $textH = if (Test-Path $errH) { (Get-Content $errH -Raw) } else { '' }
+    Assert "H3 it says a fallback implementation was taken" `
+        ($textH -match 'OpenGL implementation: fallback')
+    # The path is asserted, not just the word: without this, H passes against a
+    # build that found some other opengl32.dll on the machine.
+    Assert "H4 and that it loaded the one under gl\ beside the exe" `
+        ($textH -match '(?i)\\gl\\opengl32\.dll')
+    Assert "H5 and drew with it" ($textH -match 'impl=fallback')
+
+    [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 600)
     Remove-Item env:GHOZTTY_GL_FORCE_VERSION -ErrorAction SilentlyContinue
 
     # LAST statement of the top-level try (T1039): an unwind from anywhere above

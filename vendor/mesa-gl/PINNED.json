@@ -1,0 +1,33 @@
+{
+  "component": "mesa-gl",
+  "purpose": "Fallback OpenGL implementation shipped in <install>\\gl\\opengl32.dll (T1252), loaded by src/renderer/gl_loader.zig when the system driver measures below the renderer's floor (T1251).",
+  "mesaVersion": "26.2.1",
+  "driver": "d3d12",
+  "source": {
+    "project": "mmozeiko/build-mesa",
+    "release": "https://github.com/mmozeiko/build-mesa/releases/tag/26.2.1",
+    "asset": "mesa-d3d12-x64-26.2.1.7z",
+    "url": "https://github.com/mmozeiko/build-mesa/releases/download/26.2.1/mesa-d3d12-x64-26.2.1.7z",
+    "sha256": "42c6bbcc6f10243c712b607e34e609748f83bf4ddee5237f53e544151aa8bb14",
+    "size": 3073247
+  },
+  "files": [
+    {
+      "path": "x64/opengl32.dll",
+      "memberOf": "mesa-d3d12-x64-26.2.1.7z",
+      "member": "opengl32.dll",
+      "sha256": "fc5821c70602ca37924fd1a7941db8d8b169dbf82f6d2cfb603e4dc1d8e16b1b",
+      "size": 17092608,
+      "machine": "x86_64"
+    },
+    {
+      "path": "LICENSE",
+      "composedFrom": [
+        "https://gitlab.freedesktop.org/mesa/mesa/-/raw/mesa-26.2.1/docs/license.rst",
+        "https://gitlab.freedesktop.org/mesa/mesa/-/raw/mesa-26.2.1/licenses/MIT"
+      ]
+    }
+  ],
+  "license": "MIT",
+  "verify": "dist/windows-installer/fetch-mesa-gl.sh --verify"
+}

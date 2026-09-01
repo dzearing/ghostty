@@ -125,6 +125,7 @@ fi
 EXE="$REPO_ROOT/zig-out/bin/ghoztty.exe"
 COM_EXE="$REPO_ROOT/zig-out/bin/ghoztty.com"
 AGENT_EXE="$REPO_ROOT/zig-out/bin/ghoztty-agent.exe"
+GL_DIR="$REPO_ROOT/zig-out/bin/gl"
 SHARE="$REPO_ROOT/zig-out/share"
 [[ -f "$EXE" ]] || { echo "error: $EXE not found (build first)" >&2; exit 1; }
 # ghoztty.com is the console-subsystem twin (T245, src/cli/com_shim.zig) and it
@@ -138,6 +139,15 @@ SHARE="$REPO_ROOT/zig-out/share"
 # exec. The default `zig build` installs it on Windows targets.
 [[ -f "$AGENT_EXE" ]] || { echo "error: $AGENT_EXE not found — the MSI must carry the session-persistence agent (T89h); build first" >&2; exit 1; }
 [[ -f "$SHARE/terminfo/ghostty.terminfo" ]] || { echo "error: $SHARE/terminfo/ghostty.terminfo missing — resourcesDir sentinel would break" >&2; exit 1; }
+# The fallback OpenGL implementation (T1252), installed into gl\ and NEVER
+# beside ghoztty.exe — opengl32.dll is not a KnownDLL, so an adjacent copy is
+# loaded for every launch and would put every user with a working GPU onto the
+# fallback renderer. Required payload: without it the install starts fine on
+# every healthy machine and refuses to start on exactly the ones this exists
+# for (Remote Desktop, stripped-down VMs), which is a defect only the affected
+# user ever sees.
+[[ -f "$GL_DIR/opengl32.dll" ]] || { echo "error: $GL_DIR/opengl32.dll not found — the MSI must carry the fallback OpenGL implementation or Ghoztty cannot start over Remote Desktop (T1252); build first" >&2; exit 1; }
+[[ -f "$GL_DIR/LICENSE-Mesa.txt" ]] || { echo "error: $GL_DIR/LICENSE-Mesa.txt not found — the fallback OpenGL implementation may only be redistributed with its licence (T1252)" >&2; exit 1; }
 
 # The exe's ACTUAL PE file version (authoritative even under --skip-build):
 # scan for the VS_FIXEDFILEINFO signature (0xFEEF04BD little-endian) and read
@@ -197,13 +207,16 @@ WXS="$WORK/ghoztty.wxs"
 # Generate the WiX source. Directory tree + one component per file with
 # GUIDs derived deterministically from the install path (uuid5) so component
 # identity is stable across builds (MSI component rules).
-python3 - "$EXE" "$COM_EXE" "$AGENT_EXE" "$SHARE" "$WXS" "$TEST_IDENTITY" <<'PYEOF'
+python3 - "$EXE" "$COM_EXE" "$AGENT_EXE" "$SHARE" "$WXS" "$TEST_IDENTITY" "$GL_DIR" <<'PYEOF'
 import os, sys, uuid, hashlib
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape
 
 exe, com_exe, agent_exe, share, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
 identity = sys.argv[6] if len(sys.argv) > 6 else ""
+# The fallback OpenGL implementation's directory (T1252). Optional so the WXS
+# generator stays runnable over a fixture that has no gl\ tree.
+gl = sys.argv[7] if len(sys.argv) > 7 else ""
 
 # Stable namespace for component GUID derivation. NEVER change this, or
 # every component changes identity and upgrades misbehave.
@@ -280,6 +293,14 @@ emit_file_component("", agent_exe, 12)
 lines.append(f'            <Directory Id="{ident("d", "share")}" Name="share">')
 emit_dir(share, "share", 14)
 lines.append('            </Directory>')
+# gl\ — the fallback OpenGL implementation and its licence (T1252). A
+# SUBDIRECTORY, never INSTALLDIR itself: opengl32.dll is not a KnownDLL, so a
+# copy beside ghoztty.exe is loaded by the OS on every launch and would move
+# every user with a working GPU onto the fallback renderer with no symptom.
+if gl and os.path.isdir(gl):
+    lines.append(f'            <Directory Id="{ident("d", "gl")}" Name="gl">')
+    emit_dir(gl, "gl", 14)
+    lines.append('            </Directory>')
 
 files_xml = "\n".join(lines)
 refs_xml = "\n".join(f'      <ComponentRef Id="{c}"/>' for c in comp_refs)

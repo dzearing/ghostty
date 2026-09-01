@@ -343,6 +343,10 @@ pub fn build(b: *std.Build) !void {
                 const unlock = buildpkg.InstallUnlock.create(b);
                 unlock.guardArtifact(exe.install_step);
                 if (exe.com_install_step) |com| unlock.guardInstallFile(com);
+                // The fallback GL (T1252) is a loaded module for as long as an
+                // instance that took it is alive, so it is exactly as
+                // unreplaceable as the exe when a test run left one behind.
+                for (exe.gl_install_steps) |gl| unlock.guardInstallFile(gl);
                 unlock.guardArtifact(agent.install_step);
                 if (agent.ca_dll_install_step) |ca| unlock.guardArtifact(ca);
             }

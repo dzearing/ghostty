@@ -97,6 +97,15 @@ $checks = [ordered]@{
           $t.msi -match '"ghoztty\.com": 0' -and
           $t.msi -match '"ghoztty-agent\.exe": 0' -and
           $t.msi -match 'expected exactly 1 File-table row for each exe' }
+    # T1252. The fallback OpenGL implementation is the third sibling with no
+    # symptom: a package without it installs a terminal that starts on every
+    # machine with working graphics and REFUSES TO START over Remote Desktop,
+    # which is the one place nobody packaging it is looking.
+    'A5 packaging refuses a build with no fallback OpenGL' =
+        { param($t) $t.msi -match '\[\[ -f "\$GL_DIR/opengl32\.dll" \]\] \|\|' }
+    'A6 the fallback OpenGL is installed in gl\, never beside the exe' =
+        { param($t) $t.msi -match 'emit_dir\(gl, "gl", 14\)' -and
+                    $t.msi -notmatch 'emit_file_component\("", gl' }
 
     # B - the install ends with a running terminal.
     'B1 the wxs declares the launch pair' =
@@ -148,6 +157,10 @@ $mutations = [ordered]@{
         @{ Key = 'msi'; Find = 'emit_file_component("", agent_exe'; Replace = 'pass  # emit_file_component("", skipped_agent' }
     'A4 the File-table patch demands all three exes' =
         @{ Key = 'msi'; Find = '"ghoztty-agent.exe": 0'; Replace = '' }
+    'A5 packaging refuses a build with no fallback OpenGL' =
+        @{ Key = 'msi'; Find = '[[ -f "$GL_DIR/opengl32.dll" ]] ||'; Replace = 'true ||' }
+    'A6 the fallback OpenGL is installed in gl\, never beside the exe' =
+        @{ Key = 'msi'; Find = 'emit_dir(gl, "gl", 14)'; Replace = 'emit_file_component("", gl + "/opengl32.dll", 12)' }
     'B1 the wxs declares the launch pair' =
         @{ Key = 'msi'; Find = '<CustomAction Id="LaunchApp"'; Replace = '<!-- LaunchApp removed' }
     'B2 the launch targets the installed exe' =

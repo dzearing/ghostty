@@ -43,6 +43,11 @@ scripts/githooks/* text eol=lf
 *.icns binary
 *.ttf binary
 *.otf binary
+# vendor/mesa-gl/x64/opengl32.dll, the fallback OpenGL implementation Ghoztty
+# ships on Windows (T1252). Git's content heuristic already calls it binary;
+# saying so is what keeps a future `text=auto` from line-ending-mangling a
+# 17 MB DLL into an image that will not load.
+*.dll binary
 
 #--------------------------------------------------------------------
 # Merge drivers (T957, Stage 0 of docs/design/windows-parity-upstream-pull-plan.md)

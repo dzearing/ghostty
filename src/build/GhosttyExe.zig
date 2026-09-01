@@ -23,6 +23,16 @@ install_step: *std.Build.Step.InstallArtifact,
 /// ghoztty.exe, like ghoztty-agent.exe.
 com_install_step: ?*std.Build.Step.InstallFile,
 
+/// Windows win32 targets only (null otherwise): the vendored fallback OpenGL
+/// implementation, installed as `bin/gl/opengl32.dll` plus its licence (T1252).
+///
+/// A SUBDIRECTORY, never beside ghoztty.exe. `opengl32.dll` is not a KnownDLL,
+/// so a copy adjacent to the exe would be loaded by the operating system for
+/// every launch and would silently move every user with a working GPU onto it.
+/// `src/renderer/gl_loader.zig` opens this one by full path, and only after the
+/// display driver's own OpenGL has measured below the renderer's floor.
+gl_install_steps: []const *std.Build.Step.InstallFile,
+
 pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty {
     const exe: *std.Build.Step.Compile = b.addExecutable(.{
         .name = "ghoztty",
@@ -61,6 +71,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
 
     // OS-specific
     var com_install_step: ?*std.Build.Step.InstallFile = null;
+    var gl_install_steps: std.ArrayList(*std.Build.Step.InstallFile) = .empty;
     switch (cfg.target.result.os.tag) {
         .windows => {
             // Subsystem selection:
@@ -105,6 +116,27 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
             patch_run.addArg("console");
             const com_file = patch_run.addOutputFileArg("ghoztty.com");
             com_install_step = b.addInstallBinFile(com_file, "ghoztty.com");
+
+            // The fallback OpenGL implementation (T1252), for the frontend
+            // that can actually use it. The `none` runtime builds no renderer
+            // at all — the `lib` lane cross-builds the shared core for Windows
+            // and would otherwise copy 17 MB it will never open — and only the
+            // x86_64 build is vendored, so an arm64 Windows target ships
+            // nothing rather than an image that cannot load.
+            if (cfg.app_runtime == .win32 and
+                cfg.target.result.cpu.arch == .x86_64)
+            {
+                try gl_install_steps.append(b.allocator, b.addInstallBinFile(
+                    b.path("vendor/mesa-gl/x64/opengl32.dll"),
+                    "gl/opengl32.dll",
+                ));
+                // The licence travels with the binary, in the same directory,
+                // because that is the condition on redistributing it at all.
+                try gl_install_steps.append(b.allocator, b.addInstallBinFile(
+                    b.path("vendor/mesa-gl/LICENSE"),
+                    "gl/LICENSE-Mesa.txt",
+                ));
+            }
         },
 
         else => {},
@@ -114,6 +146,7 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Ghostty
         .exe = exe,
         .install_step = install_step,
         .com_install_step = com_install_step,
+        .gl_install_steps = try gl_install_steps.toOwnedSlice(b.allocator),
     };
 }
 
@@ -122,6 +155,7 @@ pub fn install(self: *const Ghostty) void {
     const b = self.install_step.step.owner;
     b.getInstallStep().dependOn(&self.install_step.step);
     if (self.com_install_step) |com| b.getInstallStep().dependOn(&com.step);
+    for (self.gl_install_steps) |gl| b.getInstallStep().dependOn(&gl.step);
 }
 
 /// If we're in NixOS but not in the shell environment then we issue

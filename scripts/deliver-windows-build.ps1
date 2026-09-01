@@ -152,13 +152,24 @@ if (-not (Test-Path -LiteralPath $stagingBin -PathType Container)) {
     Say "ABORT: staging has no bin\ directory: $stagingBin"
     exit 2
 }
-$stagingShare = Join-Path $Staging 'share'
 
 $fileSet = @(Get-DeliveryFileSet -AppOnly:$AppOnly)
 $missing = @($fileSet | Where-Object { -not (Test-Path -LiteralPath (Join-Path $stagingBin $_) -PathType Leaf) })
 if ($missing.Count) {
     Say "ABORT: staging is incomplete, missing: $($missing -join ', ')"
     exit 2
+}
+
+# The content trees (T1252). `gl\` carries the fallback OpenGL implementation,
+# which is what stands between a remote machine that runs Ghoztty and one that
+# refuses to start - and its absence is invisible on every box with working
+# graphics, so it is reported here rather than discovered by a user.
+$treeSet = @(Get-DeliveryTreeSet)
+foreach ($tree in $treeSet) {
+    $src = Join-Path $Staging $tree.Source
+    if (-not (Test-Path -LiteralPath $src -PathType Container)) {
+        Say "  note: staging has no $($tree.Source)\ - nothing will be mirrored to $($tree.Dest)\"
+    }
 }
 
 Say "== staging $Staging (suffix $Suffix$(if ($AppOnly) { ', app-only' })$(if ($DryRun) { ', DRY RUN' }))"
@@ -298,18 +309,22 @@ foreach ($dir in $Targets) {
         Ok $n
     }
 
-    # share\ is a tree, not a file; /MIR so a file main deleted goes away here
-    # too. /R:1 /W:1 so an unreachable share fails in seconds, not minutes.
-    if (Test-Path -LiteralPath $stagingShare -PathType Container) {
+    # share\ and gl\ are TREES, not files; /MIR so a file main deleted goes away
+    # here too (and so a Mesa version bump does not leave the previous DLL
+    # behind, T1252). /R:1 /W:1 so an unreachable share fails in seconds, not
+    # minutes.
+    foreach ($tree in $treeSet) {
+        $src = Join-Path $Staging $tree.Source
+        if (-not (Test-Path -LiteralPath $src -PathType Container)) { continue }
         if ($DryRun) {
-            Say "  dry  would mirror share\"
-        } else {
-            $rc = 0
-            robocopy $stagingShare (Join-Path $dir 'share') /MIR /NFL /NDL /NJH /NJS /R:1 /W:1 | Out-Null
-            $rc = $LASTEXITCODE
-            # robocopy: < 8 is success (0 nothing to do, 1 copied, 2 extras, 3 both).
-            if ($rc -lt 8) { Ok "share\ (robocopy $rc)" } else { Bad "$dir\share could not be mirrored (robocopy $rc)"; $failedHere = $true }
+            Say "  dry  would mirror $($tree.Dest)\"
+            continue
         }
+        robocopy $src (Join-Path $dir $tree.Dest) /MIR /NFL /NDL /NJH /NJS /R:1 /W:1 | Out-Null
+        $rc = $LASTEXITCODE
+        # robocopy: < 8 is success (0 nothing to do, 1 copied, 2 extras, 3 both).
+        if ($rc -lt 8) { Ok "$($tree.Dest)\ (robocopy $rc)" }
+        else { Bad "$dir\$($tree.Dest) could not be mirrored (robocopy $rc)"; $failedHere = $true }
     }
 
     if ($DryRun) { continue }

@@ -32,6 +32,27 @@ function Get-DeliveryFileSet {
     return $app + @('ghoztty-agent.exe', 'ghoztty-agent.pdb', 'ghoztty-agent-ca.dll')
 }
 
+# The CONTENT TREES a delivery mirrors, as (source under the staging prefix,
+# destination under the install directory).
+#
+# `share\` has always been one; `gl\` joined it with T1252, and the reason it is
+# a tree here rather than two more names in the file set above is that the file
+# set is flat - every entry is copied from `<staging>\bin\<name>` to
+# `<target>\<name>` with no directory creation - and `gl` lives at
+# `<staging>\bin\gl` and must land at `<target>\gl`. Mirroring is also the right
+# semantics for it: a Mesa version bump changes which files are there, and a
+# leftover from the previous one is a DLL the loader might still open.
+#
+# gl\ is deliberately in the -AppOnly set too: it is part of the app, not of the
+# agent, and an app delivered without it refuses to start on exactly the
+# machines the fallback exists for.
+function Get-DeliveryTreeSet {
+    return @(
+        [pscustomobject]@{ Source = 'share'; Dest = 'share' },
+        [pscustomobject]@{ Source = 'bin\gl'; Dest = 'gl' }
+    )
+}
+
 # The files whose replaced copy is worth keeping for a rollback. Deliberately
 # NOT every delivered file: the two .pdb files are 85 MB and 11 MB, and backing
 # them up on every delivery is what grew the Desktop portable directory to 62

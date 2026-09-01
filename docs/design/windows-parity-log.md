@@ -19143,3 +19143,72 @@ which the forced-version seam cannot stand in for).
 Floor: lib/none/win32/agent ALL LANES PASS; `startup-failure.ps1` ALL PASS (34,
 eight of them new), ipc-p1/p2/p3 ALL PASS, and the nine meta-audits re-run for
 the edited script.
+
+## 2026-09-01 - Ghoztty now brings the graphics driver it falls back to (T1252)
+
+[[T1251]] taught the terminal to reach for a second OpenGL implementation when
+the display driver's own measures below the renderer's floor. On a shipped
+install there was nothing there to reach for, so on the user's remote machine
+the fix changed nothing. This is the other half: every Windows build now carries
+one.
+
+It is Mesa 26.2.1, the `d3d12` gallium build, vendored at
+`vendor/mesa-gl/x64/opengl32.dll` and installed as `<install>\gl\opengl32.dll`
+with its licence beside it. ANGLE was the other candidate and is the
+conventional Windows answer, but it speaks GL ES 3.x against a desktop-GL 4.3
+renderer - a shader and pipeline port, not a second module the loader can open.
+Between Mesa's own builds, `d3d12` over `llvmpipe`: the failure this exists for
+is a Remote Desktop session, an RDP session has a working Direct3D 12 device, so
+`d3d12` reaches the real GPU and the fallback is a working renderer rather than
+a slideshow - and it is 17.1 MB against `llvmpipe`'s 58.9 MB. A machine with no
+D3D12 device at all still gets [[T1249]]'s honest refusal, which is the right
+ending when nothing can draw.
+
+The bytes are IN THE REPO rather than fetched when a package is built. Upstream
+ships `.7z` using the BCJ2 filter, which no Python library can decode, so a
+build-time fetch would put a 7-Zip binary and a network round trip on the
+critical path of every release, every CI run and every offline build - to
+re-derive a file that changes once or twice a year. `PINNED.json` records the
+upstream release, the archive's SHA-256 and the extracted file's, and
+`dist/windows-installer/fetch-mesa-gl.sh --verify` re-downloads and proves the
+tree byte for byte (it did, on this commit).
+
+`gl\` is a SUBDIRECTORY and that is the load-bearing part. `opengl32.dll` is not
+a KnownDLL, so a copy beside `ghoztty.exe` would be loaded by the operating
+system for every launch and would move every user with a working GPU onto the
+fallback renderer with no symptom whatsoever. All three packagers now refuse to
+ship without the payload, and two of them refuse to ship it in the wrong place:
+the portable ZIP fails on any `opengl32.dll` entry outside `Ghoztty/gl/`, and
+section B9 of `release-artifacts.ps1` reads the generated WXS and fails on any
+`opengl32.dll` File that does not hang under the `gl` Directory.
+
+The proof that this reaches a user is `startup-failure.ps1` arm H, which sets no
+`GHOZTTY_GL_FALLBACK_DLL` at all: with the system context forced below the floor
+and only the SHIPPED file in reach, the terminal opens, raises no dialog, and
+its log names `OpenGL implementation: fallback (...\gl\opengl32.dll)` and
+`impl=fallback`. That arm is also the only thing on this box that checks the
+vendored bytes are a working GL 4.3+ implementation rather than a plausible DLL:
+if Mesa loaded and still measured below the floor, the retry would end in arm
+E's dialog and H would go red.
+
+Arm E went red on the first run, which was the change working. With a fallback
+shipped, forcing 1.1 no longer produces a refusal - so arm E now builds the
+no-fallback state by pointing the debug seam at a file that is not there (the
+override REPLACES the shipped location rather than being tried ahead of it).
+That semantics is now documented in `gl_loader.zig`, because it is the only
+remaining way to reach the refusal on a box where `gl\opengl32.dll` is right
+there.
+
+Cost to a download: +3,746,637 bytes on the portable ZIP (48,976,335 ->
+52,722,972 measured on one tree), the same ~3.6 MB on the MSI, +17.1 MB on disk.
+
+[[T1254]] is the one shape left out: `upgrade-ghoztty-windows.ps1` mirrors
+`share\` into the dev install and not yet `gl\`. No user has a dev install.
+[[T1253]] still owes the proof inside a real RDP session, which no seam here can
+stand in for.
+
+Floor: lib/none/win32/agent ALL LANES PASS; `startup-failure.ps1` ALL PASS (42,
+eight of them new), ipc-p1/p2/p3 ALL PASS, and `release-artifacts`,
+`release-artifacts-zip`, `install-launch` (+ `-TeethCheck`), `deliver-verify`,
+`install-restart`, `install-prepare`, `update-real-msi`, `upstream-remote` and
+the six static audits all re-run and re-stamped.

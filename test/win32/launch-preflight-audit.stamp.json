@@ -1,9 +1,11 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-09-01T10:47:44-07:00",
-    "commit":  "a09636c44",
+    "generated":  "2026-09-01T11:38:32-07:00",
+    "commit":  "5ae046233",
     "uncommitted":  [
+                        "test/win32/install-launch.ps1",
+                        "test/win32/release-artifacts.ps1",
                         "test/win32/startup-failure.ps1"
                     ],
     "files":  {
@@ -114,7 +116,7 @@
                   "test/win32/hook-json.ps1":  "6ffe9bffa095bdeeb1d524990d3a7e695aa3d185596df39a7aeca44f7ed82119",
                   "test/win32/host-settings.ps1":  "4bc5045b4017d45d664d2f715b14e538022cb9ff87e40cedbdeecd4a1216ccb5",
                   "test/win32/hover-capture.ps1":  "0a8055d036ef8aa5ef83d91851c418f52dfdc09ea29d63f5eae9af87a9ee92a1",
-                  "test/win32/install-launch.ps1":  "a4ffeece18fd6409c71581b61632df08620e4d63cf3fd3676147f3d7b395d62e",
+                  "test/win32/install-launch.ps1":  "cd2204a60b017fa7a9131145a814f36f8118b45c1055da1f2baea6ec492f1333",
                   "test/win32/install-ownership.ps1":  "cdc00459bfc7611fca1aacc6756977bc9eb46e87e2b32d543638eacfe578447c",
                   "test/win32/install-prepare.ps1":  "6d8277dab8e947ddd944dbd1ce556f711cbb8e345703f06d32b17dec8995bc06",
                   "test/win32/install-restart.ps1":  "c41b5d41f9a6f3aadcbdde6f99989c35e77ddfe412b4968deb0baf956e5af1b2",
@@ -212,7 +214,7 @@
                   "test/win32/registration-sites.ps1":  "077085e9978ecece9a5c682d6c5f2c9bd7db68120d81fdc0075c0d6a48692b62",
                   "test/win32/relaunch-guard.ps1":  "784140b66081be866d4cae5cb2858ef00c9979cdce73dc6f0e4fd5a95aa1628f",
                   "test/win32/relay-account.ps1":  "8dee3165d569d5069208dee6975b251d6bb3444434e4993e5d4bda207e80250f",
-                  "test/win32/release-artifacts.ps1":  "394f2033437cf992d065f6bd1125b4b00c2b59d113c26a6c47d80a62d8e78497",
+                  "test/win32/release-artifacts.ps1":  "a77199ddcb5b7d9823976b743a10409c338cc94a00654335e607e2cefd47741a",
                   "test/win32/release-parity.ps1":  "92babe2c0e154c766dd02f9578073f6a04ec281ee706aa8a8dc83c505d579f9f",
                   "test/win32/remote-inherit.ps1":  "50b2a9d36a10d0e677963fbb7d155e3dbc45261111214c1ab8b6454f025e24da",
                   "test/win32/remote-pill.ps1":  "76ffee269bac8ababf6ead9bba303664e9ff20615ea8b738f8fbd362cb345f41",
@@ -248,7 +250,7 @@
                   "test/win32/split-dim-viewer.ps1":  "b557b55f71b6471c6b6691c2ab6474be8b86bad64e6a3df0a4ac9ef5c4516595",
                   "test/win32/split-divider.ps1":  "cf4eeef4cc31b15427bd2be83bb97e5edd88a0b055687312a3e17e4d66e16fcf",
                   "test/win32/split-zoom-nav.ps1":  "7ed3a76e0a6abc09573263efa8f7c7d3889ab31d6d8b258040ab7cf5e9882b12",
-                  "test/win32/startup-failure.ps1":  "d7e7f618373e98f77212dfb51af35b4981e7428f5b3d014cfb7c119f02543271",
+                  "test/win32/startup-failure.ps1":  "d2ed885900bd7d68765f605a5a94a622df2682d29c6d9fa27a4612b33cce6cb9",
                   "test/win32/stderr-capture-audit.ps1":  "04424b778285df67f2eeed9c8ee354d1446c62a920ab8de56bf8b4475569cf9b",
                   "test/win32/suite-run.ps1":  "e71d56fdfaa3a9cc6b386fb38358df9e038ac764d6148578412b56ff49fb5a08",
                   "test/win32/tab-color.ps1":  "af75bcd47eeb68cf93ee056b7aa4e14e147314ab8b4adc3a9c0eb27dfb43f967",

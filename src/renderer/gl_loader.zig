@@ -287,10 +287,16 @@ fn openSystem() !Api {
 ///
 /// `GHOZTTY_GL_FALLBACK_DLL` overrides the shipped location in DEBUG BUILDS
 /// ONLY. It is the seam that lets an acceptance script drive the fallback path
-/// on a box with a perfectly good GPU and no shipped fallback yet — the same
-/// reasoning as T1249's `GHOZTTY_GL_FORCE_VERSION`, and the same rule: an
-/// environment variable must never be able to move a user's terminal onto a
-/// different renderer.
+/// on a box with a perfectly good GPU — the same reasoning as T1249's
+/// `GHOZTTY_GL_FORCE_VERSION`, and the same rule: an environment variable must
+/// never be able to move a user's terminal onto a different renderer.
+///
+/// The override REPLACES the shipped location rather than being tried ahead of
+/// it, and that is load-bearing in both directions (T1252). Naming a file that
+/// is not there is how a test builds the "this machine has no fallback at all"
+/// state now that every build ships one — which is the state behind T1249's
+/// refusal dialog, and the only remaining way to reach it on a box where
+/// `gl\opengl32.dll` is right there beside the exe.
 pub fn fallbackPathW(buf: []u16) ?[:0]const u16 {
     if (comptime builtin.os.tag != .windows) return null;
     if (buf.len < 2) return null;

@@ -60,6 +60,7 @@ cd "$REPO_ROOT"
 EXE="$REPO_ROOT/zig-out/bin/ghoztty.exe"
 COM_EXE="$REPO_ROOT/zig-out/bin/ghoztty.com"
 AGENT_EXE="$REPO_ROOT/zig-out/bin/ghoztty-agent.exe"
+GL_DIR="$REPO_ROOT/zig-out/bin/gl"
 SHARE="$REPO_ROOT/zig-out/share"
 [[ -f "$EXE" ]] || { echo "error: $EXE not found (build first)" >&2; exit 1; }
 # Same required-sibling rule the MSI enforces (T89h): a layout without the
@@ -70,6 +71,13 @@ SHARE="$REPO_ROOT/zig-out/share"
 # cross-builds included, so a missing one means the build did not run.
 [[ -f "$COM_EXE" ]] || { echo "error: $COM_EXE not found -- the portable ZIP must carry the console twin or the ghoztty command line does nothing from PowerShell (T245); build first" >&2; exit 1; }
 [[ -f "$SHARE/terminfo/ghostty.terminfo" ]] || { echo "error: $SHARE/terminfo/ghostty.terminfo missing -- resourcesDir sentinel would break" >&2; exit 1; }
+# The fallback OpenGL implementation (T1252). A layout without it starts fine
+# on every machine with working graphics and REFUSES TO START on the ones this
+# exists for -- a remote desktop, a stripped-down VM -- which is a defect only
+# the affected user ever sees. It is a required payload for the same reason the
+# agent is: silently shipping without it degrades the product invisibly.
+[[ -f "$GL_DIR/opengl32.dll" ]] || { echo "error: $GL_DIR/opengl32.dll not found -- the portable ZIP must carry the fallback OpenGL implementation or Ghoztty cannot start over Remote Desktop (T1252); build first" >&2; exit 1; }
+[[ -f "$GL_DIR/LICENSE-Mesa.txt" ]] || { echo "error: $GL_DIR/LICENSE-Mesa.txt not found -- the fallback OpenGL implementation may only be redistributed with its licence (T1252)" >&2; exit 1; }
 
 if [[ -z "$STAMP" ]]; then
   STAMP="$(date +%Y%m%d)-$(git rev-parse --short HEAD)"
@@ -94,6 +102,10 @@ cp "$AGENT_EXE" "$ROOT/ghoztty-agent.exe"
 # and ghostty.terminfo is the file resourcesDir actually needs).
 cp -R "$SHARE" "$ROOT/share"
 find "$ROOT/share" -type l -delete
+# gl/ is a SUBDIRECTORY on purpose, never beside ghoztty.exe: opengl32.dll is
+# not a KnownDLL, so an adjacent copy would be loaded for every launch and would
+# move every user with a working GPU onto it (T1251).
+cp -R "$GL_DIR" "$ROOT/gl"
 
 cat > "$ROOT/READ-ME-FIRST.txt" <<EOF
 Ghoztty for Windows (x64) -- portable build $SEMVER ($STAMP)
@@ -101,7 +113,7 @@ Ghoztty for Windows (x64) -- portable build $SEMVER ($STAMP)
 
 No installer. Just run the terminal:
 
-  1. Keep this whole "Ghoztty" folder together (exe + agent + share).
+  1. Keep this whole "Ghoztty" folder together (exe + agent + share + gl).
   2. Double-click  ghoztty.exe
   3. SmartScreen may say "Windows protected your PC" because this build is
      unsigned. Click "More info" -> "Run anyway".
@@ -149,6 +161,8 @@ required = [
     "Ghoztty/ghoztty.com",
     "Ghoztty/ghoztty-agent.exe",
     "Ghoztty/share/terminfo/ghostty.terminfo",
+    "Ghoztty/gl/opengl32.dll",
+    "Ghoztty/gl/LICENSE-Mesa.txt",
     "Ghoztty/READ-ME-FIRST.txt",
 ]
 with zipfile.ZipFile(out) as z:
@@ -164,6 +178,15 @@ with zipfile.ZipFile(out) as z:
         subsystem = struct.unpack_from("<H", head, pe + 0x5C)[0]
         if subsystem != 3:
             sys.exit(f"error: Ghoztty/ghoztty.com has PE subsystem {subsystem}, expected 3 (console)")
+    # T1252: the fallback GL must be in gl\ and NOWHERE ELSE. `opengl32.dll`
+    # is not a KnownDLL, so a copy that landed at the archive root would be
+    # loaded by the operating system on every launch and would put every user
+    # with a working GPU onto the fallback renderer, silently. This is the one
+    # packaging mistake in this whole change that has no symptom.
+    hijack = [n for n in names
+              if n.lower().endswith("/opengl32.dll") and n != "Ghoztty/gl/opengl32.dll"]
+    if hijack:
+        sys.exit(f"error: portable ZIP has an opengl32.dll outside Ghoztty/gl/: {hijack}")
 missing = [r for r in required if r not in names]
 if missing:
     sys.exit(f"error: portable ZIP is missing {missing}")

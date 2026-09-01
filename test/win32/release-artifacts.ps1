@@ -140,6 +140,19 @@ Assert "A14d portable ZIP validates the packaged twin is console-subsystem" (
     ($zipSh -match 'Ghoztty/ghoztty\.com') -and ($zipSh -match 'subsystem != 3'))
 Assert "A15b MSI requires the console twin" ($msiSh -match 'COM_EXE" \]\] \|\|')
 Assert "A15c MSI emits a component for the console twin" ($msiSh -match 'emit_file_component\("", com_exe, 12\)')
+
+# A15g-A15i: the fallback OpenGL implementation ships in BOTH layouts (T1252).
+# It is the difference between a remote machine where Ghoztty starts and one
+# where it refuses, and it is invisible on every box that has working graphics -
+# so both packagers REQUIRE it rather than shipping whatever happens to be in
+# zig-out. B8/B9 below check the shape it lands in; these check it is not
+# optional.
+Assert "A15g portable ZIP requires the fallback OpenGL" (
+    $zipSh -match 'gl/opengl32\.dll' -and $zipSh -match 'must carry the fallback OpenGL')
+Assert "A15h MSI requires the fallback OpenGL" (
+    $msiSh -match 'GL_DIR/opengl32\.dll' -and $msiSh -match 'must carry the fallback OpenGL')
+Assert "A15i both ship its licence beside it" (
+    ($zipSh -match 'LICENSE-Mesa\.txt') -and ($msiSh -match 'LICENSE-Mesa\.txt'))
 # Unversioned in the File table means Windows Installer falls back to the
 # created/modified-date rule and can leave last release's CLI beside a fresh
 # app; the twin carries ghoztty.exe's version resource, so it takes the same row.
@@ -352,28 +365,41 @@ if (-not $genMatch.Success) {
     Assert "B5 WXS generator located in build-msi.sh" $false
     Assert "B6 generated WXS is well-formed XML" $false
     Assert "B7 a double hyphen in a WXS comment is caught" $false
+    Assert "B8 the WXS installs the fallback OpenGL under gl\" $false
+    Assert "B9 and nowhere else, so an install cannot hijack its own launch" $false
 } elseif (-not $pyExe) {
     Assert "B5 WXS generator located in build-msi.sh" $true
     Skip "B6 generated WXS is well-formed XML" 'no python interpreter on PATH'
     Skip "B7 a double hyphen in a WXS comment is caught" 'no python interpreter on PATH'
+    Skip "B8 the WXS installs the fallback OpenGL under gl\" 'no python interpreter on PATH'
+    Skip "B9 and nowhere else, so an install cannot hijack its own launch" 'no python interpreter on PATH'
 } else {
     Assert "B5 WXS generator located in build-msi.sh" $true
     $gen = $genMatch.Groups[1].Value
     New-Item -ItemType Directory -Path (Join-Path $wxsWork 'share\sub') -Force | Out-Null
-    foreach ($f in @('exe.exe', 'com.com', 'agent.exe', 'share\a.txt', 'share\sub\b.txt')) {
+    New-Item -ItemType Directory -Path (Join-Path $wxsWork 'gl') -Force | Out-Null
+    foreach ($f in @('exe.exe', 'com.com', 'agent.exe', 'share\a.txt', 'share\sub\b.txt',
+                     'gl\opengl32.dll', 'gl\LICENSE-Mesa.txt')) {
         [IO.File]::WriteAllText((Join-Path $wxsWork $f), 'x')
     }
     $enc = New-Object Text.UTF8Encoding $false
     $goodPy = Join-Path $wxsWork 'gen.py'
     [IO.File]::WriteAllText($goodPy, $gen, $enc)
+    # argv: exe com agent share <out.wxs> <test-identity> <gl-dir>, exactly as
+    # build-msi.sh passes them. The identity is a NON-EMPTY fixture name on
+    # purpose: PowerShell 5.1 silently DROPS an empty-string argument to a
+    # native command, so `'', 'gl'` would arrive as a single `gl` in the
+    # identity slot and the gl directory would vanish from the package with
+    # every check still green. (That is exactly what B8 did on its first run.)
     $genArgs = @('exe.exe', 'com.com', 'agent.exe', 'share')
+    $genTail = @('wxs-fixture', 'gl')
     Push-Location $wxsWork
-    $goodOut = & $pyExe $goodPy @genArgs 'good.wxs' 2>&1 | ForEach-Object { "$_" } | Out-String
+    $goodOut = & $pyExe $goodPy @genArgs 'good.wxs' @genTail 2>&1 | ForEach-Object { "$_" } | Out-String
     $goodRc = $LASTEXITCODE
     # The negative control: reintroduce the exact 2026-08-31 defect.
     $badPy = Join-Path $wxsWork 'gen-bad.py'
     [IO.File]::WriteAllText($badPy, ($gen -replace '`pty-host`', '`--pty-host`'), $enc)
-    $badOut = & $pyExe $badPy @genArgs 'bad.wxs' 2>&1 | ForEach-Object { "$_" } | Out-String
+    $badOut = & $pyExe $badPy @genArgs 'bad.wxs' @genTail 2>&1 | ForEach-Object { "$_" } | Out-String
     $badRc = $LASTEXITCODE
     Pop-Location
     $wellFormed = $false
@@ -386,6 +412,117 @@ if (-not $genMatch.Success) {
     Assert "B7 a double hyphen in a WXS comment is caught" (
         $badRc -ne 0 -and $badOut -match 'not well-formed')
     if ($badRc -eq 0) { "    the generator accepted a comment containing a double hyphen" }
+
+    # T1252: the fallback OpenGL implementation is installed, and installed
+    # under gl\ rather than beside ghoztty.exe. The second half is the one with
+    # no symptom: opengl32.dll is not a KnownDLL, so a component that put it in
+    # INSTALLDIR would be loaded on every launch and would silently move every
+    # user with a working GPU onto the fallback renderer. Read out of the
+    # generated WXS rather than asserted about the script's source text,
+    # because what ships is the package, not the intention.
+    # NOTE: on an XmlElement, `.Name` is the .NET node name ("File"), not the
+    # Name ATTRIBUTE - reading it that way makes these checks pass vacuously,
+    # which is what B9 did on its first run.
+    #
+    # Where a File INSTALLS is decided by the Directory it hangs under, so that
+    # is what is read here: climb from each File past its Component to the
+    # enclosing Directory. (Asking the gl Directory element for its descendant
+    # Files does not work through PowerShell's XML adapter - it answers empty.)
+    $glOk = $false
+    $glHijack = $true
+    if ($wellFormed) {
+        $doc = [xml](Get-Content -LiteralPath $goodWxs -Raw)
+        $glFiles = @($doc.GetElementsByTagName('File', '*') |
+            Where-Object { $_.GetAttribute('Name') -eq 'opengl32.dll' } |
+            ForEach-Object {
+                $p = $_.ParentNode
+                while ($p -and $p.LocalName -ne 'Directory') { $p = $p.ParentNode }
+                if ($p) { $p.GetAttribute('Name') } else { '<none>' }
+            })
+        $glOk = ($glFiles.Count -eq 1) -and ($glFiles[0] -eq 'gl')
+        # Every opengl32.dll in the package must be the one inside gl\.
+        $glHijack = ($glFiles.Count -eq 0) -or
+            (@($glFiles | Where-Object { $_ -ne 'gl' }).Count -gt 0)
+    }
+    Assert "B8 the WXS installs the fallback OpenGL under gl\" $glOk
+    Assert "B9 and nowhere else, so an install cannot hijack its own launch" (-not $glHijack)
+} elseif (-not $pyExe) {
+    Assert "B5 WXS generator located in build-msi.sh" $true
+    Skip "B6 generated WXS is well-formed XML" 'no python interpreter on PATH'
+    Skip "B7 a double hyphen in a WXS comment is caught" 'no python interpreter on PATH'
+    Skip "B8 the WXS installs the fallback OpenGL under gl\" 'no python interpreter on PATH'
+    Skip "B9 and nowhere else, so an install cannot hijack its own launch" 'no python interpreter on PATH'
+} else {
+    Assert "B5 WXS generator located in build-msi.sh" $true
+    $gen = $genMatch.Groups[1].Value
+    New-Item -ItemType Directory -Path (Join-Path $wxsWork 'share\sub') -Force | Out-Null
+    New-Item -ItemType Directory -Path (Join-Path $wxsWork 'gl') -Force | Out-Null
+    foreach ($f in @('exe.exe', 'com.com', 'agent.exe', 'share\a.txt', 'share\sub\b.txt',
+                     'gl\opengl32.dll', 'gl\LICENSE-Mesa.txt')) {
+        [IO.File]::WriteAllText((Join-Path $wxsWork $f), 'x')
+    }
+    $enc = New-Object Text.UTF8Encoding $false
+    $goodPy = Join-Path $wxsWork 'gen.py'
+    [IO.File]::WriteAllText($goodPy, $gen, $enc)
+    # argv: exe com agent share <out.wxs> <test-identity> <gl-dir>, exactly as
+    # build-msi.sh passes them. The identity is a NON-EMPTY fixture name on
+    # purpose: PowerShell 5.1 silently DROPS an empty-string argument to a
+    # native command, so `'', 'gl'` would arrive as a single `gl` in the
+    # identity slot and the gl directory would vanish from the package with
+    # every check still green. (That is exactly what B8 did on its first run.)
+    $genArgs = @('exe.exe', 'com.com', 'agent.exe', 'share')
+    $genTail = @('wxs-fixture', 'gl')
+    Push-Location $wxsWork
+    $goodOut = & $pyExe $goodPy @genArgs 'good.wxs' @genTail 2>&1 | ForEach-Object { "$_" } | Out-String
+    $goodRc = $LASTEXITCODE
+    # The negative control: reintroduce the exact 2026-08-31 defect.
+    $badPy = Join-Path $wxsWork 'gen-bad.py'
+    [IO.File]::WriteAllText($badPy, ($gen -replace '`pty-host`', '`--pty-host`'), $enc)
+    $badOut = & $pyExe $badPy @genArgs 'bad.wxs' @genTail 2>&1 | ForEach-Object { "$_" } | Out-String
+    $badRc = $LASTEXITCODE
+    Pop-Location
+    $wellFormed = $false
+    $goodWxs = Join-Path $wxsWork 'good.wxs'
+    if ($goodRc -eq 0 -and (Test-Path -LiteralPath $goodWxs)) {
+        try { [xml](Get-Content -LiteralPath $goodWxs -Raw) | Out-Null; $wellFormed = $true } catch { }
+    }
+    Assert "B6 generated WXS is well-formed XML" $wellFormed
+    if (-not $wellFormed) { "    $($goodOut.Trim())" }
+    Assert "B7 a double hyphen in a WXS comment is caught" (
+        $badRc -ne 0 -and $badOut -match 'not well-formed')
+    if ($badRc -eq 0) { "    the generator accepted a comment containing a double hyphen" }
+
+    # T1252: the fallback OpenGL implementation is installed, and installed
+    # under gl\ rather than beside ghoztty.exe. The second half is the one with
+    # no symptom: opengl32.dll is not a KnownDLL, so a component that put it in
+    # INSTALLDIR would be loaded on every launch and would silently move every
+    # user with a working GPU onto the fallback renderer. Read out of the
+    # generated WXS rather than asserted about the script's source text,
+    # because what ships is the package, not the intention.
+    # NOTE: on an XmlElement, `.Name` is the .NET node name ("Directory"), not
+    # the Name ATTRIBUTE - reading it that way makes every one of these checks
+    # pass vacuously, which is what B9 did on its first run.
+    $glOk = $false
+    $glHijack = $true
+    if ($wellFormed) {
+        $doc = [xml](Get-Content -LiteralPath $goodWxs -Raw)
+        $glDir = @($doc.GetElementsByTagName('Directory', '*') |
+            Where-Object { $_.GetAttribute('Name') -eq 'gl' })[0]
+        $inGl = if ($glDir) {
+            @($glDir.GetElementsByTagName('File', '*') |
+                Where-Object { $_.GetAttribute('Name') -eq 'opengl32.dll' })
+        } else { @() }
+        $glOk = ($null -ne $glDir) -and ($inGl.Count -eq 1)
+        # Every opengl32.dll in the package must be the one inside gl\.
+        $allGl = @($doc.GetElementsByTagName('File', '*') |
+            Where-Object { $_.GetAttribute('Name') -eq 'opengl32.dll' })
+        $glHijack = ($allGl.Count -eq 0) -or ($allGl.Count -ne $inGl.Count)
+    }
+    if (-not $glOk) {
+        "    DEBUG wxs=$goodWxs exists=$(Test-Path $goodWxs) dirs=$(@($doc.GetElementsByTagName('Directory','*') | ForEach-Object { $_.GetAttribute('Name') }) -join '|') glDir=$($null -ne $glDir) inGl=$($inGl.Count) allGl=$($allGl.Count) files=$(@($doc.GetElementsByTagName('File','*') | ForEach-Object { $_.GetAttribute('Name') }) -join '|')"
+    }
+    Assert "B8 the WXS installs the fallback OpenGL under gl\" $glOk
+    Assert "B9 and nowhere else, so an install cannot hijack its own launch" (-not $glHijack)
 }
 Remove-Item -LiteralPath $wxsWork -Recurse -Force -ErrorAction SilentlyContinue
 
