@@ -1,8 +1,8 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-01T10:07:08-07:00",
-    "commit":  "d478a198c",
+    "generated":  "2026-09-01T10:52:14-07:00",
+    "commit":  "a09636c44",
     "uncommitted":  [
                         "test/win32/startup-failure.ps1"
                     ],
@@ -218,7 +218,7 @@
                   "test/win32/split-dim-viewer.ps1":  "b557b55f71b6471c6b6691c2ab6474be8b86bad64e6a3df0a4ac9ef5c4516595",
                   "test/win32/split-divider.ps1":  "cf4eeef4cc31b15427bd2be83bb97e5edd88a0b055687312a3e17e4d66e16fcf",
                   "test/win32/split-zoom-nav.ps1":  "7ed3a76e0a6abc09573263efa8f7c7d3889ab31d6d8b258040ab7cf5e9882b12",
-                  "test/win32/startup-failure.ps1":  "907abe037271c671c5763af9ec1e3f6a7f7d5d44d1247a9dafd9ee463c8b3ae2",
+                  "test/win32/startup-failure.ps1":  "d7e7f618373e98f77212dfb51af35b4981e7428f5b3d014cfb7c119f02543271",
                   "test/win32/stderr-capture-audit.ps1":  "04424b778285df67f2eeed9c8ee354d1446c62a920ab8de56bf8b4475569cf9b",
                   "test/win32/suite-run.ps1":  "e71d56fdfaa3a9cc6b386fb38358df9e038ac764d6148578412b56ff49fb5a08",
                   "test/win32/tab-color.ps1":  "af75bcd47eeb68cf93ee056b7aa4e14e147314ab8b4adc3a9c0eb27dfb43f967",

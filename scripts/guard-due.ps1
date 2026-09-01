@@ -975,6 +975,10 @@ $GuardTable = @(
             'src\apprt\win32\startup_error.zig',
             'src\apprt\win32\ConfirmDialog.zig',
             'src\main_ghostty.zig',
+            # T1251: which GL implementation is chosen decides WHICH of arms E
+            # and F the user gets - an honest refusal or a working terminal on
+            # the fallback - so an edit here has to re-answer both.
+            'src\renderer\gl_loader.zig',
             'test\win32\startup-failure.ps1'
         )
     },

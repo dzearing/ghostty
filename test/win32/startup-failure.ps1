@@ -32,6 +32,13 @@
 #      the live dialog back and asserts it names the version actually found,
 #      names Remote Desktop as the usual cause, and does NOT send the user to
 #      reinstall.
+#   7. And when there IS something else to try, the terminal tries it instead of
+#      refusing (T1251). Arm F puts a fallback OpenGL implementation within
+#      reach of the same forced-1.1 state and asserts the app comes UP on it -
+#      window open, no dialog, and the log naming the implementation it drew
+#      with. Arm E and arm F are the two endings of the same condition, and
+#      neither is safe to ship without the other: E alone permits a build that
+#      never falls back, F alone permits a build that never refuses.
 #
 # The state in arm 1-4 is built with `GHOZTTY_STARTUP_FAIL=no-window`, a
 # DEBUG-ONLY seam in `App.run` that suppresses the startup window. It is the
@@ -88,6 +95,7 @@ $savedLocalAppData = $env:LOCALAPPDATA
 $savedSeam = $env:GHOZTTY_STARTUP_FAIL
 $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 $savedGlSeam = $env:GHOZTTY_GL_FORCE_VERSION
+$savedGlFallback = $env:GHOZTTY_GL_FALLBACK_DLL
 
 [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 600)
 New-Item -ItemType Directory -Force $root | Out-Null
@@ -303,6 +311,83 @@ try {
 
     Remove-Item env:GHOZTTY_GL_FORCE_VERSION -ErrorAction SilentlyContinue
 
+    # ========================================================================
+    "== F: a display below the floor falls back to a second GL instead of refusing"
+    # ========================================================================
+    # T1251. Arm E is the ending when there is nothing else to try; this is the
+    # ending when there is. The same forced-1.1 seam runs, but a fallback
+    # implementation is made available, so the app is expected to tear the first
+    # window down, load the fallback and OPEN - no dialog, nonzero exit or
+    # silence.
+    #
+    # The fallback used here is System32's own `opengl32.dll`, named by full
+    # path through the DEBUG-ONLY `GHOZTTY_GL_FALLBACK_DLL` seam. That is the
+    # honest thing to test with today: the shipped fallback arrives with T1252,
+    # and what this arm is asserting is the SELECTION - that the retry happens,
+    # that it loads a module chosen at run time, that the forced version applies
+    # to the system implementation only, and that the app comes up on the other
+    # one. `GHOZTTY_GL_FORCE_VERSION` is deliberately scoped to `.system` in the
+    # renderer for exactly this reason: a seam that also aged the fallback would
+    # make the fallback path impossible to observe.
+    [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 600)
+    $tmpF = Join-Path $root 'f'
+    New-Item -ItemType Directory -Force $tmpF | Out-Null
+    $env:LOCALAPPDATA = $tmpF
+    $env:GHOZTTY_GL_FORCE_VERSION = '1.1'
+    $env:GHOZTTY_GL_FALLBACK_DLL = Join-Path $env:SystemRoot 'System32\opengl32.dll'
+    Assert "F0 the stand-in fallback exists on this box" (Test-Path $env:GHOZTTY_GL_FALLBACK_DLL)
+
+    # Debug builds log to stderr, not to %LOCALAPPDATA%\ghoztty\ghoztty.log -
+    # the file sink is the release build's answer to having no console - so the
+    # renderer's own account of what it loaded is captured from the child's
+    # stderr here rather than read out of the log file.
+    $errF = Join-Path $tmpF 'stderr.txt'
+    $appF = Start-OnTestDesktop -Exe $Exe -Arguments @('--title=t1251-f') -StdErr $errF
+    $winF = Wait-TestWindow -ProcessId $appF.Pid -Class 'GhozttyWindow' -TimeoutMs 30000
+    Assert "F1 the terminal opened despite the system GL being below the floor" `
+        ($winF -ne [IntPtr]::Zero)
+    Assert "F2 and raised NO startup-failure dialog" `
+        (@(Get-TestWindows -ProcessId $appF.Pid -Class $DIALOG_CLASS -AllowHidden).Count -eq 0)
+
+    Start-Sleep -Milliseconds 500
+    $textF = if (Test-Path $errF) { (Get-Content $errF -Raw) } else { '' }
+    Assert "F3 it says a fallback implementation was taken" `
+        ($textF -match 'OpenGL implementation: fallback')
+    # The point of F4: without it, F1/F2 also pass on a build that simply
+    # stopped enforcing the floor. The renderer has to report that it is
+    # running on the OTHER implementation, not merely that it started.
+    Assert "F4 and that the context it drew with came from that implementation" `
+        ($textF -match 'impl=fallback')
+
+    [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 600)
+
+    # The negative control for arm F, and the one a user with a working GPU
+    # cares about most: a fallback being AVAILABLE must not be enough to be
+    # chosen. Same fallback in reach, no forced version - the terminal has to
+    # come up on the system implementation and never touch the other one. Without
+    # this, F passes just as well against a build that always falls back, which
+    # would quietly move every machine onto a software renderer.
+    $tmpG = Join-Path $root 'g'
+    New-Item -ItemType Directory -Force $tmpG | Out-Null
+    $env:LOCALAPPDATA = $tmpG
+    Remove-Item env:GHOZTTY_GL_FORCE_VERSION -ErrorAction SilentlyContinue
+
+    $errG = Join-Path $tmpG 'stderr.txt'
+    $appG = Start-OnTestDesktop -Exe $Exe -Arguments @('--title=t1251-g') -StdErr $errG
+    $winG = Wait-TestWindow -ProcessId $appG.Pid -Class 'GhozttyWindow' -TimeoutMs 30000
+    Assert "F5 a healthy display opens a window with the fallback still in reach" `
+        ($winG -ne [IntPtr]::Zero)
+    Start-Sleep -Milliseconds 500
+    $textG = if (Test-Path $errG) { (Get-Content $errG -Raw) } else { '' }
+    Assert "F6 and drew with the SYSTEM implementation, not the fallback" `
+        ($textG -match 'impl=system' -and $textG -notmatch 'impl=fallback')
+    Assert "F7 and never loaded the fallback at all" `
+        ($textG -notmatch 'OpenGL implementation: fallback')
+
+    [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 600)
+    Remove-Item env:GHOZTTY_GL_FALLBACK_DLL -ErrorAction SilentlyContinue
+    Remove-Item env:GHOZTTY_GL_FORCE_VERSION -ErrorAction SilentlyContinue
+
     # LAST statement of the top-level try (T1039): an unwind from anywhere above
     # must not be able to reach the verdict as if the run had finished.
     Complete-TestBody
@@ -313,6 +398,8 @@ try {
     else { Remove-Item env:GHOZTTY_STARTUP_FAIL -ErrorAction SilentlyContinue }
     if ($savedGlSeam) { $env:GHOZTTY_GL_FORCE_VERSION = $savedGlSeam }
     else { Remove-Item env:GHOZTTY_GL_FORCE_VERSION -ErrorAction SilentlyContinue }
+    if ($savedGlFallback) { $env:GHOZTTY_GL_FALLBACK_DLL = $savedGlFallback }
+    else { Remove-Item env:GHOZTTY_GL_FALLBACK_DLL -ErrorAction SilentlyContinue }
     $env:LOCALAPPDATA = $savedLocalAppData
     Remove-TestDesktop
     [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 600)
@@ -327,4 +414,4 @@ if ($script:failures -eq 0) {
 }
 
 Write-Host ''
-Write-TestVerdict -Pass $script:passes -Fail $script:failures -Label 'startup-failure' -MinPass 15
+Write-TestVerdict -Pass $script:passes -Fail $script:failures -Label 'startup-failure' -MinPass 23

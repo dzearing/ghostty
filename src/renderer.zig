@@ -58,6 +58,7 @@ test {
     _ = Renderer;
 
     _ = @import("renderer/gl_report.zig");
+    _ = @import("renderer/gl_loader.zig");
     _ = cursor;
     _ = message;
     _ = shadertoy;

@@ -14,6 +14,7 @@ const termio = @import("../../termio.zig");
 const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
 const remote_connection = @import("../../remote/connection.zig");
+const gl_loader = @import("../../renderer/gl_loader.zig");
 
 const App = @import("App.zig");
 const AgentIntegration = @import("AgentIntegration.zig");
@@ -512,9 +513,48 @@ pub const Overrides = struct {
     };
 };
 
-/// Initialize a new Surface by creating a Win32 window and WGL context,
-/// then initialize the core terminal surface (fonts, renderer, PTY, IO).
+/// Initialize a new Surface, retrying once against a fallback OpenGL
+/// implementation if the system one turns out to be below the renderer's
+/// version floor (T1251).
+///
+/// The retry is a WHOLE new window rather than a second context on the same
+/// one: a window's pixel format may be set exactly once, and a standalone GL
+/// implementation chooses its own formats, so reusing the device context the
+/// system driver already claimed is not a thing Windows allows. `initOnce`
+/// unwinds completely on failure — the context, the DC and the window all go
+/// back — so the second attempt starts from nothing, exactly as the first did.
+///
+/// When there is no fallback to try (the ordinary case today, and the case on
+/// any machine where the fallback is not installed) the original error is
+/// returned untouched and the T1249 startup dialog explains it.
 pub fn init(
+    self: *Surface,
+    app: *App,
+    parent: *Window,
+    context: apprt.surface.NewSurfaceContext,
+) !void {
+    self.initOnce(app, parent, context) catch |err| {
+        if (!gl_loader.shouldRetry(
+            err,
+            gl_loader.activeKind(),
+            gl_loader.fallbackAvailable(),
+        )) return err;
+
+        if (!gl_loader.switchToFallback()) return err;
+
+        log.warn(
+            "the display's OpenGL is below what the renderer needs ({}); " ++
+                "retrying with the fallback implementation",
+            .{err},
+        );
+        try self.initOnce(app, parent, context);
+    };
+}
+
+/// One attempt at creating the Win32 window and WGL context, then the core
+/// terminal surface (fonts, renderer, PTY, IO). See `init` for why this is a
+/// separate function.
+fn initOnce(
     self: *Surface,
     app: *App,
     parent: *Window,
@@ -584,11 +624,11 @@ pub fn init(
     try self.setupPixelFormat();
 
     // Create the WGL context
-    self.hglrc = w32.wglCreateContext(self.hdc.?);
+    self.hglrc = @ptrCast(gl_loader.active().createContext(@ptrCast(self.hdc.?)));
     if (self.hglrc == null) return error.Win32Error;
     errdefer {
-        _ = w32.wglMakeCurrent(null, null);
-        _ = w32.wglDeleteContext(self.hglrc.?);
+        _ = gl_loader.active().makeCurrent(null, null);
+        _ = gl_loader.active().deleteContext(@ptrCast(self.hglrc.?));
         self.hglrc = null;
     }
 
@@ -919,9 +959,9 @@ pub fn deinit(self: *Surface) void {
 
     if (self.hglrc) |hglrc| {
         log.debug("surface deinit: wglMakeCurrent(null)", .{});
-        _ = w32.wglMakeCurrent(null, null);
+        _ = gl_loader.active().makeCurrent(null, null);
         log.debug("surface deinit: wglDeleteContext", .{});
-        _ = w32.wglDeleteContext(hglrc);
+        _ = gl_loader.active().deleteContext(@ptrCast(hglrc));
         self.hglrc = null;
     }
     log.debug("surface deinit: GL context cleaned up", .{});
@@ -1068,10 +1108,14 @@ fn setupPixelFormat(self: *Surface) !void {
         .dwDamageMask = 0,
     };
 
-    const format = w32.ChoosePixelFormat(self.hdc.?, &pfd);
+    // Through the chosen implementation, not gdi32 directly (T1251): a
+    // standalone fallback such as Mesa's `opengl32.dll` owns its own pixel
+    // formats, and GDI knows nothing about them.
+    const gl = gl_loader.active();
+    const format = gl.choosePixelFormat(@ptrCast(self.hdc.?), &pfd);
     if (format == 0) return error.Win32Error;
 
-    if (w32.SetPixelFormat(self.hdc.?, format, &pfd) == 0)
+    if (gl.setPixelFormat(@ptrCast(self.hdc.?), format, &pfd) == 0)
         return error.Win32Error;
 }
 

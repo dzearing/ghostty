@@ -1954,18 +1954,14 @@ pub extern "gdi32" fn SwapBuffers(
     hdc: HDC,
 ) callconv(.winapi) i32;
 
-pub extern "opengl32" fn wglCreateContext(
-    hdc: HDC,
-) callconv(.winapi) ?HGLRC;
-
-pub extern "opengl32" fn wglMakeCurrent(
-    hdc: ?HDC,
-    hglrc: ?HGLRC,
-) callconv(.winapi) i32;
-
-pub extern "opengl32" fn wglDeleteContext(
-    hglrc: HGLRC,
-) callconv(.winapi) i32;
+// The WGL entry points are deliberately NOT declared here (T1251). They are
+// resolved at run time from whichever OpenGL implementation `gl_loader` chose,
+// so that a display driver below the renderer's version floor - which is what
+// a Remote Desktop session hands us - has a second implementation to try.
+// Declaring them `extern "opengl32"` would also put an unavoidable import in
+// the exe, and since `opengl32.dll` is not a KnownDLL, a copy laid down beside
+// `ghoztty.exe` would then be loaded ahead of System32's on EVERY launch.
+// Call `renderer.gl_loader.active()` instead.
 
 // -----------------------------------------------------------------------
 // TrackMouseEvent API (for WM_MOUSELEAVE tracking)

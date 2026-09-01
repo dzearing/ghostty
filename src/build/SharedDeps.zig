@@ -608,7 +608,11 @@ pub fn add(
             .win32 => {
                 // Link Windows system libraries for the Win32 runtime.
                 if (step.rootModuleTarget().os.tag == .windows) {
-                    step.linkSystemLibrary2("opengl32", .{});
+                    // NOT opengl32 (T1251): the WGL entry points are
+                    // resolved at run time so a display below the renderer's
+                    // version floor can be given a second implementation, and
+                    // so that an `opengl32.dll` beside the exe - not a
+                    // KnownDLL - cannot pre-empt System32's for every launch.
                     step.linkSystemLibrary2("gdi32", .{});
                     step.linkSystemLibrary2("user32", .{});
                     step.linkSystemLibrary2("dwrite", .{});

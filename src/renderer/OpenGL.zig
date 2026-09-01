@@ -11,6 +11,7 @@ const font = @import("../font/main.zig");
 const configpkg = @import("../config.zig");
 const rendererpkg = @import("../renderer.zig");
 const gl_report = @import("gl_report.zig");
+const gl_loader = @import("gl_loader.zig");
 const build_config = @import("../build_config.zig");
 const Renderer = rendererpkg.GenericRenderer(OpenGL);
 
@@ -35,15 +36,14 @@ pub const swap_chain_count = 1;
 
 const log = std.log.scoped(.opengl);
 
-/// WGL declarations for Win32 OpenGL context management.
-/// Only defined when building for the win32 apprt.
+/// Win32 window declarations used alongside the GL context. The GL and WGL
+/// entry points themselves are NOT here any more: they are resolved at run time
+/// out of whichever implementation `gl_loader` chose, so that a machine whose
+/// display driver cannot meet the version floor has a second one to try
+/// (T1251). Binding them statically would also mean an `opengl32.dll` sitting
+/// beside the exe was loaded for every launch, which is the hijack that made
+/// the fallback unsafe to ship.
 const wgl = if (apprt.runtime == apprt.win32) struct {
-    extern "opengl32" fn wglMakeCurrent(
-        hdc: ?*anyopaque,
-        hglrc: ?*anyopaque,
-    ) callconv(.c) i32;
-    extern "opengl32" fn wglGetCurrentDC() callconv(.c) ?*anyopaque;
-    extern "gdi32" fn SwapBuffers(hdc: ?*anyopaque) callconv(.c) i32;
     extern "user32" fn WindowFromDC(hdc: ?*anyopaque) callconv(.c) ?std.os.windows.HWND;
     const RECT = extern struct { left: i32, top: i32, right: i32, bottom: i32 };
     extern "user32" fn GetClientRect(
@@ -188,6 +188,15 @@ fn glString(name: gl.c.GLenum) []const u8 {
 fn forcedVersion() ?struct { major: u32, minor: u32 } {
     if (comptime !build_config.is_debug) return null;
 
+    // Only ever applied to the SYSTEM implementation. The state being
+    // simulated is "this machine's display driver is too old", and a seam that
+    // also aged the fallback would make the fallback path untestable - the
+    // retry would land on a context that reports 1.1 as well and the app would
+    // refuse exactly as if nothing had been tried (T1251).
+    if (comptime apprt.runtime == apprt.win32) {
+        if (gl_loader.activeKind() != .system) return null;
+    }
+
     const raw = std.process.getEnvVarOwned(
         std.heap.page_allocator,
         "GHOZTTY_GL_FORCE_VERSION",
@@ -225,11 +234,15 @@ fn prepareContext(getProcAddress: anytype) !void {
     report.minor = minor;
     gl_report.record(report);
 
-    log.info("loaded OpenGL {}.{} renderer=\"{s}\" vendor=\"{s}\"", .{
+    log.info("loaded OpenGL {}.{} renderer=\"{s}\" vendor=\"{s}\" impl={s}", .{
         major,
         minor,
         report.renderer.slice(),
         report.vendor.slice(),
+        if (comptime apprt.runtime == apprt.win32)
+            gl_loader.activeKind().label()
+        else
+            "system",
     });
 
     // Need to check version before trying to enable it
@@ -275,13 +288,17 @@ pub fn surfaceInit(surface: *apprt.Surface) !void {
             const hdc = surface.hdc orelse return error.InvalidSurface;
             const hglrc = surface.hglrc orelse return error.InvalidSurface;
 
-            if (wgl.wglMakeCurrent(hdc, hglrc) == 0)
+            if (gl_loader.active().makeCurrent(hdc, hglrc) == 0)
                 return error.WGLMakeCurrentFailed;
 
-            // Load GL functions. Passing null tells GLAD to use its
-            // built-in loader which on Windows uses opengl32.dll +
-            // wglGetProcAddress.
-            try prepareContext(null);
+            // Load GL functions through the implementation `gl_loader`
+            // chose. Passing null here would send GLAD to its own built-in
+            // loader, which does its own `LoadLibraryA("opengl32.dll")` and
+            // would undo the runtime selection entirely (T1251).
+            // Explicitly typed so glad's loader dispatch matches on the type
+            // rather than falling through to its `@ptrCast` branch.
+            const loader: gl_loader.GladLoadFn = gl_loader.gladLoad;
+            try prepareContext(loader);
 
             // NOTE: We intentionally do NOT release the context here.
             // Renderer.init() needs a current GL context to create resources.
@@ -310,7 +327,7 @@ pub fn finalizeSurfaceInit(self: *const OpenGL, surface: *apprt.Surface) !void {
     // was kept current since surfaceInit to allow Renderer.init() to
     // create GL resources.
     if (comptime apprt.runtime == apprt.win32) {
-        _ = wgl.wglMakeCurrent(null, null);
+        _ = gl_loader.active().makeCurrent(null, null);
     }
 }
 
@@ -339,12 +356,17 @@ pub fn threadEnter(self: *const OpenGL, surface: *apprt.Surface) !void {
             const hdc = surface.hdc orelse return error.InvalidSurface;
             const hglrc = surface.hglrc orelse return error.InvalidSurface;
 
-            if (wgl.wglMakeCurrent(hdc, hglrc) == 0)
+            if (gl_loader.active().makeCurrent(hdc, hglrc) == 0)
                 return error.WGLMakeCurrentFailed;
 
             // Reload GL functions on this thread since OpenGL is
-            // thread-local state.
-            try prepareContext(null);
+            // thread-local state. Same loader as the main thread used, so a
+            // pane never ends up half on one implementation and half on the
+            // other.
+            // Explicitly typed so glad's loader dispatch matches on the type
+            // rather than falling through to its `@ptrCast` branch.
+            const loader: gl_loader.GladLoadFn = gl_loader.gladLoad;
+            try prepareContext(loader);
         },
     }
 }
@@ -367,7 +389,7 @@ pub fn threadExit(self: *const OpenGL) void {
 
         apprt.win32 => {
             // Release the WGL context from the renderer thread.
-            _ = wgl.wglMakeCurrent(null, null);
+            _ = gl_loader.active().makeCurrent(null, null);
         },
     }
 }
@@ -388,7 +410,7 @@ pub fn displayRealized(self: *const OpenGL) void {
             // renderer thread can make it current in threadEnter.
             // The context was kept current since surfaceInit to allow
             // Renderer.init() to create GL resources.
-            _ = wgl.wglMakeCurrent(null, null);
+            _ = gl_loader.active().makeCurrent(null, null);
         },
 
         else => @compileError("only GTK should be calling displayRealized"),
@@ -415,8 +437,8 @@ pub fn drawFrameEnd(self: *OpenGL) void {
         return;
     }
 
-    const hdc = wgl.wglGetCurrentDC();
-    if (hdc != null) _ = wgl.SwapBuffers(hdc);
+    const hdc = gl_loader.active().getCurrentDC();
+    if (hdc != null) _ = gl_loader.active().swapBuffers(hdc);
     perf.frame(self.rt_surface);
 }
 
@@ -500,7 +522,7 @@ pub fn surfaceSize(self: *const OpenGL) !struct { width: u32, height: u32 } {
     if (comptime apprt.runtime == apprt.win32) {
         // Use the thread-local WGL DC to find our HWND, then query
         // the actual window client rect for the current size.
-        const hdc = wgl.wglGetCurrentDC() orelse return error.NoCurrentContext;
+        const hdc = gl_loader.active().getCurrentDC() orelse return error.NoCurrentContext;
         const hwnd = wgl.WindowFromDC(hdc) orelse return error.NoWindow;
         var rect: wgl.RECT = undefined;
         if (wgl.GetClientRect(hwnd, &rect) != 0) {

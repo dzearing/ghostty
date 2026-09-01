@@ -19095,3 +19095,51 @@ meantime needed none of that and should not have waited behind it.
 Floor: lib/none/win32/agent ALL LANES PASS; `startup-failure.ps1` ALL PASS (26,
 five of them new), ipc-p1/p2/p3 ALL PASS, and the eight meta-audits re-run for
 the edited script.
+
+## 2026-09-01 - Ghoztty picks its graphics driver when it starts, and falls back when the system one is too old (T1251)
+
+T1249 made the Remote Desktop refusal honest. This is the half that gives it
+something to do instead of refusing: when the display driver's OpenGL measures
+below what the renderer needs, Ghoztty now tears the window down, loads a second
+implementation and comes up on that one.
+
+The prerequisite was runtime resolution, and it is not a detail. `opengl32.dll`
+is not a KnownDLL, so a fallback copy laid down beside `ghoztty.exe` would
+satisfy the static import for EVERY launch - every machine with a perfectly good
+GPU silently moved onto a software renderer, with nothing said about it. So the
+WGL entry points left `win32.zig` and `OpenGL.zig`, `SharedDeps.zig` stopped
+linking `opengl32`, glad stopped being loaded with a null loader (its built-in
+one does its own `LoadLibraryA("opengl32.dll")`), and `src/renderer/gl_loader.zig`
+now opens one named implementation and resolves everything out of it: System32
+by explicit search, or a fallback by full path from `<install>\gl\opengl32.dll`.
+`dumpbin /imports` on the built exe lists nineteen DLLs and OPENGL32 is not
+among them.
+
+The design call worth recording: the fallback is taken ON FAILURE, never chosen
+by probing at startup. A probe would mean creating and destroying a throwaway GL
+context before the first window on every launch - tens to hundreds of
+milliseconds for every user - to answer a question whose answer is "system" on
+essentially every machine. `Surface.init` splits into a retry wrapper and
+`initOnce` instead, and the retry builds a WHOLE new window, because a pixel
+format may be set exactly once per device context and a standalone GL chooses
+its own formats. The retry is keyed on the measured context and not on
+`SM_REMOTESESSION`: a weak GPU and a VM produce this failure with no RDP in
+sight.
+
+`GHOZTTY_GL_FORCE_VERSION` now applies to the system implementation only, which
+is what makes any of this observable on a box with working graphics. Arms E and
+F of `startup-failure.ps1` are the two endings of one condition and neither is
+safe alone: E (nothing to fall back to - the honest dialog, nonzero exit) permits
+a build that never falls back, F (a fallback in reach - window, no dialog, the
+log naming what it loaded and what it drew with) permits a build that never
+refuses. F5-F7 is the control the user with a working GPU actually cares about:
+the fallback is available and still not taken.
+
+T1250 is split into this, T1252 (ship the fallback binary: pick between Mesa's
+`opengl32.dll` and ANGLE, vendor it reproducibly, carry it through the installer
+and the portable zip's manifest) and T1253 (prove it inside a real RDP session,
+which the forced-version seam cannot stand in for).
+
+Floor: lib/none/win32/agent ALL LANES PASS; `startup-failure.ps1` ALL PASS (34,
+eight of them new), ipc-p1/p2/p3 ALL PASS, and the nine meta-audits re-run for
+the edited script.
