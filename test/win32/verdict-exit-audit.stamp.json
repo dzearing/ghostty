@@ -1,15 +1,10 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-09-01T04:42:02-07:00",
-    "commit":  "ef6c9002a",
+    "generated":  "2026-09-01T05:57:25-07:00",
+    "commit":  "30bc22b04",
     "uncommitted":  [
-                        "test/win32/desktop-launch-audit.ps1",
-                        "test/win32/ipc-p1.ps1",
-                        "test/win32/ipc-p2.ps1",
-                        "test/win32/ipc-p3.ps1",
-                        "test/win32/lib/DesktopLaunchAudit.ps1",
-                        "test/win32/lib/TestDesktop.ps1"
+                        "test/win32/update-real-msi.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -272,6 +267,7 @@
                   "test/win32/title-jitter.ps1":  "305bd304faf09988c8852f7fa69f2c780212b639fb837085b5869ab5457acab7",
                   "test/win32/update-apply.ps1":  "22337598028ad72f60b50c9cd6272eb26b6e07ecd39d52e29ecdc328cee28111",
                   "test/win32/update-check.ps1":  "a30b6268ce08a7da0295566c914649e9190b4b77b980a5da7eeb155b5bbd9e21",
+                  "test/win32/update-real-msi.ps1":  "134c0f378f3c6dfec951e005ae4fa6e3b8d91cae13efcee691f7882b5c6bdcab",
                   "test/win32/upgrade-no-fork.ps1":  "76264704b07c6d8267edda9d19349210a5462999cc8321b7c6b4d1f5e09df56c",
                   "test/win32/upgrade-resume-readiness.ps1":  "9df12a1d37c47dddc89f67af6056dd1c850a055e8b11b119ba272f24922e61f8",
                   "test/win32/upgrade-staleness.ps1":  "ca280a6b9c10b9a96d354f640b3c76b500ff9ae3f3af3e5723e942268cbd1be8",

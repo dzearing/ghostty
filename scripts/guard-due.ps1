@@ -1016,6 +1016,27 @@ $GuardTable = @(
             'test\win32\update-check.ps1'
         )
     },
+    # The last inch of the update, which update-apply cannot reach: msiexec
+    # SUCCEEDING (T1194). It installs a REAL published win-v release under a
+    # throwaway product identity, lets the app find and stage the next one, and
+    # runs the applier for real - so it is the only thing in the suite that can
+    # say the version on disk actually moved, that a live session's holder
+    # survived it, and that the sidelined image is gone after the next launch.
+    # The identity rewriter is covered too: a package it half-rewrites installs
+    # fine and then cannot be upgraded or removed, which is a failure with no
+    # symptom until somebody tries.
+    [pscustomobject]@{
+        Name   = 'update-real-msi'
+        Script = 'test\win32\update-real-msi.ps1'
+        Stamp  = 'test\win32\update-real-msi.stamp.json'
+        Covers = @(
+            'src\apprt\win32\update_apply.zig',
+            'src\apprt\win32\update_install.zig',
+            'scripts\msi-test-identity.ps1',
+            'dist\windows-installer\build-msi.sh',
+            'test\win32\update-real-msi.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'website-windows-links'
         Script = 'test\win32\website-windows-download.ps1'

@@ -9,6 +9,57 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-01: T1194 - **the in-app update is now watched succeeding, on a real published release, with the version on disk moving afterwards.** T1178 built the whole path and could test everything except its last inch: `update-apply.ps1` runs msiexec against a package msiexec REJECTS, because a real install would have replaced the user's terminal. So "the new version is actually there" was the one claim nothing in the suite could make - and it is the claim the feature exists for.
+  The way in was to isolate the PACKAGE rather than rebuild it.
+  `scripts\msi-test-identity.ps1` takes a published `Ghoztty-<v>-x64.msi` and
+  rewrites only what decides where the product lands and what it is called -
+  ProductCode, UpgradeCode (in `Property` AND in the `Upgrade` table that
+  drives the major upgrade), ProductName, INSTALLDIR, all 578 component GUIDs,
+  the registry key, the Start Menu name, the PackageCode. The payload, the
+  File/Media tables, the cabinet, the sequences and the custom actions stay the
+  bytes that shipped. `build-msi.sh --test-identity` already knows this trick,
+  but it rebuilds with wixl - Linux, therefore Docker, and no longer the
+  published artifact. Every new GUID is derived (sha1 v5 over the identity plus
+  a seed), so the same identity always yields the same product and a leaked
+  install is always uninstallable.
+  `test\win32\update-real-msi.ps1` then walks it: install published
+  `win-v1.35.0` into `%LOCALAPPDATA%\Programs\GhozttyT1194Test`, point the app
+  at a canned feed offering published `win-v1.36.0`, let it download and stage
+  that package for real, arm the applier exactly as `arm()` does (a copy of the
+  exe in the staging directory, the spec in `GHOZTTY_UPDATE_APPLY`), and read
+  the result. 30 checks, ALL PASS: applier exit 0 - which it returns only when
+  msiexec returned 0 AND the terminal relaunched - `+version` moving 1.35.0 to
+  1.36.0, Apps & Features moving 26.8.3108 to 26.8.3110 as ONE product rather
+  than two, a live pty-host holder still running afterwards (the rename-aside
+  design's whole purpose, and nothing else in the suite could observe it), and
+  the sidelined agent image swept by the next launch. The user's install
+  directory is measured across the run - file count and `ghoztty.exe` mtime -
+  and does not move. What is still not driven is the tray balloon click and the
+  "Install and Restart" dialog; those are two mouse events in front of
+  `applyStagedUpdate`, and `update-apply.ps1` covers the shape behind them.
+  Three defects in the MSI writer were paid for on the way, each silent by
+  construction. A view `Modify` during its own enumeration re-sorts the table
+  under the cursor: rows are skipped and blanked. A structural edit RENUMBERS
+  the string pool, so cells written earlier in the same session read back as
+  somebody else's data - re-keying `Upgrade` left `ProductCode` reading
+  "OLDERVERSIONFOUND" and `ProductVersion` reading "0.0.0". And wixl records a
+  refcount of 1 for a string four cells use: "Ghoztty" is ProductName, the
+  install directory's name, the shortcut's name AND the one Feature's name, so
+  rewriting ProductName ALONE freed it and blanked `Feature`.`Feature` plus all
+  578 `FeatureComponents` rows. That package installs perfectly and then cannot
+  be upgraded or uninstalled - "Error 2711: The specified Feature name ('') not
+  found in Feature Table" - which is exactly the operation it was built to
+  test. The answer is that the rewriter now snapshots all 9,618 cells of the
+  published database first, restores blanked primary keys with
+  msiViewModifyReplace, diffs everything else back to the published values, and
+  refuses to emit a package it cannot verify. A half-rewritten one still
+  carrying the real UpgradeCode is the single artifact nobody may be handed, so
+  a failed verification deletes the file.
+  Registered with the staleness guard as `update-real-msi` over
+  `update_apply.zig`, `update_install.zig`, `msi-test-identity.ps1` and
+  `build-msi.sh`; only a clean, non-skipped run stamps, so a box with no
+  network leaves the guard due instead of claiming a pass.
+  Floor: lib/none/win32/agent ALL LANES PASS; ipc-p1/p2/p3 ALL PASS.
 - 2026-09-01: T1185 - **a markdown or code viewer pane now has its address bar from the moment it opens, instead of hiding it until you find the top edge with the mouse.** Those were the last two modes still peeking: the bar slid in when the pointer reached a 20-DIP strip, pushed the document down 45 px as it arrived, and took it back two seconds later - so the one control that gets you out of the pane was the one you had to hunt for, and the text you were reading moved while you hunted. Main removed the peek outright on 2026-08-26 (`fc7e36356`); this is the Windows half.
   The bar is now part of a viewer pane's FRAME. It is created `WS_VISIBLE` and
   never hidden, so `ViewerNavBar` has no `setVisible` at all, and the pane's
