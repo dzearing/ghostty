@@ -161,11 +161,25 @@ if ($ssNote.Success) {
     $ssText = $ssNote.Groups[1].Value
     Assert 'A15b it names SmartScreen and the dialog wording' `
         ($ssText -match 'SmartScreen' -and $ssText -match 'Windows protected your PC')
-    Assert 'A15c it says what to click' `
-        ($ssText -match 'More info' -and $ssText -match 'Run anyway')
+    # It must name the button that is actually on the dialog, and lead with
+    # it. The note used to instruct "choose More info, then Run anyway" as
+    # though that were the only shape; on 2026-08-31 the user ran the MSI on
+    # a clean machine and got Run anyway and Don't run directly, with no More
+    # info link (T1203). A page that tells someone to look for a control that
+    # is not there reads as a page describing a different program.
+    Assert 'A15c it says what to click, leading with Run anyway' `
+        ($ssText -match 'Run anyway' -and
+         $ssText.IndexOf('Run anyway') -lt $ssText.IndexOf('More info'))
+    Assert 'A15c2 More info is offered as the conditional second shape' `
+        ($ssText -match 'More info')
     # It must not claim the Windows build is signed -- the section header
     # says "signed and notarized on macOS" and this line is the other half.
     Assert 'A15d it says the build is not signed' ($ssText -match 'not code-signed|unsigned')
+    # And it must read as a MITIGATION rather than a blessing (T1203): the
+    # instruction tells Windows to run something it does not recognize, and
+    # the page is the only place that can say so before someone does it.
+    Assert 'A15e it frames the override as a workaround, not trust' `
+        ($ssText -match 'override' -or $ssText -match 'not a sign that|not a sign the')
 }
 # Same design-system rule as A14: the caveat reuses .download-note rather
 # than introducing a class of its own.

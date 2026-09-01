@@ -478,6 +478,118 @@ Assert "F6 a build with no id says so instead of shipping quietly" `
 # names one reads as a script that drives the CLI without a private endpoint.)
 
 # ============================================================================
+"== G: the release payload is Authenticode-signable (T1203)"
+# ============================================================================
+# macOS ships signed and notarized; Windows shipped unsigned, so the first
+# thing a new user met was SmartScreen's "Windows protected your PC / Unknown
+# publisher" wall. The certificate itself is the user's to obtain, so what is
+# asserted here is the PIPELINE: that the day a .pfx lands in the repo secrets
+# every release is signed with no further code change, and that until then a
+# release still builds and says plainly that it did not sign anything.
+$signShPath = Join-Path $Repo 'dist\windows-installer\sign-artifacts.sh'
+Assert "G1 the signing script exists" (Test-Path -LiteralPath $signShPath)
+$signSh = if (Test-Path -LiteralPath $signShPath) { Get-Content -LiteralPath $signShPath -Raw } else { '' }
+
+# It lives in the SHARED build script, not in the workflow: a signing step
+# only CI runs is a step scripts\publish-windows-release.ps1 never runs, and
+# then one channel ships signed bits and the other does not.
+Assert "G2 the shared build script signs the payload" `
+    ($shared -match 'sign-artifacts\.sh')
+# Before the packages are cut. The MSI and the portable ZIP are built FROM
+# these three binaries, so signing them here is what makes BOTH packages
+# carry signed bits; signing only the MSI wrapper leaves every portable-ZIP
+# user exactly as unknown to SmartScreen as before.
+$signPayloadAt = $shared.IndexOf('zig-out/bin/ghoztty-agent.exe')
+# The MSI BUILD, not the earlier --print-file-version query of the same script.
+$msiBuildAt = $shared.IndexOf('build-msi.sh" --skip-build')
+Assert "G3 the payload is signed before the MSI is built" `
+    ($signPayloadAt -ge 0 -and $msiBuildAt -ge 0 -and $signPayloadAt -lt $msiBuildAt)
+foreach ($bin in @('ghoztty.exe', 'ghoztty.com', 'ghoztty-agent.exe')) {
+    Assert "G4 $bin is in the signed set" `
+        ($shared -match ('zig-out/bin/' + [regex]::Escape($bin) + '"'))
+}
+# And the MSI on top of it: that is the file the user downloads and
+# double-clicks, so it is the one SmartScreen judges.
+Assert "G5 the MSI itself is signed too" `
+    ($shared -match 'sign-artifacts\.sh" "\$MSI"')
+
+# The workflow supplies the toolchain and the secrets, and does so as ENV
+# rather than interpolated into a `run:` body, so the value never reaches a
+# command line and cannot land in a public log.
+Assert "G6 the release workflow installs osslsigncode" `
+    ($wf -match 'osslsigncode')
+Assert "G7 the certificate arrives as an env secret" `
+    ($wf -match '(?m)^\s*WINDOWS_SIGN_PFX_BASE64: \$\{\{ secrets\.WINDOWS_SIGN_PFX_BASE64 \}\}')
+Assert "G8 its password arrives the same way" `
+    ($wf -match '(?m)^\s*WINDOWS_SIGN_PASSWORD: \$\{\{ secrets\.WINDOWS_SIGN_PASSWORD \}\}')
+Assert "G9 nothing echoes the certificate or its password" `
+    (-not ($wf -match 'echo[^\r\n]*WINDOWS_SIGN') -and
+     -not ($signSh -match 'echo[^\r\n]*\$(PFX_B64|\{?WINDOWS_SIGN_PASSWORD)'))
+# argv is visible to every process on the box, so the password goes through a
+# file (-readpass), never as an option value.
+Assert "G10 the password is passed by file, not on the command line" `
+    ($signSh -match '-readpass' -and -not ($signSh -match '-pass\s'))
+# SHA-1 Authenticode is trusted by no supported Windows, and an untimestamped
+# signature stops being trusted the day the certificate expires -- which would
+# retroactively break every build already in the field.
+Assert "G11 it signs with SHA-256" ($signSh -match '-h sha256')
+Assert "G12 it timestamps the signature" ($signSh -match '-ts "\$TIMESTAMP_URL"')
+# "osslsigncode returned 0" is the same class of evidence as "Copy-Item did
+# not throw". Read it back.
+Assert "G13 it verifies the signature before installing it" `
+    ($signSh -match 'osslsigncode verify')
+
+# Now RUN it, because a gate nobody has watched fail is indistinguishable
+# from a gate that cannot fail (T1133).
+if (-not $bash) {
+    Skip 'G14 the unsigned path really exits 0' 'no bash on this box'
+    Skip 'G15 a configured-but-unusable certificate really fails' 'no bash on this box'
+    Skip 'G16 a missing input is a usage error' 'no bash on this box'
+} else {
+    # Section B's $work is gone by now (it cleans up after itself), so this
+    # section owns its own scratch dir.
+    $signWork = Join-Path ([IO.Path]::GetTempPath()) "release-signing-$PID"
+    New-Item -ItemType Directory -Path $signWork -Force | Out-Null
+    $sample = Join-Path $signWork 'sign-sample.bin'
+    [IO.File]::WriteAllBytes($sample, [byte[]](1..64))
+    $before = (Get-FileHash -LiteralPath $sample -Algorithm SHA256).Hash
+    $signUnix = ConvertTo-MsysPath $signShPath
+    $sampleUnix = ConvertTo-MsysPath $sample
+
+    # No certificate configured: build, say so loudly, exit 0, touch nothing.
+    # A release must never be held hostage to a certificate the build cannot
+    # obtain for itself.
+    $out = & $bash -c "unset WINDOWS_SIGN_PFX_BASE64; bash '$signUnix' '$sampleUnix' 2>&1"
+    $code = $LASTEXITCODE
+    $outText = ($out | Out-String)
+    Assert "G14 the unsigned path really exits 0" `
+        ($code -eq 0 -and $outText -match 'NOT CONFIGURED' -and $outText -match 'UNSIGNED' -and
+         (Get-FileHash -LiteralPath $sample -Algorithm SHA256).Hash -eq $before)
+
+    # Configured and unusable is the OPPOSITE call: a release that claims to
+    # be signed and is not is worse than an openly unsigned one, so this is a
+    # hard failure rather than a fallback to unsigned.
+    $out = & $bash -c "export WINDOWS_SIGN_PFX_BASE64='!!!not base64!!!'; bash '$signUnix' '$sampleUnix' 2>&1"
+    $code = $LASTEXITCODE
+    $outText = ($out | Out-String)
+    Assert "G15 a configured-but-unusable certificate really fails" `
+        ($code -eq 1 -and $outText -match '::error::' -and
+         (Get-FileHash -LiteralPath $sample -Algorithm SHA256).Hash -eq $before)
+
+    # Called after the thing it signs is built, so an absent input is a
+    # caller bug, not a signing failure -- distinct exit code, distinct blame.
+    $missingUnix = ConvertTo-MsysPath (Join-Path $signWork 'does-not-exist.bin')
+    $null = & $bash -c "unset WINDOWS_SIGN_PFX_BASE64; bash '$signUnix' '$missingUnix' 2>&1"
+    $usageCode = $LASTEXITCODE
+    $null = & $bash -c "bash '$signUnix' 2>&1"
+    $noArgCode = $LASTEXITCODE
+    Assert "G16 a missing input is a usage error" `
+        ($usageCode -eq 2 -and $noArgCode -eq 2)
+
+    Remove-Item -LiteralPath $signWork -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ============================================================================
 if ($Full) {
     "== D: the on-box publish, end to end (-DryRun)"
     # ============================================================================

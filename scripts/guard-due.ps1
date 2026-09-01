@@ -784,6 +784,7 @@ $GuardTable = @(
             '.github\workflows\fork-ci.yml',
             'dist\windows-installer\build-release-artifacts.sh',
             'dist\windows-installer\install-msitools.sh',
+            'dist\windows-installer\sign-artifacts.sh',
             'scripts\publish-windows-release.ps1',
             'test\win32\release-artifacts.ps1'
         )

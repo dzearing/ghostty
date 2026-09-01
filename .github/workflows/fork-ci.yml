@@ -177,6 +177,12 @@ jobs:
       # exercising every real step: the ReleaseFast x86_64-windows-gnu
       # cross-compile, the version-string embedding check, wixl's MSI build
       # (PATH component included), and the portable-ZIP layout gates.
+      #
+      # Deliberately NOT signed (T1203): the signing secrets are not passed
+      # here, so sign-artifacts.sh takes its unsigned path and says so. A
+      # per-commit artifact nobody downloads has nothing to gain from the
+      # release certificate, and everything to lose by being one more place it
+      # is decrypted.
       - name: Build Windows release artifacts (not published)
         if: steps.detect.outputs.present == 'true'
         run: |

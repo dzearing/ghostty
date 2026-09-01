@@ -18953,3 +18953,51 @@ ecord writes one row per boot to temp\go-loop-boots.jsonl, is idempotent on the 
   and a `# preflight: none` marker (its fixtures are string literals holding the
   very launch sites it detects), and its section-E `try/finally` had an unwind
   path to a green verdict.
+
+## 2026-09-01 - a Windows release will sign itself the day it has a certificate (T1203)
+
+Downloading Ghoztty for Windows and double-clicking the installer raises a
+full-screen "Windows protected your PC", publisher **Unknown**. macOS ships
+signed and notarized; Windows shipped nothing at all, and that asymmetry lands
+on the exact sentence the install epic exists to make true.
+
+The certificate itself cannot be bought by this seat - it needs payment and
+identity validation - so the task splits at that line, and what landed here is
+the whole pipeline behind it. `dist/windows-installer/sign-artifacts.sh` signs
+with `osslsigncode` (PE and MSI both, from a Linux runner, since the release
+cross-compiles and there is no Windows box in CI), and it is called from the
+SHARED `build-release-artifacts.sh` rather than from the workflow - the same
+rule that keeps CI and the on-box publish from drifting. It signs
+`ghoztty.exe`, `ghoztty.com` and `ghoztty-agent.exe` BEFORE the packages are
+cut, so the portable ZIP carries signed bits too rather than only the MSI
+wrapper, then the MSI on top. SHA-256, RFC3161-timestamped so shipped builds
+stay trusted past the certificate's expiry, and read back with `osslsigncode
+verify` before the signed file replaces the original.
+
+The two states that matter are opposite calls, deliberately. No certificate
+configured: build, print an UNSIGNED banner naming the task, exit 0 - no
+release may be held hostage to a certificate the build cannot obtain. A
+certificate configured that does not work: hard failure, because a release
+claiming to be signed and not being so is worse than an openly unsigned one.
+Both are RUN in section G rather than asserted about, along with the usage
+error for a missing input, so the gate has been watched failing (T1133). The
+password goes through `-readpass` and never argv; neither secret is ever
+echoed.
+
+Also corrected on the way past: the site told people to choose **More info**
+then **Run anyway**. The dialog the user actually got offered **Run anyway**
+and **Don't run** directly, so the page was describing a control that is not
+there. It now leads with the button on the dialog, offers More info as the
+conditional second shape, and says plainly that clicking through overrides the
+warning rather than meaning the file is trusted. Pushed to gh-pages and the
+in-repo mirror re-synced.
+
+Filed T1246 for the certificate and D87 for the question that precedes it -
+EV (no warning from the first download, hardware or cloud key, more money) vs
+OV (publisher named immediately, but SmartScreen keeps warning until download
+volume builds reputation). That one is the user's because they can tell the
+two apart by using the product.
+
+Floor: lib/none/win32/agent ALL LANES PASS; `release-artifacts.ps1` ALL PASS
+(1 skipped - Docker down by design) and `website-windows-download.ps1` ALL
+PASS, including F1 against the deployed page.

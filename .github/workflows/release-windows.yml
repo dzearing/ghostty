@@ -91,6 +91,14 @@ jobs:
       - name: Build and install msitools 0.106 (wixl, msiinfo, msibuild)
         run: dist/windows-installer/install-msitools.sh
 
+      # osslsigncode is what Authenticode-signs the payload and the MSI from a
+      # Linux runner (T1203). Installed unconditionally, even though signing
+      # is a no-op without the certificate secret: a toolchain that is only
+      # present on the runs that use it is a toolchain whose absence is
+      # discovered by the first release that needs it.
+      - name: Install osslsigncode
+        run: sudo apt-get update && sudo apt-get install -y osslsigncode
+
       - name: Set release variables
         run: |
           if [ "${{ github.event_name }}" = "push" ]; then
@@ -128,6 +136,15 @@ jobs:
           # or the two clients sign in to different projects. The confidential
           # client secret lives only on the relay, never here.
           GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          # The Authenticode certificate, base64-encoded because a GitHub
+          # secret is a string and a .pfx is binary (T1203). While these are
+          # unset the build still succeeds and prints an UNSIGNED banner --
+          # the certificate is the user's to obtain, and no release may be
+          # held hostage to that. Passed as env rather than interpolated into
+          # the `run:` body so the value never reaches the shell's command
+          # line, and never as an `echo`, so it cannot land in the log.
+          WINDOWS_SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
+          WINDOWS_SIGN_PASSWORD: ${{ secrets.WINDOWS_SIGN_PASSWORD }}
         run: |
           # The same-day rebuild counter: republishing a version on the same
           # date needs a strictly greater MSI ProductVersion or the package

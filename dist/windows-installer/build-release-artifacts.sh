@@ -133,10 +133,33 @@ if needle not in data and needle.decode().encode("utf-16-le") not in data:
 print(f"==> exe embeds {want}")
 PYEOF
 
+# -- 1b. sign the payload ------------------------------------------------
+# Before the packages are cut, not after: the MSI and the portable ZIP are
+# both built FROM these three files, so signing them here is what makes both
+# packages carry signed bits. Signing only the MSI wrapper would leave every
+# portable-ZIP user, and every exe the MSI lays down, exactly as unknown to
+# SmartScreen as before (T1203).
+#
+# ghoztty.com carries ghoztty.exe's identity as the console twin, and the
+# agent is a required sibling the installer runs on its own, so all three are
+# in scope. Absent certificate config is a no-op with a banner -- see the
+# script.
+bash "$SCRIPT_DIR/sign-artifacts.sh" \
+  "$REPO_ROOT/zig-out/bin/ghoztty.exe" \
+  "$REPO_ROOT/zig-out/bin/ghoztty.com" \
+  "$REPO_ROOT/zig-out/bin/ghoztty-agent.exe" || exit 1
+
 # -- 2. MSI + portable ZIP ----------------------------------------------
 echo "==> MSI"
 bash "$SCRIPT_DIR/build-msi.sh" --skip-build \
   --semver "$SEMVER" --build-num "$BUILD_NUM" --version "$STAMP" --out "$MSI"
+
+# The MSI is signed as a package in its own right, on top of the signed
+# payload above: it is the file the user downloads and double-clicks, so it
+# is the one SmartScreen judges. The portable ZIP has no Authenticode
+# equivalent -- a zip cannot be signed -- which is why the three binaries
+# inside it were signed before it was built.
+bash "$SCRIPT_DIR/sign-artifacts.sh" "$MSI" || exit 1
 
 echo "==> portable ZIP"
 bash "$SCRIPT_DIR/build-portable-zip.sh" \
