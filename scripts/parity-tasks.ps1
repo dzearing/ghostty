@@ -1036,7 +1036,25 @@ switch ($Command) {
             # harness stamps.
         }
         elseif ($NoGuardDue) {
-            Write-Host "GUARD DUE CHECK SKIPPED (-NoGuardDue): harness staleness was not checked for this commit"
+            # T1189: name what is being excused. "SKIPPED" alone made the hatch
+            # unreadable after the fact - a turn excusing a harness that cannot
+            # run on this box at all and a turn excusing a harness that is RED
+            # produced the identical line, which is how a routine override stops
+            # carrying information. The check itself is local hashing, so asking
+            # anyway costs nothing but the answer.
+            Write-Host "GUARD DUE CHECK SKIPPED (-NoGuardDue): harness staleness was not enforced for this commit"
+            if (Test-Path -LiteralPath $dueScript) {
+                $guardRepo = $RepoRoot
+                if ($env:GHOZTTY_GUARD_DUE_REPO) { $guardRepo = $env:GHOZTTY_GUARD_DUE_REPO }
+                $skipOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $dueScript check -Repo $guardRepo 2>&1 | Out-String
+                $excused = @($skipOut -split "`r?`n" | Where-Object { $_ -match '^GUARD DUE' })
+                if ($excused.Count -gt 0) {
+                    foreach ($line in $excused) { Write-Host ("  excused: {0}" -f $line.Trim()) }
+                    Write-Host "  (say which of these cannot run here, and why, in the commit body)"
+                } else {
+                    Write-Host "  nothing was actually due - the hatch was not needed"
+                }
+            }
         }
         elseif (Test-Path -LiteralPath $dueScript) {
             # GHOZTTY_GUARD_DUE_REPO points the staleness question at a fixture

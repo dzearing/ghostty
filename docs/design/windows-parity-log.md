@@ -18723,3 +18723,33 @@ ecord writes one row per boot to temp\go-loop-boots.jsonl, is idempotent on the 
   this box ever delivers a real double-click or ctrl+wheel to an image pane) and
   T1234 (HEIC/TIFF/ICNS decode depends on the box's codecs, so the same photo
   can be a picture on one Windows machine and an error card on the next).
+
+- **2026-09-01 - the packaging guard stops being an override nobody reads (T1189).**
+  `release-artifacts-packaging` asks whether the Windows MSI still compiles.
+  Nothing on this box can answer that - wixl is Linux tooling, so it needs
+  Docker, and starting Docker here is the user's call - so the row went due
+  after every `build-msi.sh` edit and every commit in between went out under
+  `parity-tasks.ps1 validate -NoGuardDue`. A hatch pressed every time is
+  indistinguishable from the misuse it exists to expose, and the previous entry
+  above is one of those commits. The row is ADVISORY now: reported in the same
+  words by every claim (`GUARD DUE (advisory) ...`) and counted against nothing.
+  That is a de-escalation rather than a hole, because three things still hold
+  `build-msi.sh` to account - `install-launch` covers the same file and blocks,
+  sections B5-B7 of `release-artifacts.ps1` parse the generated WXS with no
+  Docker (T1218's defect class, B7 its negative control), and fork-ci's
+  `windows-cross` job COMPILES the package on every push while `validate`
+  already fails on a red CI verdict (T1219). What is new is that the answer can
+  now be read back: `guard-due.ps1 stamp-ci -Guard <row>` finds a successful run
+  of the job a row names, checks that every covered file AT THAT RUN'S COMMIT
+  hashes the same as the file on disk, and only then stamps - recording the run
+  url and sha, so the `GUARD CURRENT` line says the proof came from CI rather
+  than from here. There is no hatch past the content check. The packaging row
+  was cleared that way today, from the run that built exactly these bytes. And
+  `-NoGuardDue` now NAMES the rows it excused, so a turn excusing an unrunnable
+  harness and a turn excusing a red one no longer leave identical evidence.
+  Floor: lib/none/win32/agent ALL LANES PASS, ipc-p1/p2/p3 ALL PASS,
+  `test\win32\guard-due.ps1` ALL PASS (80 assertions, section K new: a red build
+  machine, a green run whose named job failed, and a green job over other bytes
+  each stamp nothing), plus gate-negatives, parity-tasks-seat, release-artifacts,
+  docs-routing, merge-terminology and the six harness audits re-run and
+  re-stamped.

@@ -399,6 +399,23 @@ Concretely, in order, with no stops in between:
    `scripts\guard-due.ps1` is the whole cost of closing the same gap for the
    next harness that grows one.
 
+   **Two lines you may see there mean something different** (T1189).
+   `GUARD DUE (advisory) ...` is a row whose question this box cannot answer at
+   all - today that is `release-artifacts-packaging`, which needs wixl and
+   therefore Docker, and starting Docker is the user's call. It is reported and
+   never fails `validate`; its teeth are elsewhere (fork-ci compiles the package
+   on every push, and `validate` fails on a red CI verdict). Clear it from the
+   run that proved it rather than reaching for the hatch:
+
+   ```
+   powershell -NoProfile -File scripts\guard-due.ps1 stamp-ci -Guard release-artifacts-packaging
+   ```
+
+   which stamps only when the covered files at that green run's commit are byte
+   for byte the ones on disk. And `-NoGuardDue` now NAMES what it excused, so
+   the hatch is readable after the fact instead of one line that fit every
+   case.
+
    **A new gate ships with the demonstration that it can fail, or it is not a
    gate** (T1133). A check that has never been observed saying anything but
    "fine" is indistinguishable from a check that cannot say anything else, and

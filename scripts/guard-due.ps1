@@ -33,6 +33,28 @@
   decides that a harness PASSES - only that one has not been asked. A red
   harness run leaves the stamp alone, so red stays due.
 
+  ADVISORY ROWS (T1189). A row may declare `Advisory = $true`, which means it
+  is REPORTED everywhere a blocking row is and never counted against the
+  validate gate. That is not a softer version of the same claim - it is for the
+  one shape this mechanism otherwise handles badly: a question this box is
+  physically unable to answer (the MSI compile needs Linux tooling and
+  therefore Docker, which is deliberately kept down here), whose real
+  enforcement lives elsewhere (fork-ci compiles the package on every push and
+  `validate` fails on a red CI verdict). Before it, that row was due after every
+  packaging edit and the only way past the gate was `-NoGuardDue` on every
+  commit; a hatch pressed every time stops being a signal, and it hid the case
+  the hatch exists for. An advisory row still says `GUARD DUE (advisory)` until
+  it is cleared, so nothing goes quiet.
+
+  CLEARED FROM CI (T1189). A row may declare `CiEvidence` - a workflow and a
+  job whose green run over a commit proves what the harness would have proved
+  locally. `stamp-ci` finds a successful run of that job, checks that every
+  covered file AT THAT RUN'S COMMIT hashes the same as the file on disk now, and
+  only then writes the stamp (recording the run url and sha as its provenance).
+  A stamp written from a run whose tree differed would be the exact lie this
+  whole mechanism exists to prevent, so the content check is not optional and
+  there is no hatch past it.
+
   WIRED INTO (both deliberately different in force):
     * scripts\go-loop-exec.ps1 claim - go.md step 0, every turn. Reports, never
       fails: a claim that can exit nonzero over a stale stamp would wedge the
@@ -50,7 +72,7 @@
 #>
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('check', 'update', 'list')]
+    [ValidateSet('check', 'update', 'list', 'stamp-ci')]
     [string]$Action = 'check',
 
     # Limit to one harness by name. Omitted => every row in the table.
@@ -58,6 +80,23 @@ param(
 
     [string]$Repo,
     [switch]$Json,
+
+    # --- stamp-ci only (T1189) --------------------------------------------
+    # The GitHub repository to ask. NEVER let `gh` resolve this itself: this
+    # repo has `upstream` (ghostty-org/ghostty) as a remote and a bare gh
+    # command resolves to it (go.md, step 6.9).
+    [string]$Nwo = 'dzearing/ghoztty',
+
+    # The branch whose runs are enumerated. Defaults to the repo's current one.
+    [string]$Branch,
+
+    # Read the run list from a file instead of calling gh, in the shape
+    # `gh run list --json ...` returns (each run may carry its own `jobs`
+    # array, as `gh run view --json jobs` returns them). This is how the
+    # acceptance harness constructs green and red CI without a build machine:
+    # the eligibility rules are the script's own, only the transport is
+    # replaced. Also settable as GHOZTTY_GUARD_CI_RUNS_JSON.
+    [string]$RunsJsonFile,
 
     # T1039 escape hatch, for the ONE caller whose subject is stamping itself:
     # `test\win32\guard-due.ps1` drives `update` against a throwaway fixture
@@ -763,12 +802,45 @@ $GuardTable = @(
     # months - could not be proved here at all. The harness itself is
     # deliberately NOT covered by either row: it is the wiring row's subject,
     # and an edit to a static assertion must not put these rows out of reach.
+    #
+    # ADVISORY since T1189, and that word is doing real work. The question this
+    # row asks - does the package still COMPILE? - cannot be answered on this
+    # box at all: wixl is Linux tooling, Docker is deliberately kept down here
+    # (a WSL2 backend that has buried the machine before), and starting it is
+    # the user's call. So the row was due after every build-msi.sh edit and the
+    # only way past the pre-commit gate was `validate -NoGuardDue` - an override
+    # pressed every time, which is indistinguishable from the misuse that hatch
+    # exists to make visible. A blocking gate with only one possible answer is
+    # not a gate.
+    #
+    # What still holds build-msi.sh to account, so this is a de-escalation and
+    # not a hole:
+    #   * the `install-launch` row below covers the same file and IS blocking -
+    #     it is cleared by a Docker-less run, so a build-msi.sh edit still has
+    #     to produce evidence before it can be committed;
+    #   * sections B5-B7 of this same harness parse the generated WXS without
+    #     Docker, which is T1218's whole defect class;
+    #   * fork-ci's `windows-cross` job COMPILES the MSI on every push, and
+    #     `parity-tasks.ps1 validate` already FAILS on a red CI verdict (T1219),
+    #     so the compile is enforced by the machine that can actually answer it,
+    #     one turn later, rather than by a stamp nothing here can write.
+    #
+    # This row is what reports whether that answer has been READ: printed by
+    # every claim, never counted against validate, and cleared either by a local
+    # Docker run (exactly as before) or from the green CI run that proved it -
+    #
+    #   powershell -NoProfile -File scripts\guard-due.ps1 stamp-ci -Guard release-artifacts-packaging
+    #
+    # which stamps only when the covered files at that run's commit are byte for
+    # byte what is on disk now (see `CiEvidence` and the `stamp-ci` action).
     [pscustomobject]@{
-        Name    = 'release-artifacts-packaging'
-        Script  = 'test\win32\release-artifacts.ps1'
-        RunArgs = '-RequireDocker'
-        Stamp   = 'test\win32\release-artifacts-packaging.stamp.json'
-        Covers  = @(
+        Name       = 'release-artifacts-packaging'
+        Script     = 'test\win32\release-artifacts.ps1'
+        RunArgs    = '-RequireDocker'
+        Stamp      = 'test\win32\release-artifacts-packaging.stamp.json'
+        Advisory   = $true
+        CiEvidence = [pscustomobject]@{ Workflow = 'Fork CI'; Job = 'windows-cross' }
+        Covers     = @(
             'dist\windows-installer\build-msi.sh'
         )
     },
@@ -2130,15 +2202,21 @@ function Get-CoveredFiles($row) {
     return @($found.ToArray() | Sort-Object -CaseSensitive)
 }
 
-function Get-NormalizedHash([string]$relPath) {
+function Get-NormalizedFileHash([string]$fullPath) {
     <#
       SHA-256 of the file's bytes with CRLF folded to LF and any UTF-8 BOM
       dropped. .ps1 carries no `text` attribute in .gitattributes, so the bytes
       on disk depend on the checkout's line-ending settings; hashing them raw
       would report every file as changed on a differently-configured clone, and
       a gate that cries wolf on a fresh clone is a gate nobody reads.
+
+      Takes a full path rather than a repo-relative one so `stamp-ci` can hash a
+      blob it extracted from a commit through the SAME normalisation the stamp
+      itself uses - comparing a git blob hash against a working-tree file would
+      answer a subtly different question (whether the checkout's filters match),
+      which is not the question.
     #>
-    $bytes = [System.IO.File]::ReadAllBytes((Join-Path $Repo $relPath))
+    $bytes = [System.IO.File]::ReadAllBytes($fullPath)
     $out = New-Object System.Collections.Generic.List[byte]
     $start = 0
     if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { $start = 3 }
@@ -2151,6 +2229,10 @@ function Get-NormalizedHash([string]$relPath) {
         $digest = $sha.ComputeHash($out.ToArray())
     } finally { $sha.Dispose() }
     return ([System.BitConverter]::ToString($digest)).Replace('-', '').ToLowerInvariant()
+}
+
+function Get-NormalizedHash([string]$relPath) {
+    return Get-NormalizedFileHash (Join-Path $Repo $relPath)
 }
 
 function Get-LiveMap($row) {
@@ -2199,8 +2281,10 @@ function Get-GuardState($row) {
     if ($live.Count -eq 0 -and $null -eq $stamp) {
         return [pscustomobject]@{
             Name = $row.Name; Script = $row.Script; RunArgs = [string]$row.RunArgs; Stamp = $row.Stamp
+            Advisory = [bool]$row.Advisory; CiGuard = ($null -ne $row.CiEvidence)
             Kind = 'n/a'; Reason = 'no-covered-files'; Findings = @()
             Files = @(); StampedAt = ''; StampedCommit = ''; StampedUncommitted = @()
+            StampedSource = ''; StampedCiUrl = ''
         }
     }
     # A plain array, not a generic List: PowerShell 5.1's enumerable binder
@@ -2211,8 +2295,10 @@ function Get-GuardState($row) {
     if ($null -eq $stamp) {
         return [pscustomobject]@{
             Name = $row.Name; Script = $row.Script; RunArgs = [string]$row.RunArgs; Stamp = $row.Stamp
+            Advisory = [bool]$row.Advisory; CiGuard = ($null -ne $row.CiEvidence)
             Kind = 'due'; Reason = 'no-stamp'; Findings = @()
             Files = @($live.Keys); StampedAt = ''; StampedCommit = ''; StampedUncommitted = @()
+            StampedSource = ''; StampedCiUrl = ''
         }
     }
 
@@ -2233,28 +2319,51 @@ function Get-GuardState($row) {
     $reason = if ($findings.Count -gt 0) { 'covered-files-changed' } else { '' }
     return [pscustomobject]@{
         Name = $row.Name; Script = $row.Script; RunArgs = [string]$row.RunArgs; Stamp = $row.Stamp
+        Advisory = [bool]$row.Advisory; CiGuard = ($null -ne $row.CiEvidence)
         Kind = $kind; Reason = $reason; Findings = $findings
         Files = @($live.Keys)
         StampedAt = [string]$stamp.generated
         StampedCommit = [string]$stamp.commit
         StampedUncommitted = @($stamp.uncommitted | Where-Object { $_ })
+        StampedSource = [string]$stamp.source
+        StampedCiUrl = [string]$stamp.ciRun
     }
 }
 
-function Write-Stamp($row) {
+function Write-Stamp($row, $Provenance) {
     <#
       Rewrite the stamp only when the file MAP actually moved. A green harness
       run that changed nothing must leave a clean working tree behind it -
       otherwise every run of the harness produces a diff, and a diff nobody
       means is a diff nobody reads.
+
+      $Provenance (T1189) is an ordered map of extra fields describing WHERE the
+      evidence came from - the CI run url and sha, for a stamp written by
+      `stamp-ci`. A change of provenance over an unchanged file map still
+      rewrites, because "the same code, proved somewhere else" is exactly the
+      transition worth recording; a stamp that already names this run is left
+      alone, so re-running stamp-ci is a no-op like every other update here.
     #>
     $live = Get-LiveMap $row
-    $existing = Get-StampMap (Read-Stamp $row)
+    $prevStamp = Read-Stamp $row
+    $existing = Get-StampMap $prevStamp
     $same = ($existing.Count -eq $live.Count)
     if ($same) {
         foreach ($k in $live.Keys) {
             if (-not $existing.Contains($k) -or $existing[$k] -ne $live[$k]) { $same = $false; break }
         }
+    }
+    if ($same -and $Provenance) {
+        foreach ($k in $Provenance.Keys) {
+            $was = if ($prevStamp) { [string]$prevStamp.$k } else { '' }
+            if ($was -ne [string]$Provenance[$k]) { $same = $false; break }
+        }
+    }
+    elseif ($same -and $prevStamp -and [string]$prevStamp.source) {
+        # A local harness run re-taking a stamp that CI had written must drop
+        # the CI provenance with it, or the file keeps naming a run that is no
+        # longer what vouches for it.
+        $same = $false
     }
     if ($same) { return [pscustomobject]@{ Written = $false; Files = @($live.Keys) } }
 
@@ -2295,10 +2404,17 @@ function Write-Stamp($row) {
         generated    = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK')
         commit       = $commit
         uncommitted  = $uncommitted
-        files        = $files
     }
+    if ($Provenance) { foreach ($k in $Provenance.Keys) { $doc[$k] = $Provenance[$k] } }
+    $doc['files'] = $files
     $json = ($doc | ConvertTo-Json -Depth 5)
     $path = Join-Path $Repo $row.Stamp
+    # A first stamp in a tree that has no test\win32 yet (a fixture repo, a
+    # fresh worktree) must not die on the missing directory.
+    $parent = Split-Path -Parent $path
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Force -Path $parent | Out-Null
+    }
     # UTF-8 without a BOM, LF endings: *.json is `text eol=lf` in .gitattributes.
     [System.IO.File]::WriteAllText($path, ($json -replace "`r`n", "`n") + "`n",
         (New-Object System.Text.UTF8Encoding($false)))
@@ -2358,6 +2474,214 @@ switch ($Action) {
         exit 0
     }
 
+    'stamp-ci' {
+        <#
+          T1189. Clear a row from the build machine that CAN answer its
+          question, for the case this box physically cannot: the MSI compile
+          needs wixl, wixl is Linux tooling, and Docker is deliberately kept
+          down here.
+
+          The claim it writes is narrow on purpose - "a run of <workflow>'s
+          <job> concluded success over a commit whose covered files are byte for
+          byte the ones on disk now" - and every part of it is checked:
+
+            * the run's workflow name matches the row's CiEvidence,
+            * the run completed with conclusion `success`,
+            * the NAMED JOB inside it concluded success (a run can be green with
+              the job that matters skipped, which proves nothing),
+            * every covered file at that run's commit hashes the same as the
+              working tree, through this script's own normalisation.
+
+          Anything short of that stamps nothing and exits 1: an unproved stamp
+          is the exact lie the whole mechanism exists to prevent, so there is no
+          hatch past the content check.
+        #>
+        if ($env:GHOZTTY_TEST_BODY -eq 'pending' -and -not $IgnoreRunState) {
+            "STAMP REFUSED: the calling run has not reached the end of its body (GHOZTTY_TEST_BODY=pending)."
+            exit 3
+        }
+        if (-not $RunsJsonFile -and $env:GHOZTTY_GUARD_CI_RUNS_JSON) { $RunsJsonFile = $env:GHOZTTY_GUARD_CI_RUNS_JSON }
+
+        $ciRows = @($rows | Where-Object { $null -ne $_.CiEvidence })
+        if ($ciRows.Count -eq 0) {
+            "ERROR no selected guard declares CiEvidence (known: {0})" -f (
+                (@($GuardTable | Where-Object { $null -ne $_.CiEvidence } | ForEach-Object { $_.Name })) -join ', ')
+            exit 2
+        }
+
+        # Same stderr discipline as ci-status.ps1's Invoke-Gh: under PS 5.1 with
+        # $ErrorActionPreference = 'Stop' a native command's stderr line becomes
+        # a TERMINATING error, so a routine gh warning would kill the run it was
+        # only meant to inform.
+        function Invoke-Gh([string[]]$argList) {
+            $prev = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                # NEVER `| Out-String` here: it wraps at the host's buffer width
+                # and a wrap lands INSIDE a sha, which ConvertFrom-Json tolerates
+                # (ci-status.ps1 paid half an hour for that one).
+                $out = @(& gh @argList 2>&1 | ForEach-Object { $_.ToString() }) -join "`n"
+                return @{ Code = $LASTEXITCODE; Out = $out.Trim() }
+            } catch {
+                return @{ Code = 127; Out = $_.Exception.Message }
+            } finally { $ErrorActionPreference = $prev }
+        }
+
+        # PS 5.1 hands a JSON array back as ONE object rather than enumerating
+        # it; the ForEach-Object is what unrolls it.
+        function Expand-Json([string]$text) {
+            if (-not $text) { return @() }
+            return @($text | ConvertFrom-Json | ForEach-Object { $_ })
+        }
+
+        function Get-GitOut([string[]]$argList) {
+            $prev = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $out = & git -C $Repo @argList 2>$null
+                if ($LASTEXITCODE -ne 0) { return $null }
+                return (@($out) -join "`n").Trim()
+            } finally { $ErrorActionPreference = $prev }
+        }
+
+        $branch = $Branch
+        if (-not $branch) { $branch = Get-GitOut @('rev-parse', '--abbrev-ref', 'HEAD') }
+
+        $runs = @()
+        if ($RunsJsonFile) {
+            if (-not (Test-Path -LiteralPath $RunsJsonFile)) {
+                "CI EVIDENCE UNAVAILABLE: runs file not found: {0}" -f $RunsJsonFile
+                exit 1
+            }
+            $runs = @(Expand-Json ([System.IO.File]::ReadAllText($RunsJsonFile, [System.Text.Encoding]::UTF8)))
+        }
+        else {
+            if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+                "CI EVIDENCE UNAVAILABLE: gh is not installed on this box"
+                exit 1
+            }
+            if (-not $branch -or $branch -eq 'HEAD') {
+                "CI EVIDENCE UNAVAILABLE: no branch to enumerate runs for (detached HEAD?)"
+                exit 1
+            }
+            $r = Invoke-Gh @('run', 'list', '--repo', $Nwo, '--branch', $branch, '--limit', '30',
+                '--json', 'databaseId,headSha,workflowName,status,conclusion,url,createdAt')
+            if ($r.Code -ne 0) {
+                $why = (@($r.Out -split "`r?`n") | Where-Object { $_.Trim() } | Select-Object -First 1)
+                if (-not $why) { $why = "gh run list exited $($r.Code)" }
+                "CI EVIDENCE UNAVAILABLE: {0}" -f $why
+                exit 1
+            }
+            try { $runs = @(Expand-Json $r.Out) }
+            catch { "CI EVIDENCE UNAVAILABLE: gh returned output that is not JSON"; exit 1 }
+        }
+
+        function Test-JobGreen($run, [string]$jobName) {
+            # Offline (the acceptance fixture): the run object carries its own
+            # `jobs` array, in the shape `gh run view --json jobs` returns. The
+            # rule below is the real one either way; only the transport moves.
+            $jobs = $null
+            if ($null -ne $run.jobs) { $jobs = @($run.jobs) }
+            elseif ($run.databaseId) {
+                $jr = Invoke-Gh @('run', 'view', [string]$run.databaseId, '--repo', $Nwo, '--json', 'jobs')
+                if ($jr.Code -ne 0) { return @{ Ok = $false; Why = "could not read the run's jobs" } }
+                try { $jobs = @(($jr.Out | ConvertFrom-Json).jobs) }
+                catch { return @{ Ok = $false; Why = "the run's jobs are not JSON" } }
+            }
+            if ($null -eq $jobs -or $jobs.Count -eq 0) { return @{ Ok = $false; Why = 'the run lists no jobs' } }
+            $mine = @($jobs | Where-Object { [string]$_.name -eq $jobName })
+            if ($mine.Count -eq 0) { return @{ Ok = $false; Why = "no job named '$jobName' in that run" } }
+            $bad = @($mine | Where-Object { [string]$_.conclusion -ne 'success' })
+            if ($bad.Count -gt 0) {
+                return @{ Ok = $false; Why = ("job '{0}' concluded {1}" -f $jobName, [string]$bad[0].conclusion) }
+            }
+            return @{ Ok = $true; Why = '' }
+        }
+
+        function Test-ContentMatches($row, [string]$sha) {
+            # Every covered file, as that commit had it, hashed through this
+            # script's own normalisation. Extracted with Start-Process rather
+            # than a PowerShell redirect because a redirect re-encodes the
+            # stream and would change the bytes being hashed.
+            if ($null -eq (Get-GitOut @('cat-file', '-e', "$sha^{commit}"))) {
+                # cat-file -e prints nothing on success, so a null here is
+                # ambiguous; ask again in a form that answers.
+                if ($null -eq (Get-GitOut @('rev-parse', '--verify', "$sha^{commit}"))) {
+                    return @{ Ok = $false; Why = "commit $($sha.Substring(0, [Math]::Min(9, $sha.Length))) is not in this clone (fetch first)" }
+                }
+            }
+            $work = Join-Path ([IO.Path]::GetTempPath()) ("guard-due-ci-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+            New-Item -ItemType Directory -Force -Path $work | Out-Null
+            try {
+                foreach ($rel in (Get-CoveredFiles $row)) {
+                    $blobOut = Join-Path $work 'blob.bin'
+                    $errOut = Join-Path $work 'blob.err'
+                    $pathInGit = $rel.Replace('\', '/')
+                    $proc = Start-Process -FilePath 'git' -PassThru -Wait -NoNewWindow `
+                        -ArgumentList @('-C', $Repo, 'show', "${sha}:${pathInGit}") `
+                        -RedirectStandardOutput $blobOut -RedirectStandardError $errOut
+                    if ($proc.ExitCode -ne 0) {
+                        return @{ Ok = $false; Why = "$pathInGit did not exist at that commit" }
+                    }
+                    if ((Get-NormalizedFileHash $blobOut) -ne (Get-NormalizedHash $rel)) {
+                        return @{ Ok = $false; Why = "$pathInGit differs from the version that run built" }
+                    }
+                }
+                return @{ Ok = $true; Why = '' }
+            }
+            finally { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+        }
+
+        $failed = 0
+        foreach ($row in $ciRows) {
+            $ev = $row.CiEvidence
+            $cands = @($runs | Where-Object {
+                    [string]$_.workflowName -eq [string]$ev.Workflow -and
+                    [string]$_.status -eq 'completed' -and
+                    [string]$_.conclusion -eq 'success'
+                })
+            if ($cands.Count -eq 0) {
+                "CI EVIDENCE NONE {0}: no successful '{1}' run on {2}" -f $row.Name, $ev.Workflow, $branch
+                $failed++
+                continue
+            }
+            $stamped = $false
+            $reasons = @()
+            foreach ($run in $cands) {
+                $sha = [string]$run.headSha
+                if (-not $sha) { continue }
+                $short = $sha.Substring(0, [Math]::Min(9, $sha.Length))
+                $jobOk = Test-JobGreen $run ([string]$ev.Job)
+                if (-not $jobOk.Ok) { $reasons += ("{0}: {1}" -f $short, $jobOk.Why); continue }
+                $contentOk = Test-ContentMatches $row $sha
+                if (-not $contentOk.Ok) { $reasons += ("{0}: {1}" -f $short, $contentOk.Why); continue }
+                $prov = [ordered]@{
+                    source     = 'ci'
+                    ciWorkflow = [string]$ev.Workflow
+                    ciJob      = [string]$ev.Job
+                    ciSha      = $sha
+                    ciRun      = [string]$run.url
+                }
+                $w = Write-Stamp $row $prov
+                if ($w.Written) {
+                    "STAMPED FROM CI {0} ({1} files) <- {2} {3} at {4}" -f $row.Name, @($w.Files).Count, $ev.Workflow, $ev.Job, $short
+                    if ($run.url) { "  run: {0}" -f [string]$run.url }
+                } else {
+                    "STAMP UNCHANGED {0} (already stamped from this run)" -f $row.Name
+                }
+                $stamped = $true
+                break
+            }
+            if (-not $stamped) {
+                "CI EVIDENCE REJECTED {0}: no successful '{1}' run proves the code on disk" -f $row.Name, $ev.Job
+                foreach ($why in @($reasons | Select-Object -First 5)) { "    $why" }
+                "  (the covered files must be exactly what that run built; push this code and let CI answer)"
+                $failed++
+            }
+        }
+        exit ([int]($failed -gt 0))
+    }
+
     'check' {
         $states = @(foreach ($row in $rows) { Get-GuardState $row })
         if ($Json) {
@@ -2373,6 +2697,13 @@ switch ($Action) {
             }
             if ($s.Kind -eq 'current') {
                 $stampedAt = if ($s.StampedAt) { $s.StampedAt.Substring(0, [Math]::Min(10, $s.StampedAt.Length)) } else { '?' }
+                # A stamp CI wrote says so, because "proved on the build machine"
+                # and "proved here" are different sentences and the reader of a
+                # green line is entitled to know which one they are reading.
+                if ($s.StampedSource -eq 'ci') {
+                    "GUARD CURRENT {0} ({1} files, stamped {2} from CI run {3})" -f $s.Name, @($s.Files).Count, $stampedAt, $s.StampedCiUrl
+                    continue
+                }
                 # `from <sha>` is where the stamp was taken, not what it holds -
                 # a green run over uncommitted work stamps the tree it saw, and
                 # the sha it names predates that content (T1164). Say so, so the
@@ -2383,11 +2714,16 @@ switch ($Action) {
                     $(if ($wip -gt 0) { " +$wip uncommitted" } else { '' })
                 continue
             }
-            $due++
+            # An advisory row (T1189) is reported in the same breath as every
+            # other and counted against nothing: its subject is a question this
+            # box cannot answer, and its enforcement lives elsewhere. The word
+            # is in the line so a reader can never mistake one for a gate that
+            # let something through.
+            $tag = if ($s.Advisory) { ' (advisory)' } else { $due++; '' }
             if ($s.Reason -eq 'no-stamp') {
-                "GUARD DUE {0}: no stamp - {1} has never recorded a green run over this code" -f $s.Name, $s.Script
+                "GUARD DUE{0} {1}: no stamp - {2} has never recorded a green run over this code" -f $tag, $s.Name, $s.Script
             } else {
-                "GUARD DUE {0}: {1} has not been run since these changed:" -f $s.Name, $s.Script
+                "GUARD DUE{0} {1}: {2} has not been run since these changed:" -f $tag, $s.Name, $s.Script
                 foreach ($f in $s.Findings) { "    {0,-8} {1}" -f $f.Kind, $f.Path }
             }
             # RunArgs is how a row says "this harness needs more than its bare
@@ -2396,6 +2732,12 @@ switch ($Action) {
             # says so instead of reporting ALL PASS and leaving it due.
             "  run: powershell -NoProfile -File {0}{1}" -f $s.Script,
                 $(if ($s.RunArgs) { " $($s.RunArgs)" } else { '' })
+            # The second remedy, for a row whose evidence CI can produce and this
+            # box cannot: name it, or the only route a reader knows about is the
+            # one that does not work here.
+            if ($s.CiGuard) {
+                "  or, once the build machine has gone green over this exact code: powershell -NoProfile -File scripts\guard-due.ps1 stamp-ci -Guard {0}" -f $s.Name
+            }
         }
         exit ([int]($due -gt 0))
     }

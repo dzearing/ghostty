@@ -99,7 +99,9 @@ function Invoke-Due {
     # T1039: `update` refuses to stamp while its caller's run is unfinished,
     # and this harness IS an unfinished run every time it drives one - against
     # a throwaway fixture repo, which is the case the gate is not about.
-    if ($Action -eq 'update') { $a += '-IgnoreRunState' }
+    # ... and `stamp-ci` refuses for the same reason, so the harness that
+    # measures it must say the same thing about itself.
+    if ($Action -eq 'update' -or $Action -eq 'stamp-ci') { $a += '-IgnoreRunState' }
     $out = & powershell.exe @a 2>&1
     return [pscustomobject]@{ Lines = @($out); Exit = $LASTEXITCODE; Text = (@($out) -join "`n") }
 }
@@ -242,8 +244,11 @@ try {
         ($r.Text -match 'run it, or fix what it catches, before committing') $r.Text
 
     $r = Invoke-Validate -GuardRepo $Fixture -NoGuardDue
+    # Asserted on the ENFORCEMENT, not on the absence of the words: since T1189
+    # the hatch names what it excused, so the guard's own line appears here on
+    # purpose - prefixed `excused:`, and with nothing counted against the run.
     Check 'D3 -NoGuardDue does not fail over it' `
-        ($r.Text -notmatch 'GUARD DUE go-loop') $r.Text
+        ($r.Text -notmatch 'unrun harness is a problem here') $r.Text
     Check 'D4 but says out loud that the check was skipped' `
         ($r.Text -match 'GUARD DUE CHECK SKIPPED') $r.Text
 
@@ -368,7 +373,16 @@ try {
     $rp = Invoke-Due check -Guard 'release-artifacts-packaging' -AtRepo $RelFixture
     $rw = Invoke-Due check -Guard 'release-artifacts' -AtRepo $RelFixture
     Check 'G7 a payload edit makes the PACKAGING row due' `
-        ($rp.Exit -eq 1 -and $rp.Text -match 'changed\s+dist/windows-installer/build-msi\.sh') $rp.Text
+        ($rp.Text -match 'changed\s+dist/windows-installer/build-msi\.sh') $rp.Text
+    # T1189 made that row ADVISORY: it is still reported in the same words, and
+    # it no longer counts against the exit code the validate gate reads. Both
+    # halves are asserted, because either one alone is the wrong feature - a
+    # silent row is a hole, and a blocking row nothing here can clear is what
+    # trained twelve turns to pass -NoGuardDue.
+    Check 'G7b and says so as advisory rather than as a blocking gate' `
+        ($rp.Text -match 'GUARD DUE \(advisory\) release-artifacts-packaging') $rp.Text
+    Check 'G7c and an advisory row alone does not make check exit nonzero' `
+        ($rp.Exit -eq 0) "exit=$($rp.Exit): $($rp.Text)"
     Check 'G8 and does not touch the wiring row' ($rw.Exit -eq 0) $rw.Text
     Check 'G9 the packaging row asks for the run that can actually clear it' `
         ($rp.Text -match 'run: powershell -NoProfile -File test\\win32\\release-artifacts\.ps1 -RequireDocker') $rp.Text
@@ -477,13 +491,164 @@ try {
     Check 'J8 and names the commit that does hold the stamped content' `
         ($rj.Text -match "from $head3\b") $rj.Text
 
+    # --- K. cleared from CI: the machine that CAN answer -------------------
+    # T1189. The packaging row asks whether the MSI still compiles, and this box
+    # cannot answer it: wixl is Linux tooling, Docker is deliberately kept down
+    # here, so the row was due after every build-msi.sh edit and every commit in
+    # between went out under `validate -NoGuardDue`. fork-ci's windows-cross job
+    # compiles that package on every push, so the answer exists - it just lived
+    # somewhere no stamp could read. `stamp-ci` reads it.
+    #
+    # What is measured here is the NARROWNESS of the claim it writes, because a
+    # stamp is only worth what it refuses to say: a red job, a job that did not
+    # run, and a green run over different bytes must all stamp nothing.
+    Write-Host "`n-- K. stamp-ci: a green build machine clears an advisory row --"
+    $CiFixture = Join-Path $env:TEMP ("ghoztty-guard-due-ci-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    function Set-CiFile([string]$rel, [string]$text) {
+        $p = Join-Path $CiFixture $rel
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $p) | Out-Null
+        [System.IO.File]::WriteAllText($p, ($text -replace "`r`n", "`n"),
+            (New-Object System.Text.UTF8Encoding($false)))
+    }
+    function Set-CiRuns($runs) {
+        $f = Join-Path $CiFixture 'runs.json'
+        [System.IO.File]::WriteAllText($f, (ConvertTo-Json -Depth 6 -InputObject @($runs)),
+            (New-Object System.Text.UTF8Encoding($false)))
+        return $f
+    }
+    function Invoke-StampCi([string]$RunsFile) {
+        $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $Due, 'stamp-ci',
+            '-Guard', 'release-artifacts-packaging', '-Repo', $CiFixture, '-RunsJsonFile', $RunsFile,
+            '-IgnoreRunState')
+        $out = & powershell.exe @a 2>&1
+        return [pscustomobject]@{ Exit = $LASTEXITCODE; Text = (@($out) -join "`n") }
+    }
+
+    Set-CiFile 'dist\windows-installer\build-msi.sh' "# fake msi builder v1`n"
+    & git -C $CiFixture init -q 2>$null | Out-Null
+    & git -C $CiFixture config user.email 'harness@example.invalid' 2>$null | Out-Null
+    & git -C $CiFixture config user.name 'guard-due harness' 2>$null | Out-Null
+    & git -C $CiFixture config core.autocrlf false 2>$null | Out-Null
+    & git -C $CiFixture add -A 2>$null | Out-Null
+    & git -C $CiFixture -c commit.gpgsign=false commit -q -m 'msi v1' 2>$null | Out-Null
+    $ciSha1 = (& git -C $CiFixture rev-parse HEAD 2>$null | Out-String).Trim()
+    Set-CiFile 'dist\windows-installer\build-msi.sh' "# fake msi builder v2 - packaging rule changed`n"
+    & git -C $CiFixture add -A 2>$null | Out-Null
+    & git -C $CiFixture -c commit.gpgsign=false commit -q -m 'msi v2' 2>$null | Out-Null
+    $ciSha2 = (& git -C $CiFixture rev-parse HEAD 2>$null | Out-String).Trim()
+    Check 'K0 the CI fixture is a real repo with two commits (positive control)' `
+        ($ciSha1 -and $ciSha2 -and $ciSha1 -ne $ciSha2) "1=$ciSha1 2=$ciSha2"
+
+    $ciStampPath = Join-Path $CiFixture 'test\win32\release-artifacts-packaging.stamp.json'
+
+    # K1: nothing green to read.
+    $runsFile = Set-CiRuns @(
+        [pscustomobject]@{ databaseId = 1; headSha = $ciSha2; workflowName = 'Fork CI'
+            status = 'completed'; conclusion = 'failure'; url = 'https://example.invalid/1' })
+    $rk = Invoke-StampCi $runsFile
+    Check 'K1 a red build machine stamps nothing' `
+        ($rk.Exit -eq 1 -and $rk.Text -match 'CI EVIDENCE NONE') "exit=$($rk.Exit): $($rk.Text)"
+    Check 'K1b and writes no stamp file' (-not (Test-Path -LiteralPath $ciStampPath)) ''
+
+    # K2: the run is green but the job that proves this row is not. A workflow
+    # can go green with its packaging job skipped or failed-then-ignored, and a
+    # stamp taken from that would vouch for a compile that never happened.
+    $runsFile = Set-CiRuns @(
+        [pscustomobject]@{ databaseId = 2; headSha = $ciSha2; workflowName = 'Fork CI'
+            status = 'completed'; conclusion = 'success'; url = 'https://example.invalid/2'
+            jobs = @([pscustomobject]@{ name = 'windows-cross'; conclusion = 'failure' }) })
+    $rk = Invoke-StampCi $runsFile
+    Check 'K2 a green run whose named job failed stamps nothing' `
+        ($rk.Exit -eq 1 -and $rk.Text -match 'CI EVIDENCE REJECTED') "exit=$($rk.Exit): $($rk.Text)"
+    Check 'K2b and says which job it was' ($rk.Text -match "job 'windows-cross' concluded failure") $rk.Text
+
+    # K3: the whole point. The run is green, the job is green, and it built
+    # DIFFERENT BYTES - which is the shape a stamp must never be written from.
+    $runsFile = Set-CiRuns @(
+        [pscustomobject]@{ databaseId = 3; headSha = $ciSha1; workflowName = 'Fork CI'
+            status = 'completed'; conclusion = 'success'; url = 'https://example.invalid/3'
+            jobs = @([pscustomobject]@{ name = 'windows-cross'; conclusion = 'success' }) })
+    $rk = Invoke-StampCi $runsFile
+    Check 'K3 a green job over OTHER code stamps nothing' `
+        ($rk.Exit -eq 1 -and $rk.Text -match 'CI EVIDENCE REJECTED') "exit=$($rk.Exit): $($rk.Text)"
+    Check 'K3b and names the file that differs from what that run built' `
+        ($rk.Text -match 'build-msi\.sh differs from the version that run built') $rk.Text
+    Check 'K3c and still writes no stamp file' (-not (Test-Path -LiteralPath $ciStampPath)) ''
+
+    # K4: green job over exactly these bytes.
+    $runsFile = Set-CiRuns @(
+        [pscustomobject]@{ databaseId = 4; headSha = $ciSha2; workflowName = 'Fork CI'
+            status = 'completed'; conclusion = 'success'; url = 'https://example.invalid/4'
+            jobs = @([pscustomobject]@{ name = 'windows-cross'; conclusion = 'success' }) })
+    $rk = Invoke-StampCi $runsFile
+    Check 'K4 a green job over exactly this code stamps the row' `
+        ($rk.Exit -eq 0 -and $rk.Text -match 'STAMPED FROM CI release-artifacts-packaging') "exit=$($rk.Exit): $($rk.Text)"
+    $ciStamp = $null
+    if (Test-Path -LiteralPath $ciStampPath) {
+        $ciStamp = Get-Content -LiteralPath $ciStampPath -Raw | ConvertFrom-Json
+    }
+    Check 'K4b and the stamp records where the evidence came from' `
+        ($ciStamp -and [string]$ciStamp.source -eq 'ci' -and [string]$ciStamp.ciSha -eq $ciSha2 -and
+            [string]$ciStamp.ciRun -eq 'https://example.invalid/4') (($ciStamp | ConvertTo-Json -Depth 4))
+
+    $rk2 = Invoke-Due check -Guard 'release-artifacts-packaging' -AtRepo $CiFixture
+    Check 'K5 the row reads CURRENT afterwards' `
+        ($rk2.Exit -eq 0 -and $rk2.Text -match 'GUARD CURRENT release-artifacts-packaging') $rk2.Text
+    Check 'K5b and the line says the proof came from CI, not from here' `
+        ($rk2.Text -match 'from CI run https://example\.invalid/4') $rk2.Text
+
+    $rk = Invoke-StampCi $runsFile
+    Check 'K6 re-stamping the same run is a no-op (no diff nobody meant)' `
+        ($rk.Exit -eq 0 -and $rk.Text -match 'STAMP UNCHANGED') "exit=$($rk.Exit): $($rk.Text)"
+
+    # K7: the next packaging edit is due again - advisory, with BOTH remedies
+    # named, because on this box only one of them can ever work.
+    Set-CiFile 'dist\windows-installer\build-msi.sh' "# fake msi builder v3 - not pushed yet`n"
+    $rk2 = Invoke-Due check -Guard 'release-artifacts-packaging' -AtRepo $CiFixture
+    Check 'K7 an edit after a CI stamp is due again' `
+        ($rk2.Text -match 'GUARD DUE \(advisory\) release-artifacts-packaging') $rk2.Text
+    Check 'K7b and names the CI route as well as the Docker one' `
+        ($rk2.Text -match 'stamp-ci -Guard release-artifacts-packaging' -and
+         $rk2.Text -match '-RequireDocker') $rk2.Text
+
+    # K8: and the force. An advisory row must not fail the pre-commit gate -
+    # that is the whole de-escalation - while a blocking row still does (D1).
+    # Three other rows cover build-msi.sh too (install-launch, install-restart,
+    # install-prepare) and all of them BLOCK - they are what makes a packaging
+    # edit produce evidence at all. They are stamped first so what is measured
+    # here is the advisory row ALONE, which is the state this box is permanently
+    # in. Derived from the check output rather than named, so a fourth row
+    # covering the same file does not quietly turn this arm into a pass for the
+    # wrong reason.
+    $rkAll = Invoke-Due check -AtRepo $CiFixture
+    foreach ($line in ($rkAll.Text -split "`r?`n")) {
+        if ($line -match '^GUARD DUE ([^ (][^:]*):') {
+            Invoke-Due update -Guard $matches[1] -AtRepo $CiFixture | Out-Null
+        }
+    }
+    $rk3 = Invoke-Validate -GuardRepo $CiFixture
+    Check 'K8 validate does not fail over an advisory row' `
+        ($rk3.Text -notmatch 'GUARD DUE' -and $rk3.Text -notmatch 'unrun harness is a problem here') $rk3.Text
+
+    # K9: the hatch says what it excused. `-NoGuardDue` used to print one line
+    # whatever the state was, so a turn excusing an unrunnable harness and a
+    # turn excusing a RED one left identical evidence behind them.
+    $rk4 = Invoke-Validate -GuardRepo $Fixture -NoGuardDue
+    Check 'K9 -NoGuardDue names what it excused' `
+        ($rk4.Text -match 'excused: GUARD DUE go-loop') $rk4.Text
+
+    $rk5 = Invoke-Due 'stamp-ci' -Guard 'go-loop' -AtRepo $CiFixture
+    Check 'K10 a row with no CI evidence cannot be stamped from CI' `
+        ($rk5.Exit -eq 2 -and $rk5.Text -match 'no selected guard declares CiEvidence') "exit=$($rk5.Exit): $($rk5.Text)"
+
     Complete-TestBody  # T1039: the run reached the end of its body
 }
 finally {
     Remove-Item -LiteralPath $Fixture -Recurse -Force -ErrorAction SilentlyContinue
     if ($RelFixture) { Remove-Item -LiteralPath $RelFixture -Recurse -Force -ErrorAction SilentlyContinue }
     if ($ProvFixture) { Remove-Item -LiteralPath $ProvFixture -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($CiFixture) { Remove-Item -LiteralPath $CiFixture -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 Write-Host ''
-Write-TestVerdict -Pass $script:passes -Fail $script:failures -MinPass 32
+Write-TestVerdict -Pass $script:passes -Fail $script:failures -MinPass 46

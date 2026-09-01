@@ -1,10 +1,13 @@
 {
     "guard":  "parity-tasks",
     "script":  "test/win32/parity-tasks-seat.ps1",
-    "generated":  "2026-08-31T15:30:53-07:00",
-    "commit":  "f3b7fca7f",
+    "generated":  "2026-09-01T02:10:20-07:00",
+    "commit":  "196672948",
+    "uncommitted":  [
+                        "scripts/parity-tasks.ps1"
+                    ],
     "files":  {
-                  "scripts/parity-tasks.ps1":  "4e9d6635ac9ae140022fef249fd5fc3cf8f1d8ff5142db5a6a3c79215b6fad2a",
+                  "scripts/parity-tasks.ps1":  "dd29ccc11362836b57fc05462a7f37cd397c7b5b45897ba59663cad9268e278c",
                   "test/win32/parity-tasks-seat.ps1":  "9d4fd7827c725e599eccd9469a03447d724c47424d893d526ad8d4b0a90b5ca9"
               }
 }

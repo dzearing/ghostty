@@ -1,11 +1,11 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-09-01T01:29:47-07:00",
-    "commit":  "cc0a1b123",
+    "generated":  "2026-09-01T02:10:45-07:00",
+    "commit":  "196672948",
     "uncommitted":  [
-                        "test/win32/viewer-narrow-pane.ps1",
-                        "test/win32/viewer-nav-pin.ps1"
+                        "test/win32/guard-due.ps1",
+                        "test/win32/release-artifacts.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -99,7 +99,7 @@
                   "test/win32/ghoztty-cleanup.ps1":  "81bfcb6cb5b018195e1056d6ce7203f18235763916bcec4cffcdafa811e73f76",
                   "test/win32/go-loop-guard.ps1":  "0df25a2d58850d6ec39789c7d5e7a3678b59afe67e5ebba942d05cf1bb84e298",
                   "test/win32/go-loop-uptime.ps1":  "a97005d970a564088741646542ffaca3cb9ffe03d2eb30c55b96841607948b82",
-                  "test/win32/guard-due.ps1":  "365078e95882b855545719afe986a5fa6525945ac99474bd325d59b8a33990e9",
+                  "test/win32/guard-due.ps1":  "95b2baa69d25835a2f648437d216e9a349c113a9eda1baabac8dc7230438c7ff",
                   "test/win32/gui-launch-command.ps1":  "a8d4b110a16877255e0dbdb4b01a021a33cf1386462da9bf8a63f3cef4105be1",
                   "test/win32/harness-exitcode-audit.ps1":  "1fdbe9c4d70fd1e9fe80ac17257de1d346a3b5c07c7c69628578eba5ac45f033",
                   "test/win32/harness-process-leak.ps1":  "c62a0f43277632a1bd8506273912a0f73b13ed311d3f84e6a3763b425a9d14a9",
@@ -210,7 +210,7 @@
                   "test/win32/registration-sites.ps1":  "077085e9978ecece9a5c682d6c5f2c9bd7db68120d81fdc0075c0d6a48692b62",
                   "test/win32/relaunch-guard.ps1":  "784140b66081be866d4cae5cb2858ef00c9979cdce73dc6f0e4fd5a95aa1628f",
                   "test/win32/relay-account.ps1":  "8dee3165d569d5069208dee6975b251d6bb3444434e4993e5d4bda207e80250f",
-                  "test/win32/release-artifacts.ps1":  "c388b9589fc63d65fbc3f0c60aa7a96e82d7c7a0e62144875cfe96d14661ea66",
+                  "test/win32/release-artifacts.ps1":  "64942904757622f1d6d73e32aa642c8b2f5ea82311ecc0894e6548245448be81",
                   "test/win32/release-parity.ps1":  "92babe2c0e154c766dd02f9578073f6a04ec281ee706aa8a8dc83c505d579f9f",
                   "test/win32/remote-inherit.ps1":  "50b2a9d36a10d0e677963fbb7d155e3dbc45261111214c1ab8b6454f025e24da",
                   "test/win32/remote-pill.ps1":  "76ffee269bac8ababf6ead9bba303664e9ff20615ea8b738f8fbd362cb345f41",

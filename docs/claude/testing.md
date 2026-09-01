@@ -508,7 +508,34 @@ Four consequences it was built for:
   the cure; `parity-tasks.ps1 validate` (go.md step 6, before every commit)
   FAILS, because that is where the remedy — run the harness, or fix what it
   catches — is the work this exists to cause. `-NoGuardDue` is the stated-intent
-  hatch and prints that it was used.
+  hatch; it prints that it was used **and names which rows it excused** (T1189),
+  so a turn excusing a harness that cannot run here and a turn excusing a RED
+  one no longer leave identical evidence behind them.
+- **A row this box cannot answer is `Advisory`** (T1189). The
+  `release-artifacts-packaging` row asks whether the MSI still compiles, which
+  needs wixl — Linux tooling, therefore Docker, which is deliberately kept down
+  on this box. It was due after every `build-msi.sh` edit and the only way past
+  the gate was `-NoGuardDue`, every time; a hatch pressed every time carries no
+  information. An advisory row is reported everywhere a blocking one is (as
+  `GUARD DUE (advisory) …`) and counted against nothing. That is a
+  de-escalation, not a hole: `install-launch` covers the same file and still
+  blocks, sections B5–B7 of `release-artifacts.ps1` parse the generated WXS
+  without Docker, and fork-ci compiles the package on every push while
+  `validate` already fails on a red CI verdict (T1219).
+- **A row may be cleared from the build machine** (T1189):
+
+  ```
+  powershell -NoProfile -File scripts\guard-due.ps1 stamp-ci -Guard release-artifacts-packaging
+  ```
+
+  A row declaring `CiEvidence` names the workflow and job whose green run proves
+  what the local harness would have. `stamp-ci` finds a successful run of that
+  JOB (a green run with the job skipped proves nothing), checks that every
+  covered file **at that run's commit** hashes the same as the file on disk now,
+  and only then stamps — recording the run url and sha as the stamp's
+  provenance, so the `GUARD CURRENT` line says the proof came from CI rather
+  than from here. There is no hatch past the content check: a stamp taken from a
+  run that built other bytes is the exact lie this mechanism exists to prevent.
 
 It never runs a harness (that would put a multi-minute GUI-launching script
 inside whatever called it) and never decides one PASSES — only that one has not

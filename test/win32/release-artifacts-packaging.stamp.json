@@ -1,9 +1,17 @@
 {
     "guard":  "release-artifacts-packaging",
     "script":  "test/win32/release-artifacts.ps1",
-    "generated":  "2026-08-21T09:24:41-07:00",
-    "commit":  "2a7b7783f",
+    "generated":  "2026-09-01T01:40:51-07:00",
+    "commit":  "196672948",
+    "uncommitted":  [
+
+                    ],
+    "source":  "ci",
+    "ciWorkflow":  "Fork CI",
+    "ciJob":  "windows-cross",
+    "ciSha":  "cc0a1b1239b0313ceb849404328df834f90f9169",
+    "ciRun":  "https://github.com/dzearing/ghoztty/actions/runs/33482880105",
     "files":  {
-                  "dist/windows-installer/build-msi.sh":  "54a40f24d052dbcc8fc8630bca1634fa6bc18972deed602f85c0dadec1b6a5c5"
+                  "dist/windows-installer/build-msi.sh":  "6b9399c1a54d4e90675776514d57b33dfa1ec4fd946d2ab7a2ce0a9895b1ea60"
               }
 }

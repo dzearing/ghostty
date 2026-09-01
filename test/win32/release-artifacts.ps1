@@ -524,8 +524,13 @@ if ($Full) {
 #   release-artifacts-packaging    stamped only by a run with zero skips too.
 #     Its file (build-msi.sh) is only really proved by section B compiling it
 #     under the msitools-local image, so a Docker-less run must not vouch for
-#     it. That row staying due while Docker is down is the honest answer, not a
-#     wedge: it names one file nobody edits often.
+#     it. That bar is unchanged; what changed in T1189 is what a due row COSTS.
+#     It is ADVISORY now (scripts\guard-due.ps1): reported by every claim,
+#     never failing the pre-commit gate, and clearable from the fork-ci run that
+#     compiled the same bytes -
+#       powershell -NoProfile -File scripts\guard-due.ps1 stamp-ci -Guard release-artifacts-packaging
+#     Before that, every packaging edit on this Docker-less box ended in
+#     `validate -NoGuardDue`, and a hatch pressed every time says nothing.
 if ($script:failures -eq 0) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
         update -Guard release-artifacts -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
@@ -539,7 +544,8 @@ if ($script:failures -eq 0) {
         & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
             update -Guard release-artifacts-packaging -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
     } else {
-        "  packaging stamp NOT updated ($($script:skipped) section(s) skipped; re-run with Docker up)"
+        "  packaging stamp NOT updated ($($script:skipped) section(s) skipped; re-run with Docker up,"
+        "    or clear it from CI: scripts\guard-due.ps1 stamp-ci -Guard release-artifacts-packaging)"
     }
 }
 
