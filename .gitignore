@@ -72,3 +72,8 @@ sprite_face_test-*.png
 # scripts\go-loop-boot.ps1 writes these next to the script they launch, with
 # this clone's paths baked in; a committed copy would hardcode one box.
 scripts/*-launch.vbs
+
+# rdp-session.ps1 -SelfTest proves the harness body runs on whatever desktop it
+# finds; its numbers were taken on the wrong one, so they are never evidence.
+# The real run's `rdp-session.json` IS committed - that is the point of it.
+test/win32/artifacts/rdp-session-selftest.json

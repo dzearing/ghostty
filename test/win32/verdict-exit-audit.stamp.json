@@ -1,12 +1,10 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-09-01T11:38:42-07:00",
-    "commit":  "5ae046233",
+    "generated":  "2026-09-01T12:17:43-07:00",
+    "commit":  "9aa532901",
     "uncommitted":  [
-                        "test/win32/install-launch.ps1",
-                        "test/win32/release-artifacts.ps1",
-                        "test/win32/startup-failure.ps1"
+                        "test/win32/rdp-session.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -209,6 +207,7 @@
                   "test/win32/profile-latency.ps1":  "1a7892f8121a0aab717f21026c5dfdeb7c477f8549e58ac1659986faad60191f",
                   "test/win32/pty-holder.ps1":  "fb439d3945ab88b58031e421c65aa0e088ea9144bf5637195a1871ae68b84473",
                   "test/win32/pty-host.ps1":  "0f55c91a5950ac27a78bf29b90e3ea613948a586da2ca66dba17a5d8aa220333",
+                  "test/win32/rdp-session.ps1":  "9323be4d3b8cf4fb208acbe2858a4abf67010a29925b76f89e876c64737d6ff4",
                   "test/win32/readonly-badge.ps1":  "b35e31283126676ccaafc9253a6816fe4b21dc454a27b1e8eea999316f27c12c",
                   "test/win32/rearrange-session-drop.ps1":  "6518414ea072bf9c8a31da3b073363ea3cd07bef2ffddca9d4df42c0cb81a13c",
                   "test/win32/registration-sites.ps1":  "077085e9978ecece9a5c682d6c5f2c9bd7db68120d81fdc0075c0d6a48692b62",

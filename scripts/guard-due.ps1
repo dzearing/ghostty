@@ -845,6 +845,34 @@ $GuardTable = @(
             'dist\windows-installer\build-msi.sh'
         )
     },
+    # Remote Desktop, for real (T1253). This is the second shape of the row
+    # above: a question this box is PHYSICALLY unable to answer, whose answer
+    # matters anyway. Windows 11 Pro serves one interactive session at a time,
+    # so an RDP connection from anywhere - localhost included - disconnects the
+    # console rather than joining it; getting a remote session takes a second
+    # machine and a person on it. Unlike `release-artifacts-packaging` there is
+    # no `CiEvidence` to lean on either: a GitHub runner has no RDP session
+    # either, and the whole point of T1253 is that the environment, not the
+    # code path, is the subject. `GHOZTTY_GL_FORCE_VERSION` proves the path.
+    #
+    # So this row is a standing REMINDER with a narrow trigger: an edit to the
+    # two files that decide which OpenGL implementation a remote session ends
+    # up on makes the recorded RDP evidence stale, and says so at every claim,
+    # until somebody re-runs it from a remote session. `Surface.zig` is
+    # deliberately NOT covered - it is edited constantly for reasons that have
+    # nothing to do with GL selection, and a row that is always due is a row
+    # nobody reads.
+    [pscustomobject]@{
+        Name     = 'rdp-session'
+        Script   = 'test\win32\rdp-session.ps1'
+        Stamp    = 'test\win32\rdp-session.stamp.json'
+        Advisory = $true
+        Covers   = @(
+            'src\renderer\gl_loader.zig',
+            'src\renderer\gl_report.zig',
+            'test\win32\rdp-session.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'release-artifacts-zip'
         Script = 'test\win32\release-artifacts.ps1'

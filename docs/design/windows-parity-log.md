@@ -19212,3 +19212,72 @@ eight of them new), ipc-p1/p2/p3 ALL PASS, and `release-artifacts`,
 `release-artifacts-zip`, `install-launch` (+ `-TeethCheck`), `deliver-verify`,
 `install-restart`, `install-prepare`, `update-real-msi`, `upstream-remote` and
 the six static audits all re-run and re-stamped.
+
+## 2026-09-01 - the Remote Desktop claim now has a test that refuses to pass from the wrong place (T1255)
+
+Four tasks in a row - T1224, T1249, T1251, T1252 - are about a display driver
+whose OpenGL is below the renderer's floor, and all four are proved by
+PRETENDING. `GHOZTTY_GL_FORCE_VERSION` moves the number a context reports and
+nothing else. The failure the user actually hit was a whole environment: this
+box reached from a MacBook over Microsoft's Windows App, where the driver really
+is that old, the desktop is encoded and shipped over a wire, and the DPI and
+monitor topology are the client's. Nobody had ever watched Ghoztty launch inside
+an RDP session.
+
+`test\win32dp-session.ps1` is the checklist for when somebody does. Six arms:
+the session's own identity, a launch with no startup-failure dialog, the
+renderer's account of the OpenGL context and the implementation it drew with,
+`+list` over the remote session, frame pacing under a sustained stream, and a
+named window surviving a kill-and-relaunch restore. Whichever way arm C goes is
+a RESULT - `impl=fallback` means T1251/T1252 are working on the display that
+motivated them, `impl=system` means the session's driver clears 4.3 on its own -
+and the only defect is a terminal that comes up with no account of either. Arm E
+measures rather than asserts, because T1253 was explicit that slow-but-working
+belongs in a follow-up and not in a red run; what it asserts is that a
+measurement happened at all.
+
+The refusal is the design rather than a skip branch. Outside a remote session
+the script prints `ASSERTED NOTHING` and exits 2, so a console run can never be
+mistaken for evidence - which matters because this box CANNOT make itself a
+remote session. Windows 11 Pro serves one interactive session at a time, so an
+RDP connection from anywhere, localhost included, takes over the console rather
+than joining it; Windows Sandbox and Hyper-V both need an elevated feature
+install and a reboot. That is why T1253 split: [[T1255]] is the checklist and
+landed here, [[T1256]] is the run and needs a second machine and a person on it.
+It keeps the P0 on the half that is actually blocked instead of on one that also
+hid an unwritten script.
+
+It also runs on the INTERACTIVE desktop, which no other GUI script in this suite
+does. A background desktop is never composited and never presented, so its
+frames are not shipped over the RDP wire - arm E would be measuring a renderer
+talking to nothing, which is the exact number the script exists to get right.
+
+`-SelfTest` runs the body on whatever desktop it finds so the harness can be
+proved to work without a second machine, and is deliberately incapable of
+scoring green: `SELF-TEST`, exit 2, its numbers written to a separate gitignored
+artifact, and no guard stamp. It earned its keep on the first run by finding
+`+list --json` parsed one level too shallow (`.windows`, not `.data.windows`),
+which had silently failed three arms; `stderr-capture-audit` then caught arm D
+piping a merged stream to `Out-String` unstringified. A harness whose body has
+never executed is a harness the first person in an RDP session debugs instead of
+the terminal.
+
+The `guard-due` row is ADVISORY, the second of that shape after
+`release-artifacts-packaging` and for a stronger reason: not only can this box
+not answer the question, no CI runner can either - a GitHub runner has no RDP
+session, and the subject here is the environment, not the code path. It covers
+`gl_loader.zig` and `gl_report.zig` and deliberately not `Surface.zig`, which is
+edited constantly for unrelated reasons; a row that is always due is a row
+nobody reads.
+
+Also filed: [[T1257]], for `asserted-nothing.ps1` being red at HEAD (soak.ps1
+scores a zero-assertion abort green, and the uncounted-final ceiling has walked
+UP by three). Confirmed pre-existing by stashing this work and re-running
+against a clean `9aa532901`.
+
+Floor: lib/none/win32/agent ALL LANES PASS; ipc-p1/p2/p3 ALL PASS;
+`stderr-capture-audit`, `verdict-exit-audit`, `body-complete-audit`,
+`isolation-meta`, `launch-preflight-audit`, `cleanslate-audit` and
+`desktop-launch-audit` re-run and re-stamped. `asserted-nothing` and
+`skip-visibility` are red at HEAD for reasons that predate this work (T1257,
+T1043, T775).
