@@ -1,42 +1,21 @@
-//! Geometry and reveal policy for the viewer nav bar (T159, design P3): where
-//! the four buttons and the address field sit at one DPI scale, how tall the
-//! hover strip is, and WHEN the bar shows or hides. Pure — every number is
-//! arithmetic on the design-system scale, so the whole module asserts in the
-//! none-runtime lane at 1.0/1.25/1.5/2.0 (the defects this catches are
-//! invisible at 1.0 and obvious at 1.25).
+//! Geometry for the viewer nav bar (T159, design P3): where the buttons and
+//! the address field sit at one DPI scale, and what the bar sheds as the pane
+//! narrows. Pure — every number is arithmetic on the design-system scale, so
+//! the whole module asserts in the none-runtime lane at 1.0/1.25/1.5/2.0 (the
+//! defects this catches are invisible at 1.0 and obvious at 1.25).
 //!
-//! Reveal geometry follows Mac (`ViewerView.chromeRevealHeight` = 20, 2s
-//! auto-hide, held open while the address field has focus or the cursor is on
-//! the bar). The DECISION lives here rather than in the timer handler so the
-//! show/hide policy is a table a unit test walks, not a WM_TIMER side effect.
-
+//! There is no show/hide policy here, and that absence is the point (T1185,
+//! Mac fc7e36356): the bar is part of every viewer pane's frame, always on
+//! screen, so the only question left is where its controls go.
 const std = @import("std");
 const icon_button = @import("icon_button.zig");
 
 pub const Rect = icon_button.Rect;
 
-/// The pane-top strip (in DIP) that reveals the bar on hover. Deliberately
-/// thin so ordinary interaction with the page never triggers the bar — only
-/// an intentional move to the very top edge (Mac's `chromeRevealHeight`).
-pub const reveal_dip: f32 = 20.0;
-
 /// Bar height: a 28 DIP icon button with the design system's 4 DIP breathing
 /// room above and below. The container is sized to the control, not the
 /// reverse.
 pub const bar_dip: f32 = 36.0;
-
-/// Auto-hide delays, matching Mac's `scheduleChromeHide` call sites: 2s after
-/// the strip revealed it, 0.7s once the cursor has drifted down into the
-/// content, 0.5s once it has left the pane entirely.
-pub const hide_delay_ms: u32 = 2000;
-pub const drift_delay_ms: u32 = 700;
-pub const leave_delay_ms: u32 = 500;
-
-/// How often the pane samples the cursor. Polling, not `TrackMouseEvent`:
-/// the mouse spends its life over WebView2's own Chromium child windows, so
-/// the host window never receives the move messages a tracking rectangle
-/// needs (the same reason Mac uses an app-local event monitor here).
-pub const poll_ms: u32 = 150;
 
 /// The condensed address field's designed minimum width (DIP), and the whole
 /// answer to "1 button and 1 tiny input?" (user, on D83's resolution). The
@@ -50,8 +29,8 @@ pub const field_min_dip: f32 = 72.0;
 
 /// The bar's buttons, in strip order. `contents` leads and exists only in a
 /// narrow viewer pane whose document has a table of contents (T160): the
-/// compact card's only opener lives in the chrome bar, which is why the bar
-/// pins open there. Mac puts the same button first in its chrome bar.
+/// compact card's only opener lives in the chrome bar. Mac puts the same
+/// button first in its chrome bar.
 ///
 /// `feedback` TRAILS — it is the only button on the far side of the address
 /// field — and exists only when the pane's content resolves to a git worktree
@@ -81,11 +60,9 @@ pub const Shown = struct {
 
 /// Everything the bar paints, in physical pixels, for one scale and width.
 pub const Layout = struct {
-    /// Bar band height (the host window insets the content by exactly this
-    /// while the bar is visible, so top-of-page content is never covered).
+    /// Bar band height (the host window insets the content by exactly this,
+    /// so top-of-page content is never covered).
     bar_h: i32,
-    /// Hover strip height, for the reveal test.
-    reveal_h: i32,
     /// Painted squares of the buttons, indexed by `Button`. A button the bar
     /// is not showing (the contents toggle outside the compact TOC layout)
     /// has an EMPTY rect: it takes no room, paints nothing, and hits nothing.
@@ -270,7 +247,6 @@ pub const Layout = struct {
         const field_right = if (fit.field) @max(field_limit, field_left) else field_left;
         return .{
             .bar_h = bar_h,
-            .reveal_h = px(reveal_dip, scale),
             .buttons = buttons,
             .overflowed = overflowed,
             .address = .{
@@ -305,109 +281,6 @@ pub const Layout = struct {
 fn px(dip: f32, scale: f32) i32 {
     return @intFromFloat(@round(dip * scale));
 }
-
-// -----------------------------------------------------------------------------
-// Pin policy
-// -----------------------------------------------------------------------------
-
-/// Every reason the bar stays on screen instead of peeking on hover. Mac's
-/// `ViewerView.chromeAlwaysVisible`, in one place for the same reason it is
-/// one place there: the conditions OVERLAP, and a pane pinned by two of them
-/// at once must not lose the bar when the first one ends.
-///
-/// A struct of named bools rather than positional ones so a fourth condition
-/// cannot silently swap with a third at the call site.
-pub const Pin = struct {
-    /// The pane is on a LIVE PAGE - a website, or a local `.html` file the web
-    /// view renders as one (`viewer_content.Mode.isLivePage`). That is
-    /// something you navigate, so the address and the history controls are
-    /// part of using it, and a blank browser pane is nothing but its address
-    /// field. A markdown or code viewer is a reading surface whose address
-    /// rarely changes, so it keeps the hover peek rather than spending a
-    /// permanent strip of the document on chrome (T1131; Mac 5241d7bec).
-    live_page: bool = false,
-    /// The compact table-of-contents layout: the card's only opener is the
-    /// bar's contents button, so a bar that auto-hides strands the card
-    /// (T160).
-    compact_toc: bool = false,
-    /// The feedback composer is open: its only close affordance lives in the
-    /// bar, so a bar that auto-hid out from under it would leave the composer
-    /// with no way out (T634).
-    feedback_open: bool = false,
-};
-
-/// Whether the bar is pinned open right now. Deliberately a function over the
-/// whole struct rather than an `or` at each site: the poll, the mode change
-/// and the composer all ask the same question, and three copies of it is three
-/// chances to disagree.
-pub fn pinned(p: Pin) bool {
-    return p.live_page or p.compact_toc or p.feedback_open;
-}
-
-// -----------------------------------------------------------------------------
-// Reveal policy
-// -----------------------------------------------------------------------------
-
-/// One cursor sample, in the pane's own coordinates.
-pub const HoverInput = struct {
-    /// Cursor is inside the pane's client rect.
-    in_pane: bool,
-    /// Cursor y in pane coordinates (physical px); meaningless when
-    /// `in_pane` is false.
-    y: i32 = 0,
-    /// The bar is currently shown.
-    visible: bool,
-    /// The bar must not hide out from under the user: the address field has
-    /// keyboard focus, or the cursor is on the bar itself.
-    held: bool,
-    now_ms: u64,
-    /// The pending hide deadline, 0 when none is scheduled.
-    deadline_ms: u64,
-    reveal_h: i32,
-};
-
-pub const HoverAction = struct {
-    show: bool = false,
-    hide: bool = false,
-    deadline_ms: u64 = 0,
-};
-
-/// Decide what this cursor sample does to the bar. The rules, in order:
-/// - held (field focused, or cursor on the bar): never hide; keep pushing the
-///   deadline out.
-/// - cursor in the reveal strip: show if hidden, and re-arm the full delay.
-/// - otherwise, a visible bar hides when its deadline lapses; drifting into
-///   the content or out of the pane can only PULL the deadline in, never push
-///   it out (Mac's shorter re-schedules).
-pub fn hoverTick(in: HoverInput) HoverAction {
-    var out: HoverAction = .{ .deadline_ms = in.deadline_ms };
-
-    if (in.held) {
-        out.deadline_ms = in.now_ms + hide_delay_ms;
-        return out;
-    }
-
-    if (in.in_pane and in.y >= 0 and in.y < in.reveal_h) {
-        if (!in.visible) out.show = true;
-        out.deadline_ms = in.now_ms + hide_delay_ms;
-        return out;
-    }
-
-    if (!in.visible) return out;
-
-    const cap: u64 = if (in.in_pane)
-        in.now_ms + drift_delay_ms
-    else
-        in.now_ms + leave_delay_ms;
-    if (out.deadline_ms == 0 or out.deadline_ms > cap) out.deadline_ms = cap;
-
-    if (in.now_ms >= out.deadline_ms) {
-        out.hide = true;
-        out.deadline_ms = 0;
-    }
-    return out;
-}
-
 // -----------------------------------------------------------------------------
 
 const testing = std.testing;
@@ -459,9 +332,6 @@ test "bar geometry holds the design system at every scale" {
                 // And the trailing button keeps the band's own 4 DIP edge.
                 try testing.expect(px(600.0, scale) - fb.right >= gap - 1);
             }
-
-            // Reveal strip is 20 DIP.
-            try testing.expectEqual(px(reveal_dip, scale), l.reveal_h);
         }
     }
 }
@@ -767,139 +637,4 @@ test "hit testing answers on the hit box, not the paint" {
     _ = l.hitButton(scale, back.right + m.hit_pad + 1, -50);
     // Far outside is nobody's.
     try testing.expectEqual(@as(?Button, null), l.hitButton(scale, 0, l.bar_h * 3));
-}
-
-test "hover policy: strip reveals, drift and leave pull the deadline in" {
-    const reveal = 25; // px at some scale; the policy is scale-agnostic
-
-    // In the strip, hidden -> show with the full delay armed.
-    var a = hoverTick(.{
-        .in_pane = true,
-        .y = 10,
-        .visible = false,
-        .held = false,
-        .now_ms = 1000,
-        .deadline_ms = 0,
-        .reveal_h = reveal,
-    });
-    try testing.expect(a.show);
-    try testing.expectEqual(@as(u64, 1000 + hide_delay_ms), a.deadline_ms);
-
-    // Still in the strip -> deadline keeps re-arming, no hide.
-    a = hoverTick(.{
-        .in_pane = true,
-        .y = 5,
-        .visible = true,
-        .held = false,
-        .now_ms = 2000,
-        .deadline_ms = 3000,
-        .reveal_h = reveal,
-    });
-    try testing.expect(!a.show and !a.hide);
-    try testing.expectEqual(@as(u64, 2000 + hide_delay_ms), a.deadline_ms);
-
-    // Drift into the content: the 2s deadline is pulled IN to 0.7s...
-    a = hoverTick(.{
-        .in_pane = true,
-        .y = 300,
-        .visible = true,
-        .held = false,
-        .now_ms = 2100,
-        .deadline_ms = 4000,
-        .reveal_h = reveal,
-    });
-    try testing.expect(!a.hide);
-    try testing.expectEqual(@as(u64, 2100 + drift_delay_ms), a.deadline_ms);
-
-    // ...but a deadline already sooner is never pushed OUT.
-    a = hoverTick(.{
-        .in_pane = true,
-        .y = 300,
-        .visible = true,
-        .held = false,
-        .now_ms = 2200,
-        .deadline_ms = 2400,
-        .reveal_h = reveal,
-    });
-    try testing.expectEqual(@as(u64, 2400), a.deadline_ms);
-
-    // Leaving the pane arms the shortest delay.
-    a = hoverTick(.{
-        .in_pane = false,
-        .visible = true,
-        .held = false,
-        .now_ms = 3000,
-        .deadline_ms = 0,
-        .reveal_h = reveal,
-    });
-    try testing.expectEqual(@as(u64, 3000 + leave_delay_ms), a.deadline_ms);
-
-    // The deadline lapsing hides the bar and clears itself.
-    a = hoverTick(.{
-        .in_pane = true,
-        .y = 300,
-        .visible = true,
-        .held = false,
-        .now_ms = 5000,
-        .deadline_ms = 4500,
-        .reveal_h = reveal,
-    });
-    try testing.expect(a.hide);
-    try testing.expectEqual(@as(u64, 0), a.deadline_ms);
-
-    // Held (field focused / cursor on the bar): never hides, keeps re-arming,
-    // even outside the pane.
-    a = hoverTick(.{
-        .in_pane = false,
-        .visible = true,
-        .held = true,
-        .now_ms = 9000,
-        .deadline_ms = 100,
-        .reveal_h = reveal,
-    });
-    try testing.expect(!a.hide);
-    try testing.expectEqual(@as(u64, 9000 + hide_delay_ms), a.deadline_ms);
-
-    // A hidden bar with the cursor idle in content does nothing at all.
-    a = hoverTick(.{
-        .in_pane = true,
-        .y = 300,
-        .visible = false,
-        .held = false,
-        .now_ms = 9500,
-        .deadline_ms = 0,
-        .reveal_h = reveal,
-    });
-    try testing.expect(!a.show and !a.hide);
-    try testing.expectEqual(@as(u64, 0), a.deadline_ms);
-}
-
-test "T1131: pin policy is the OR of every reason, and nothing else" {
-    // Nothing pinning: the bar peeks on hover, which is the reading-surface
-    // default (markdown, code).
-    try testing.expect(!pinned(.{}));
-
-    // Each reason pins on its own.
-    try testing.expect(pinned(.{ .live_page = true }));
-    try testing.expect(pinned(.{ .compact_toc = true }));
-    try testing.expect(pinned(.{ .feedback_open = true }));
-
-    // And they OVERLAP: a live page whose composer closes is still a live
-    // page, so the bar stays. This is the whole reason the question is asked
-    // in one place instead of at each site (Mac 5241d7bec).
-    try testing.expect(pinned(.{ .live_page = true, .feedback_open = true }));
-    try testing.expect(pinned(.{ .live_page = true, .feedback_open = false }));
-    try testing.expect(pinned(.{ .compact_toc = true, .feedback_open = true }));
-}
-
-test "T1131: a live page pins the bar, a reading surface does not" {
-    const content = @import("viewer_content.zig");
-    // The split the user feels: navigate-able pages keep their address on
-    // screen; documents keep the hover peek.
-    for ([_]content.Mode{ .web, .html }) |m| {
-        try testing.expect(pinned(.{ .live_page = m.isLivePage() }));
-    }
-    for ([_]content.Mode{ .markdown, .code, .diff }) |m| {
-        try testing.expect(!pinned(.{ .live_page = m.isLivePage() }));
-    }
 }

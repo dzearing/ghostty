@@ -23,22 +23,18 @@
 # background test desktop, where `CopyFromScreen` and `PrintWindow` are dead
 # (lib\TestDesktop.ps1's capture limit).
 #
-# SECTIONS A-D CANNOT SEE the nav bar's own button strip: on a reading surface
-# the bar is hidden unless something reveals it, and the compact-TOC pin that
-# would hold it open runs behind a `GetCursorPos` that FAILS on a background
-# desktop (T1152). What those sections assert about the bar is containment of
-# whatever they find, plus a positive control that SOMETHING was found, so a run
-# where no chrome exists at all cannot score green.
+# SECTIONS A-D assert containment of whatever chrome they find, plus a positive
+# control that SOMETHING was found, so a run where no chrome exists at all
+# cannot score green. Since T1185 the nav bar is part of every viewer pane's
+# frame, so it is among what they find in every mode - there is no hover left
+# for a background desktop to be unable to perform.
 #
-# SECTION E GETS IN ANYWAY (T1159), through a live page: an `.html` pane is
-# pinned open by `viewer_nav_layout.Pin.live_page` from its first layout, with
-# no cursor anywhere in the path, and `GhozttyViewerNav` answers WM_PRINTCLIENT
-# - the one capture that works off the input desktop. That is what lets the
-# narrow-bar LOOK be measured here (a control always in the leading slot, a
-# field that is legible or absent, nothing gained by narrowing, and a leading
-# mark that visibly changes) rather than only its arithmetic, which is asserted
-# in the none/win32 lanes (`viewer_nav_layout.zig`, the `T1130:` and `T1159:`
-# tests, all teeth-checked).
+# SECTION E measures the narrow bar's LOOK (T1159): `GhozttyViewerNav` answers
+# WM_PRINTCLIENT, which is the one capture that works off the input desktop, so
+# a control always in the leading slot, a field that is legible or absent,
+# nothing gained by narrowing, and a leading mark that visibly changes are all
+# assertable here rather than only in the arithmetic the none/win32 lanes cover
+# (`viewer_nav_layout.zig`, the `T1130:` and `T1159:` tests, all teeth-checked).
 #
 #   powershell -NoProfile -File test\win32\viewer-narrow-pane.ps1
 #
@@ -343,13 +339,11 @@ try {
     # -----------------------------------------------------------------------
     # E. T1159 - the narrow bar looks DESIGNED, not trimmed.
     #
-    # Section B cannot see the button strip (the bar is hidden on a reading
-    # surface, and the hover poll that would reveal it needs a cursor this
-    # desktop has not got). A LIVE PAGE is the way in: `viewer_nav_layout.Pin`
-    # pins the bar open for an .html pane from its first layout, with no cursor
-    # anywhere in the path - so the strip is on screen, its EDIT is a real
-    # child window to measure, and the bar answers WM_PRINTCLIENT, which is the
-    # one capture that works off the input desktop.
+    # The bar is on screen from an .html pane's first layout, with no cursor
+    # anywhere in the path (T1185 made that true of every mode) - so the strip
+    # is there to look at, its EDIT is a real child window to measure, and the
+    # bar answers WM_PRINTCLIENT, which is the one capture that works off the
+    # input desktop.
     #
     # What is asserted here is behaviour, not the layout's own arithmetic
     # restated (that is `viewer_nav_layout.zig`'s job, and mirroring it would

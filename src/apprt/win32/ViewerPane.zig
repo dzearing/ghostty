@@ -175,12 +175,9 @@ const feedback_close_timer_id: usize = 3;
 /// The debounce timer's id, in the host window's own timer space.
 const reload_timer_id: usize = 1;
 
-/// The nav chrome's cursor-sampling timer (T159). Polling, not
-/// `TrackMouseEvent`: the cursor spends its life over WebView2's own Chromium
-/// child windows, so this host window never sees the WM_MOUSEMOVEs a tracking
-/// rectangle needs — the same reason Mac watches with an app-local event
-/// monitor rather than a tracking area.
-const nav_timer_id: usize = 2;
+/// (Timer id 2 was the nav chrome's cursor poll, deleted with the hover peek
+/// in T1185. Left unreused so a stray WM_TIMER from an older build cannot be
+/// mistaken for a live one.)
 
 /// The working-tree poll's timer id, in the host window's own timer space
 /// (T463).
@@ -650,20 +647,6 @@ toc_width_dip: f32 = 0,
 /// reset the page's own padding.
 toc_gutter_css: f32 = 0,
 
-/// Whether the bar is currently revealed. The content inset follows this bit
-/// and nothing else, so the bar RESERVES its space (Mac parity: top-of-page
-/// content is never covered).
-nav_visible: bool = false,
-
-/// When the revealed bar hides, in `GetTickCount64` ms; 0 = nothing armed.
-nav_deadline: u64 = 0,
-
-/// The pin state the bar currently reflects, so `updateNavPin` acts only on a
-/// real CHANGE - it must never re-show a bar the user is already looking at,
-/// and must never re-arm the hide timer under one either (Mac's
-/// `chromePinned`).
-nav_pinned: bool = false,
-
 /// The last FILE location this pane rendered, kept across web navigations —
 /// it is what Back re-renders when the browser walks history onto the
 /// bundled template again (Mac's `fileLocation`, which its `syncMode` reads
@@ -1018,12 +1001,7 @@ pub fn createHostWindow(
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
     self.readScale();
 
-    // The nav chrome's hover poll (T159): samples the cursor for the reveal
-    // strip. Runs for the pane's whole life — 150ms of GetCursorPos is noise,
-    // and a timer that starts and stops with visibility is two more states
-    // that can disagree.
     if (self.pending) |p| self.ensureNav(p.alloc, hinstance, hwnd);
-    _ = w32.SetTimer(hwnd, nav_timer_id, nav_layout.poll_ms, null);
 }
 
 /// Create the nav bar once both halves exist: the host window to parent it
@@ -1077,13 +1055,10 @@ fn ensureNav(self: *ViewerPane, alloc: Allocator, hinstance: ?w32.HINSTANCE, hwn
             log.warn("viewer find card could not be created; ctrl+F does nothing", .{});
         }
     }
-    // Last, once there IS a bar to pin: a pane opened on a live page reserves
-    // the band in its FIRST layout, so the page paints once at its final size
-    // instead of being pushed down by a bar arriving a poll later (T1131,
-    // Mac's `updateChromePin()` in `init`). `navigate` normally runs before
-    // this, when `setNavVisible` had no bar to show.
-    self.nav_pinned = false;
-    self.updateNavPin();
+    // Last, once there IS a bar: place it and inset the content below it, so
+    // the page paints once at its final size rather than being pushed down by
+    // chrome that arrived later (T1185).
+    self.syncBounds();
 }
 
 /// Re-derive which worktree this pane's content belongs to, and move the nav
@@ -1125,7 +1100,7 @@ fn pushWorktree(self: *ViewerPane) void {
     // what keeps the composer from being a form with no destination.
     if (root == null and self.feedback_open) self.setFeedbackOpen(false);
     const nav = self.nav orelse return;
-    if (nav.setWorktree(root) and self.nav_visible) self.syncBounds();
+    if (nav.setWorktree(root)) self.syncBounds();
 }
 
 /// The worktree the composer would file into, or null when this pane's
@@ -1170,11 +1145,6 @@ pub fn setFeedbackOpen(self: *ViewerPane, open: bool) void {
         // `pending` can have set a status in the first place — every path that
         // sets one goes through its allocator.)
         if (self.pending) |p| self.setFeedbackStatus(p.alloc, "");
-        // The composer's only close affordance is the button that opened it,
-        // so the nav bar has to stop auto-hiding while it is open — the same
-        // reason the compact TOC layout pins it.
-        self.updateNavPin();
-        if (!self.nav_visible) self.setNavVisible(true);
         // Placed BEFORE it is shown: `place` is what gives the window its
         // size, its position and its fonts, and a window shown at 0x0 with no
         // scale would take one paint pass to become itself.
@@ -1193,11 +1163,6 @@ pub fn setFeedbackOpen(self: *ViewerPane, open: bool) void {
             bar.setVisible(false);
         }
         self.syncBounds();
-        // The bar was pinned open by the composer; give it back its ordinary
-        // auto-hide deadline rather than leaving it open forever - unless a
-        // live page or the compact card still pins it, which is the one thing
-        // the old bare deadline here could not know (T1131).
-        self.updateNavPin();
     }
 
     // The acceptance script's oracle, and the same shape T633's line has:
@@ -1560,10 +1525,6 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, requested: []const u8) Allo
     // the markdown template.
     const was_template = self.mode.usesTemplate();
     self.mode = content.modeFor(url);
-    // The bar follows the pane's CURRENT mode, so every assignment to it
-    // re-asks the pin question (T1131). Here that is the pane-initiated move:
-    // typing a URL into a markdown viewer's address field pins the bar.
-    self.updateNavPin();
     // Leaving the TEMPLATE — for the web, or for a rendered `.html` page, which
     // the web view loads itself: whatever headings the template last reported
     // are gone with it, and nothing will arrive to clear them, because the
@@ -2672,13 +2633,11 @@ fn updateTOC(self: *ViewerPane, alloc: Allocator) void {
     const width = @max(r.right - r.left, 0);
     const height = @max(r.bottom - r.top, 0);
     var top: i32 = 0;
-    if (self.nav_visible) {
-        if (self.nav) |nav| {
-            top = @min(
-                nav_layout.Layout.init(self.scale, width, nav.shown()).bar_h,
-                height,
-            );
-        }
+    if (self.nav) |nav| {
+        top = @min(
+            nav_layout.Layout.init(self.scale, width, nav.shown()).bar_h,
+            height,
+        );
     }
     // The card starts BELOW the composer, not behind it. Mac solves the same
     // problem by z-order (`composerDrawsAboveTheTOCCard`); here the two are
@@ -2714,8 +2673,9 @@ fn updateTOC(self: *ViewerPane, alloc: Allocator) void {
     const panel = self.toc.?;
 
     // Entering the compact layout closes the overlay (it opens only from its
-    // button) and hands the bar its contents toggle; the pinning itself rides
-    // the hover poll, which shows the bar and holds it open while compact.
+    // button) and hands the bar its contents toggle. The card's opener is
+    // therefore always reachable, because the bar itself always is (T1185) -
+    // which is what the compact layout used to need its own pin for.
     if (wanted == .compact and self.toc_mode != .compact) self.toc_open = false;
     self.toc_mode = wanted;
     if (self.nav) |nav| nav.setContentsButton(wanted == .compact);
@@ -4243,17 +4203,15 @@ pub fn syncBounds(self: *ViewerPane) void {
     const width = @max(r.right - r.left, 0);
     const height = @max(r.bottom - r.top, 0);
 
-    // The bar reserves its band while visible (Mac parity: the content is
-    // inset, never covered), and follows the pane's width live.
+    // The bar reserves its band (Mac parity: the content is inset, never
+    // covered), and follows the pane's width live.
     var top: i32 = 0;
-    if (self.nav_visible) {
-        if (self.nav) |nav| {
-            nav.place(width, self.scale);
-            top = @min(
-                nav_layout.Layout.init(self.scale, width, nav.shown()).bar_h,
-                height,
-            );
-        }
+    if (self.nav) |nav| {
+        nav.place(width, self.scale);
+        top = @min(
+            nav_layout.Layout.init(self.scale, width, nav.shown()).bar_h,
+            height,
+        );
     }
 
     // The composer takes the next band down, and reserves it the same way the
@@ -4827,16 +4785,14 @@ fn placeFind(self: *ViewerPane) bool {
     return bar.place(self.contentTop(width), width, self.scale);
 }
 
-/// Where the page starts: below the nav bar's band and the composer's while
-/// those are showing. The card hangs off the CONTENT's top edge rather than the
-/// pane's, so a revealing nav bar moves it down with the text instead of
+/// Where the page starts: below the nav bar's band, and below the composer's
+/// while that is open. The card hangs off the CONTENT's top edge rather than
+/// the pane's, so the composer opening moves it down with the text instead of
 /// sliding under it (Mac anchors it to the web view for the same reason).
 fn contentTop(self: *ViewerPane, width: i32) i32 {
     var top: i32 = 0;
-    if (self.nav_visible) {
-        if (self.nav) |nav| {
-            top += nav_layout.Layout.init(self.scale, width, nav.shown()).bar_h;
-        }
+    if (self.nav) |nav| {
+        top += nav_layout.Layout.init(self.scale, width, nav.shown()).bar_h;
     }
     if (self.feedback_open) {
         if (self.feedback) |bar| top += bar.barHeight(width, self.scale);
@@ -5018,126 +4974,11 @@ fn onDocumentTitleChanged(
 // Navigation chrome (T159)
 // -------------------------------------------------------------------------
 
-/// Every reason this pane's bar stays on screen, gathered for
-/// `nav_layout.pinned`. Read from where the pane IS right now, never from
-/// where it was opened: the address field navigates a markdown viewer to a
-/// website and Back brings it home, and the bar has to follow (T1131).
-fn navPin(self: *const ViewerPane) nav_layout.Pin {
-    return .{
-        // A website or a local `.html` page is something you NAVIGATE, so the
-        // address and the history controls are part of using it. A markdown or
-        // code document is a reading surface and keeps the hover peek.
-        .live_page = self.mode.isLivePage(),
-        // The compact TOC layout: its contents button is the card's only
-        // opener, so a bar that auto-hides strands the card (T160).
-        .compact_toc = self.toc_mode == .compact,
-        // The open composer: the button that CLOSES it lives in the bar, so a
-        // bar that auto-hid out from under it would leave the composer with no
-        // close affordance at all (T634).
-        .feedback_open = self.feedback_open,
-    };
-}
-
-/// Re-evaluate the pin after something that can change it - a navigation, the
-/// side panel switching layout, the composer opening or closing.
-///
-/// EVERY pin transition goes through here, because the conditions OVERLAP: a
-/// pane can be pinned by two of them at once, and one of them ending must not
-/// un-pin a bar the other still needs. That is the bug Mac's `updateChromePin`
-/// exists to prevent, and this is the same choke point.
-///
-/// The TOC half is asked from the POLL rather than eagerly at the layout
-/// transition, which is where it already lived: `updateTOC` runs inside
-/// `syncBounds`, and pinning from there would re-enter `syncBounds` through
-/// `setNavVisible` in the middle of placing the card. 150ms is imperceptible
-/// for a card the user just resized a divider to summon, and the poll asks the
-/// whole `Pin` struct, so the overlap rule holds either way.
-fn updateNavPin(self: *ViewerPane) void {
-    const want = nav_layout.pinned(self.navPin());
-    if (want == self.nav_pinned) return;
-    self.nav_pinned = want;
-    if (want) {
-        // Newly pinned: show it now, so the content is inset below the bar
-        // from this layout rather than being pushed down a poll later.
-        self.setNavVisible(true);
-    } else {
-        // No longer pinned: hand it back to the hover timer rather than
-        // yanking it away mid-glance.
-        self.nav_deadline = w32.GetTickCount64() + nav_layout.hide_delay_ms;
-    }
-}
-
-/// One cursor sample against the reveal strip. The DECISION is
-/// `nav_layout.hoverTick`, pure and unit-tested; this is only the plumbing
-/// that feeds it and obeys it.
-fn navHoverTick(self: *ViewerPane) void {
-    const h = self.hwnd orelse return;
-    const nav = self.nav orelse return;
-    if (!self.visible) return;
-
-    var pt: w32.POINT = undefined;
-    if (w32.GetCursorPos_(&pt) == 0) return;
-    if (w32.ScreenToClient(h, &pt) == 0) return;
-    var r: w32.RECT = undefined;
-    if (w32.GetClientRect(h, &r) == 0) return;
-
-    // Only an ACTIVE window's cursor reveals chrome: hovering across a
-    // background app should not animate it (and the cursor's absolute screen
-    // position is meaningless to a window the user is not in — the live test
-    // depends on that, since a test window never owns the real cursor).
-    // Active, not foreground, since T215: there is no foreground window at
-    // all on a background desktop, which pinned this false and made the
-    // hover reveal unreachable by any script running there.
-    //
-    // The poll is also the pin's BACKSTOP: every state that pins the bar
-    // routes through `updateNavPin` at the moment it changes, and asking again
-    // here costs a struct compare while covering any future site that forgets
-    // to (and a pane whose bar did not exist yet when its mode was decided).
-    self.updateNavPin();
-    const pinned = self.nav_pinned;
-    if (pinned and !self.nav_visible) self.setNavVisible(true);
-
-    const window_active_now = w32.windowIsActive(w32.GetAncestor(h, w32.GA_ROOT));
-    const in_pane = window_active_now and
-        pt.x >= 0 and pt.y >= 0 and pt.x < r.right and pt.y < r.bottom;
-    const l = nav_layout.Layout.init(self.scale, r.right - r.left, nav.shown());
-    // "Held" = the address field owns the keyboard, or the cursor is on the
-    // revealed bar itself (its band is the top `bar_h` of the pane).
-    const edit_focused = w32.GetFocus() == @as(?w32.HWND, nav.edit) or
-        (if (self.feedback) |bar| bar.hasFocus() else false);
-    const on_bar = self.nav_visible and in_pane and pt.y < l.bar_h;
-
-    const action = nav_layout.hoverTick(.{
-        .in_pane = in_pane,
-        .y = pt.y,
-        .visible = self.nav_visible,
-        .held = edit_focused or on_bar or pinned,
-        .now_ms = w32.GetTickCount64(),
-        .deadline_ms = self.nav_deadline,
-        .reveal_h = l.reveal_h,
-    });
-    self.nav_deadline = action.deadline_ms;
-    if (action.show) self.setNavVisible(true);
-    if (action.hide) self.setNavVisible(false);
-}
-
-/// Reveal or retract the bar, moving the content edge with it.
-fn setNavVisible(self: *ViewerPane, visible: bool) void {
-    if (self.nav_visible == visible) return;
-    const nav = self.nav orelse return;
-    self.nav_visible = visible;
-    if (visible) self.pushAddress();
-    self.syncBounds(); // places the bar and insets the content
-    nav.setVisible(visible);
-}
-
-/// Reveal the bar and put the caret in the address field with the whole
-/// address selected — the keyboard entry point (Mac's `focusAddressBar`).
-/// Returns false when this pane has no bar to focus.
+/// Put the caret in the address field with the whole address selected — the
+/// keyboard entry point (Mac's `focusAddressBar`). Returns false when this
+/// pane has no bar to focus.
 pub fn focusAddressBar(self: *ViewerPane) bool {
     const nav = self.nav orelse return false;
-    self.setNavVisible(true);
-    self.nav_deadline = w32.GetTickCount64() + nav_layout.hide_delay_ms;
     nav.focusAddress();
     return true;
 }
@@ -5315,8 +5156,6 @@ fn syncCommitted(self: *ViewerPane, alloc: Allocator, src: []const u8) void {
         if (self.mode.usesTemplate()) return;
         const floc = self.file_location orelse return;
         self.mode = content.modeFor(floc);
-        // Back over the web->file boundary un-pins the bar (T1131).
-        self.updateNavPin();
         self.page_loaded = false;
         if (alloc.dupeZ(u8, floc)) |dup| {
             if (self.location) |l| alloc.free(l);
@@ -5335,9 +5174,6 @@ fn syncCommitted(self: *ViewerPane, alloc: Allocator, src: []const u8) void {
     } else if (viewMode(src) == .web) {
         const was_file = self.mode.isFile();
         self.mode = .web;
-        // A link the PAGE followed out to the web pins the bar just as a typed
-        // address does (T1131).
-        self.updateNavPin();
         if (alloc.dupeZ(u8, src)) |dup| {
             if (self.location) |l| alloc.free(l);
             self.location = dup;
@@ -5402,8 +5238,6 @@ fn syncCommittedPage(self: *ViewerPane, alloc: Allocator, src: []const u8) void 
     if (self.file_path) |cur| if (content.samePath(cur, path)) return;
 
     self.mode = .html;
-    // A local `.html` file is a live page: same pin as a website (T1131).
-    self.updateNavPin();
     if (alloc.dupe(u8, path)) |dup| {
         if (self.file_path) |old| alloc.free(old);
         self.file_path = dup;
@@ -5803,10 +5637,6 @@ pub fn wndProc(
         },
 
         w32.WM_TIMER => {
-            if (wparam == nav_timer_id) {
-                self.navHoverTick();
-                return 0;
-            }
             if (wparam == feedback_close_timer_id) {
                 // One-shot: the confirmation has been read, so the composer
                 // gives the pane its band back.
@@ -6144,14 +5974,10 @@ test "host floor: a real controller on a real window, on this box" {
     try testing.expectEqual(@as(i32, 0), b.left);
     try testing.expectEqual(@as(i32, 640), b.right);
     try testing.expectEqual(@as(i32, 480), b.bottom);
-    // The top is the pinned nav band, not zero: this pane is in `.web` mode
-    // (the default, and what `+split --view=<url>` lands in), which is a LIVE
-    // PAGE, so the bar is pinned open from the pane's first layout and the
-    // content is INSET below it rather than covered (T1131). That the number
-    // is the layout's own `bar_h` is the point — the reserve and the paint
-    // read the same source.
-    try testing.expect(pane.nav_pinned);
-    try testing.expect(pane.nav_visible);
+    // The top is the nav band, not zero: the bar is part of every viewer
+    // pane's frame from its first layout, so the content is INSET below it
+    // rather than covered (T1185). That the number is the layout's own
+    // `bar_h` is the point — the reserve and the paint read the same source.
     const band = nav_layout.Layout.init(pane.scale, 640, pane.nav.?.shown()).bar_h;
     try testing.expectEqual(band, b.top);
 
@@ -6888,8 +6714,8 @@ test "host floor: a real controller on a real window, on this box" {
     try testing.expectEqualStrings(md_path, pane.location.?);
 
     // ------------------------------------------------------------------
-    // T159: the chrome itself — the bar exists, reveals, reserves its band,
-    // and the address field holds the retypable location selected
+    // T159: the chrome itself — the bar exists, reserves its band, and the
+    // address field holds the retypable location selected
     // ------------------------------------------------------------------
     try testing.expect(pane.nav != null);
     const nav = pane.nav.?;
@@ -9192,62 +9018,36 @@ test "visibility is recorded even before a controller exists" {
     try testing.expect(pane.focused);
 }
 
-test "T1131: the pin follows where the pane IS, and overlapping reasons hold it" {
-    // No window and no bar: `nav_pinned` is the pane's own record of the
-    // answer, so the wiring is assertable without a browser (the GEOMETRY of
-    // the same rule is `viewer_nav_layout`'s, at every scale).
+test "T1185: the bar's band is reserved in every viewer mode" {
+    // No window and no browser: `contentTop` is where the pane decides how
+    // much of itself the page gets, and since T1185 that answer no longer
+    // depends on a hover poll, a pin, or which mode the pane is in — a
+    // markdown document reserves exactly the band a website does.
     var pane: ViewerPane = .{};
 
-    // Default `.web`: a live page, pinned.
-    pane.updateNavPin();
-    try testing.expect(pane.nav_pinned);
+    // With no bar (the degraded path where the chrome could not be created),
+    // the page gets the whole pane and nothing is reserved for a bar that is
+    // not there.
+    for ([_]content.Mode{ .web, .html, .markdown, .code, .diff }) |m| {
+        pane.mode = m;
+        try testing.expectEqual(@as(i32, 0), pane.contentTop(640));
+    }
 
-    // Browsing to a document releases it — a markdown or code viewer is a
-    // reading surface and keeps the hover peek.
-    pane.mode = .markdown;
-    pane.updateNavPin();
-    try testing.expect(!pane.nav_pinned);
-
-    // ...and a rendered local `.html` file pins it again: it is a page the web
-    // view navigates, exactly like a website.
-    pane.mode = .html;
-    pane.updateNavPin();
-    try testing.expect(pane.nav_pinned);
-
-    // A diff keeps today's hover behavior; its own pin is T817's, with the
-    // controls that make it worth pinning for.
-    pane.mode = .diff;
-    pane.updateNavPin();
-    try testing.expect(!pane.nav_pinned);
-
-    // The OVERLAP rule, which is the whole reason there is one choke point:
-    // the composer pins a document pane, and closing it releases the bar —
-    // but on a live page the bar was already pinned and must STAY.
-    pane.feedback_open = true;
-    pane.updateNavPin();
-    try testing.expect(pane.nav_pinned);
-    pane.feedback_open = false;
-    pane.updateNavPin();
-    try testing.expect(!pane.nav_pinned);
-
-    pane.mode = .web;
-    pane.feedback_open = true;
-    pane.updateNavPin();
-    try testing.expect(pane.nav_pinned);
-    pane.feedback_open = false;
-    pane.updateNavPin();
-    try testing.expect(pane.nav_pinned);
-
-    // And the compact card is the third overlapping reason.
-    pane.mode = .code;
-    pane.updateNavPin();
-    try testing.expect(!pane.nav_pinned);
-    pane.toc_mode = .compact;
-    pane.updateNavPin();
-    try testing.expect(pane.nav_pinned);
-    pane.toc_mode = .gutter;
-    pane.updateNavPin();
-    try testing.expect(!pane.nav_pinned);
+    // With a bar, every mode reserves the same band — the layout's own
+    // `bar_h`, so the reserve and the paint read one source.
+    // Only the two fields `shown()` reads are set: the test needs a bar to
+    // exist, not a window to exist behind it.
+    var nav: ViewerNavBar = undefined;
+    nav.show_contents = false;
+    nav.worktree_len = 0;
+    pane.nav = &nav;
+    defer pane.nav = null;
+    const band = nav_layout.Layout.init(pane.scale, 640, .{}).bar_h;
+    try testing.expect(band > 0);
+    for ([_]content.Mode{ .web, .html, .markdown, .code, .diff }) |m| {
+        pane.mode = m;
+        try testing.expectEqual(band, pane.contentTop(640));
+    }
 }
 
 test "a restored open re-homes the pane; a fresh open homes it where it went" {

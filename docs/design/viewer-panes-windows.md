@@ -133,8 +133,9 @@ WebView2 as page content. It would have to be injected into arbitrary
 third-party pages, it would fight their CSS and z-index, and it would put the
 address field inside the very content it navigates.
 
-Reveal geometry follows Mac (`chromeRevealHeight = 20`, 2s auto-hide,
-held open while focused or while the pane is narrow-TOC).
+Always on screen, in every mode, from the pane's first layout (T1185, Mac
+`fc7e36356`). There is no reveal geometry and no hide timer: the bar is part of
+the pane's frame and reserves its band, so nothing reflows under the pointer.
 
 ### P4. `isFilePath` must be Windows-shaped
 

@@ -1,19 +1,19 @@
-# T1131 acceptance: which viewer panes keep their address bar on screen.
+# T1185 acceptance: every viewer pane keeps its address bar on screen.
 #
-# THE CONTRACT, carried over from Mac's 5241d7bec. A LIVE PAGE - a website, or
-# a local `.html` file the web view renders as one - is something you NAVIGATE,
-# so its address and history controls stay put: the bar is pinned open from the
-# pane's first layout, with no hover and no cursor anywhere near it. A markdown
-# or code viewer is a reading surface whose address rarely changes, so it keeps
-# the HOVER PEEK and shows no bar until the mouse reaches the strip at the top.
+# THE CONTRACT, carried over from Mac's fc7e36356 (which finished what
+# 5241d7bec started). The nav bar is part of a viewer pane's FRAME: it is there
+# from the pane's first layout in every mode - website, local `.html` page,
+# markdown document, code file, diff - with no hover and no cursor anywhere
+# near it. There is no peek left to reveal it and no state in which it is
+# absent, which is the whole point: the way out of a pane is never something to
+# hunt for with the mouse, and nothing reflows when the pointer crosses the top
+# edge.
 #
-# WHY THIS IS MEASURABLE WHERE THE HOVER PEEK IS NOT (T1152). The peek runs
-# behind a `GetCursorPos` sample that fails on a background desktop, so a script
-# running there can never reveal the bar by hovering. The PIN does not go
-# through the cursor at all - it is applied at the moment the pane's mode is
-# decided (`ViewerPane.updateNavPin`) - which is exactly why the pinned half is
-# assertable here and the peek half is asserted in the none/win32 lanes
-# (`viewer_nav_layout.zig`'s hover policy table).
+# WHY THIS IS MEASURABLE (T1152). The old peek ran behind a `GetCursorPos`
+# sample that fails on a background desktop, so a script running there could
+# never reveal a bar by hovering - which is why the peek's own half was only
+# ever assertable in the unit lanes. With the peek gone the whole contract is
+# cursor-free, so all of it is assertable right here.
 #
 # THE ORACLE is window state, not pixels: the bar is a `GhozttyViewerNav` child
 # window of the pane host, so "is it on screen" is `IsWindowVisible` plus a rect
@@ -23,11 +23,11 @@
 #
 #   powershell -NoProfile -File test\win32\viewer-nav-pin.ps1
 #
-# -NegativeControl inverts the FLAVOR SPLIT (sections A-D): every pane is
-# asserted to do the opposite of what it should, so a correct build fails all
-# four and a build that pinned everything (or nothing) would score some of them
-# green. Anything other than four failures means the split is not what is being
-# measured.
+# -NegativeControl inverts the PRESENCE assertions (sections A-E): every pane is
+# asserted to hide the bar it must show, so a correct build fails all five. A
+# build that regressed one mode back to the peek would score that one green,
+# which is the shape this control exists to make visible. Anything other than
+# five failures means presence is not what is being measured.
 param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
 
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
@@ -55,8 +55,8 @@ function Assert([bool]$cond, [string]$label) {
     if ($cond) { $script:pass++; Write-Host "PASS  $label" }
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
 }
-# The four flavor assertions, and the only ones -NegativeControl inverts.
-function Assert-Split([bool]$cond, [string]$label) {
+# The five presence assertions, and the only ones -NegativeControl inverts.
+function Assert-Pinned([bool]$cond, [string]$label) {
     if ($NegativeControl) { Assert (-not $cond) "$label (INVERTED)" }
     else { Assert $cond $label }
 }
@@ -108,12 +108,15 @@ function Measure-Bar([IntPtr]$topHwnd) {
 }
 
 # Open one viewer pane in its own window, measure it, and tear the window down
-# again - so each flavor is a FRESH pane whose mode was decided at open, which
-# is the moment the pin is applied.
+# again - so each flavor is a FRESH pane, measured in the state its very first
+# layout left it in.
 function Measure-Flavor([string]$target, [string]$location) {
     Invoke-Verb @('+new-window', "--target=$target") | Out-Null
     if (-not (Wait-Win $target)) { return $null }
-    $r = Invoke-Verb @('+split', "--target=$target", "--view=$location", "--name=$target-v")
+    # --working-directory pins where a repo-relative view (git-diff:) resolves
+    # from, rather than inheriting whatever the app was launched in.
+    $r = Invoke-Verb @('+split', "--target=$target", "--view=$location", "--name=$target-v",
+        "--working-directory=$repo")
     if ($r.Code -ne 0) {
         Write-Host "      +split --view exited $($r.Code): $($r.Out)" -ForegroundColor Yellow
         return $null
@@ -160,10 +163,9 @@ try {
         Write-Host 'SETUP FAIL: no GhozttyWindow'; exit 1
     }
 
-    # A: a local .html page is a LIVE page - the bar is there without hovering.
-    # This is also the section that proves the measurement works at all, so it
-    # runs first and its containment/inset checks are the ones sections B-D
-    # lean on.
+    # A: a local .html page. This is also the section that proves the
+    # measurement works at all, so it runs first and its containment checks are
+    # the ones sections B-E lean on.
     Write-Host ''
     Write-Host 'A: a local HTML page keeps its address bar'
     $html = Measure-Flavor 'vpA' $htmlFile
@@ -171,7 +173,7 @@ try {
     if ($html) {
         Write-Host ("      bar visible=$($html.BarVisible) rect=$($html.Bar.Left),$($html.Bar.Top).." +
             "$($html.Bar.Right),$($html.Bar.Bottom) host top=$($html.Host.Top) pageTop=$($html.PageTop)")
-        Assert-Split $html.BarVisible 'A: the bar is on screen with no hover at all'
+        Assert-Pinned $html.BarVisible 'A: the bar is on screen with no hover at all'
         # It is the pane's OWN top band: a bar somewhere else on screen would
         # satisfy "visible" and be useless.
         Assert ($html.Bar.Top -eq $html.Host.Top) 'A: the bar sits at the top of its pane'
@@ -198,34 +200,62 @@ try {
     Assert ($null -ne $web) 'B: the website viewer pane and its nav bar exist'
     if ($web) {
         Write-Host "      bar visible=$($web.BarVisible) height=$($web.Bar.Height)"
-        Assert-Split $web.BarVisible 'B: the bar is on screen with no hover at all'
+        Assert-Pinned $web.BarVisible 'B: the bar is on screen with no hover at all'
     }
     Invoke-Verb @('+close', '--target=vpB') | Out-Null
     Start-Sleep -Milliseconds 800
 
-    # C: a markdown document is a READING surface - hover peek, so no bar until
-    # the mouse asks for one, and nothing on this desktop can ask.
+    # C: a markdown document - one of the two modes T1185 changed, and the one
+    # the inset matters most in: this is where the document used to reflow
+    # under the pointer as the bar peeked in over it.
     Write-Host ''
-    Write-Host 'C: a markdown document keeps the hover peek'
+    Write-Host 'C: a markdown document keeps its address bar'
     $md = Measure-Flavor 'vpC' $mdFile
     Assert ($null -ne $md) 'C: the markdown viewer pane and its nav bar exist'
     if ($md) {
-        Write-Host "      bar visible=$($md.BarVisible) height=$($md.Bar.Height)"
-        Assert-Split (-not $md.BarVisible) 'C: no bar is showing until it is hovered'
+        Write-Host "      bar visible=$($md.BarVisible) height=$($md.Bar.Height) pageTop=$($md.PageTop)"
+        Assert-Pinned $md.BarVisible 'C: the bar is on screen with no hover at all'
+        Assert ($md.Bar.Top -eq $md.Host.Top) 'C: the bar sits at the top of its pane'
+        Assert ($null -ne $md.PageTop) 'C: the page window under the bar was found (positive control)'
+        if ($null -ne $md.PageTop) {
+            Assert ($md.PageTop -ge $md.Bar.Bottom) `
+                "C: the document starts below the bar (page top=$($md.PageTop), bar bottom=$($md.Bar.Bottom))"
+        }
     }
     Invoke-Verb @('+close', '--target=vpC') | Out-Null
     Start-Sleep -Milliseconds 800
 
-    # D: and so is a code file.
+    # D: and so does a code file.
     Write-Host ''
-    Write-Host 'D: a code file keeps the hover peek'
+    Write-Host 'D: a code file keeps its address bar'
     $code = Measure-Flavor 'vpD' $codeFile
     Assert ($null -ne $code) 'D: the code viewer pane and its nav bar exist'
     if ($code) {
-        Write-Host "      bar visible=$($code.BarVisible) height=$($code.Bar.Height)"
-        Assert-Split (-not $code.BarVisible) 'D: no bar is showing until it is hovered'
+        Write-Host "      bar visible=$($code.BarVisible) height=$($code.Bar.Height) pageTop=$($code.PageTop)"
+        Assert-Pinned $code.BarVisible 'D: the bar is on screen with no hover at all'
+        Assert ($code.Bar.Top -eq $code.Host.Top) 'D: the bar sits at the top of its pane'
+        Assert ($null -ne $code.PageTop) 'D: the page window under the bar was found (positive control)'
+        if ($null -ne $code.PageTop) {
+            Assert ($code.PageTop -ge $code.Bar.Bottom) `
+                "D: the code starts below the bar (page top=$($code.PageTop), bar bottom=$($code.Bar.Bottom))"
+        }
     }
     Invoke-Verb @('+close', '--target=vpD') | Out-Null
+    Start-Sleep -Milliseconds 800
+
+    # E: a diff pane. Its OWN chrome - the change list and the layout controls
+    # - is T817's, but the unconditional rule covers it today, and a mode that
+    # quietly kept the old absence is exactly what this section catches.
+    Write-Host ''
+    Write-Host 'E: a diff pane keeps its address bar'
+    $diff = Measure-Flavor 'vpE' 'git-diff:HEAD'
+    Assert ($null -ne $diff) 'E: the diff viewer pane and its nav bar exist'
+    if ($diff) {
+        Write-Host "      bar visible=$($diff.BarVisible) height=$($diff.Bar.Height) pageTop=$($diff.PageTop)"
+        Assert-Pinned $diff.BarVisible 'E: the bar is on screen with no hover at all'
+        Assert ($diff.Bar.Top -eq $diff.Host.Top) 'E: the bar sits at the top of its pane'
+    }
+    Invoke-Verb @('+close', '--target=vpE') | Out-Null
 
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'the GUI survived the whole run'
 } finally {

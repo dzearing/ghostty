@@ -7,13 +7,13 @@
 //! fight their CSS and z-index, and would put the address field inside the
 //! very content it navigates. Precedents for the shape of this file are
 //! `RenameDialog.zig` (the EDIT handling) and `BannerOverlay.zig` (the
-//! icon-button painting); the geometry and the reveal policy live in
-//! `viewer_nav_layout.zig` where they assert at every scale without a window.
+//! icon-button painting); the geometry lives in `viewer_nav_layout.zig` where
+//! it asserts at every scale without a window.
 //!
 //! ## Who does what
 //!
-//! The bar OWNS its controls and their painting. The PANE owns when the bar
-//! is visible (the hover poll, the content inset) and what the buttons mean —
+//! The bar OWNS its controls and their painting. The PANE owns the content
+//! inset the bar's band costs, and what the buttons mean —
 //! every click lands back on `ViewerPane` (`goBack`, `goForward`,
 //! `reloadFromChrome`, `goHome`, `navigateFromAddress`). The main message
 //! loop owns the two keystrokes an EDIT cannot see the house way
@@ -154,9 +154,13 @@ fn registerClass(hinstance: ?w32.HINSTANCE) void {
     class_registered = true;
 }
 
-/// Create the bar as a HIDDEN child of the pane's host window. Null when any
+/// Create the bar as a VISIBLE child of the pane's host window. Null when any
 /// window cannot be created — the pane then simply has no chrome, which
 /// degrades to the pre-T159 world rather than to a crash.
+///
+/// Visible from birth since T1185: the bar is part of every viewer pane's
+/// frame, so there is no state in which it is created and not shown, and no
+/// `setVisible` to get that wrong from.
 pub fn create(
     alloc: Allocator,
     pane: *ViewerPane,
@@ -172,7 +176,7 @@ pub fn create(
         0,
         CLASS_NAME,
         std.unicode.utf8ToUtf16LeStringLiteral(""),
-        w32.WS_CHILD, // not visible until the hover strip reveals it
+        w32.WS_CHILD | w32.WS_VISIBLE_STYLE,
         0,
         0,
         0,
@@ -357,10 +361,6 @@ pub fn place(self: *ViewerNavBar, width: i32, scale: f32) void {
         if (self.font) |f| _ = w32.SendMessageW(self.edit, w32.WM_SETFONT, @intFromPtr(f), 1);
     }
     self.syncTip(l);
-}
-
-pub fn setVisible(self: *ViewerNavBar, visible: bool) void {
-    _ = w32.ShowWindow(self.hwnd, if (visible) w32.SW_SHOWNA else w32.SW_HIDE);
 }
 
 // -------------------------------------------------------------------------
@@ -880,9 +880,7 @@ fn wndProc(
             const code: u16 = @intCast((wparam >> 16) & 0xFFFF);
             const id: u16 = @intCast(wparam & 0xFFFF);
             if (id == edit_id and code == w32.EN_SETFOCUS) {
-                // Focus arriving by any road holds the bar open; the pane's
-                // hover poll reads GetFocus, so nothing to store — but a
-                // KEYBOARD arrival (tab, palette command) should select all,
+                // A KEYBOARD arrival (tab, palette command) should select all,
                 // and a click arrival is handled by noteClickDown/Up. The
                 // click case is distinguishable: the mouse is down over us.
                 if (w32.GetKeyState(w32.VK_LBUTTON) >= 0) {

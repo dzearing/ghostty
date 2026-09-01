@@ -1888,8 +1888,7 @@ pub fn hasFocus(self: *const ViewerFeedbackBar) bool {
     if (f == self.hwnd or f == self.edit) return true;
     // The web surface's caret lives several windows down inside Chromium's own
     // hierarchy, all of it parented to this band - so the test is descent, not
-    // equality. Equality is what would have made the nav bar auto-hide out from
-    // under a composer somebody was typing into.
+    // equality.
     return w32.IsChild(self.hwnd, f) != 0;
 }
 

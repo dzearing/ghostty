@@ -3,13 +3,11 @@
 //! close controls.
 //!
 //! A FLOATING CARD at the content's top-trailing corner, not a strip under the
-//! nav bar — the same call Mac made, for a reason that applies here harder. A
-//! markdown or code pane hides its nav bar until you reach for it
-//! (`viewer_nav_layout.reveal_dip`), so making find a second band would mean
-//! ctrl+F both pins the bar open AND adds a row under it: the document reflows
-//! by ~64 px and the text you were about to search scrolls out from under you.
-//! The card costs no layout at all, looks identical in every viewer mode, and
-//! is the shape Chrome trained people to expect. Its one cost — it covers the
+//! nav bar — the same call Mac made. A second band would push the document
+//! down by ~64 px on every ctrl+F, so the text you were about to search
+//! scrolls out from under you as you ask for it. The card costs no layout at
+//! all, looks identical in every viewer mode, and is the shape Chrome trained
+//! people to expect. Its one cost — it covers the
 //! document's top-right corner — is paid back by `find.js` scrolling matches to
 //! the MIDDLE of the pane, so the card is never over the match it just found.
 //!

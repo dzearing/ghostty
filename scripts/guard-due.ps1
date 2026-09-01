@@ -293,12 +293,13 @@ $GuardTable = @(
             'src\apprt\win32\viewer_accel.zig'
         )
     },
-    # The viewer nav-bar PIN (T1131): which viewer flavors keep their address
-    # bar on screen and which peek on hover. The unit lanes assert the policy
-    # table and the pane's own record of it; only this script proves that a
-    # real `+split --view=` pane comes up with the bar shown - or hidden - and
-    # that a shown bar reserves its band instead of covering the page. Covers
-    # the pane that applies the pin and the module that decides it.
+    # The viewer nav bar's PRESENCE (T1131, finished by T1185): every viewer
+    # flavor keeps its address bar on screen, in every mode, with no hover
+    # anywhere in the path. The unit lanes assert the band arithmetic; only
+    # this script proves that a real `+split --view=` pane comes up with the
+    # bar shown and reserving its band instead of covering the page. Covers the
+    # pane that insets the content, the module that sizes the band, and the bar
+    # itself - which is the window whose visibility is being measured.
     [pscustomobject]@{
         Name   = 'viewer-nav-pin'
         Script = 'test\win32\viewer-nav-pin.ps1'
@@ -306,7 +307,8 @@ $GuardTable = @(
         Covers = @(
             'test\win32\viewer-nav-pin.ps1',
             'src\apprt\win32\viewer_nav_layout.zig',
-            'src\apprt\win32\ViewerPane.zig'
+            'src\apprt\win32\ViewerPane.zig',
+            'src\apprt\win32\ViewerNavBar.zig'
         )
     },
     # The feedback composer (T644): its undo behaviour, quote formatting and

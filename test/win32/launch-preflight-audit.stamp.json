@@ -1,10 +1,11 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-09-01T00:26:59-07:00",
-    "commit":  "55cf82c0d",
+    "generated":  "2026-09-01T01:29:47-07:00",
+    "commit":  "cc0a1b123",
     "uncommitted":  [
-                        "test/win32/viewer-find.ps1"
+                        "test/win32/viewer-narrow-pane.ps1",
+                        "test/win32/viewer-nav-pin.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -279,8 +280,8 @@
                   "test/win32/viewer-find.ps1":  "fc96957e53741109ee6580420d854a7f28defd53c9bc7d02232bc86e19d0cd7f",
                   "test/win32/viewer-html.ps1":  "da63fa5c0af6cb62ef6852187d873d89cc860d22e1f55435cc85c59c4e98769d",
                   "test/win32/viewer-image.ps1":  "c9cd6b45f00b3138dd1c93860e04f3705127ac8dde2c5a9005a13208b7f5bfde",
-                  "test/win32/viewer-narrow-pane.ps1":  "251859079a93e237045acf2a9e7ead61655863ba45c37a0b8ae0367a98f05e21",
-                  "test/win32/viewer-nav-pin.ps1":  "f96acd0e9478195b660b6ca9024e069cab06dcb8b2300aff238b8459929d1294",
+                  "test/win32/viewer-narrow-pane.ps1":  "764b24f911d9bd641d121d1e2eb2534c9f5d35e9afc222a5d71298295270740d",
+                  "test/win32/viewer-nav-pin.ps1":  "7cbcd650ee1a3dd4ea2a8e47847185ecf2c870949c5671cb174f01b06f79a115",
                   "test/win32/viewer-panes.ps1":  "f679e363da3a45c230d2ef91e3e7b61d8baa34ae59af3b05cfd43a0fb3ea632c",
                   "test/win32/viewer-popup.ps1":  "207d22eddae6f4326f1c25a3d64e1e745b705bf53651526519b596318b8de890",
                   "test/win32/viewer-restore.ps1":  "ccca2d3b05ca78901733377666281e357f64b36a57b729f2c54af0252239afb0",

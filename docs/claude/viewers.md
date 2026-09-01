@@ -240,20 +240,14 @@ ghoztty +close --target=doc
   page in place instead of re-rendering into the template — same promise, the
   engine's own scroll restoration rather than the template's.
 - **Navigation chrome**: every mode gets a bar with back / forward / reload /
-  **home** and an **editable address field**; what differs is whether it is
-  always there. A **live page** — a website, or a local HTML file the web view
-  renders as one — **pins it open**: that is something you navigate, so the
-  address and the history controls are part of using it, and a blank browser
-  pane is nothing but its address field. A **markdown or code** viewer is a
-  reading surface whose address rarely changes, so it keeps the **hover peek**:
-  the bar slides in when the cursor reaches the thin strip at the pane's top and
-  auto-hides after inactivity. The pin follows the pane's CURRENT mode, not the
-  location it was opened with — a markdown pane that browses to a website gains
-  the pinned bar, and Back to the file hands it back to the hover timer. Either
-  way a visible bar **reserves** its band (the page is inset below it, never
-  covered), so a pinned pane's content is laid out below the bar from its first
-  frame. The compact table-of-contents layout pins it too, for its own reason
-  (see Table of contents). Typing an `http(s)` address (or a
+  **home** and an **editable address field**, and it is **always there** — from
+  the pane's first layout, in every mode, with no hover involved (T1185, Mac
+  `fc7e36356`). The way out of a pane is never something to hunt for with the
+  mouse, and nothing reflows when the pointer crosses the top edge. The bar
+  **reserves** its band (the page is inset below it, never covered), so a
+  pane's content is laid out below the bar from its first frame and stays put.
+  Markdown and code panes were the last modes to peek on hover, and losing that
+  is what this bullet used to describe. Typing an `http(s)` address (or a
   bare `example.com`, completed omnibox-style) navigates the pane to the web;
   typing an absolute or `~` path points it back at a file. Back and forward
   reflect real history (disabled when there is none) and work across the

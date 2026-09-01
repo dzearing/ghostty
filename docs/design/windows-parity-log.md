@@ -9,6 +9,36 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-01: T1185 - **a markdown or code viewer pane now has its address bar from the moment it opens, instead of hiding it until you find the top edge with the mouse.** Those were the last two modes still peeking: the bar slid in when the pointer reached a 20-DIP strip, pushed the document down 45 px as it arrived, and took it back two seconds later - so the one control that gets you out of the pane was the one you had to hunt for, and the text you were reading moved while you hunted. Main removed the peek outright on 2026-08-26 (`fc7e36356`); this is the Windows half.
+  The bar is now part of a viewer pane's FRAME. It is created `WS_VISIBLE` and
+  never hidden, so `ViewerNavBar` has no `setVisible` at all, and the pane's
+  three layout sites reserve its band on `self.nav != null` rather than on a
+  visibility bit. What that deletes is the whole peek apparatus rather than a
+  flag over it: `viewer_nav_layout` loses `reveal_dip`, the `Layout.reveal_h`
+  it fed, the 2s/0.7s/0.5s hide delays, the 150ms `poll_ms`, `HoverInput`,
+  `HoverAction` and `hoverTick`; `ViewerPane` loses `nav_visible`,
+  `nav_deadline`, `nav_pinned`, `navPin`, `updateNavPin`, `navHoverTick`,
+  `setNavVisible`, its `WM_TIMER` arm and the timer id. The `Pin` struct goes
+  with them - T1131 built it because three overlapping reasons (live page,
+  compact TOC card, open composer) each had to hold a bar the others might
+  release, and a bar that is always there has no such question to answer. Two
+  loose ends the T1131 log named close themselves the same way: the TOC card's
+  opener is reachable because the bar always is, with no re-entrancy left to
+  route around, and the diff pane keeps a visible bar under the unconditional
+  rule (its own change/layout controls remain T817's).
+  Evidence: `test\win32\viewer-nav-pin.ps1` rewritten from a FLAVOR SPLIT into
+  a PRESENCE contract over five modes - html, website, markdown, code and a new
+  section E for a diff pane - ALL PASS (24), with sections C and D now measuring
+  the inset (page top 243 = bar bottom 243) that used to be the reflow; its
+  `-NegativeControl` scores exactly the declared 5 red. The whole harness is
+  cursor-free now, which is why it can run on the background test desktop that
+  T1152 could never hover on. `viewer-narrow-pane.ps1` ALL PASS (56),
+  `viewer-find.ps1` ALL PASS (30), `viewer-feedback.ps1` ALL PASS (71); floor
+  lib/none/win32/agent ALL LANES PASS; ipc-p1/p2/p3 ALL PASS; the six harness
+  audits plus `docs-routing` re-run and re-stamped. `-NoGuardDue` for
+  `release-artifacts-packaging`, due since an earlier packaging commit and
+  untouched here: its section B is Docker-only and Docker is down, which T1187
+  tracks.
 - 2026-09-01: T1184 - **Ctrl+F now searches what a viewer pane is showing.** A pane could be holding a long README, a diff, or a whole website, and there was no way to find a word in it: Ctrl+F did nothing at all. It now opens a small find card at the pane's top-trailing corner, highlights every match, says which one you are on ("3/17"), and steps through them with Enter, the card's chevrons, Ctrl+G and F3. Escape closes it and clears the highlights but KEEPS the query, so the next-match chord resumes the search and Ctrl+F comes back to it selected. Every viewer mode answers - markdown, code, a local HTML page, a website, a git diff - because the card is injected per DOCUMENT rather than wired per mode.
 
   The search itself is not ours to write twice. `src/viewer/find.js` came across from main's 3213f83a9 VERBATIM, along with the `diff.js`/`viewer.js` hunks that let a diff pane say which file it is searching, and `viewer_bridge.zig` embeds it in the same injected blob that already carries `selection.js` and `links.js` - so the index, the block rule that stops a match straddling a paragraph, the 5000-match cap and the honesty note are ONE file for both platforms, and a Mac fix to any of them lands here with no translation. The lane asserts that verbatim-ness by LENGTH as well as by substring, which is what makes it a "not forked" check rather than a "starts with" one.
