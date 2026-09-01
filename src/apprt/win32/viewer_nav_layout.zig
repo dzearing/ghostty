@@ -38,6 +38,16 @@ pub const leave_delay_ms: u32 = 500;
 /// needs (the same reason Mac uses an app-local event monitor here).
 pub const poll_ms: u32 = 150;
 
+/// The condensed address field's designed minimum width (DIP), and the whole
+/// answer to "1 button and 1 tiny input?" (user, on D83's resolution). The
+/// field is either wide enough to read an address in — about ten characters at
+/// the body ramp — or it is not painted at all. There is deliberately no band
+/// in between: a field that keeps shrinking past legibility is the "trimmed,
+/// not designed" look this task exists to remove, and a two-pixel EDIT with a
+/// caret in it is worse than an honest absence, because it looks like a
+/// rendering fault rather than a compact mode.
+pub const field_min_dip: f32 = 72.0;
+
 /// The bar's buttons, in strip order. `contents` leads and exists only in a
 /// narrow viewer pane whose document has a table of contents (T160): the
 /// compact card's only opener lives in the chrome bar, which is why the bar
@@ -48,8 +58,18 @@ pub const poll_ms: u32 = 150;
 /// (T633). With nowhere to file a report the button would be a lie, so it is
 /// absent rather than disabled; Mac's chrome bar places and gates it the same
 /// way.
-pub const Button = enum { contents, back, forward, reload, home, feedback };
+/// `overflow` is the "…" control (T1159): it closes the leading cluster and
+/// exists only when this width could not pay for every command, carrying the
+/// ones it dropped in a popup menu. It is a CONSEQUENCE of the layout rather
+/// than an input to it — nothing asks for it, the arithmetic decides — which is
+/// why it has no flag in `Shown`.
+pub const Button = enum { contents, back, forward, reload, home, overflow, feedback };
 pub const button_count = std.enums.values(Button).len;
+
+/// The leading cluster, in strip order, before the overflow control. The
+/// order is also the SHED order read backwards: what goes into the menu first
+/// is what is reached for least.
+const leading_order = [_]Button{ .contents, .back, .forward, .reload, .home };
 
 /// Which of the two conditional buttons this bar is showing. A struct rather
 /// than positional bools so a third condition cannot silently swap with a
@@ -70,83 +90,189 @@ pub const Layout = struct {
     /// is not showing (the contents toggle outside the compact TOC layout)
     /// has an EMPTY rect: it takes no room, paints nothing, and hits nothing.
     buttons: [button_count]Rect,
-    /// The address field (a real EDIT control fills this rect).
+    /// The address field (a real EDIT control fills this rect). EMPTY when the
+    /// pane is too narrow for a legible field (`field_min_dip`) — see there for
+    /// why there is no shrinking middle ground.
     address: Rect,
+    /// The commands this width folded into the overflow menu, indexed by
+    /// `Button`. Every true here has an empty rect in `buttons`, and the
+    /// `overflow` control is painted iff any of them is true — so "a dropped
+    /// button is unreachable" cannot come back by accident: the two facts are
+    /// the same array.
+    overflowed: [button_count]bool,
+
+    /// Whether the "…" control is showing (equivalently: whether anything was
+    /// folded into its menu).
+    pub fn hasOverflow(self: *const Layout) bool {
+        return self.buttons[@intFromEnum(Button.overflow)].width() > 0;
+    }
+
+    /// The commands in the overflow menu, in strip order, written into `buf`.
+    /// The order matters: the menu reads like the strip it stands in for.
+    pub fn overflowItems(self: *const Layout, buf: *[button_count]Button) []const Button {
+        var n: usize = 0;
+        for (leading_order) |b| {
+            if (self.overflowed[@intFromEnum(b)]) {
+                buf[n] = b;
+                n += 1;
+            }
+        }
+        if (self.overflowed[@intFromEnum(Button.feedback)]) {
+            buf[n] = .feedback;
+            n += 1;
+        }
+        return buf[0..n];
+    }
 
     pub fn init(scale: f32, width: i32, shown: Shown) Layout {
         const m = icon_button.Metrics.init(scale);
         const pad = px(4.0, scale); // band edge + inter-button gap
         const field_gap = px(8.0, scale); // buttons cluster <-> field
+        const field_min = px(field_min_dip, scale);
         const bar_h = px(bar_dip, scale);
         const top = @divTrunc(bar_h - m.target, 2);
+        const slot = m.target + pad; // one button plus the gap after it
 
-        var buttons: [button_count]Rect = undefined;
-        var x = pad;
-        for (&buttons, 0..) |*b, i| {
-            const absent = switch (@as(Button, @enumFromInt(i))) {
-                .contents => !shown.contents,
-                .feedback => true, // placed from the trailing edge below
-                else => false,
-            };
-            // A button that does not fit WHOLE is not painted at all (T1130,
-            // D83). The strip used to lay every button out from its own
-            // natural width and let the bar's right edge cut through them: a
-            // 62 DIP pane showed one button, a sliced second, and a trailing
-            // button placed entirely outside the bar. A control the pane
-            // cannot pay for reads as a rendering fault, so the strip ends on
-            // the last whole button instead. Order is priority order, so what
-            // goes first is what is reached for least.
-            if (absent or x + m.target > width - pad) {
-                b.* = .{ .left = x, .top = top, .right = x, .bottom = top };
+        // The commands this bar wants to show, in strip order. Everything
+        // after `wanted` in `leading_order` is not asked for at this width.
+        var order: [leading_order.len]Button = undefined;
+        var wanted: usize = 0;
+        for (leading_order) |b| {
+            if (b == .contents and !shown.contents) continue;
+            order[wanted] = b;
+            wanted += 1;
+        }
+
+        // Pick the widest arrangement this pane can actually pay for: the most
+        // leading buttons — then the trailing feedback button — that still
+        // leaves a LEGIBLE address field. Shedding is one direction only, from
+        // the trailing end of the leading cluster inward, so widening can never
+        // take a control away.
+        //
+        // Since T1159 what is shed does not vanish: the moment anything is,
+        // the cluster ends in a "…" control carrying the dropped commands, so
+        // a compact bar is a compact bar rather than a truncated one. That
+        // control costs a slot, which is why it is inside the search instead of
+        // bolted on after it.
+        const Fit = struct {
+            leading: usize,
+            feedback: bool,
+            overflow: bool,
+            field: bool,
+        };
+        var fit: Fit = .{ .leading = 0, .feedback = false, .overflow = false, .field = false };
+        var k: usize = wanted;
+        var want_fb = shown.feedback;
+        while (true) {
+            const ovf = (k < wanted) or (shown.feedback and !want_fb);
+            const slots: i32 = @intCast(k + @intFromBool(ovf));
+            const cluster: i32 = slots * slot;
+            const fb_left = width - pad - m.target;
+            const f_left = if (slots > 0) cluster + field_gap else pad;
+            const f_right = if (want_fb) fb_left - field_gap else width - pad;
+            const room = (slots == 0 or cluster <= width - pad) and
+                (!want_fb or (fb_left >= cluster + pad and fb_left >= pad)) and
+                (f_right - f_left >= field_min);
+            if (room) {
+                fit = .{ .leading = k, .feedback = want_fb, .overflow = ovf, .field = true };
+                break;
+            }
+            if (k > 0) {
+                k -= 1;
                 continue;
             }
-            b.* = .{
+            if (want_fb) {
+                want_fb = false;
+                continue;
+            }
+            // Nothing fits with a field: the minimum band. All that is left is
+            // the "…" — one whole control the user can still reach every
+            // command through — and even that goes if the band cannot hold it.
+            const ovf_only = (wanted > 0 or shown.feedback) and pad + m.target <= width - pad;
+            fit = .{ .leading = 0, .feedback = false, .overflow = ovf_only, .field = false };
+            break;
+        }
+
+        var buttons: [button_count]Rect = undefined;
+        var overflowed: [button_count]bool = undefined;
+        for (&buttons, &overflowed) |*b, *o| {
+            b.* = .{ .left = 0, .top = top, .right = 0, .bottom = top };
+            o.* = false;
+        }
+
+        var x = pad;
+        for (order[0..wanted], 0..) |b, i| {
+            if (i < fit.leading) {
+                buttons[@intFromEnum(b)] = .{
+                    .left = x,
+                    .top = top,
+                    .right = x + m.target,
+                    .bottom = top + m.target,
+                };
+                x += slot;
+            } else {
+                overflowed[@intFromEnum(b)] = true;
+            }
+        }
+        if (fit.overflow) {
+            buttons[@intFromEnum(Button.overflow)] = .{
                 .left = x,
                 .top = top,
                 .right = x + m.target,
                 .bottom = top + m.target,
             };
-            x += m.target + pad;
+            x += slot;
+        }
+        // No "…" control means no menu to be in. Below about 40 DIP the band
+        // cannot hold even one whole button, so the commands really are gone
+        // for that width — and `overflowed` must say so, or `hasOverflow` and
+        // the array it indexes would disagree about the same fact.
+        if (!fit.overflow) {
+            for (&overflowed) |*o| o.* = false;
         }
 
+        const painted_any = x > pad;
         // The leading cluster's right edge — where the field may start, and the
         // floor the trailing button may not cross.
-        const cluster_right = x - pad;
+        const cluster_right = if (painted_any) x - pad else 0;
 
         // Feedback trails: measured in from the band's own right edge, never
-        // past the leading cluster. A pane too narrow to hold both squeezes the
-        // FIELD to nothing rather than overlapping two painted controls — and a
-        // pane too narrow to hold the button INSIDE the bar drops it, rather
-        // than parking it off the edge where it painted nothing and answered
-        // no click.
+        // past the leading cluster. When the width cannot hold it there it is
+        // not parked off the edge (where it painted nothing and answered no
+        // click) and no longer merely dropped — it joins the overflow menu.
         if (shown.feedback) {
-            const left = width - pad - m.target;
-            if (left >= cluster_right + pad) {
+            if (fit.feedback) {
+                const left = width - pad - m.target;
                 buttons[@intFromEnum(Button.feedback)] = .{
                     .left = left,
                     .top = top,
                     .right = left + m.target,
                     .bottom = top + m.target,
                 };
+            } else if (fit.overflow) {
+                overflowed[@intFromEnum(Button.feedback)] = true;
             }
         }
 
-        // The field takes what is left, floored so a violently narrow pane
-        // yields an empty (never inverted) rect rather than a control painted
-        // over the buttons.
-        // Clamped to the band as well as floored: a bar too narrow to hold
-        // even the leading gap would otherwise put an empty field rect PAST
-        // the bar's right edge, which is still a rect outside the pane.
-        const field_left = @min(cluster_right + field_gap, @max(width, 0));
-        const field_limit = if (buttons[@intFromEnum(Button.feedback)].width() > 0)
+        // The field takes what is left between the cluster and the trailing
+        // button — or nothing at all, in the minimum band. Both edges are
+        // clamped into the band: a bar too narrow to hold even the leading gap
+        // would otherwise put an empty field rect PAST the bar's right edge,
+        // which is still a rect outside the pane.
+        const field_left = @min(
+            if (painted_any) cluster_right + field_gap else pad,
+            @max(width, 0),
+        );
+        const field_limit = if (fit.feedback)
             buttons[@intFromEnum(Button.feedback)].left - field_gap
         else
-            width - field_gap;
-        const field_right = @max(field_limit, field_left);
+            width - pad;
+        const field_right = if (fit.field) @max(field_limit, field_left) else field_left;
         return .{
             .bar_h = bar_h,
             .reveal_h = px(reveal_dip, scale),
             .buttons = buttons,
+            .overflowed = overflowed,
             .address = .{
                 .left = field_left,
                 .top = top,
@@ -422,18 +548,25 @@ test "T1130: buttons drop from the trailing end, and come back as the pane widen
         try testing.expect(wide.button(which).width() > 0);
     }
 
-    // Room for exactly two leading buttons and nothing else: the two that
-    // survive are the two that LEAD, and the strip ends on a whole control.
+    // Room for two slots and nothing else: too narrow for a legible field, so
+    // this is the MINIMUM band — one whole control, the "…", and every command
+    // inside it.
     const two = Layout.init(scale, pad + 2 * (m.target + pad), .{ .contents = true, .feedback = true });
-    try testing.expect(two.button(.contents).width() > 0);
-    try testing.expect(two.button(.back).width() > 0);
-    try testing.expectEqual(@as(i32, 0), two.button(.forward).width());
-    try testing.expectEqual(@as(i32, 0), two.button(.reload).width());
-    try testing.expectEqual(@as(i32, 0), two.button(.home).width());
-    try testing.expectEqual(@as(i32, 0), two.button(.feedback).width());
+    try testing.expect(two.hasOverflow());
+    for ([_]Button{ .contents, .back, .forward, .reload, .home, .feedback }) |which| {
+        try testing.expectEqual(@as(i32, 0), two.button(which).width());
+        try testing.expect(two.overflowed[@intFromEnum(which)]);
+    }
+    try testing.expectEqual(@as(i32, 0), two.address.width());
 
-    // A dropped button answers no hit, dead on where it would have been.
-    try testing.expect(two.hitButton(scale, two.button(.home).left, two.button(.home).top) == null);
+    // A button that moved into the menu answers no hit on the strip, dead on
+    // where it would have been.
+    const home_was = wide.button(.home);
+    try testing.expect(two.hitButton(
+        scale,
+        @divTrunc(home_was.left + home_was.right, 2),
+        @divTrunc(home_was.top + home_was.bottom, 2),
+    ) == null);
 
     // Monotone: widening never takes a button away. (The control for the drop
     // rule — a rule that dropped on the way UP would be worse than clipping.)
@@ -447,6 +580,138 @@ test "T1130: buttons drop from the trailing end, and come back as the pane widen
         }
         try testing.expect(painted >= painted_prev);
         painted_prev = painted;
+    }
+}
+
+test "T1159: nothing the bar drops becomes unreachable" {
+    // The invariant the overflow menu exists for. At every width and every
+    // variant: a command the bar asked for is EITHER painted on the strip OR
+    // in the menu — never both, and never neither while the "…" is up. Walked
+    // one pixel at a time, because a rule that holds only at the widths
+    // somebody thought to name is not the rule.
+    for (scales) |scale| {
+        const m = icon_button.Metrics.init(scale);
+        for ([_]Shown{
+            .{},
+            .{ .contents = true },
+            .{ .feedback = true },
+            .{ .contents = true, .feedback = true },
+        }) |shown| {
+            var width: i32 = 0;
+            while (width <= m.target * 12) : (width += 1) {
+                const l = Layout.init(scale, width, shown);
+                var folded: usize = 0;
+                for (std.enums.values(Button)) |b| {
+                    const asked = switch (b) {
+                        .contents => shown.contents,
+                        .feedback => shown.feedback,
+                        .overflow => false,
+                        else => true,
+                    };
+                    const painted = l.button(b).width() > 0;
+                    const in_menu = l.overflowed[@intFromEnum(b)];
+                    try testing.expect(!(painted and in_menu));
+                    if (!asked) try testing.expect(!in_menu);
+                    if (asked and l.hasOverflow()) try testing.expect(painted or in_menu);
+                    if (in_menu) folded += 1;
+                }
+                // And the control is up exactly when it has something in it.
+                try testing.expectEqual(l.hasOverflow(), folded > 0);
+                // The menu never lists itself.
+                try testing.expect(!l.overflowed[@intFromEnum(Button.overflow)]);
+
+                // The condensed field is legible or absent — never a stub.
+                const fw = l.address.width();
+                try testing.expect(fw == 0 or fw >= px(field_min_dip, scale));
+            }
+        }
+    }
+}
+
+test "T1159: the overflow menu lists the dropped commands in strip order" {
+    const scale: f32 = 1.0;
+    const m = icon_button.Metrics.init(scale);
+    const pad = px(4.0, scale);
+    const slot = m.target + pad;
+
+    // A width with room for the "…" plus a legible field and nothing else:
+    // every command is in the menu, in the order the strip would have shown
+    // them, with the trailing feedback button last.
+    const min_field = px(field_min_dip, scale);
+    const narrow = Layout.init(scale, pad + slot + px(8.0, scale) + min_field + pad, .{
+        .contents = true,
+        .feedback = true,
+    });
+    try testing.expect(narrow.hasOverflow());
+    try testing.expect(narrow.address.width() >= min_field);
+    var buf: [button_count]Button = undefined;
+    try testing.expectEqualSlices(
+        Button,
+        &[_]Button{ .contents, .back, .forward, .reload, .home, .feedback },
+        narrow.overflowItems(&buf),
+    );
+
+    // Wide: nothing is dropped, so there is no "…" and the menu is empty.
+    const wide = Layout.init(scale, px(600.0, scale), .{ .contents = true, .feedback = true });
+    try testing.expect(!wide.hasOverflow());
+    try testing.expectEqual(@as(usize, 0), wide.overflowItems(&buf).len);
+
+    // In between, the strip sheds from the TRAILING end of the leading
+    // cluster, so what lands in the menu first is what is reached for least.
+    var seen_partial = false;
+    var width: i32 = 0;
+    while (width <= px(600.0, scale)) : (width += 1) {
+        const l = Layout.init(scale, width, .{ .contents = true, .feedback = true });
+        const items = l.overflowItems(&buf);
+        if (items.len == 0 or items.len == 6) continue;
+        seen_partial = true;
+        // Whatever is folded is a SUFFIX of the leading cluster — no hole in
+        // the middle of the painted strip — and the trailing feedback button
+        // only ever joins them once the whole cluster has already gone.
+        const fb_in = items[items.len - 1] == .feedback;
+        const lead = if (fb_in) items[0 .. items.len - 1] else items;
+        if (fb_in) try testing.expectEqual(leading_order.len, lead.len);
+        try testing.expectEqualSlices(
+            Button,
+            leading_order[leading_order.len - lead.len ..],
+            lead,
+        );
+    }
+    try testing.expect(seen_partial);
+}
+
+test "T1159: the three bands, and no control ever lands outside the pane" {
+    const scale: f32 = 1.0;
+    const m = icon_button.Metrics.init(scale);
+
+    // Minimum band: the "…" alone, no field.
+    const tiny = Layout.init(scale, m.target * 2, .{ .contents = true, .feedback = true });
+    try testing.expect(tiny.hasOverflow());
+    try testing.expectEqual(@as(i32, 0), tiny.address.width());
+
+    // Below even that, nothing is painted at all — and nothing claims to be in
+    // a menu that is not there.
+    const nothing = Layout.init(scale, 12, .{ .contents = true, .feedback = true });
+    try testing.expect(!nothing.hasOverflow());
+    for (nothing.buttons) |b| try testing.expectEqual(@as(i32, 0), b.width());
+    for (nothing.overflowed) |o| try testing.expect(!o);
+
+    // Containment, re-asserted with the overflow control in the mix: the
+    // T1130 rule may not have been traded away for the new one.
+    for (scales) |s| {
+        const mm = icon_button.Metrics.init(s);
+        var width: i32 = 0;
+        while (width <= mm.target * 12) : (width += 1) {
+            const l = Layout.init(s, width, .{ .contents = true, .feedback = true });
+            for (l.buttons) |b| {
+                if (b.width() <= 0) continue;
+                try testing.expect(b.left >= 0);
+                try testing.expect(b.right <= width);
+            }
+            try testing.expect(l.address.right >= l.address.left);
+            try testing.expect(l.address.left >= 0);
+            try testing.expect(l.address.right <= @max(width, 0));
+        }
     }
 }
 

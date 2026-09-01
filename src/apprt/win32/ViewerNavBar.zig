@@ -55,6 +55,13 @@ const class_name_utf8 = "GhozttyViewerNav";
 /// `selectAddressWhenClickCompletes` encodes.
 pub const WM_APP_SELECT_ALL: u32 = w32.WM_APP + 1;
 
+/// Open the "…" overflow menu (T1159). POSTED from the button's mouse-up
+/// rather than tracked inside it: `TrackPopupMenuEx` runs its own modal loop,
+/// and starting one from inside a click handler that still owns the bar's
+/// press state leaves that state frozen under the menu for as long as it is
+/// up. The same reason `ViewerPane` posts its own menu openers.
+pub const WM_APP_OVERFLOW_MENU: u32 = w32.WM_APP + 2;
+
 const edit_id: usize = 1;
 
 /// The feedback tooltip's tool id, in this bar's own tool space.
@@ -313,14 +320,20 @@ pub fn shown(self: *const ViewerNavBar) layout_mod.Shown {
 pub fn place(self: *ViewerNavBar, width: i32, scale: f32) void {
     const l = layout_mod.Layout.init(scale, width, self.shown());
     _ = w32.MoveWindow(self.hwnd, 0, 0, width, l.bar_h, 1);
+    const field_w = @max(l.address.right - l.address.left, 0);
     _ = w32.MoveWindow(
         self.edit,
         l.address.left,
         l.address.top,
-        @max(l.address.right - l.address.left, 0),
+        field_w,
         l.address.bottom - l.address.top,
         1,
     );
+    // In the minimum band the field is not painted at all (T1159), and an EDIT
+    // moved to zero width is still a focusable control that draws a caret at
+    // the band's left edge. Hidden, it is out of the tab order and off the
+    // screen, which is what "absent" has to mean for it to read as designed.
+    _ = w32.ShowWindow(self.edit, if (field_w > 0) w32.SW_SHOWNA else w32.SW_HIDE);
     if (self.scale != scale) {
         self.scale = scale;
         if (self.font) |f| _ = w32.DeleteObject(@ptrCast(f));
@@ -605,8 +618,9 @@ fn buttonEnabled(self: *const ViewerNavBar, b: layout_mod.Button) bool {
         .back => self.can_back,
         .forward => self.can_forward,
         // Never disabled: a feedback button with nowhere to file is ABSENT,
-        // which the layout expresses as an empty rect.
-        .reload, .home, .feedback => true,
+        // which the layout expresses as an empty rect. The overflow control is
+        // only ever placed when it has something in it.
+        .reload, .home, .feedback, .overflow => true,
     };
 }
 
@@ -617,8 +631,76 @@ fn buttonGlyph(b: layout_mod.Button) icon_button.Glyph {
         .forward => .forward,
         .reload => .refresh,
         .home => .home,
+        .overflow => .overflow,
         .feedback => .feedback,
     };
+}
+
+/// The menu label for a command that did not fit on the strip. Written the way
+/// the tooltip would read, not the way the enum is spelled: this is the only
+/// place these commands are ever WORDS rather than glyphs.
+fn overflowTitle(b: layout_mod.Button) [:0]const u16 {
+    const L = std.unicode.utf8ToUtf16LeStringLiteral;
+    return switch (b) {
+        .contents => L("Contents"),
+        .back => L("Back"),
+        .forward => L("Forward"),
+        .reload => L("Reload"),
+        .home => L("Home"),
+        .feedback => L("Send feedback…"),
+        // Never in its own menu.
+        .overflow => L("More"),
+    };
+}
+
+/// Show the commands this width could not paint. The menu is the whole reason
+/// the strip is allowed to drop a button at all (T1159): before it, a pane
+/// narrow enough to shed `home` simply had no way to go home.
+fn openOverflowMenu(self: *ViewerNavBar) void {
+    const l = self.currentLayout();
+    var buf: [layout_mod.button_count]layout_mod.Button = undefined;
+    const items = l.overflowItems(&buf);
+    if (items.len == 0) return;
+
+    const menu = w32.CreatePopupMenu() orelse return;
+    defer _ = w32.DestroyMenu(menu);
+    for (items) |b| {
+        // A command with nowhere to go is GRAYED here rather than omitted: the
+        // menu stands in for the strip, and the strip dims those buttons too —
+        // an item that came and went with history would make the menu's own
+        // length jump around.
+        const flags: u32 = w32.MF_STRING |
+            (if (self.buttonEnabled(b)) @as(u32, 0) else w32.MF_GRAYED);
+        _ = w32.AppendMenuW(menu, flags, @intFromEnum(b) + 1, overflowTitle(b).ptr);
+    }
+
+    // Under the control's own left edge, so the menu reads as belonging to the
+    // "…" rather than to the cursor.
+    const box = l.button(.overflow);
+    var pt = w32.POINT{ .x = box.left, .y = l.bar_h };
+    _ = w32.ClientToScreen(self.hwnd, &pt);
+
+    // The MSDN pair for a tracked menu whose owner is not foreground (the same
+    // one `ViewerPane.openLinkMenu` uses): foreground the top-level window
+    // first so an outside click dismisses the menu, and post it a message
+    // after so the menu's own loop exits cleanly.
+    const top: ?w32.HWND = if (self.pane.pane_view) |pv| pv.parentWindow().hwnd else null;
+    if (top) |t| _ = w32.SetForegroundWindow(t);
+    const cmd = w32.TrackPopupMenuEx(
+        menu,
+        w32.TPM_LEFTALIGN | w32.TPM_TOPALIGN | w32.TPM_RETURNCMD,
+        pt.x,
+        pt.y,
+        self.hwnd,
+        null,
+    );
+    if (top) |t| _ = w32.PostMessageW(t, w32.WM_NULL, 0, 0);
+    if (cmd <= 0) return; // dismissed without choosing
+    const idx: usize = @intCast(cmd - 1);
+    if (idx >= layout_mod.button_count) return;
+    const chosen: layout_mod.Button = @enumFromInt(idx);
+    if (chosen == .overflow) return;
+    self.activate(chosen);
 }
 
 fn paint(self: *ViewerNavBar, hdc: w32.HDC, width: i32, height: i32) void {
@@ -778,6 +860,11 @@ fn wndProc(
             return 0;
         },
 
+        WM_APP_OVERFLOW_MENU => {
+            self.openOverflowMenu();
+            return 0;
+        },
+
         w32.WM_CTLCOLOREDIT => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
             _ = w32.SetTextColor(hdc, self.text_ref);
@@ -819,6 +906,8 @@ fn activate(self: *ViewerNavBar, b: layout_mod.Button) void {
         .reload => self.pane.reloadFromChrome(),
         .home => self.pane.goHome(),
         .feedback => self.pane.toggleFeedback(),
+        // Posted, never tracked inline — see WM_APP_OVERFLOW_MENU.
+        .overflow => _ = w32.PostMessageW(self.hwnd, WM_APP_OVERFLOW_MENU, 0, 0),
     }
 }
 

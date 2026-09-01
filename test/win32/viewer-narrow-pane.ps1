@@ -23,15 +23,22 @@
 # background test desktop, where `CopyFromScreen` and `PrintWindow` are dead
 # (lib\TestDesktop.ps1's capture limit).
 #
-# THE ONE THING IT CANNOT SEE is the nav bar's own button strip: the bar is
-# hidden unless something reveals it, and the compact-TOC pin that should hold
-# it open runs behind a `GetCursorPos` that FAILS on a background desktop
-# (T1152). The strip's narrow-width contract - a button that does not fit whole
-# is not painted, and nothing is placed outside the band - is asserted in the
-# none/win32 lanes instead (`viewer_nav_layout.zig`, the two `T1130:` tests,
-# both teeth-checked). What this script asserts about the bar is containment of
-# whatever it finds, plus a positive control that SOMETHING was found, so a run
+# SECTIONS A-D CANNOT SEE the nav bar's own button strip: on a reading surface
+# the bar is hidden unless something reveals it, and the compact-TOC pin that
+# would hold it open runs behind a `GetCursorPos` that FAILS on a background
+# desktop (T1152). What those sections assert about the bar is containment of
+# whatever they find, plus a positive control that SOMETHING was found, so a run
 # where no chrome exists at all cannot score green.
+#
+# SECTION E GETS IN ANYWAY (T1159), through a live page: an `.html` pane is
+# pinned open by `viewer_nav_layout.Pin.live_page` from its first layout, with
+# no cursor anywhere in the path, and `GhozttyViewerNav` answers WM_PRINTCLIENT
+# - the one capture that works off the input desktop. That is what lets the
+# narrow-bar LOOK be measured here (a control always in the leading slot, a
+# field that is legible or absent, nothing gained by narrowing, and a leading
+# mark that visibly changes) rather than only its arithmetic, which is asserted
+# in the none/win32 lanes (`viewer_nav_layout.zig`, the `T1130:` and `T1159:`
+# tests, all teeth-checked).
 #
 #   powershell -NoProfile -File test\win32\viewer-narrow-pane.ps1
 #
@@ -332,6 +339,169 @@ try {
     } else {
         Assert $false "D: expected one terminal + one code viewer, got $($leaves2.Count) leaves"
     }
+
+    # -----------------------------------------------------------------------
+    # E. T1159 - the narrow bar looks DESIGNED, not trimmed.
+    #
+    # Section B cannot see the button strip (the bar is hidden on a reading
+    # surface, and the hover poll that would reveal it needs a cursor this
+    # desktop has not got). A LIVE PAGE is the way in: `viewer_nav_layout.Pin`
+    # pins the bar open for an .html pane from its first layout, with no cursor
+    # anywhere in the path - so the strip is on screen, its EDIT is a real
+    # child window to measure, and the bar answers WM_PRINTCLIENT, which is the
+    # one capture that works off the input desktop.
+    #
+    # What is asserted here is behaviour, not the layout's own arithmetic
+    # restated (that is `viewer_nav_layout.zig`'s job, and mirroring it would
+    # only prove the mirror). Four claims, all measured:
+    #   1. A control is ALWAYS painted in the leading slot, at every width down
+    #      to a sliver - that is the "..." overflow taking over from a strip
+    #      that no longer fits, and it is why a dropped command is still
+    #      reachable.
+    #   2. The address field is legible or absent - never a stub. This is the
+    #      thing the user flagged as unproven ("1 button and 1 tiny input?").
+    #   3. Widening never takes anything away: painted controls and field width
+    #      both climb monotonically.
+    #   4. The leading slot's mark CHANGES between the widest and the narrowest
+    #      pane - a short "..." against a full-height chevron - so the narrow
+    #      bar is demonstrably showing the overflow control rather than the
+    #      first navigation button with everything after it cut off.
+    # -----------------------------------------------------------------------
+    $htmlFile = Join-Path $env:TEMP "ghoztty-vnp-$PID.html"
+    Set-Content -Path $htmlFile -Encoding utf8 -Value @'
+<!doctype html><title>vnp</title><body style="background:#123;color:#eee">
+<h1>narrow pane probe</h1><p>T1159</p></body>
+'@
+    Invoke-Verb @('+close', '--target=vc') | Out-Null
+    Start-Sleep -Milliseconds 800
+    $r = Invoke-Verb @('+split', '--target=vnp', "--view=$htmlFile", '--name=vh')
+    Assert ($r.Code -eq 0) 'E: +split --view=<html file> succeeded'
+    Start-Sleep -Seconds 4
+    $w3 = Wait-Win 'vnp'
+    $leaves3 = @(Get-Leaves $w3.tabs[0].splits)
+    $term3 = @($leaves3 | Where-Object { $_.type -ne 'viewer' })
+    $view3 = @($leaves3 | Where-Object { $_.type -eq 'viewer' })
+    if ($term3.Count -ne 1 -or $view3.Count -ne 1) {
+        Assert $false "E: expected one terminal + one live-page viewer, got $($leaves3.Count) leaves"
+    } else {
+        # The layout's own numbers, in DIP, so the pixel maths below is scale
+        # aware. These are READ from the module, not re-derived: a change to
+        # either one has to be made here too, which is the point.
+        $targetPx = [int][Math]::Round(28 * $scale)   # icon_button target
+        $padPx = [int][Math]::Round(4 * $scale)       # band edge / inter-button gap
+        $fieldMinPx = [int][Math]::Round(72 * $scale) # viewer_nav_layout.field_min_dip
+        $slotPx = $targetPx + $padPx
+        $topPx = [int][Math]::Round((36 * $scale - $targetPx) / 2)
+
+        function Set-HtmlRatio([int]$leftPercent) {
+            $layout = '{"direction":"horizontal","ratio":' + $leftPercent +
+                ',"left":{"pane":"' + $term3[0].name + '"},"right":{"pane":"' + $view3[0].name + '"}}'
+            [void](Invoke-Verb @('+rearrange', '--target=vnp', ('--layout=' + ($layout -replace '"', '\"'))))
+            Start-Sleep -Milliseconds 1200
+        }
+
+        # One measurement of the nav bar: its rect, its EDIT's width, which
+        # button slots carry ink, and how tall the ink in the leading slot is.
+        function Measure-NavBar([IntPtr]$topHwnd) {
+            $hosts = @(Get-TestChildWindows -Window $topHwnd -Class 'GhozttyViewer')
+            if ($hosts.Count -ne 1) { return $null }
+            $hostRect = Get-Rect ([IntPtr]$hosts[0].Hwnd)
+            $bars = @(Get-TestChildWindows -Window ([IntPtr]$hosts[0].Hwnd) -Class 'GhozttyViewerNav')
+            if ($bars.Count -ne 1) { return $null }
+            $barH = [IntPtr]$bars[0].Hwnd
+            $barRect = Get-Rect $barH
+            $barW = Rect-Width $barRect
+            if ($barW -le 0) { return $null }
+            $editW = 0
+            foreach ($e in @(Get-TestChildWindows -Window $barH -Class 'Edit')) {
+                $editW = [Math]::Max($editW, (Rect-Width (Get-Rect ([IntPtr]$e.Hwnd))))
+            }
+            $shot = $null
+            try { $shot = Get-TestWindowPixels -Window $barH -Sync -AllowUniform } catch { $shot = $null }
+            $slots = 0; $leadRows = 0
+            if ($shot) {
+                try {
+                    # The band's own background, sampled above the controls at
+                    # its trailing edge - a pixel no control can reach.
+                    $bg = $shot.Bitmap.GetPixel([Math]::Max($shot.Width - 2, 0), 1)
+                    $maxSlots = [int][Math]::Floor(($barW - $padPx) / $slotPx)
+                    for ($i = 0; $i -lt $maxSlots; $i++) {
+                        $x0 = $padPx + $i * $slotPx
+                        $x1 = [Math]::Min($x0 + $targetPx, $shot.Width - 1)
+                        $rows = 0
+                        for ($y = $topPx; $y -lt [Math]::Min($topPx + $targetPx, $shot.Height); $y++) {
+                            $inked = $false
+                            for ($x = $x0; $x -lt $x1; $x++) {
+                                $c = $shot.Bitmap.GetPixel($x, $y)
+                                if ([Math]::Abs($c.R - $bg.R) + [Math]::Abs($c.G - $bg.G) +
+                                    [Math]::Abs($c.B - $bg.B) -gt 40) { $inked = $true; break }
+                            }
+                            if ($inked) { $rows++ }
+                        }
+                        if ($rows -gt 0) { $slots++ }
+                        if ($i -eq 0) { $leadRows = $rows }
+                    }
+                    $png = Join-Path $env:TEMP ("ghoztty-vnp-band-$barW.png")
+                    $shot.Bitmap.Save($png, [System.Drawing.Imaging.ImageFormat]::Png)
+                } finally { if ($shot.Bitmap) { $shot.Bitmap.Dispose() } }
+            }
+            return [pscustomobject]@{
+                Host = $hostRect; BarRect = $barRect; BarWidth = $barW
+                EditWidth = $editW; Slots = $slots; LeadRows = $leadRows
+            }
+        }
+
+        # Wide -> narrow, so the monotone claim is checked on the way back up.
+        $bands = @()
+        foreach ($ratio in @(55, 72, 80, 86, 92)) {
+            Set-HtmlRatio $ratio
+            $mb = Measure-NavBar $top
+            if ($null -eq $mb) { Assert $false "E[$ratio]: the live page's nav bar is on screen to measure"; continue }
+            Write-Host ("      ratio $ratio -> bar $($mb.BarWidth)px, edit $($mb.EditWidth)px, " +
+                "inked slot boxes $($mb.Slots), lead-slot ink $($mb.LeadRows) rows")
+            $bands += $mb
+
+            Assert (Inside $mb.BarRect $mb.Host) "E[$ratio]: the nav bar is inside the viewer pane"
+            # 1. Something is always reachable: the leading slot always carries
+            #    a control, however narrow the pane gets.
+            Assert ($mb.LeadRows -gt 0) `
+                "E[$ratio]: a control is painted in the leading slot ($($mb.LeadRows) ink rows)"
+            # 2. Legible or absent - never a stub.
+            Assert ($mb.EditWidth -eq 0 -or $mb.EditWidth -ge $fieldMinPx) `
+                "E[$ratio]: the address field is legible (${fieldMinPx}px min) or absent, not a $($mb.EditWidth)px stub"
+        }
+
+        Assert ($bands.Count -eq 5) "E: all five width bands were measured (got $($bands.Count))"
+        if ($bands.Count -eq 5) {
+            # 3. Widening never takes anything away. The list runs wide ->
+            #    narrow, so each step may only shed.
+            $monoSlots = $true; $monoEdit = $true; $monoWidth = $true
+            for ($i = 1; $i -lt $bands.Count; $i++) {
+                if ($bands[$i].BarWidth -gt $bands[$i - 1].BarWidth) { $monoWidth = $false }
+                if ($bands[$i].Slots -gt $bands[$i - 1].Slots) { $monoSlots = $false }
+                if ($bands[$i].EditWidth -gt $bands[$i - 1].EditWidth) { $monoEdit = $false }
+            }
+            Assert $monoWidth 'E: the five ratios really did narrow the pane (negative control for the two below)'
+            Assert $monoSlots 'E: narrowing never ADDS ink to the strip'
+            Assert $monoEdit 'E: narrowing never widens the address field'
+            # And the squeeze did something: a run where every band measured
+            # the same bar would pass everything above and prove nothing.
+            Assert ($bands[0].Slots -gt $bands[-1].Slots -or $bands[0].EditWidth -gt $bands[-1].EditWidth) `
+                'E: the narrowest band really is more compact than the widest'
+
+            # 4. The leading mark CHANGES: "..." is three dots on one short
+            #    band of rows, the widest pane's first control is a full-height
+            #    glyph. If the narrow bar were merely the wide strip cut off,
+            #    these two would be identical.
+            Assert ($bands[-1].LeadRows -gt 0 -and $bands[0].LeadRows -gt 0) `
+                'E: both the widest and the narrowest leading slot carry ink'
+            Assert ($bands[-1].LeadRows -lt $bands[0].LeadRows) `
+                ("E: the narrow bar's leading control is the '...' overflow, not the wide strip's " +
+                 "first button ($($bands[-1].LeadRows) ink rows vs $($bands[0].LeadRows))")
+        }
+        Write-Host "      band captures written to $env:TEMP\ghoztty-vnp-band-*.png"
+    }
+    Remove-Item $htmlFile -ErrorAction SilentlyContinue
 
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'the GUI survived the whole run'
 } finally {

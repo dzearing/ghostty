@@ -1,13 +1,13 @@
 {
     "guard":  "viewer-narrow-pane",
     "script":  "test/win32/viewer-narrow-pane.ps1",
-    "generated":  "2026-08-23T07:56:12-07:00",
-    "commit":  "155ac6b27",
+    "generated":  "2026-08-31T17:28:29-07:00",
+    "commit":  "855796a94",
     "files":  {
-                  "src/apprt/win32/viewer_nav_layout.zig":  "984630df5656911b7d2f21ccbfe9bcd0eca9aecaca9a260a80bb350479ad6799",
+                  "src/apprt/win32/viewer_nav_layout.zig":  "910427805abaa7e180fdca6630e1cd9612bae67927c974e41468b1f52b998798",
                   "src/apprt/win32/viewer_toc_layout.zig":  "1edf8b60dd5e13bceb9edcccd59ec25d32e1502459e2c5299e05bfaa0e878abc",
-                  "src/apprt/win32/ViewerNavBar.zig":  "455593dd1c5a7b6566aaab263486c3f3eeea25d1cd8714935941543ce900f007",
+                  "src/apprt/win32/ViewerNavBar.zig":  "5563e581f389fb259d8394a9a6e508c6abc462a67b2c14e706fde60c035679ee",
                   "src/apprt/win32/ViewerTOCPanel.zig":  "a719fe9f6ec513535ebfea8eb51ade441658a023df3f6ea506a620a9b6c70991",
-                  "test/win32/viewer-narrow-pane.ps1":  "3ec9fe602de3280f068ea5f8016cdf3349fac86fcf8167b6a939b014af9e2166"
+                  "test/win32/viewer-narrow-pane.ps1":  "251859079a93e237045acf2a9e7ead61655863ba45c37a0b8ae0367a98f05e21"
               }
 }
