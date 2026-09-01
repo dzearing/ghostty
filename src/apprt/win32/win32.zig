@@ -137,6 +137,11 @@ pub const WM_CLOSE: u32 = 0x0010;
 pub const WM_QUERYENDSESSION: u32 = 0x0011;
 pub const WM_ENDSESSION: u32 = 0x0016;
 pub const WM_DESTROY: u32 = 0x0002;
+/// The LAST message a window receives — after its children and owned popups
+/// are gone. The one place a self-owned popup can free its heap state and
+/// still be correct when the OS destroyed it as an owner's dependent rather
+/// than the popup closing itself (T1195).
+pub const WM_NCDESTROY: u32 = 0x0082;
 pub const WM_SIZE: u32 = 0x0005;
 // WM_SIZE wParam values.
 pub const SIZE_RESTORED: usize = 0;
@@ -2445,6 +2450,20 @@ pub extern "wininet" fn InternetReadFile(
     lpBuffer: [*]u8,
     dwNumberOfBytesToRead: u32,
     lpdwNumberOfBytesRead: *u32,
+) callconv(.winapi) i32;
+
+/// `HttpQueryInfoW` levels. `CONTENT_LENGTH | FLAG_NUMBER` writes a u32 into
+/// the buffer instead of a string, which is what the update download asks for
+/// so it can show a determinate progress bar (T1195).
+pub const HTTP_QUERY_CONTENT_LENGTH: u32 = 5;
+pub const HTTP_QUERY_FLAG_NUMBER: u32 = 0x20000000;
+
+pub extern "wininet" fn HttpQueryInfoW(
+    hRequest: HINTERNET,
+    dwInfoLevel: u32,
+    lpvBuffer: ?*anyopaque,
+    lpdwBufferLength: *u32,
+    lpdwIndex: ?*u32,
 ) callconv(.winapi) i32;
 
 pub extern "wininet" fn InternetCloseHandle(hInternet: HINTERNET) callconv(.winapi) i32;

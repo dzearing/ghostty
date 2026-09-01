@@ -148,6 +148,12 @@ test {
     // and "does this URL belong to this release" are answered.
     _ = @import("apprt/win32/update_apply.zig");
 
+    // Pure win32 update-DOWNLOAD progress model (T1195): byte formatting, the
+    // bar's fill, the marquee for an unknown total, and the movement tracker
+    // that tells a stalled download from a merely slow one. Every lane, same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/update_progress.zig");
+
     // Pure win32 "is this window running the build that is on disk?" (T1205):
     // the FILETIME conversion and the started-vs-written comparison behind
     // About's stale-build line and its restart offer. Every lane, same

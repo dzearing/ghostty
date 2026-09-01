@@ -20,6 +20,10 @@ test {
     // a deliberately broken assertion inside it still went green until the line
     // below existed.
     _ = @import("win32/startup_error.zig");
+    // The update-download progress panel (T1195). Its LAYOUT is the part a
+    // lane can check - the paint needs a desktop - and a panel whose rows
+    // overlap at 1.5x is a panel nobody can read the status line off.
+    _ = @import("win32/UpdateProgress.zig");
     _ = @import("win32/RenameDialog.zig");
     _ = @import("win32/MachineChooser.zig");
     _ = @import("win32/DarkMode.zig");

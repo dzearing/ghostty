@@ -1037,6 +1037,23 @@ $GuardTable = @(
             'test\win32\update-real-msi.ps1'
         )
     },
+    # The update download's own REPORT (T1195): does a consented download show
+    # progress a user can watch, is a stall named as a stall rather than left
+    # looking like a slow link, and does the unprompted background pre-download
+    # stay silent? The panel paints on a background desktop where no pixel can
+    # be read, so the harness's oracle is the sentence the panel logs - which
+    # is why `UpdateProgress.zig` is in this row and not just the model.
+    [pscustomobject]@{
+        Name   = 'update-progress'
+        Script = 'test\win32\update-progress.ps1'
+        Stamp  = 'test\win32\update-progress.stamp.json'
+        Covers = @(
+            'src\apprt\win32\update_progress.zig',
+            'src\apprt\win32\UpdateProgress.zig',
+            'src\apprt\win32\update_install.zig',
+            'test\win32\update-progress.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'website-windows-links'
         Script = 'test\win32\website-windows-download.ps1'

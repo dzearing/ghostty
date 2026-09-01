@@ -90,7 +90,27 @@ pub fn stagingDir(arena: Allocator) ![]const u8 {
 /// (caller-owned, allocated with `alloc`). The bytes are verified as an MSI
 /// before the path is returned, so a caller can never hand msiexec an HTML
 /// error page.
-pub fn download(alloc: Allocator, url: []const u8, version: []const u8) ![]u8 {
+/// Where a download reports its byte counts while it runs (T1195). The
+/// callback fires on the DOWNLOAD thread after every chunk, so it must not
+/// block: the progress panel's implementation is two atomic stores.
+///
+/// `total` is 0 when the server sent no Content-Length — an honest "unknown",
+/// never a guess, because a made-up denominator produces a bar that lies.
+pub const Progress = struct {
+    ctx: *anyopaque,
+    report: *const fn (ctx: *anyopaque, received: u64, total: u64) void,
+
+    fn emit(self: Progress, received: u64, total: u64) void {
+        self.report(self.ctx, received, total);
+    }
+};
+
+pub fn download(
+    alloc: Allocator,
+    url: []const u8,
+    version: []const u8,
+    progress: ?Progress,
+) ![]u8 {
     var arena_state = std.heap.ArenaAllocator.init(alloc);
     defer arena_state.deinit();
     const arena = arena_state.allocator();
@@ -100,7 +120,7 @@ pub fn download(alloc: Allocator, url: []const u8, version: []const u8) ![]u8 {
     const name = try update_apply.stagedName(&name_buf, url, version);
     const dest = try std.fmt.allocPrint(arena, "{s}\\{s}", .{ dir, name });
 
-    const body = try fetch(arena, url);
+    const body = try fetch(arena, url, progress);
     if (!update_apply.looksLikeMsi(body)) {
         log.warn("update download: {d} bytes from {s} is not an MSI package", .{ body.len, url });
         return error.NotAPackage;
@@ -117,13 +137,18 @@ pub fn download(alloc: Allocator, url: []const u8, version: []const u8) ![]u8 {
 /// Read a URL into memory. `file://` is handled directly — WinINet's
 /// `InternetOpenUrlW` rejects it, and it is how the acceptance test serves a
 /// canned package without a network.
-fn fetch(arena: Allocator, url: []const u8) ![]u8 {
+fn fetch(arena: Allocator, url: []const u8, progress: ?Progress) ![]u8 {
     if (std.mem.startsWith(u8, url, "file://")) {
         var path = url["file://".len..];
         if (path.len > 2 and path[0] == '/') path = path[1..]; // file:///C:/…
         const f = std.fs.openFileAbsolute(path, .{}) catch return error.ReadFailed;
         defer f.close();
-        return f.readToEndAlloc(arena, max_package_bytes) catch error.ReadFailed;
+        const body = f.readToEndAlloc(arena, max_package_bytes) catch return error.ReadFailed;
+        // A local file is instantaneous, but it still reports: the acceptance
+        // path serves its canned package this way, and a panel that only ever
+        // works over the network is a panel nothing on this box can check.
+        if (progress) |p| p.emit(body.len, body.len);
+        return body;
     }
 
     const agent = std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty-Update/1.0");
@@ -143,8 +168,25 @@ fn fetch(arena: Allocator, url: []const u8) ![]u8 {
         return error.InternetOpenUrlFailed;
     defer _ = w32.InternetCloseHandle(conn);
 
+    // Content-Length, so the bar can be determinate. A server that will not
+    // say leaves this 0 and the panel shows an indeterminate bar — the read
+    // loop below is unchanged either way, since the cap is what bounds it.
+    const total: u64 = blk: {
+        var value: u32 = 0;
+        var len: u32 = @sizeOf(u32);
+        if (w32.HttpQueryInfoW(
+            conn,
+            w32.HTTP_QUERY_CONTENT_LENGTH | w32.HTTP_QUERY_FLAG_NUMBER,
+            @ptrCast(&value),
+            &len,
+            null,
+        ) == 0) break :blk 0;
+        break :blk value;
+    };
+
     var body: std.ArrayList(u8) = .empty;
     errdefer body.deinit(arena);
+    if (progress) |p| p.emit(0, total);
     while (body.items.len < max_package_bytes) {
         try body.ensureUnusedCapacity(arena, 256 * 1024);
         const dst = body.unusedCapacitySlice();
@@ -153,6 +195,7 @@ fn fetch(arena: Allocator, url: []const u8) ![]u8 {
         if (w32.InternetReadFile(conn, dst.ptr, want, &bytes_read) == 0) return error.ReadFailed;
         if (bytes_read == 0) break;
         body.items.len += bytes_read;
+        if (progress) |p| p.emit(body.items.len, total);
     }
     return body.items;
 }

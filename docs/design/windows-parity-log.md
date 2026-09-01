@@ -9,6 +9,57 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-01: T1195 - **an update that has to download now shows you it is downloading.** With `auto-update = check`, clicking the update notification started tens of megabytes moving and said so exactly once, in a balloon: "Downloading the update...". Then silence, until the terminal either restarted into the new build or reported a failure. On a slow link that silence is minutes long, and a silence is the one thing a stall and a slow transfer look identical through. Mac has shown a progress bar for this stretch since Sparkle.
+  What landed is a small modeless panel (`UpdateProgress.zig`, class
+  `GhozttyUpdateProgress`) centered on the window whose dialog the user just
+  clicked through, in the same dark palette as that dialog: a title, a bar, and
+  a sentence. The bar is DETERMINATE when the server sent a `Content-Length` -
+  `update_install.fetch` now asks for one with `HttpQueryInfoW` and reports
+  every chunk through an optional `Progress` callback - and an indeterminate
+  marquee when it did not, because a percentage derived from a guessed total is
+  a bar that lies.
+  The part worth the design time is telling a stall from a slow link, which is
+  the failure the balloon could not express at all.
+  `update_progress.StallTracker` watches the RECEIVED COUNT rather than the
+  clock: a download that is merely slow keeps moving the count, one that has
+  stopped does not, and after ten seconds of no movement the panel says
+  "Stalled - no data for Ns" and freezes the marquee instead of continuing to
+  animate a transfer that is not happening. All of the numbers, the sentence
+  and that rule are OS-free and unit tested in every lane, including a 120 s
+  transfer with 9 s between chunks that must never be accused.
+  Three deliberate restraints. The `auto-update = download` default fetches in
+  the BACKGROUND, before the user has clicked anything, and passes no progress
+  at all: chrome for work nobody asked for and nobody is waiting on is chrome
+  the user did not want. Closing the panel dismisses the report, not the
+  transfer - consent was given to install, and cancelling behind a close box
+  would be a different promise than the dialog made (a real Cancel is T1244).
+  And the panel frees itself from `WM_NCDESTROY` rather than its close path,
+  because it is owned by a terminal window that can take it down without asking.
+  Validation: `test\win32\update-progress.ps1`, new, ALL PASS (27) with its
+  `-NegativeControl` failing as it must. It serves the asset from a loopback
+  `TcpListener` it can trickle, stall and truncate at will, and drives the REAL
+  consent path - the balloon callback posted into `GhozttyMsg`, then a
+  `WM_COMMAND`/IDOK into the confirm dialog. Its oracle is the sentence the
+  panel LOGS, because the panel paints on a background desktop where no pixel
+  can be read and carries no control text either. Case 1 watches the report
+  advance 1.2 MB -> 9.2 MB with real percentages; case 2 stops the server and
+  requires the word Stalled; case 3 requires no panel and no progress line
+  anywhere in a background pre-download.
+  Floor: lib/none/win32/agent ALL LANES PASS; ipc-p1/p2/p3 ALL PASS. The
+  guards this change made due are all green and re-stamped - update-apply (41),
+  update-real-msi (30, a real install), printclient-audit, test-reach,
+  body-complete and the harness audits the new script pulled in. Two of those
+  caught the new code on the way past and both were right: the panel owner-draws
+  and therefore owed a `WM_PRINTCLIENT` arm so a probe can photograph it without
+  tearing, and its tests were compiled but never RUN until `src\apprt\win32.zig`
+  named the module.
+  Filed on the way through: **T1243** (P1) - `fetch` breaks on a zero-length
+  read without comparing against the `Content-Length` it now knows, so a
+  connection that dies mid-transfer yields a short body that `looksLikeMsi`
+  passes on its leading signature alone; a truncated package can be staged and
+  handed to msiexec. The panel is what makes that visible, which is how a bug
+  with no symptom acquired one. And **T1244** (P2) - the panel has no Cancel.
+
 - 2026-09-01: T1194 - **the in-app update is now watched succeeding, on a real published release, with the version on disk moving afterwards.** T1178 built the whole path and could test everything except its last inch: `update-apply.ps1` runs msiexec against a package msiexec REJECTS, because a real install would have replaced the user's terminal. So "the new version is actually there" was the one claim nothing in the suite could make - and it is the claim the feature exists for.
   The way in was to isolate the PACKAGE rather than rebuild it.
   `scripts\msi-test-identity.ps1` takes a published `Ghoztty-<v>-x64.msi` and

@@ -52,6 +52,8 @@ const update_check = @import("update_check.zig");
 const install_location = @import("install_location.zig");
 const update_apply = @import("update_apply.zig");
 const update_install = @import("update_install.zig");
+const update_progress = @import("update_progress.zig");
+const UpdateProgress = @import("UpdateProgress.zig");
 const install_prepare = @import("install_prepare.zig");
 const utf16_text = @import("utf16_text.zig");
 const tray_notify = @import("tray_notify.zig");
@@ -7751,7 +7753,10 @@ fn updateCheckThread(app: *App, trigger: UpdateTrigger, already_offered: ?[]u8) 
     var staged: ?[]u8 = null;
     if (app.updatePolicy() == .download) {
         if (release.asset_url) |url| {
-            staged = update_install.download(alloc, url, release.version) catch |err| blk: {
+            // No progress panel here: this download is unprompted background
+            // work the user did not ask for and is not waiting on. The panel
+            // belongs to the click path, where somebody IS waiting (T1195).
+            staged = update_install.download(alloc, url, release.version, null) catch |err| blk: {
                 log.warn("update pre-download failed: {}", .{err});
                 break :blk null;
             };
@@ -7796,16 +7801,26 @@ fn postUpdateFeedback(app: *App, code: isize) void {
 /// Worker for a download the user consented to at the balloon (the
 /// `auto-update = check` path, or a background pre-download that failed).
 /// Posts the staged package back so the GUI thread can install it.
-fn updateDownloadThread(app: *App, version: []u8, url: []u8) void {
+///
+/// `shared` is the progress channel the panel reads (T1195); this thread
+/// holds one of its two references and releases it on every exit, including
+/// the failure paths, so a panel that has already closed frees it here.
+fn updateDownloadThread(app: *App, version: []u8, url: []u8, shared: *update_progress.Shared) void {
     const alloc = app.core_app.alloc;
     defer alloc.free(version);
     defer alloc.free(url);
+    defer shared.release(alloc);
 
-    const staged: []u8 = update_install.download(alloc, url, version) catch |err| {
+    const staged: []u8 = update_install.download(alloc, url, version, .{
+        .ctx = shared,
+        .report = reportUpdateProgress,
+    }) catch |err| {
         log.warn("update download failed: {}", .{err});
+        shared.finish(.failed);
         postUpdateFeedback(app, 2);
         return;
     };
+    shared.finish(.ok);
 
     const found = alloc.create(UpdateFound) catch {
         alloc.free(staged);
@@ -7829,6 +7844,15 @@ fn updateDownloadThread(app: *App, version: []u8, url: []u8) void {
     if (w32.PostMessageW(hwnd, WM_APP_UPDATE_AVAILABLE, @intFromPtr(found), 2) == 0) {
         found.destroy(alloc);
     }
+}
+
+/// `update_install.Progress` shim: two relaxed atomic stores, called from the
+/// download thread after every chunk. Deliberately does nothing else — the
+/// panel's timer is what turns these numbers into pixels, so the transfer
+/// never waits on a repaint.
+fn reportUpdateProgress(ctx: *anyopaque, received: u64, total: u64) void {
+    const shared: *update_progress.Shared = @ptrCast(@alignCast(ctx));
+    shared.report(received, total);
 }
 
 /// Show a notification balloon that an update is available. Remembers the
@@ -7950,15 +7974,44 @@ fn offerUpdate(self: *App) bool {
         alloc.free(ver_copy);
         return true;
     };
-    self.update_download_inflight = true;
-    _ = std.Thread.spawn(.{}, updateDownloadThread, .{ self, ver_copy, url_copy }) catch |err| {
-        log.warn("failed to start update download thread: {}", .{err});
-        self.update_download_inflight = false;
+    // The progress channel (T1195): two holders, the worker and the panel,
+    // whichever outlives the other frees it. Allocated before the thread so a
+    // failure to allocate never leaves a thread reporting into nothing.
+    const shared = alloc.create(update_progress.Shared) catch {
         alloc.free(ver_copy);
         alloc.free(url_copy);
         return true;
     };
-    self.showUpdateBalloon("Ghoztty", "Downloading the update…");
+    shared.* = .{};
+
+    self.update_download_inflight = true;
+    _ = std.Thread.spawn(.{}, updateDownloadThread, .{ self, ver_copy, url_copy, shared }) catch |err| {
+        log.warn("failed to start update download thread: {}", .{err});
+        self.update_download_inflight = false;
+        alloc.free(ver_copy);
+        alloc.free(url_copy);
+        // Both references are ours to drop: no worker, and no panel yet.
+        shared.release(alloc);
+        shared.release(alloc);
+        return true;
+    };
+
+    // A panel instead of the one-shot balloon this path used to show. It is
+    // self-managing: it ticks on its own timer and closes itself when the
+    // download reaches a terminal state, so nothing here holds a pointer to
+    // it. A window that fails to open costs the report, not the update - the
+    // balloon is still there to say something happened.
+    if (UpdateProgress.create(
+        alloc,
+        self.hinstance,
+        if (owner) |win| win.hwnd else null,
+        if (owner) |win| win.scale else 1.0,
+        ver,
+        shared,
+    ) == null) {
+        shared.release(alloc);
+        self.showUpdateBalloon("Ghoztty", "Downloading the update…");
+    }
     return true;
 }
 
