@@ -2123,7 +2123,7 @@ function Get-GuardState($row) {
         return [pscustomobject]@{
             Name = $row.Name; Script = $row.Script; RunArgs = [string]$row.RunArgs; Stamp = $row.Stamp
             Kind = 'n/a'; Reason = 'no-covered-files'; Findings = @()
-            Files = @(); StampedAt = ''; StampedCommit = ''
+            Files = @(); StampedAt = ''; StampedCommit = ''; StampedUncommitted = @()
         }
     }
     # A plain array, not a generic List: PowerShell 5.1's enumerable binder
@@ -2135,7 +2135,7 @@ function Get-GuardState($row) {
         return [pscustomobject]@{
             Name = $row.Name; Script = $row.Script; RunArgs = [string]$row.RunArgs; Stamp = $row.Stamp
             Kind = 'due'; Reason = 'no-stamp'; Findings = @()
-            Files = @($live.Keys); StampedAt = ''; StampedCommit = ''
+            Files = @($live.Keys); StampedAt = ''; StampedCommit = ''; StampedUncommitted = @()
         }
     }
 
@@ -2160,6 +2160,7 @@ function Get-GuardState($row) {
         Files = @($live.Keys)
         StampedAt = [string]$stamp.generated
         StampedCommit = [string]$stamp.commit
+        StampedUncommitted = @($stamp.uncommitted | Where-Object { $_ })
     }
 }
 
@@ -2183,14 +2184,41 @@ function Write-Stamp($row) {
     $commit = ''
     try { $commit = (& git -C $Repo rev-parse --short HEAD 2>$null | Out-String).Trim() } catch { $commit = '' }
 
+    <#
+      Which covered files were NOT that commit's content when the stamp was
+      taken (T1164). The stamp gate is a CONTENT check and always was, so this
+      changes no verdict - it exists because the provenance line did not say
+      so. On 2026-08-23 a green run at 01:59 stamped the working tree that was
+      committed seven minutes later as 9d445b377, and the line therefore read
+      `stamped 2026-08-23 from 820193367` - a commit that predated the change.
+      A turn read that as proof the gate had let a changed file through and
+      opened a question about the gate; the gate was right and the sentence was
+      not. `from <sha> +N uncommitted` cannot be read that way.
+    #>
+    $uncommitted = @()
+    try {
+        $porcelain = @(& git -C $Repo status --porcelain --untracked-files=all -- @($live.Keys) 2>$null)
+        foreach ($line in $porcelain) {
+            if (-not $line -or $line.Length -le 3) { continue }
+            # `XY <path>`, and for a rename `XY <old> -> <new>`: the new name is
+            # the one that is in the stamp.
+            $path = $line.Substring(3).Trim()
+            $arrow = $path.LastIndexOf(' -> ')
+            if ($arrow -ge 0) { $path = $path.Substring($arrow + 4) }
+            $uncommitted += $path.Trim('"').Replace('\', '/')
+        }
+    } catch { $uncommitted = @() }
+    $uncommitted = @($uncommitted | Sort-Object -Unique)
+
     $files = [ordered]@{}
     foreach ($k in $live.Keys) { $files[$k] = $live[$k] }
     $doc = [ordered]@{
-        guard     = $row.Name
-        script    = $row.Script.Replace('\', '/')
-        generated = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK')
-        commit    = $commit
-        files     = $files
+        guard        = $row.Name
+        script       = $row.Script.Replace('\', '/')
+        generated    = (Get-Date -Format 'yyyy-MM-ddTHH:mm:ssK')
+        commit       = $commit
+        uncommitted  = $uncommitted
+        files        = $files
     }
     $json = ($doc | ConvertTo-Json -Depth 5)
     $path = Join-Path $Repo $row.Stamp
@@ -2268,8 +2296,14 @@ switch ($Action) {
             }
             if ($s.Kind -eq 'current') {
                 $stampedAt = if ($s.StampedAt) { $s.StampedAt.Substring(0, [Math]::Min(10, $s.StampedAt.Length)) } else { '?' }
-                "GUARD CURRENT {0} ({1} files, stamped {2}{3})" -f $s.Name, @($s.Files).Count, $stampedAt,
-                    $(if ($s.StampedCommit) { " from $($s.StampedCommit)" } else { '' })
+                # `from <sha>` is where the stamp was taken, not what it holds -
+                # a green run over uncommitted work stamps the tree it saw, and
+                # the sha it names predates that content (T1164). Say so, so the
+                # line cannot be read as the gate having missed a change.
+                $wip = @($s.StampedUncommitted).Count
+                "GUARD CURRENT {0} ({1} files, stamped {2}{3}{4})" -f $s.Name, @($s.Files).Count, $stampedAt,
+                    $(if ($s.StampedCommit) { " from $($s.StampedCommit)" } else { '' }),
+                    $(if ($wip -gt 0) { " +$wip uncommitted" } else { '' })
                 continue
             }
             $due++

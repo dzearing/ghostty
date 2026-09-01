@@ -438,18 +438,43 @@ try {
     # The fixture script raises one from a DETACHED process and exits 0 with a
     # clean ALL PASS, which is exactly the shape that scored green: the dialog
     # outlives the script that raised it.
+    #
+    # It WAITS for its own dialog to be on screen before exiting, rather than
+    # sleeping a fixed three seconds and hoping (T1164). The sweep runs after the
+    # script exits, so a box slow enough that WinForms had not finished painting
+    # by then makes the sweep find nothing - and M1 through M4 all go red at once
+    # with no defect behind them, which is what happened on 2026-08-23 during the
+    # soak work and read as "M is flaky". A cold `Add-Type -AssemblyName
+    # System.Windows.Forms` is 0.2s on an idle box and unbounded on a loaded one,
+    # so the wait is the only version of this fixture that is not a race.
+    # It waits on the SWEEP'S OWN predicate: "the thing the runner looks for is
+    # there" is the only handshake that cannot be satisfied by a window the sweep
+    # would not have counted anyway.
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'lib\ModalSweep.ps1') `
+        -Destination (Join-Path $FixTests 'lib\ModalSweep.ps1') -Force
+    $modalPidFile = Join-Path $env:TEMP 'ghoztty-suite-modal-pid.txt'
+    $modalUpFile = Join-Path $env:TEMP 'ghoztty-suite-modal-up.txt'
     Set-FixtureScript 'h-modal.ps1' @'
 $body = "Add-Type -AssemblyName System.Windows.Forms; " +
     "[void][System.Windows.Forms.MessageBox]::Show('suite-run fixture','Unsupported 16-Bit Application')"
 $p = Start-Process powershell -PassThru -WindowStyle Hidden -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-Command',$body)
 Set-Content -LiteralPath (Join-Path $env:TEMP 'ghoztty-suite-modal-pid.txt') -Value $p.Id -Encoding ASCII
-Start-Sleep -Seconds 3
+. (Join-Path $PSScriptRoot 'lib\ModalSweep.ps1')
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+while ($sw.Elapsed.TotalSeconds -lt 30) {
+    if (@(Get-StrayModalDialog | Where-Object { $_.ProcessId -eq $p.Id }).Count -gt 0) {
+        Set-Content -LiteralPath (Join-Path $env:TEMP 'ghoztty-suite-modal-up.txt') `
+            -Value ("up after {0:N2}s" -f $sw.Elapsed.TotalSeconds) -Encoding ASCII
+        break
+    }
+    Start-Sleep -Milliseconds 100
+}
 "ALL PASS (1 assertions)"
 exit 0
 '@
 
-    $modalPidFile = Join-Path $env:TEMP 'ghoztty-suite-modal-pid.txt'
     Remove-Item -LiteralPath $modalPidFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $modalUpFile -Force -ErrorAction SilentlyContinue
     $dirM = Join-Path $Fixture 'runM'
     $rM = Invoke-Runner @('-Include', 'h-modal.ps1', '-OutDir', $dirM, '-TimeoutSec', '60')
     $sM = Get-Summary $dirM
@@ -468,7 +493,18 @@ exit 0
     if (Test-Path -LiteralPath $modalPidFile) {
         try { $modalPid = [int]((Get-Content -LiteralPath $modalPidFile -Raw).Trim()) } catch { $modalPid = 0 }
     }
-    Check 'M5 the fixture really raised one (positive control)' ($modalPid -gt 0) "pid $modalPid"
+    # The positive control is that the dialog was SEEN ON SCREEN, not that a pid
+    # was written: the pid file is written before the box paints, so the old
+    # version of this check passed in exactly the run where M1-M4 had nothing to
+    # find. When this one fails, the four above it are explained rather than
+    # mysterious - the fixture never got its dialog up, and no verdict of the
+    # runner's is in question.
+    $modalUp = ''
+    if (Test-Path -LiteralPath $modalUpFile) {
+        try { $modalUp = (Get-Content -LiteralPath $modalUpFile -Raw).Trim() } catch { $modalUp = '' }
+    }
+    Check 'M5 the fixture really got one on screen (positive control)' `
+        (($modalPid -gt 0) -and $modalUp) "pid $modalPid, $(if ($modalUp) { $modalUp } else { 'never appeared' })"
     if ($modalPid -gt 0) {
         $stillUp = @(Get-StrayModalDialog | Where-Object { $_.ProcessId -eq $modalPid })
         Check 'M6 and the sweep dismissed it rather than leaving it on screen' ($stillUp.Count -eq 0) `
@@ -476,6 +512,7 @@ exit 0
         try { & taskkill.exe /T /F /PID $modalPid *> $null } catch { }
     }
     Remove-Item -LiteralPath $modalPidFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $modalUpFile -Force -ErrorAction SilentlyContinue
 
     # --- N. per-script declared timeout (T1125) ----------------------------
     Write-Host ''

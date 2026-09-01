@@ -407,11 +407,82 @@ try {
     }
     Check 'H2 every row names a harness that exists and stamps itself' ($noStamp.Count -eq 0) `
         ($noStamp -join ', ')
+
+    # --- J. what `from <sha>` on a CURRENT line actually means --------------
+    # T1164. The gate compares content and only content, so a green run over
+    # uncommitted work is a correct stamp - but it records the HEAD it was taken
+    # at, which is a commit that does not contain the stamped content. On
+    # 2026-08-23 that produced `stamped 2026-08-23 from 820193367` over the tree
+    # committed seven minutes later as 9d445b377, and a turn read the line as
+    # the gate having let a changed file through and opened a question about it.
+    # The claim here is that the line now distinguishes the two cases itself.
+    Write-Host "`n-- J. a stamp taken over uncommitted work says so --"
+    $ProvFixture = Join-Path $env:TEMP ("ghoztty-guard-due-prov-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    function Set-ProvFile([string]$rel, [string]$text) {
+        $p = Join-Path $ProvFixture $rel
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $p) | Out-Null
+        [System.IO.File]::WriteAllText($p, ($text -replace "`r`n", "`n"),
+            (New-Object System.Text.UTF8Encoding($false)))
+    }
+    Set-ProvFile 'scripts\go-loop-lock.ps1'     "# fake lock v1`n"
+    Set-ProvFile 'scripts\go-loop-exec.ps1'     "# fake exec v1`n"
+    Set-ProvFile 'scripts\go-loop-watchdog.ps1' "# fake watchdog v1`n"
+    Set-ProvFile 'scripts\loop-session.ps1'     "# fake loop-session v1`n"
+    Set-ProvFile 'test\win32\go-loop-guard.ps1' "# fake harness v1`n"
+    # A real git repo, because the question is literally "was this committed".
+    & git -C $ProvFixture init -q 2>$null | Out-Null
+    & git -C $ProvFixture config user.email 'harness@example.invalid' 2>$null | Out-Null
+    & git -C $ProvFixture config user.name 'guard-due harness' 2>$null | Out-Null
+    # No autocrlf translation: a warning on stderr from a native command is an
+    # ErrorRecord under `$ErrorActionPreference = 'Stop'`, and this fixture's
+    # files are written LF on purpose.
+    & git -C $ProvFixture config core.autocrlf false 2>$null | Out-Null
+    & git -C $ProvFixture add -A 2>$null | Out-Null
+    & git -C $ProvFixture -c commit.gpgsign=false commit -q -m 'fixture v1' 2>$null | Out-Null
+    $gitOk = (& git -C $ProvFixture rev-parse --short HEAD 2>$null | Out-String).Trim()
+    Check 'J1 the fixture is a real repo with a commit (positive control)' ($gitOk -ne '') "head '$gitOk'"
+
+    Invoke-Due update -Guard 'go-loop' -AtRepo $ProvFixture | Out-Null
+    $rj = Invoke-Due check -Guard 'go-loop' -AtRepo $ProvFixture
+    Check 'J2 a stamp taken over a clean tree names its commit and nothing more' `
+        ($rj.Text -match "GUARD CURRENT go-loop \(5 files, stamped \d{4}-\d{2}-\d{2} from $gitOk\)") $rj.Text
+    Check 'J3 and does not claim uncommitted work it did not see' `
+        ($rj.Text -notmatch 'uncommitted') $rj.Text
+
+    # Now the 2026-08-23 shape: the harness goes green over an edit that has not
+    # been committed yet, so the stamp holds content this HEAD does not.
+    Set-ProvFile 'scripts\go-loop-lock.ps1' "# fake lock v2 - green, not yet committed`n"
+    Invoke-Due update -Guard 'go-loop' -AtRepo $ProvFixture | Out-Null
+    $rj = Invoke-Due check -Guard 'go-loop' -AtRepo $ProvFixture
+    Check 'J4 the tree is still CURRENT (content is what the gate compares)' `
+        ($rj.Exit -eq 0 -and $rj.Text -match 'GUARD CURRENT go-loop') $rj.Text
+    Check 'J5 and the line says the stamp was taken over uncommitted work' `
+        ($rj.Text -match "from $gitOk \+1 uncommitted") $rj.Text
+    $provStamp = Get-Content -LiteralPath (Join-Path $ProvFixture 'test\win32\go-loop-guard.stamp.json') -Raw | ConvertFrom-Json
+    Check 'J6 and the stamp names which file it was' `
+        (@($provStamp.uncommitted) -contains 'scripts/go-loop-lock.ps1') `
+        (@($provStamp.uncommitted) -join ', ')
+
+    # Committing it does not change the verdict - it changes the sentence.
+    & git -C $ProvFixture add -A 2>$null | Out-Null
+    & git -C $ProvFixture -c commit.gpgsign=false commit -q -m 'fixture v2' 2>$null | Out-Null
+    Set-ProvFile 'scripts\go-loop-exec.ps1' "# fake exec v2`n"
+    & git -C $ProvFixture add -A 2>$null | Out-Null
+    & git -C $ProvFixture -c commit.gpgsign=false commit -q -m 'fixture v3' 2>$null | Out-Null
+    $head3 = (& git -C $ProvFixture rev-parse --short HEAD 2>$null | Out-String).Trim()
+    Invoke-Due update -Guard 'go-loop' -AtRepo $ProvFixture | Out-Null
+    $rj = Invoke-Due check -Guard 'go-loop' -AtRepo $ProvFixture
+    Check 'J7 a stamp taken after the commit drops the qualifier again' `
+        ($rj.Text -match 'GUARD CURRENT go-loop' -and $rj.Text -notmatch 'uncommitted') $rj.Text
+    Check 'J8 and names the commit that does hold the stamped content' `
+        ($rj.Text -match "from $head3\b") $rj.Text
+
     Complete-TestBody  # T1039: the run reached the end of its body
 }
 finally {
     Remove-Item -LiteralPath $Fixture -Recurse -Force -ErrorAction SilentlyContinue
     if ($RelFixture) { Remove-Item -LiteralPath $RelFixture -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($ProvFixture) { Remove-Item -LiteralPath $ProvFixture -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 Write-Host ''

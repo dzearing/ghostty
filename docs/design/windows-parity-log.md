@@ -18552,3 +18552,55 @@ ecord writes one row per boot to temp\go-loop-boots.jsonl, is idempotent on the 
   Filed on the way past: T1226 (no way to construct "session alive, no reader" from a script), T1227 (two `guard-due` Covers paths hold control bytes where a backslash belongs, so those checks can never go due - the heredoc-eats-backslashes trap, which also corrupted T1162's own summary text and was repaired in this commit).
 
   Green: floor all four lanes PASS; `session-vanished` ALL PASS (18 assertions) and stamped; unit negative control - `vanish_strikes_needed` set to 3 - scored exactly one failure and green again on revert; `holder-volume` ALL PASS (17), `agent-relay-session-e2e` ALL PASS (18) and `agent-sharing-uplink` ALL PASS (18), all re-stamped over the edited agent sources; `isolation-meta`, `launch-preflight`, `verdict-exit`, `cleanslate`, `stderr-capture` and `body-complete` all ALL PASS and re-stamped over the new script; ipc-p1/p2/p3 ALL PASS (25/20/16). `-NoGuardDue` for `release-artifacts-packaging`, due since an earlier packaging commit and untouched by this change: its section B is Docker-only and Docker is down, which T1189 tracks.
+
+- 2026-08-31: T1164 - the suite runner's own acceptance stops going red when the box is busy.
+
+  Two clusters were reported and they turned out to be two different things.
+  Section N - the per-script timeout declaration - was already fixed, by
+  6dc4708ed, three commits after this task was filed: the declaration regex
+  anchored `[ \t]*$`, and .NET's multiline `$` matches BEFORE the `\n`, so a
+  CRLF file's `\r` sat inside the line and `soak.ps1`'s declaration read as no
+  declaration at all. `soak.ps1` became CRLF in ce943e238, which is the commit
+  this task was filed from, and that is the whole story of why N12 (parse the
+  file) passed while N13 (ask the runner) failed. Five full runs on HEAD score
+  it green, three of them before anything was edited here.
+
+  Section M was a race in the fixture, not in the runner. `h-modal.ps1` raised
+  a dialog from a detached process, slept a flat three seconds and exited - and
+  the sweep under test runs AFTER the script exits, so on a box slow enough
+  that WinForms had not finished painting, the sweep found nothing and M1
+  through M4 all went red at once with no defect behind any of them. Painting
+  is 0.23s idle here and unbounded under load, and this task was filed during
+  the soak work, which is exactly the load. The fixture now waits on the
+  SWEEP'S OWN predicate - the only handshake that cannot be satisfied by a
+  window the sweep would not have counted - and M5 became a real positive
+  control: it reads a marker written only after the dialog was seen on screen,
+  so a future failure there explains the four above it instead of joining them.
+  Demonstrated rather than asserted: driving the real runner over a dialog that
+  takes 8s to paint, the old blind-sleep shape scores `verdict=pass modals=0`
+  and the waiting shape scores `verdict=fail modals=1`.
+
+  The task's second question - did `guard-due` let a changed file through? - is
+  answered no. The gate compares content hashes and always did; the stamp dated
+  2026-08-23 holds 9d445b377's `scripts/suite-run.ps1` hash, because it was
+  written at 01:59 over the working tree that was committed at 02:06. What
+  misled was the sentence: `stamped 2026-08-23 from 820193367` names where the
+  stamp was TAKEN and reads like a claim about what it HOLDS. A `CURRENT` line
+  now says `+N uncommitted` when the stamp was taken over work not yet
+  committed, and the stamp records which files those were - so the same reading
+  cannot happen twice. It changes no verdict; a gate that scores by content is
+  the point, and this is the sentence catching up with it.
+
+  Filed on the way past: T1228 (the fixed-sleep-as-handshake shape, swept
+  across the other ~290 acceptance scripts).
+
+  Green: floor all four lanes PASS; `suite-run` ALL PASS (88 assertions) five
+  times over and re-stamped; `guard-due` ALL PASS (60 assertions) with the new
+  section J - eight arms over a real git fixture covering clean stamp, stamp
+  over an uncommitted edit, and the qualifier disappearing once it is
+  committed; `body-complete`, `isolation-meta`, `launch-preflight`,
+  `verdict-exit`, `cleanslate` and `stderr-capture` all ALL PASS and re-stamped
+  over the two edited scripts; ipc-p1/p2/p3 ALL PASS. `-NoGuardDue` for
+  `release-artifacts-packaging`, due since an earlier packaging commit and
+  untouched by this change: its section B is Docker-only and Docker is down,
+  which T1187 tracks.

@@ -1,8 +1,12 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-08-31T19:00:11-07:00",
-    "commit":  "98c2c31f4",
+    "generated":  "2026-08-31T19:26:13-07:00",
+    "commit":  "0e45ff388",
+    "uncommitted":  [
+                        "test/win32/guard-due.ps1",
+                        "test/win32/suite-run.ps1"
+                    ],
     "files":  {
                   "docs/claude/testing.md":  "1b503c70c1fc424dc7a2583a8ef10a7216f91586d06e0983bfb9ecc7f139f5c3",
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -95,7 +99,7 @@
                   "test/win32/ghoztty-cleanup.ps1":  "81bfcb6cb5b018195e1056d6ce7203f18235763916bcec4cffcdafa811e73f76",
                   "test/win32/go-loop-guard.ps1":  "0df25a2d58850d6ec39789c7d5e7a3678b59afe67e5ebba942d05cf1bb84e298",
                   "test/win32/go-loop-uptime.ps1":  "a97005d970a564088741646542ffaca3cb9ffe03d2eb30c55b96841607948b82",
-                  "test/win32/guard-due.ps1":  "07109213b51ed1d878f3b211ba039c2314c46e78c5be2ccbe3127dcbb4ecdb85",
+                  "test/win32/guard-due.ps1":  "365078e95882b855545719afe986a5fa6525945ac99474bd325d59b8a33990e9",
                   "test/win32/gui-launch-command.ps1":  "a8d4b110a16877255e0dbdb4b01a021a33cf1386462da9bf8a63f3cef4105be1",
                   "test/win32/harness-exitcode-audit.ps1":  "1fdbe9c4d70fd1e9fe80ac17257de1d346a3b5c07c7c69628578eba5ac45f033",
                   "test/win32/harness-process-leak.ps1":  "1b3ca8f6fae959330ae28f6f67a326a0bcb0ae67a457d3bf2e2965ba8e0c6215",
@@ -244,7 +248,7 @@
                   "test/win32/split-zoom-nav.ps1":  "7ed3a76e0a6abc09573263efa8f7c7d3889ab31d6d8b258040ab7cf5e9882b12",
                   "test/win32/startup-failure.ps1":  "f981d7a429b24f598fee7f5fb8f5833a846a824230b2d70756d888e6c3532d66",
                   "test/win32/stderr-capture-audit.ps1":  "04424b778285df67f2eeed9c8ee354d1446c62a920ab8de56bf8b4475569cf9b",
-                  "test/win32/suite-run.ps1":  "99947d57395697a2935c885b5d94b44d5bb90ad4889b700d9054452807158086",
+                  "test/win32/suite-run.ps1":  "e71d56fdfaa3a9cc6b386fb38358df9e038ac764d6148578412b56ff49fb5a08",
                   "test/win32/tab-color.ps1":  "af75bcd47eeb68cf93ee056b7aa4e14e147314ab8b4adc3a9c0eb27dfb43f967",
                   "test/win32/tab-strip.ps1":  "143b3b882fe5959f213828260770f0f6d97c323a6929b28ec6986f67fab8d2de",
                   "test/win32/tab-strip-autohide.ps1":  "53655e95850098c972752b1deee1a16488c6c1abd4b46b6734c7500b896bae50",
