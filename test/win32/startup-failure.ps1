@@ -25,6 +25,13 @@
 #   5. The negative control: with the seam off, the same build opens a real
 #      window and raises NO such dialog. Without this arm every assertion above
 #      would still pass against a build that shows the dialog unconditionally.
+#   6. A display that cannot run the renderer is EXPLAINED rather than blamed on
+#      the install (T1224). Over Remote Desktop the display driver offers
+#      OpenGL 1.1, Ghoztty needs 4.3, and the dialog the user got said
+#      "reinstall it" - the one remedy that cannot possibly work. Arm E reads
+#      the live dialog back and asserts it names the version actually found,
+#      names Remote Desktop as the usual cause, and does NOT send the user to
+#      reinstall.
 #
 # The state in arm 1-4 is built with `GHOZTTY_STARTUP_FAIL=no-window`, a
 # DEBUG-ONLY seam in `App.run` that suppresses the startup window. It is the
@@ -80,6 +87,7 @@ $root = Join-Path $env:TEMP "ghoztty-startup-failure-$PID"
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedSeam = $env:GHOZTTY_STARTUP_FAIL
 $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
+$savedGlSeam = $env:GHOZTTY_GL_FORCE_VERSION
 
 [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 600)
 New-Item -ItemType Directory -Force $root | Out-Null
@@ -238,6 +246,63 @@ try {
     try { $stillUpD = -not ([System.Diagnostics.Process]::GetProcessById($appD.Pid).HasExited) } catch { }
     Assert "D5 dismissing it leaves the terminal running (a notice, not a refusal)" $stillUpD
 
+    # ========================================================================
+    "== E: a display that cannot run the renderer is explained, not blamed on the install"
+    # ========================================================================
+    # The Remote Desktop failure (T1224). An RDP session's display driver offers
+    # OpenGL 1.1 because the desktop is encoded and shipped over the wire rather
+    # than scanned out of a GPU; Ghoztty needs 4.3, so it refuses to start - and
+    # the refusal the user actually got told them to reinstall, which cannot
+    # change a display driver. The state is built with
+    # `GHOZTTY_GL_FORCE_VERSION=1.1`, a DEBUG-ONLY seam in the renderer's
+    # context load, because there is no way to make a local GPU report 1.1 from
+    # outside the process and an RDP box is not something this suite can stand
+    # up. The seam moves the reported VERSION only: what runs here is the
+    # shipping floor check, the shipping error, the shipping reporter and the
+    # shipping dialog text.
+    [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 600)
+    $tmpE = Join-Path $root 'e'
+    New-Item -ItemType Directory -Force $tmpE | Out-Null
+    $env:LOCALAPPDATA = $tmpE
+    Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue
+    $env:GHOZTTY_GL_FORCE_VERSION = '1.1'
+
+    $appE = Start-OnTestDesktop -Exe $Exe -Arguments @('--title=t1224-e')
+    $procE = $appE.Process
+    if ($procE) { $null = $procE.Handle }
+    $foundE = Wait-Dialog $appE.Pid $FEEDBACK_BUDGET_MS
+    Assert "E1 an unrunnable display raises the startup dialog" `
+        ($foundE.Hwnd -ne [IntPtr]::Zero)
+
+    $bodyE = if ($foundE.Hwnd -ne [IntPtr]::Zero) { Get-DialogBody $foundE.Hwnd } else { '' }
+    Assert "E2 the body names the error, so a bug report can quote it" `
+        ($bodyE -match 'OpenGLOutdated')
+    Assert "E3 it names the OpenGL the display ACTUALLY offers" `
+        ($bodyE -match 'OpenGL 1\.1')
+    Assert "E4 it names the version Ghoztty needs" `
+        ($bodyE -match 'OpenGL 4\.3')
+    Assert "E5 it names Remote Desktop, the usual cause" `
+        ($bodyE -match 'Remote Desktop')
+    # The defect itself: reinstalling cannot change a display driver, so the
+    # dialog must not send the user to do it.
+    Assert "E6 it does NOT tell the user to reinstall" `
+        ($bodyE -notmatch 'Reinstall Ghoztty' -and $bodyE -notmatch 'reinstall it')
+    Assert "E7 it still points at the log" ($bodyE -match 'ghoztty\.log')
+
+    if ($foundE.Hwnd -ne [IntPtr]::Zero) {
+        [void](Invoke-TestMessage -Window $foundE.Hwnd -Message ([uint32]$WM_CLOSE))
+    }
+    $exitedE = $false
+    $exitCodeE = $null
+    if ($procE) {
+        $exitedE = $procE.WaitForExit(10000)
+        if ($exitedE) { $exitCodeE = $procE.ExitCode }
+    }
+    Assert "E8 it exited NONZERO, like every other failed launch (got $exitCodeE)" `
+        ($exitedE -and ($exitCodeE -is [int]) -and $exitCodeE -ne 0)
+
+    Remove-Item env:GHOZTTY_GL_FORCE_VERSION -ErrorAction SilentlyContinue
+
     # LAST statement of the top-level try (T1039): an unwind from anywhere above
     # must not be able to reach the verdict as if the run had finished.
     Complete-TestBody
@@ -246,6 +311,8 @@ try {
     if ($savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
     if ($savedSeam) { $env:GHOZTTY_STARTUP_FAIL = $savedSeam }
     else { Remove-Item env:GHOZTTY_STARTUP_FAIL -ErrorAction SilentlyContinue }
+    if ($savedGlSeam) { $env:GHOZTTY_GL_FORCE_VERSION = $savedGlSeam }
+    else { Remove-Item env:GHOZTTY_GL_FORCE_VERSION -ErrorAction SilentlyContinue }
     $env:LOCALAPPDATA = $savedLocalAppData
     Remove-TestDesktop
     [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 600)

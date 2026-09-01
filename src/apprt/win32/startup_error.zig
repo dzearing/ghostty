@@ -35,12 +35,17 @@ const builtin = @import("builtin");
 
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const w32 = @import("win32.zig");
+const gl_report = @import("../../renderer/gl_report.zig");
 
 const log = std.log.scoped(.win32_startup);
 
 /// Where the log the dialog points at lives. Kept in one place so the message
 /// and `main_ghostty.zig`'s sink cannot drift apart.
 pub const log_path = "%LOCALAPPDATA%\\ghoztty\\ghoztty.log";
+
+/// Largest DETAIL line we compose - one sentence naming what the display
+/// actually offers. Sized for a driver string pair plus its frame.
+pub const max_detail = 256;
 
 /// Largest message we compose. A stage sentence, an error name and a remedy
 /// paragraph; anything longer would be an unreadable dialog anyway.
@@ -71,6 +76,23 @@ pub fn remedyFor(err: anyerror) []const u8 {
         return "Windows would not let Ghoztty open a file it needs. " ++
             "Check that your antivirus is not blocking it, then start Ghoztty again.";
 
+    // The Remote Desktop case (T1224). "Reinstall it" was the remedy this used
+    // to fall through to, and it is the one remedy that CANNOT work: a
+    // reinstall does not change which OpenGL the display driver offers, and an
+    // RDP session offers 1.1 no matter how many times Ghoztty is laid down. So
+    // this says what is actually true, and what actually changes it.
+    if (std.mem.eql(u8, name, "OpenGLOutdated") or
+        std.mem.eql(u8, name, "GLInitFailed"))
+        return std.fmt.comptimePrint(
+            "Ghoztty draws its terminal with OpenGL {d}.{d}, and this display " ++
+                "does not provide it. Remote Desktop sessions and some virtual " ++
+                "machines hand applications a basic display driver that cannot " ++
+                "run it. Using this machine directly - or giving the remote " ++
+                "session access to its graphics hardware - is what lets Ghoztty " ++
+                "start. Reinstalling will not change it.",
+            .{ gl_report.min_version_major, gl_report.min_version_minor },
+        );
+
     if (std.mem.eql(u8, name, "Win32Error"))
         return "Windows refused a request Ghoztty made while building its window. " ++
             "Sign out and back in, then start Ghoztty again.";
@@ -87,14 +109,61 @@ pub fn remedyFor(err: anyerror) []const u8 {
 /// window and had to close." The error name follows on its own line — it is the
 /// only part a bug report can be matched on — and the remedy closes.
 pub fn describe(buf: []u8, stage: []const u8, err: anyerror) []const u8 {
+    var dbuf: [max_detail]u8 = undefined;
+    return describeWithDetail(buf, stage, err, detailFor(&dbuf, err));
+}
+
+/// `describe`, with the diagnosis line supplied rather than looked up.
+///
+/// Split out so the wording is testable without a GL context anywhere in
+/// sight: `detailFor` reads process-wide state a test lane has no way to
+/// produce, and an unassertable message is how "loud" quietly becomes "loud
+/// and wrong" (the note at the top of this file).
+///
+/// `detail` sits between the error name and the remedy, and is omitted
+/// entirely when empty - a blank gap where a fact should be reads as a bug.
+pub fn describeWithDetail(
+    buf: []u8,
+    stage: []const u8,
+    err: anyerror,
+    detail: []const u8,
+) []const u8 {
+    if (detail.len == 0) {
+        return std.fmt.bufPrint(
+            buf,
+            "Ghoztty ran into a problem while {s} and had to close.\n\n" ++
+                "Error: {s}\n\n" ++
+                "{s}\n\n" ++
+                "Details are in " ++ log_path ++ ".",
+            .{ stage, @errorName(err), remedyFor(err) },
+        ) catch buf[0..0];
+    }
+
     return std.fmt.bufPrint(
         buf,
         "Ghoztty ran into a problem while {s} and had to close.\n\n" ++
             "Error: {s}\n\n" ++
             "{s}\n\n" ++
+            "{s}\n\n" ++
             "Details are in " ++ log_path ++ ".",
-        .{ stage, @errorName(err), remedyFor(err) },
+        .{ stage, @errorName(err), detail, remedyFor(err) },
     ) catch buf[0..0];
+}
+
+/// The one concrete fact that turns a named error into an explanation, or ""
+/// when there is none to add.
+///
+/// Today that is the graphics case (T1224): the user is told which OpenGL
+/// their display actually offers and which driver is providing it, so the
+/// dialog answers "why me?" rather than only "no". Every other error has
+/// nothing to add and says nothing.
+pub fn detailFor(buf: []u8, err: anyerror) []const u8 {
+    const name = @errorName(err);
+    if (!std.mem.eql(u8, name, "OpenGLOutdated") and
+        !std.mem.eql(u8, name, "GLInitFailed")) return "";
+
+    const report = gl_report.get() orelse return "";
+    return gl_report.describeDisplay(buf, report);
 }
 
 /// The body for a DEGRADED start: a window is up, but `what` is missing.
@@ -185,6 +254,63 @@ test "remedyFor: a missing file reads as a broken install, not a stack trace" {
         remedyFor(error.AgentBinaryNotFound),
         "Reinstall Ghoztty",
     ) != null);
+}
+
+test "remedyFor: an unrunnable display is not blamed on the install" {
+    const testing = std.testing;
+    const text = remedyFor(error.OpenGLOutdated);
+    // The whole defect: "reinstall it" was the advice, and it cannot work.
+    try testing.expect(std.mem.indexOf(u8, text, "Reinstall Ghoztty") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "Reinstalling will not") != null);
+    // It names the real cause and the real remedy.
+    try testing.expect(std.mem.indexOf(u8, text, "Remote Desktop") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "OpenGL 4.3") != null);
+}
+
+test "detailFor: names the display when one was recorded, and only then" {
+    const testing = std.testing;
+    var buf: [max_detail]u8 = undefined;
+
+    gl_report.reset();
+    try testing.expectEqualStrings("", detailFor(&buf, error.OpenGLOutdated));
+
+    gl_report.record(.{
+        .major = 1,
+        .minor = 1,
+        .vendor = gl_report.Str.of("Microsoft Corporation"),
+        .renderer = gl_report.Str.of("GDI Generic"),
+    });
+    defer gl_report.reset();
+
+    const text = detailFor(&buf, error.OpenGLOutdated);
+    try testing.expect(std.mem.indexOf(u8, text, "OpenGL 1.1") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "GDI Generic") != null);
+
+    // An unrelated error gets no graphics sentence bolted onto it.
+    try testing.expectEqualStrings("", detailFor(&buf, error.FileNotFound));
+}
+
+test "describeWithDetail: the display sentence lands between error and remedy" {
+    const testing = std.testing;
+    var buf: [max_message]u8 = undefined;
+    const text = describeWithDetail(
+        &buf,
+        "starting its renderer",
+        error.OpenGLOutdated,
+        "This display offers OpenGL 1.1 (GDI Generic).",
+    );
+    const err_at = std.mem.indexOf(u8, text, "OpenGLOutdated").?;
+    const detail_at = std.mem.indexOf(u8, text, "GDI Generic").?;
+    const remedy_at = std.mem.indexOf(u8, text, "Remote Desktop").?;
+    try testing.expect(err_at < detail_at and detail_at < remedy_at);
+    try testing.expect(std.mem.indexOf(u8, text, "ghoztty.log") != null);
+}
+
+test "describeWithDetail: no detail leaves no blank gap" {
+    const testing = std.testing;
+    var buf: [max_message]u8 = undefined;
+    const text = describeWithDetail(&buf, "opening its first window", error.NoStartupWindow, "");
+    try testing.expect(std.mem.indexOf(u8, text, "\n\n\n") == null);
 }
 
 test "remedyFor: an unmapped error still gets actionable guidance" {

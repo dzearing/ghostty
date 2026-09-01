@@ -10,6 +10,8 @@ const apprt = @import("../apprt.zig");
 const font = @import("../font/main.zig");
 const configpkg = @import("../config.zig");
 const rendererpkg = @import("../renderer.zig");
+const gl_report = @import("gl_report.zig");
+const build_config = @import("../build_config.zig");
 const Renderer = rendererpkg.GenericRenderer(OpenGL);
 
 pub const GraphicsAPI = OpenGL;
@@ -50,9 +52,12 @@ const wgl = if (apprt.runtime == apprt.win32) struct {
     ) callconv(.c) i32;
 } else struct {};
 
-/// We require at least OpenGL 4.3
-pub const MIN_VERSION_MAJOR = 4;
-pub const MIN_VERSION_MINOR = 3;
+/// We require at least OpenGL 4.3. Defined in `gl_report` rather than here so
+/// the startup dialog can format the SAME numbers into the sentence it shows a
+/// user whose display cannot meet them (T1224) - a floor that lives in two
+/// places is a floor that eventually disagrees with the message about it.
+pub const MIN_VERSION_MAJOR = gl_report.min_version_major;
+pub const MIN_VERSION_MINOR = gl_report.min_version_minor;
 
 alloc: std.mem.Allocator,
 
@@ -163,20 +168,74 @@ fn glDebugMessageCallback(
     });
 }
 
+/// The NUL-terminated string a GL context returns for `name`, or "" when the
+/// context is too primitive to answer. Borrowed from GL memory, so callers copy
+/// it (`gl_report.Str`) rather than hold it.
+fn glString(name: gl.c.GLenum) []const u8 {
+    const get = gl.glad.context.GetString orelse return "";
+    const ptr = get(name) orelse return "";
+    return std.mem.sliceTo(@as([*:0]const u8, @ptrCast(ptr)), 0);
+}
+
+/// Debug-only seam that makes a context REPORT an older version than it has, so
+/// the too-old path can be exercised on a developer box (T1224). The failure it
+/// stands in for - a Remote Desktop session, where the display driver offers
+/// OpenGL 1.1 - cannot be produced any other way from outside the process, and
+/// a startup refusal nobody has ever watched fire is a refusal nobody knows the
+/// wording of. Format: `GHOZTTY_GL_FORCE_VERSION=1.1`. Never compiled into a
+/// release build: an environment variable must not be able to stop a user's
+/// terminal from opening.
+fn forcedVersion() ?struct { major: u32, minor: u32 } {
+    if (comptime !build_config.is_debug) return null;
+
+    const raw = std.process.getEnvVarOwned(
+        std.heap.page_allocator,
+        "GHOZTTY_GL_FORCE_VERSION",
+    ) catch return null;
+    defer std.heap.page_allocator.free(raw);
+    if (raw.len == 0 or raw.len > 32) return null;
+
+    var it = std.mem.splitScalar(u8, raw, '.');
+    const major = std.fmt.parseInt(u32, it.next() orelse return null, 10) catch return null;
+    const minor = std.fmt.parseInt(u32, it.next() orelse "0", 10) catch return null;
+    log.warn("GL version forced to {d}.{d} (debug test hook)", .{ major, minor });
+    return .{ .major = major, .minor = minor };
+}
+
 /// Prepares the provided GL context, loading it with glad.
 fn prepareContext(getProcAddress: anytype) !void {
     const version = try gl.glad.load(getProcAddress);
-    const major = gl.glad.versionMajor(@intCast(version));
-    const minor = gl.glad.versionMinor(@intCast(version));
+    var major: u32 = @intCast(gl.glad.versionMajor(@intCast(version)));
+    var minor: u32 = @intCast(gl.glad.versionMinor(@intCast(version)));
     errdefer gl.glad.unload();
-    log.info("loaded OpenGL {}.{}", .{ major, minor });
+
+    // Capture WHO is providing this context, not just which version. Over
+    // Remote Desktop the answer is "GDI Generic / Microsoft Corporation", and
+    // that pair is the difference between a bug report that explains itself
+    // and one that says only `OpenGLOutdated` (T1224).
+    var report: gl_report.Report = .{
+        .vendor = gl_report.Str.of(glString(gl.c.GL_VENDOR)),
+        .renderer = gl_report.Str.of(glString(gl.c.GL_RENDERER)),
+    };
+    if (forcedVersion()) |forced| {
+        major = forced.major;
+        minor = forced.minor;
+    }
+    report.major = major;
+    report.minor = minor;
+    gl_report.record(report);
+
+    log.info("loaded OpenGL {}.{} renderer=\"{s}\" vendor=\"{s}\"", .{
+        major,
+        minor,
+        report.renderer.slice(),
+        report.vendor.slice(),
+    });
 
     // Need to check version before trying to enable it
-    if (major < MIN_VERSION_MAJOR or
-        (major == MIN_VERSION_MAJOR and minor < MIN_VERSION_MINOR))
-    {
+    if (report.belowFloor()) {
         log.warn(
-            "OpenGL version is too old. Ghostty requires OpenGL {d}.{d}",
+            "OpenGL version is too old. Ghoztty requires OpenGL {d}.{d}",
             .{ MIN_VERSION_MAJOR, MIN_VERSION_MINOR },
         );
         return error.OpenGLOutdated;

@@ -19049,3 +19049,49 @@ PASS (28), `update-apply.ps1` ALL PASS (42, with scenario 8 now dismissing the
 new modal), `update-progress.ps1` ALL PASS (27), `update-real-msi.ps1` ALL PASS
 (30, a real published MSI installed under a throwaway identity), and the nine
 meta-audits re-run for the new script.
+
+## 2026-09-01 - a display that cannot run Ghoztty now says so, instead of telling the user to reinstall (T1249)
+
+The user connected to a Windows machine over Remote Desktop, installed Ghoztty,
+and was told: *"Error: OpenGLOutdated. Start Ghoztty again. If it keeps
+failing, reinstall it."* Reinstalling could not possibly help. An RDP session's
+display driver offers OpenGL 1.1 - the desktop is encoded and shipped over the
+wire rather than scanned out of a GPU - and Ghoztty's renderer requires 4.3. So
+the one remedy the app offered was the one remedy that cannot work, and the
+dialog never said which OpenGL the machine actually had, so a careful reader
+could not even tell whether to blame the install or the machine.
+
+The refusal now explains itself. `src/renderer/gl_report.zig` (new) captures
+what the GL context turned out to be - version, vendor, renderer string - into
+fixed buffers at load time; it is a leaf module so `startup_error.zig` can read
+it without importing the renderer, and it now owns the version floor that
+`OpenGL.zig` aliases, so the number in the code and the number in the sentence
+a user reads cannot drift. `OpenGLOutdated` gets its own remedy: it names 4.3,
+names Remote Desktop and VMs as the usual cause, says using the machine
+directly (or giving the session access to its graphics hardware) is what works,
+and says outright that reinstalling will not change it. A diagnosis line sits
+between the error name and the remedy - "This display offers OpenGL 1.1 (GDI
+Generic, Microsoft Corporation)." - and is omitted entirely when nothing was
+recorded, since a blank gap where a fact should be reads as a bug.
+
+The state could not be built from outside the process: there is no way to make
+a local GPU report 1.1, and no RDP box in this suite. `GHOZTTY_GL_FORCE_VERSION`
+is a Debug-only seam in the context load, the `GHOZTTY_STARTUP_FAIL` pattern
+again, moving the reported version and nothing else - so arm E of
+`startup-failure.ps1` exercises the shipping floor check, error, reporter and
+dialog, reads the live dialog body back with WM_GETTEXT, and asserts it names
+1.1, names 4.3, names Remote Desktop, points at the log, does NOT say reinstall,
+and exits nonzero. Without it this would be a refusal nobody had ever watched
+fire.
+
+T1224 asked for both halves at once and is split: this is T1249, and T1250
+carries the fallback renderer that makes the terminal actually RUN there. That
+half is a project - a vendored software or D3D-backed GL, dynamic resolution of
+the `opengl32` entry points (a copy of `opengl32.dll` beside the exe wins over
+System32 for every launch, GPU or not, so the choice has to be made at runtime),
+an installer change, and a remote box to validate on. Telling the truth in the
+meantime needed none of that and should not have waited behind it.
+
+Floor: lib/none/win32/agent ALL LANES PASS; `startup-failure.ps1` ALL PASS (26,
+five of them new), ipc-p1/p2/p3 ALL PASS, and the eight meta-audits re-run for
+the edited script.
