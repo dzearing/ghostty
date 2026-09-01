@@ -222,6 +222,117 @@ pub fn parseSpec(raw: []const u8) ?Spec {
     return .{ .pid = pid, .msi = msi, .exe = exe };
 }
 
+/// The largest failure message `describeFailure` composes. A cause sentence, a
+/// remedy paragraph and a pointer at the log — anything longer would be a
+/// dialog nobody reads.
+pub const max_failure_message = 1024;
+
+/// The dialog title an update failure is reported under. A constant so the
+/// acceptance script can assert on the same string the app shows (T1206).
+pub const failure_title = "Ghoztty could not finish updating";
+
+/// Windows Installer exit codes this build says something specific about.
+/// Named rather than inlined because the acceptance script and the unit tests
+/// both refer to them, and a bare 1618 in three places is how a wrong number
+/// survives.
+pub const install_already_running: u32 = 1618; // ERROR_INSTALL_ALREADY_RUNNING
+pub const install_user_exit: u32 = 1602; // ERROR_INSTALL_USEREXIT
+pub const install_failure: u32 = 1603; // ERROR_INSTALL_FAILURE
+pub const install_service_failure: u32 = 1601; // ERROR_INSTALL_SERVICE_FAILURE
+pub const install_package_open_failed: u32 = 1619; // ERROR_INSTALL_PACKAGE_OPEN_FAILED
+pub const install_package_invalid: u32 = 1620; // ERROR_INSTALL_PACKAGE_INVALID
+pub const install_package_rejected: u32 = 1625; // ERROR_INSTALL_PACKAGE_REJECTED
+pub const install_product_version: u32 = 1638; // ERROR_PRODUCT_VERSION
+
+/// What went wrong, in one sentence a person would say out loud.
+///
+/// 1618 is the one this module exists for (T1206): a second installer
+/// transaction cannot start while another holds the Windows Installer, and
+/// before this the only thing that happened was a window disappearing.
+pub fn failureCause(code: u32) []const u8 {
+    return switch (code) {
+        install_already_running =>
+            "Another installation is already running on this PC, so Windows would " ++
+            "not let Ghoztty's update start.",
+        install_user_exit =>
+            "The installation was cancelled before it finished.",
+        install_service_failure =>
+            "The Windows Installer service could not be started.",
+        install_package_open_failed, install_package_invalid =>
+            "The downloaded update package could not be opened — it looks damaged " ++
+            "or incomplete.",
+        install_package_rejected =>
+            "Windows refused the update package because of a policy on this PC.",
+        install_product_version =>
+            "A different version of Ghoztty is already installed, and Windows would " ++
+            "not install this one over it.",
+        install_failure =>
+            "Windows Installer stopped with a fatal error part way through.",
+        else =>
+            "Windows Installer stopped without finishing.",
+    };
+}
+
+/// What to DO about it. Every branch ends with something the user can act on;
+/// "contact support" is not an option here, so the fallback is the update page
+/// they can install from by hand.
+pub fn failureRemedy(code: u32) []const u8 {
+    return switch (code) {
+        install_already_running =>
+            "Wait for the other installation to finish — look for a setup or " ++
+            "Windows Installer window — then check for updates again from " ++
+            "Ghoztty's menu.",
+        install_user_exit =>
+            "Check for updates again from Ghoztty's menu when you are ready.",
+        install_service_failure =>
+            "Restart Windows, then check for updates again from Ghoztty's menu.",
+        install_package_open_failed, install_package_invalid =>
+            "Check for updates again from Ghoztty's menu — that downloads a fresh " ++
+            "copy of the package.",
+        install_package_rejected =>
+            "Ask whoever manages this PC about its software installation policy, " ++
+            "then check for updates again.",
+        install_product_version =>
+            "Uninstall Ghoztty from Windows Settings, then install the new version " ++
+            "from the Ghoztty releases page.",
+        else =>
+            "Check for updates again from Ghoztty's menu. If it keeps failing, " ++
+            "install the new version from the Ghoztty releases page.",
+    };
+}
+
+/// The whole dialog body for an update that could not be applied.
+///
+/// It opens by saying what the user still HAS — their old version, still
+/// working — because the first thing someone whose update just failed wants to
+/// know is whether their terminal is broken. The numeric code comes last: it
+/// is the only part a bug report can be matched on, and it is the only part
+/// that means nothing to the reader.
+pub fn describeFailure(buf: []u8, code: u32, log_path: []const u8) []const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "Ghoztty could not finish updating, so it is still running the version " ++
+            "you already had.\n\n{s}\n\n{s}\n\nDetails are in {s} (Windows " ++
+            "Installer code {d}).",
+        .{ failureCause(code), failureRemedy(code), log_path, code },
+    ) catch buf[0..0];
+}
+
+/// The body for the other silent outcome on this path: the app the update was
+/// waiting for never exited, so nothing was installed at all. Installing over a
+/// live app would half-replace it, so the applier gives up — and before T1206
+/// it gave up without saying anything.
+pub fn describeAppStillRunning(buf: []u8) []const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "Ghoztty could not finish updating, so it is still running the version " ++
+            "you already had.\n\nThe update waited for Ghoztty to close and it " ++
+            "was still running, so nothing was installed.\n\nClose every Ghoztty " ++
+            "window, then check for updates again from Ghoztty's menu.",
+        .{},
+    ) catch buf[0..0];
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -416,4 +527,71 @@ test "the spec buffer holds two max-length paths" {
     const p = parseSpec(s).?;
     try testing.expectEqual(@as(u32, 4294967295), p.pid);
     try testing.expectEqualStrings(long, p.exe);
+}
+
+test "describeFailure names the collision in words, not just a number" {
+    // The defect T1206 exists for: a second installer transaction collided
+    // with the first and the only visible outcome was a window disappearing.
+    var buf: [max_failure_message]u8 = undefined;
+    const text = describeFailure(&buf, install_already_running, "C:\\stage\\install.log");
+
+    try testing.expect(std.mem.indexOf(u8, text, "Another installation is already running") != null);
+    // It says what the user still has, so nobody has to wonder whether their
+    // terminal survived the failed update.
+    try testing.expect(std.mem.indexOf(u8, text, "still running the version") != null);
+    // It says what to do, and where to look.
+    try testing.expect(std.mem.indexOf(u8, text, "Wait for the other installation") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "C:\\stage\\install.log") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "1618") != null);
+}
+
+test "describeFailure: every named code gets its own cause and remedy" {
+    const codes = [_]u32{
+        install_already_running,
+        install_user_exit,
+        install_failure,
+        install_service_failure,
+        install_package_open_failed,
+        install_package_invalid,
+        install_package_rejected,
+        install_product_version,
+    };
+    for (codes) |code| {
+        var buf: [max_failure_message]u8 = undefined;
+        const text = describeFailure(&buf, code, "C:\\l.log");
+        // Nothing may truncate: bufPrint failure returns an empty slice, which
+        // would be a dialog with no words in it — the very failure this fixes.
+        try testing.expect(text.len > 120);
+        try testing.expect(std.mem.indexOf(u8, text, failureCause(code)) != null);
+        try testing.expect(std.mem.indexOf(u8, text, failureRemedy(code)) != null);
+    }
+    // 1618's cause is not shared with anything else; a copy-paste that mapped
+    // the collision onto the generic sentence would pass every check above.
+    try testing.expect(!std.mem.eql(u8, failureCause(install_already_running), failureCause(9999)));
+    try testing.expect(!std.mem.eql(u8, failureRemedy(install_already_running), failureRemedy(9999)));
+}
+
+test "describeFailure: an unmapped code still says something actionable" {
+    var buf: [max_failure_message]u8 = undefined;
+    const text = describeFailure(&buf, 4242, "C:\\l.log");
+    try testing.expect(std.mem.indexOf(u8, text, "without finishing") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Check for updates again") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "4242") != null);
+}
+
+test "describeFailure fits its buffer with a deep log path" {
+    // The log lives beside the staged package, which lives under LOCALAPPDATA;
+    // a long profile name must not silently empty the message.
+    var buf: [max_failure_message]u8 = undefined;
+    const deep = "C:\\Users\\" ++ ("n" ** 180) ++ "\\AppData\\Local\\ghoztty\\updates\\install.log";
+    const text = describeFailure(&buf, install_failure, deep);
+    try testing.expect(text.len > 0);
+    try testing.expect(std.mem.indexOf(u8, text, deep) != null);
+}
+
+test "describeAppStillRunning tells the user what to close" {
+    var buf: [max_failure_message]u8 = undefined;
+    const text = describeAppStillRunning(&buf);
+    try testing.expect(std.mem.indexOf(u8, text, "nothing was installed") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "Close every Ghoztty window") != null);
 }

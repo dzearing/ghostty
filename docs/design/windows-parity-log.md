@@ -19001,3 +19001,51 @@ two apart by using the product.
 Floor: lib/none/win32/agent ALL LANES PASS; `release-artifacts.ps1` ALL PASS
 (1 skipped - Docker down by design) and `website-windows-download.ps1` ALL
 PASS, including F1 against the deployed page.
+
+## 2026-09-01 - an update that cannot be installed now says why (T1206)
+
+Half of what the user saw on the clean-machine walk was an installer window
+that said "configuring" and then vanished. The cause was a second msiexec
+transaction colliding with the first one, and nothing anywhere said so: the
+1500 went to the event log, the window went away, and the only thing left was
+a person wondering whether Ghoztty had installed.
+
+The half that is entirely ours is the in-app update, and that is the half fixed
+here. When msiexec comes back non-zero the applier now gives the user their
+terminal back FIRST and then raises Ghoztty's own dialog: what still works
+("still running the version you already had"), what went wrong in a sentence
+per Windows Installer code, what to do about it, and last the log path and the
+number a bug report is matched on. It is modal and it stays until it is
+dismissed, because the defect was a message nobody could read. The other silent
+outcome on the same path - the app never closed, so nothing was installed at
+all - is reported the same way.
+
+The messages are pure functions in `update_apply.zig` with unit tests, for the
+reason `startup_error.zig` next door has them: an untested message is how
+"loud" quietly becomes "loud and wrong".
+
+`test\win32\update-failure-visible.ps1` is the new acceptance script (28
+assertions). Arm A drives a REAL msiexec rejection end to end and asserts the
+relaunch line is already in the log when the dialog goes up. Arm C is the
+negative control: an update that succeeds raises no dialog, so a build that
+showed one unconditionally scores red rather than green.
+
+Arm B needed the collision itself, and 1618 turns out not to be provokable from
+outside msiexec: a user-created `Global\_MSIExecute` is created happily and
+msiexec runs straight past it (measured on box - a valid package under the held
+mutex returned 1603 from its own install), and the only other way to hold that
+mutex is a real installation, which an acceptance script may not start. So the
+code alone is stubbed through a Debug-only seam, the `GHOZTTY_STARTUP_FAIL`
+pattern, and everything downstream of it is the shipping path.
+
+The double-clicked MSI is still Windows Installer's UI to own; making that
+first-contact moment ours needs a bootstrapper and overlaps T1203's signing
+work on the same moment. Filed as T1247. Also filed T1248 for an
+`update-real-msi` arm that raced the applier's exit and went red once before
+passing on an immediate re-run.
+
+Floor: lib/none/win32/agent ALL LANES PASS; `update-failure-visible.ps1` ALL
+PASS (28), `update-apply.ps1` ALL PASS (42, with scenario 8 now dismissing the
+new modal), `update-progress.ps1` ALL PASS (27), `update-real-msi.ps1` ALL PASS
+(30, a real published MSI installed under a throwaway identity), and the nine
+meta-audits re-run for the new script.

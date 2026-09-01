@@ -998,6 +998,22 @@ $GuardTable = @(
             'test\win32\update-apply.ps1'
         )
     },
+    # Whether a failed update SAYS anything (T1206). The update-apply row above
+    # covers the same two files for a different question - did the applier get
+    # to msiexec and back - and neither row can answer the other's. A change
+    # that keeps the choreography and drops the dialog leaves update-apply
+    # green and puts the user back where they started: a window that said
+    # "configuring" and then vanished.
+    [pscustomobject]@{
+        Name   = 'update-failure-visible'
+        Script = 'test\win32\update-failure-visible.ps1'
+        Stamp  = 'test\win32\update-failure-visible.stamp.json'
+        Covers = @(
+            'src\apprt\win32\update_apply.zig',
+            'src\apprt\win32\update_install.zig',
+            'test\win32\update-failure-visible.ps1'
+        )
+    },
     # The release-channel check itself (T24, T1171): does the app find a newly
     # published win-v release, and does it stay quiet about one it has already
     # offered? Nothing tied this harness to the code under it, and it drifted

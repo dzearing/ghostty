@@ -30,9 +30,14 @@
 //!   `ghoztty-agent.exe` into a path that is now empty. The holders keep the
 //!   old code until they are next restarted, which is precisely the situation
 //!   the app↔agent protocol handshake already exists to handle.
-//! - **A failed update leaves a working terminal.** Every failure path still
-//!   relaunches the exe it was given. The worst outcome is the version the
-//!   user already had, plus an msiexec log to read.
+//! - **A failed update leaves a working terminal, and SAYS SO.** Every failure
+//!   path still relaunches the exe it was given, so the worst outcome is the
+//!   version the user already had. Since T1206 it is also reported: the
+//!   relaunch happens first, then a modal names the cause, the remedy, the log
+//!   and the Windows Installer code, and stays up until it is dismissed. The
+//!   defect that bought that rule was an installer window which said
+//!   "configuring" and then vanished, leaving nobody able to tell an update
+//!   that failed from one that never started.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -40,6 +45,7 @@ const Allocator = std.mem.Allocator;
 
 const build_config = @import("../../build_config.zig");
 const internal_os = @import("../../os/main.zig");
+const ConfirmDialog = @import("ConfirmDialog.zig");
 const job_spawn = @import("job_spawn.zig");
 const update_apply = @import("update_apply.zig");
 const w32 = @import("win32.zig");
@@ -356,6 +362,11 @@ fn run(alloc: Allocator, spec: update_apply.Spec) u8 {
             // Still running after the cap. Installing over a live app would
             // half-replace it; leaving the package staged is recoverable.
             log.err("update apply: app pid {d} still alive after {d}ms; not installing", .{ spec.pid, waited });
+            // Loud, not just logged (T1206). The user consented to an update
+            // and closed their terminal for it; "nothing happened" is not an
+            // outcome they can act on.
+            var buf: [update_apply.max_failure_message]u8 = undefined;
+            report(update_apply.describeAppStillRunning(&buf));
             return 1;
         }
     }
@@ -384,7 +395,8 @@ fn run(alloc: Allocator, spec: update_apply.Spec) u8 {
         clearInstallDir(arena, dir);
     }
 
-    const code = runMsiexec(arena, spec.msi);
+    const log_path = installLogPath(arena, spec.msi);
+    const code = runMsiexec(arena, spec.msi, log_path);
     if (code == 0) {
         log.warn("update apply: msiexec succeeded", .{});
         std.fs.cwd().deleteFile(spec.msi) catch {};
@@ -395,6 +407,16 @@ fn run(alloc: Allocator, spec: update_apply.Spec) u8 {
     // Relaunch on every path. A failed install must still give the user their
     // terminal back — the worst outcome is the version they already had.
     const relaunched = relaunch(arena, spec.exe);
+
+    // Then SAY what happened, when it was not what the user asked for (T1206).
+    // After the relaunch on purpose: the modal blocks this process until it is
+    // dismissed, and a message that arrives while the terminal is still
+    // missing reads as "your terminal is gone" rather than "the update did not
+    // take".
+    if (code != 0) {
+        var buf: [update_apply.max_failure_message]u8 = undefined;
+        report(update_apply.describeFailure(&buf, code, log_path));
+    }
     return if (code == 0 and relaunched) 0 else 1;
 }
 
@@ -437,13 +459,67 @@ fn isLocked(path: []const u8) bool {
     return false;
 }
 
+/// DEBUG-ONLY seam: the msiexec exit code to act on WITHOUT running msiexec.
+///
+/// It exists because the outcome this module's reporting was built for — 1618,
+/// a transaction that could not start because another one holds the Windows
+/// Installer — cannot be manufactured from outside msiexec. A user-created
+/// `Global\_MSIExecute` does not collide (measured, 2026-09-01: msiexec ran
+/// straight past it), and the only other way to hold that mutex is a real
+/// installation running on the box, which an acceptance script may not start.
+/// So the shipping reporter, the shipping message and the shipping dialog are
+/// driven with the shipping code, and only the process that produced the code
+/// is stubbed. Same shape and same reasoning as `GHOZTTY_STARTUP_FAIL` in
+/// `App.run`; compiled out of every release build.
+const code_seam_var = "GHOZTTY_UPDATE_MSI_CODE";
+
+fn forcedCode(arena: Allocator) ?u32 {
+    if (comptime builtin.mode != .Debug) return null;
+    const raw = std.process.getEnvVarOwned(arena, code_seam_var) catch return null;
+    return std.fmt.parseInt(u32, std.mem.trim(u8, raw, " \t\r\n"), 10) catch null;
+}
+
+/// Where msiexec's verbose log goes: beside the staged package, so the dialog
+/// can point at a path that exists whether or not the install got anywhere.
+/// Resolved by the caller rather than inside `runMsiexec`, because the failure
+/// message has to name the same file msiexec was told to write.
+fn installLogPath(arena: Allocator, msi_path: []const u8) []const u8 {
+    const dir = std.fs.path.dirname(msi_path) orelse ".";
+    return std.fmt.allocPrint(arena, "{s}\\install.log", .{dir}) catch
+        "%LOCALAPPDATA%\\ghoztty\\updates\\install.log";
+}
+
+/// Put `text` on screen and keep it there until it is read.
+///
+/// The applier has no App, no window and no message loop — it is a bare copy
+/// of ghoztty.exe running out of the staging directory — which is exactly the
+/// state `showStandalone` exists for (`startup_error.zig` next door is in the
+/// same position for the same reason). Modal on purpose: the defect being
+/// fixed is a window that closed before anyone could read it.
+fn report(text: []const u8) void {
+    if (comptime builtin.os.tag != .windows) return;
+    log.err("update apply: {s}", .{text});
+
+    var wbuf: [update_apply.max_failure_message * 2]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(wbuf[0 .. wbuf.len - 1], text) catch return;
+    wbuf[n] = 0;
+    _ = ConfirmDialog.showStandalone(null, 1.0, .{
+        .title = std.unicode.utf8ToUtf16LeStringLiteral(update_apply.failure_title),
+        .text = wbuf[0..n :0],
+        .style = .ok_only,
+        .icon = .warning,
+    });
+}
+
 /// Run msiexec and return its exit code (or a non-zero stand-in when it could
 /// not be run or did not finish).
-fn runMsiexec(arena: Allocator, msi_path: []const u8) u32 {
+fn runMsiexec(arena: Allocator, msi_path: []const u8, log_path: []const u8) u32 {
     const windows = std.os.windows;
 
-    const dir = std.fs.path.dirname(msi_path) orelse ".";
-    const log_path = std.fmt.allocPrint(arena, "{s}\\install.log", .{dir}) catch return 1602;
+    if (forcedCode(arena)) |code| {
+        log.warn("update apply: {s}={d}; msiexec not run", .{ code_seam_var, code });
+        return code;
+    }
 
     var cmd_buf: [2 * std.fs.max_path_bytes + 128]u8 = undefined;
     const cmd = update_apply.msiexecCommandLine(&cmd_buf, msi_path, log_path) catch return 1602;

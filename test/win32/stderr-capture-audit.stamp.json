@@ -1,11 +1,11 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-01T08:04:08-07:00",
-    "commit":  "ee44c8158",
+    "generated":  "2026-09-01T08:36:56-07:00",
+    "commit":  "e5b95e1af",
     "uncommitted":  [
-                        "test/win32/release-artifacts.ps1",
-                        "test/win32/website-windows-download.ps1"
+                        "test/win32/update-apply.ps1",
+                        "test/win32/update-failure-visible.ps1"
                     ],
     "files":  {
                   "docs/claude/testing.md":  "353e090f48ab5d8f8eee4042ac2689134b9f082800c4a067d625af97eec7f2c7",
@@ -267,8 +267,9 @@
                   "test/win32/test-reach-audit.ps1":  "9987988dde78037ac8545dd70de97e50d2d9312bca3e9c0ee89d0be955eb638e",
                   "test/win32/title-font.ps1":  "946fd12880bb0433a535283fb6146fb7d2a8fd1b2d1f0f74e00fa7ce1720dcb8",
                   "test/win32/title-jitter.ps1":  "305bd304faf09988c8852f7fa69f2c780212b639fb837085b5869ab5457acab7",
-                  "test/win32/update-apply.ps1":  "22337598028ad72f60b50c9cd6272eb26b6e07ecd39d52e29ecdc328cee28111",
+                  "test/win32/update-apply.ps1":  "f88873b05e0ef70adb64067e7ce1a4c1f54aca5409b0e427324e6266aa362453",
                   "test/win32/update-check.ps1":  "a30b6268ce08a7da0295566c914649e9190b4b77b980a5da7eeb155b5bbd9e21",
+                  "test/win32/update-failure-visible.ps1":  "2aa609f410ee44f950354c01637ed81552791e88331178423f5b9686d5748c34",
                   "test/win32/update-progress.ps1":  "b8e99fafbc291da0a4b269b0102a3f934e08758be39f7b77e2e5086f71cd2e4b",
                   "test/win32/update-real-msi.ps1":  "134c0f378f3c6dfec951e005ae4fa6e3b8d91cae13efcee691f7882b5c6bdcab",
                   "test/win32/upgrade-no-fork.ps1":  "76264704b07c6d8267edda9d19349210a5462999cc8321b7c6b4d1f5e09df56c",

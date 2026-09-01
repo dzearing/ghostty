@@ -1,15 +1,11 @@
 {
     "guard":  "test-reach",
     "script":  "test/win32/test-reach-audit.ps1",
-    "generated":  "2026-09-01T07:05:19-07:00",
-    "commit":  "672cb8453",
+    "generated":  "2026-09-01T09:16:36-07:00",
+    "commit":  "e5b95e1af",
     "uncommitted":  [
-                        "src/apprt/win32.zig",
-                        "src/apprt/win32/App.zig",
-                        "src/apprt/win32/update_install.zig",
-                        "src/apprt/win32/update_progress.zig",
-                        "src/apprt/win32/UpdateProgress.zig",
-                        "src/apprt/win32/win32.zig"
+                        "src/apprt/win32/update_apply.zig",
+                        "src/apprt/win32/update_install.zig"
                     ],
     "files":  {
                   "src/apprt/win32.zig":  "7a666e06c809d420ef7b353e8c46cf6ef9bf365f324f5da8c13ffde07478c8ce",
@@ -170,9 +166,9 @@
                   "src/apprt/win32/tray_notify.zig":  "ec34084d33a80b8d031deb7c95ccc813d0605023c1e7c4ea3a514b3f1d0257c4",
                   "src/apprt/win32/trend_gauge.zig":  "8e40bbb1bb211dddaa315851043ecabdc88fb365a735ce5dbd2f062ba90e3483",
                   "src/apprt/win32/type_ramp.zig":  "c7c36e8fa6e894ad362e6d91a78518a5c0d24a7ff6a47cd5c6d79a42d376b7b9",
-                  "src/apprt/win32/update_apply.zig":  "da3a5f65d077a64031382beb7b9399ab23693c12ee8728cba74c1960223c00f7",
+                  "src/apprt/win32/update_apply.zig":  "74f3697471e258291f733b76ef3e667e63020e755484b931eda16b80d0e9a21f",
                   "src/apprt/win32/update_check.zig":  "ea85c66bcb9959c90d3a0446453fbb28dee9ca60727926947617319e985b3d59",
-                  "src/apprt/win32/update_install.zig":  "b04bd6fd88e3d7009156eba77393060243b52d80ffe2c8d114fe65eeea902c16",
+                  "src/apprt/win32/update_install.zig":  "b8f3fa0d8efc209360a9897b4802c723f4908ffcb1720ba3b723eb5f692db703",
                   "src/apprt/win32/update_progress.zig":  "a090e739bf82ae630fa588b22362156891207a83bd3dfde3f41ae13b09a61b3b",
                   "src/apprt/win32/UpdateProgress.zig":  "13aacc529a801083a8baed1ce899eefc3c2d7e2c5b3530926dbd319ba7bdfbbe",
                   "src/apprt/win32/url_scheme.zig":  "032b929c9ad26a92fe16cd31b3d115ef47f5a8a7f9e63c91c591c27d9d3a634d",

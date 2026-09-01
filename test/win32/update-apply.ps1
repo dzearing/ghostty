@@ -55,6 +55,55 @@ function Kill-RepoInstances {
     [void](Stop-RepoGhoztty -Exe $exe -AppOnly -SettleMs 500)
 }
 
+# T1206: a non-zero msiexec now raises Ghoztty's own modal and HOLDS it until it
+# is read, so the applier no longer exits on its own after a rejection. That
+# message is `update-failure-visible.ps1`'s subject; here it is just something
+# to dismiss so the choreography this script tests can finish. WM_CLOSE is
+# posted, not sent - the target is another process's modal loop.
+if (-not ('Ghoztty.ApplierDialog' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace Ghoztty {
+    public class ApplierDialog {
+        delegate bool EnumProc(IntPtr hwnd, IntPtr lp);
+        [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr lp);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern int GetClassNameW(IntPtr h, StringBuilder buf, int max);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern bool PostMessageW(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
+
+        public static int CloseAll(int procId, string cls) {
+            var hits = new List<IntPtr>();
+            EnumWindows((h, lp) => {
+                uint owner; GetWindowThreadProcessId(h, out owner);
+                if (owner != (uint)procId) return true;
+                var sb = new StringBuilder(256);
+                GetClassNameW(h, sb, sb.Capacity);
+                if (sb.ToString() == cls) hits.Add(h);
+                return true;
+            }, IntPtr.Zero);
+            foreach (var h in hits) PostMessageW(h, 0x0010, IntPtr.Zero, IntPtr.Zero);
+            return hits.Count;
+        }
+    }
+}
+'@
+}
+
+function Close-ApplierDialog([int]$procId, [int]$timeoutMs = 30000) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $timeoutMs) {
+        if ([Ghoztty.ApplierDialog]::CloseAll($procId, 'GhozttyConfirmDialog') -gt 0) { return $true }
+        Start-Sleep -Milliseconds 200
+    }
+    return $false
+}
+
 # ---------------------------------------------------------------- fixtures
 $work = Join-Path $env:TEMP 'ghoztty-t1178'
 Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
@@ -254,12 +303,17 @@ $env:GHOZTTY_UPDATE_APPLY = "$deadPid|$applyMsi|$exe"
 try {
     $p = Start-Process -FilePath $applier -PassThru -RedirectStandardError $errFile
     $null = $p.Handle
+    # The rejection raises the T1206 dialog and the applier waits on it; dismiss
+    # it, then let the process finish the way it does once a user has read the
+    # message.
+    $dismissed = Close-ApplierDialog $p.Id
     $exited = $p.WaitForExit(120000)
 } finally {
     Remove-Item Env:GHOZTTY_UPDATE_APPLY -ErrorAction SilentlyContinue
 }
 if (-not $exited) { try { $p.Kill() } catch {} }
 $log8 = if (Test-Path $errFile) { [IO.File]::ReadAllText($errFile) } else { '' }
+Assert $dismissed 'applier(run): said the install failed instead of vanishing (T1206)'
 Assert $exited 'applier(run): finished instead of hanging'
 Assert ($log8 -match 'waiting for app pid') 'applier(run): waited for the app to exit'
 Assert ($log8 -match 'msiexec\.exe /i .*apply-me\.msi.* /qb-! /norestart /l\*v') 'applier(run): ran msiexec on the staged package, non-interactive and without a reboot'
