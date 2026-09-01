@@ -172,6 +172,14 @@ $Registry = @(
     [pscustomobject]@{ Label = 'ODD PRIORITY'; Kind = 'gate'; Demo = $Seat; Marker = 'ODD PRIORITY' }
     [pscustomobject]@{ Label = 'ODD TAG'; Kind = 'gate'; Demo = $Seat; Marker = 'ODD TAG' }
     [pscustomobject]@{ Label = 'NO PROGRESS LOG'; Kind = 'gate'; Demo = $Seat; Marker = 'NO PROGRESS LOG' }
+    # T1231. A control character inside a tracked text file: invisible to a
+    # reader, and a path that cannot exist to a script. validate emits the
+    # headline itself rather than only relaying the scanner's, so this row is a
+    # plain gate rather than a delegated one - the condition is reported from
+    # validate's own text and demonstrated where the scanner is driven red.
+    [pscustomobject]@{ Label = 'CONTROL CHARACTERS'; Kind = 'gate'
+        Demo = 'test\win32\control-char-scan.ps1'; Marker = 'CONTROL CHARACTERS'
+    }
     [pscustomobject]@{ Label = 'GUARD DUE CHECK SKIPPED'; Kind = 'hatch'; Demo = 'test\win32\guard-due.ps1'
         Marker = 'GUARD DUE CHECK SKIPPED'
     }

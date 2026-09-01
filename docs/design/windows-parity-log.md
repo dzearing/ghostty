@@ -18336,7 +18336,7 @@ ecord writes one row per boot to temp\go-loop-boots.jsonl, is idempotent on the 
 
   Order independence was discharged by measurement rather than argument, on the 16 fastest GUI scripts in the sample: forward, forward again, reverse (3m 27s / 3m 26s / 3m 25s, ALL PASS each), then `compare` over the three summaries - STABLE. The whole-suite version costs the seven hours above and belongs to T1094.
 
-  It is serial, and that is a decision with a reason rather than an omission: 91 scripts compute the app path as `<repo>\zig-outin\ghoztty.exe` internally and ignore an injected `-Exe`, and `CleanSlate` kills the app under test by exact ExecutablePath - so two workers out of one `zig-out` kill each other's app mid-assertion, with no error either can attribute. Parallelism needs an injected exe path honored suite-wide first, filed as T1092.
+  It is serial, and that is a decision with a reason rather than an omission: 91 scripts compute the app path as `<repo>\zig-out\bin\ghoztty.exe` internally and ignore an injected `-Exe`, and `CleanSlate` kills the app under test by exact ExecutablePath - so two workers out of one `zig-out` kill each other's app mid-assertion, with no error either can attribute. Parallelism needs an injected exe path honored suite-wide first, filed as T1092.
 
   One bug in this turn's own work is worth recording, because it is the class the runner exists to catch: the first version reported a 116.2-second script as **2m 56s**, since `[int]$ts.TotalMinutes` ROUNDS in .NET rather than truncating. A number nobody can check by eye does not belong in a test report, so the formatter moved to `scripts\lib\Duration.ps1` where section J of the acceptance calls it directly. The same run found a second one: PS 5.1 unrolls a one-element array on return, so a one-script run printed `[  1/]` and `( scripts)` - now covered by B11.
 
@@ -19460,3 +19460,63 @@ Floor: lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS;
 `go-loop-guard` ALL PASS (263 assertions) plus the audits its edit made due -
 isolation-meta, launch-preflight, verdict-exit, cleanslate, stderr-capture,
 merge-terminology, desktop-launch - all green.
+
+## 2026-09-01 - invisible control characters can no longer reach a repository file (T1231)
+
+Fifteen tracked files were carrying real control bytes where a Windows path had
+been written with a backslash escape: something interpreted `\a`, `\b` and `\f`
+on the way in and wrote 0x07, 0x08 and 0x0c into the file. `zig-out\bin` was on
+disk as `zig-out<0x08>in`; `scripts\floor-lane.ps1` as `scripts<0x0c>loor-lane.ps1`.
+A reader sees the two halves of the path run together and files it as a typo. A
+script sees a path that quietly does not exist and reports it as not-found.
+
+That is what happened to `scripts\guard-due.ps1` (repaired in passing by T1170):
+its `install-prepare` row named `src<0x07>pprt\win32\install_prepare.zig`, so a
+guard whose entire job is resolving file paths could never resolve its own, and
+nothing said so.
+
+All fifteen are repaired **byte for byte** - each damaged byte replaced in place
+through `ReadAllBytes`/`WriteAllBytes`, so the diff is one line per file. A
+whole-file rewrite from PowerShell would have re-encoded every one of them (PS
+5.1 reads UTF-8 as the ANSI codepage and writes a BOM), which is a larger defect
+than the one being fixed. Fourteen restored a path; `T851.md`'s was prose, and
+its own title said which word it had to be.
+
+Two of the fifteen (`T1251.md`, `T1252.md`) were filed **after** T1231 was
+written and had picked up the same damage, which is the argument for the guard
+rather than the repair: whatever writes it was still active while the task
+describing it sat in the queue.
+
+The guard is `scripts\control-char-scan.ps1` - any byte below 0x20 other than
+tab/LF/CR, plus DEL, in a tracked file whose extension is in its allowlist. The
+allowlist rather than an exclusion list is deliberate: the extensionless
+libghostty fuzz corpora exist to hold control bytes, and a check that has to be
+argued with about its own exemptions is one people learn to skip. A full scan of
+3,879 files takes about a second, which is what makes both call sites
+affordable:
+
+- `parity-tasks.ps1 validate`, the gate go.md runs before every commit. It emits
+  `CONTROL CHARACTERS:` as its own headline rather than relaying the scanner's,
+  so the condition is reported from the gate's own text.
+- `scripts\githooks\pre-commit`, over staged files only. That is the half
+  covering the OTHER window sharing this working tree, which never runs
+  `validate`. A scan that cannot run at all (exit 2) deliberately does not block
+  a commit - this hook must never be the reason a commit is impossible.
+
+Per T1133 the gate ships with the demonstration that it can fail:
+`test\win32\control-char-scan.ps1` section E points `validate` at a fixture git
+tree holding one damaged file and reads the red back, then repairs the fixture
+and reads the silence back; `-NegativeControl` plants a 0x08 in a live tracked
+file and a healthy repo scores exactly 1 FAILURE. The `CONTROL CHARACTERS` row
+is in `gate-negatives.ps1`'s registry, and `guard-due.ps1` carries a coverage row
+so an edit to the scanner or either caller has to re-prove it.
+
+Also filed: [[T1263]] - the SOURCE is still unidentified. The damage is now loud
+at commit time instead of silent, so the next occurrence can be caught in the
+act.
+
+Floor: lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS;
+`control-char-scan` ALL PASS (39), plus every harness the edit made due -
+gate-negatives, parity-tasks-seat, go-loop-guard, suite-run, agent-autostart,
+isolation-meta, launch-preflight, verdict-exit, cleanslate, stderr-capture,
+body-complete, desktop-launch - all green.

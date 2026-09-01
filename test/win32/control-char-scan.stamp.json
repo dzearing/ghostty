@@ -1,0 +1,16 @@
+{
+    "guard":  "control-char-scan",
+    "script":  "test/win32/control-char-scan.ps1",
+    "generated":  "2026-09-01T16:14:11-07:00",
+    "commit":  "58921a3ba",
+    "uncommitted":  [
+                        "scripts/control-char-scan.ps1",
+                        "scripts/githooks/pre-commit",
+                        "test/win32/control-char-scan.ps1"
+                    ],
+    "files":  {
+                  "scripts/control-char-scan.ps1":  "5d86caddd7c8b44be9b3148dd5994881a8f8fa8eb1a07d2fe5414b0dd6428ba8",
+                  "scripts/githooks/pre-commit":  "daec7d5f82b46569ef65b60775e50f2dc971c8fa6dc21855d438c14e3dd52d92",
+                  "test/win32/control-char-scan.ps1":  "0e6725c84ae641d646628368de8bfc251f063d56923401c170111928f361f451"
+              }
+}

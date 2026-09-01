@@ -1,15 +1,14 @@
 {
     "guard":  "go-loop",
     "script":  "test/win32/go-loop-guard.ps1",
-    "generated":  "2026-09-01T15:00:04-07:00",
-    "commit":  "14c905732",
+    "generated":  "2026-09-01T16:18:37-07:00",
+    "commit":  "58921a3ba",
     "uncommitted":  [
-                        "scripts/go-loop-health.ps1",
-                        "test/win32/go-loop-guard.ps1"
+                        "scripts/githooks/pre-commit"
                     ],
     "files":  {
                   "scripts/git-commit-guard.ps1":  "45917907651c35444f920feea99d2acfd0a44043c449351dfaea1c7bc9ea1edf",
-                  "scripts/githooks/pre-commit":  "eac5e129af9f636f296b1acb4d91c8d97671cc6497cfe1e16e6930c9f859f990",
+                  "scripts/githooks/pre-commit":  "daec7d5f82b46569ef65b60775e50f2dc971c8fa6dc21855d438c14e3dd52d92",
                   "scripts/go-loop-boot.ps1":  "e5de72ebfc0d1b065c9090e7b4c968c46edc217a08277d1feab61d1452441545",
                   "scripts/go-loop-exec.ps1":  "82f1d9ae878c882b4bc73f8fee49e3c343f29563909760a29c35af9d0fd24f57",
                   "scripts/go-loop-health.ps1":  "fb79d6ddc7852e55d17058af73a7f731ea4256f33f58085845adfca51cb2090b",

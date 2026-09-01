@@ -26,6 +26,29 @@
 git_dir="${GIT_DIR:-$(git rev-parse --git-dir 2>/dev/null)}"
 [ -n "$git_dir" ] || exit 0
 
+# T1231: refuse a commit that would write a control character into a text file.
+# `zig-out\bin` arriving as `zig-out<0x08>in` is invisible to a reader and a
+# path that cannot exist to a script; fifteen files were in that state before
+# anyone noticed, one of them a guard's own coverage table. The loop's
+# `parity-tasks.ps1 validate` asks the same question, but the OTHER window
+# sharing this working tree never runs it - the hook is what covers everybody.
+# Staged files only, so it costs nothing on a small commit; skipped silently if
+# powershell is not on PATH, since this hook must never be the reason a commit
+# cannot be made.
+top=$(git rev-parse --show-toplevel 2>/dev/null)
+if [ -n "$top" ] && [ -f "$top/scripts/control-char-scan.ps1" ] && command -v powershell >/dev/null 2>&1; then
+    powershell -NoProfile -ExecutionPolicy Bypass \
+        -File "$top/scripts/control-char-scan.ps1" -Staged -Repo "$top" -Quiet >&2
+    # Only 1 means "found one". 2 means the scan could not run at all, and a
+    # check that cannot answer must not be the thing that stops a commit.
+    if [ "$?" -eq 1 ]; then
+        echo "" >&2
+        echo "COMMIT REFUSED - a staged file holds a control character (T1231)." >&2
+        echo "Fix the line above, then commit again." >&2
+        exit 1
+    fi
+fi
+
 lock="$git_dir/ghoztty-commit.lock"
 [ -f "$lock" ] || exit 0
 

@@ -55,7 +55,7 @@ $ErrorActionPreference = 'Stop'
 # statements. No ghoztty CLI verb is ever run, and the one process this launches
 # is a copy of cmd.exe under the fixture's own zig-out.
 #
-# preflight: none - section I launches `<fixture>\zig-outin\ghoztty.exe`,
+# preflight: none - section I launches `<fixture>\zig-out\bin\ghoztty.exe`,
 # which is a COPY OF cmd.exe standing in for a leaked app so the sweep has
 # something real to kill. There is no ghoztty build behind that path for
 # `Assert-GhozttyIsolatedBuild` to vouch for, and the gate's whole subject -

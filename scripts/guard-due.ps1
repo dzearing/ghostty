@@ -2105,6 +2105,26 @@ $GuardTable = @(
             'test\win32\merge-terminology.ps1'
         )
     },
+    # The control-character lint (T1231): a text file holding a real 0x07/0x08/
+    # 0x0c where a backslash escape was meant. Fifteen files were in that state,
+    # and one of them was THIS file's own coverage table - `src\apprt\win32\...`
+    # written as `src<0x07>pprt\...`, a path that could never resolve, in a guard
+    # row whose whole job is to resolve paths. Coverage is deliberately narrow:
+    # the scanner, its two callers (the loop's pre-commit validate and the git
+    # hook that covers the other window sharing this tree) and the harness. The
+    # tree it scans is NOT in the list - every commit would make the guard due,
+    # which is what the pre-commit hook already answers per commit. About two
+    # seconds.
+    [pscustomobject]@{
+        Name   = 'control-char-scan'
+        Script = 'test\win32\control-char-scan.ps1'
+        Stamp  = 'test\win32\control-char-scan.stamp.json'
+        Covers = @(
+            'scripts\control-char-scan.ps1',
+            'scripts\githooks\pre-commit',
+            'test\win32\control-char-scan.ps1'
+        )
+    },
     # The chooser's SELECTION TREATMENT (T828): the pixels a user reported as "a
     # loud purple pill with a thick purple outline". Coverage is the row model
     # that resolves the pill, the mark and the rim (chooser_rows.zig), the

@@ -77,7 +77,7 @@
   powershell -NoProfile -File scripts\suite-run.ps1 -Set gui -Order reverse
   powershell -NoProfile -File scripts\suite-run.ps1 -Resume temp\suite-runs\20260822-021500\summary.json
   powershell -NoProfile -File scripts\suite-run.ps1 compare -Runs run1\summary.json,run2\summary.json
-  powershell -NoProfile -File scripts\suite-run.ps1 confirm -Resume temp\suite-runswd1
+  powershell -NoProfile -File scripts\suite-run.ps1 confirm -Resume temp\suite-runs\fwd1
 #>
 param(
     [Parameter(Position = 0)]

@@ -1071,6 +1071,30 @@ switch ($Command) {
             }
         }
 
+        # T1231: a control character inside a repository text file. It is here
+        # rather than in a lint nobody runs because the damage is INVISIBLE:
+        # `zig-out\bin` written as `zig-out<0x08>in` reads as a typo to a human
+        # and is a path that cannot exist to a script, and fifteen files sat in
+        # that state - one of them scripts\guard-due.ps1's own coverage table,
+        # where the broken path silently disabled a guard row. Skipped for
+        # -TaskDir fixture runs for the same reason the guard-due check is -
+        # unless GHOZTTY_CONTROL_CHAR_REPO is set, which is the harness pointing
+        # this gate at a fixture tree so it can be driven RED without planting
+        # damage in the real repo. Unset in every real run.
+        if (-not $TaskDirGiven -or $env:GHOZTTY_CONTROL_CHAR_REPO) {
+            $ccScript = Join-Path $PSScriptRoot 'control-char-scan.ps1'
+            $ccRepo = $RepoRoot
+            if ($env:GHOZTTY_CONTROL_CHAR_REPO) { $ccRepo = $env:GHOZTTY_CONTROL_CHAR_REPO }
+            if (Test-Path -LiteralPath $ccScript) {
+                $ccOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $ccScript -Repo $ccRepo -Quiet 2>&1 | Out-String
+                if ($LASTEXITCODE -eq 1) {
+                    Write-Host "CONTROL CHARACTERS: a tracked text file holds a byte no text file should (T1231)"
+                    foreach ($line in ($ccOut -split "`r?`n")) { if ($line.Trim()) { Write-Host ("  " + $line.TrimEnd()) } }
+                    $problems++
+                }
+            }
+        }
+
         # T847: stranded work - paths that were already dirty when this turn
         # claimed the loop (snapshotted by go-loop-exec.ps1 claim, which owns
         # the rationale). Failing here is what makes the claim-time report a

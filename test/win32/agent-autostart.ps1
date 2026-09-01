@@ -275,7 +275,7 @@ Assert "C3 no Run value written by a debug build" ($null -eq (Get-RunValue))
 "== D: location gate -> no Run value from a build inside a source checkout"
 # ============================================================================
 # T1146. The build-mode gate (section C) is not enough on its own: the staging
-# release we build to package a delivery lives at zig-out-releasein INSIDE
+# release we build to package a delivery lives at zig-out-release\bin INSIDE
 # this checkout and IS a release build, so it would have written the real
 # `GhozttyAgent` value and had Windows start the user's session agent out of a
 # scratch directory at every sign-in. `gate` is the seam that lets this debug
