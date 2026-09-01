@@ -26,7 +26,14 @@
 # for.
 #
 # Usage:
-#   sign-artifacts.sh <file> [<file> ...]
+#   bash sign-artifacts.sh <file> [<file> ...]
+#
+# Always through `bash`, never `./sign-artifacts.sh`. This repo has
+# core.fileMode off on the Windows seat, so a +x bit set here cannot be
+# committed from this box and the file ships 100644 -- which a direct
+# invocation in CI would discover as "Permission denied" on the first release
+# that needed it. build-release-artifacts.sh calls it the safe way; keep it
+# that way rather than chasing the mode bit.
 #
 # Both PE images (.exe/.com/.dll) and MSI packages are accepted; osslsigncode
 # handles both, which is the reason it is the tool here rather than
