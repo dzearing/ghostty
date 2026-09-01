@@ -47,7 +47,25 @@
 param(
     [Parameter(Mandatory = $true)][string]$Msi,
     [Parameter(Mandatory = $true)][string]$Out,
-    [string]$Identity = 'GhozttyT1194Test'
+    [string]$Identity = 'GhozttyT1194Test',
+    # Mint a SYNTHETIC PREDECESSOR of the package being rewritten (T1209): the
+    # same payload, registered at a lower ProductVersion, so a harness can
+    # install it and then let the published package upgrade it for real.
+    #
+    # This exists because the two newest published releases are not
+    # interchangeable subjects. An upgrade is only graceful when the build being
+    # REPLACED knows how to be closed by an installer, and that landed in
+    # win-v1.36.0 - so measuring the graceful route against win-v1.35.0 measures
+    # a build that predates it. One published package on both sides, with the
+    # version moved underneath the older copy, keeps the payload honest and the
+    # question answerable.
+    #
+    # Lower, never higher: the package's own OLDERVERSIONFOUND row carries
+    # `VersionMax = <this package's version>` with the max NOT inclusive, so a
+    # bumped-up copy would fail to detect the installed product and install
+    # BESIDE it - a side-by-side pair that passes every version check while
+    # testing the opposite of an upgrade.
+    [string]$ProductVersion = ''
 )
 $ErrorActionPreference = 'Stop'
 
@@ -431,7 +449,32 @@ Open-MsiDb
 $oldProduct = Get-MsiValue "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductCode'"
 $oldUpgrade = Get-MsiValue "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='UpgradeCode'"
 $oldName = Get-MsiValue "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductName'"
-$version = Get-MsiValue "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductVersion'"
+$sourceVersion = Get-MsiValue "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductVersion'"
+$version = if ($ProductVersion) { $ProductVersion } else { $sourceVersion }
+if ($ProductVersion -and ([version]$ProductVersion -ge [version]$sourceVersion)) {
+    # Closed and deleted the way a verification failure is: a half-written $Out
+    # carrying the real UpgradeCode is the artifact nobody may be handed.
+    Close-MsiDb
+    Remove-Item -LiteralPath $Out -Force -ErrorAction SilentlyContinue
+    throw ("-ProductVersion $ProductVersion is not BELOW the package's own $sourceVersion " +
+        '(package deleted). See the parameter comment: a raised version installs beside ' +
+        'the product it should have replaced.')
+}
+
+# The Upgrade table's version BOUNDS, captured before any write. They are not
+# covered by the snapshot/repair machinery - `Upgrade` is in $skipTables,
+# because its rows deliberately change primary key here - and they share their
+# string pool entries with `Property.ProductVersion`, so a write to one can
+# blank the others. Session 4 puts them back.
+$upgradeBounds = @{}
+foreach ($row in (Get-MsiRows "SELECT ``ActionProperty``,``VersionMin``,``VersionMax`` FROM ``Upgrade``" 3)) {
+    # A bound spelled with the source's own version follows the version: this
+    # package IS $version now, so "older than me" and "newer than me" have to
+    # move with it. Anything else is left exactly as published.
+    $vmin = if ($row[1] -eq $sourceVersion) { $version } else { $row[1] }
+    $vmax = if ($row[2] -eq $sourceVersion) { $version } else { $row[2] }
+    $upgradeBounds[$row[0]] = @($vmin, $vmax)
+}
 
 $newProduct = New-DerivedGuid -Identity $Identity -Seed "productcode::$version"
 $newUpgrade = New-DerivedGuid -Identity $Identity -Seed 'upgradecode'
@@ -439,7 +482,7 @@ $newPackage = New-DerivedGuid -Identity $Identity -Seed "packagecode::$version"
 
 Write-Host "  source      : $Msi"
 Write-Host "  identity    : $Identity (was $oldName)"
-Write-Host "  version     : $version"
+Write-Host "  version     : $version$(if ($ProductVersion) { " (was $sourceVersion)" })"
 Write-Host "  ProductCode : $oldProduct -> $newProduct"
 Write-Host "  UpgradeCode : $oldUpgrade -> $newUpgrade"
 
@@ -500,6 +543,9 @@ $propMap = @{
     'UpgradeCode' = $newUpgrade
     'ProductName' = $Identity
 }
+# Only when asked. Writing the value it already holds would be a no-op in the
+# database and a lie in the "N rewritten" count.
+if ($ProductVersion) { $propMap['ProductVersion'] = $version }
 $propChanged = Update-MsiColumn -Table 'Property' -Columns @('Property', 'Value') `
     -KeyColumn 'Property' -Column 'Value' -Rewrite {
     param($cur, $row)
@@ -622,6 +668,77 @@ Write-Host "  repaired    : $repairedTotal collateral cell(s)"
 
 Close-MsiDb
 
+# ------------------------------------- session 4: re-assert the identity
+#
+# The repair pass above cannot fix the identity's own cells: `Property|Value`
+# is on the intended list, so a cell that went BLANK there reads as "changed on
+# purpose" and is skipped. That is not hypothetical - it is the same freed
+# shared string the header describes, arriving from the other direction.
+# Measured on the published 1.36.0 package: `Property.ProductVersion` shares its
+# pool entry with `Upgrade.VersionMax` (both `26.8.3110`), so re-keying the
+# Upgrade rows frees it and the Property cell reads back as ''. Every other
+# identity cell survived because each was written to a string nothing else
+# holds, which is why this only ever showed up once -ProductVersion existed.
+#
+# So: read the identity back, write whatever is not what it should be, and
+# repeat while anything moves. A write here can free another string in turn,
+# hence the loop - and not converging is a failure, never a shrug.
+function Set-MsiCell([string]$Update, [string]$Value) {
+    $v = $db.OpenView($Update)
+    $rec = $installer.CreateRecord(1)
+    $rec.StringData(1) = $Value
+    [void]$v.Execute($rec)
+    [void]$v.Close()
+    [void][Runtime.InteropServices.Marshal]::ReleaseComObject($rec)
+    [void][Runtime.InteropServices.Marshal]::ReleaseComObject($v)
+}
+
+for ($pass = 1; $pass -le 3; $pass++) {
+    Open-MsiDb
+    $wrong = @()
+    foreach ($k in $propMap.Keys) {
+        $cur = Get-MsiValue "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='$k'"
+        if ($cur -ne $propMap[$k]) { $wrong += "Property.$k" }
+    }
+    foreach ($row in (Get-MsiRows "SELECT ``ActionProperty``,``VersionMin``,``VersionMax`` FROM ``Upgrade``" 3)) {
+        $want = $upgradeBounds[$row[0]]
+        if ($null -eq $want) { continue }
+        if ($row[1] -ne $want[0]) { $wrong += "Upgrade.$($row[0]).VersionMin" }
+        if ($row[2] -ne $want[1]) { $wrong += "Upgrade.$($row[0]).VersionMax" }
+    }
+    if ($wrong.Count -eq 0) { Close-MsiDb; break }
+    foreach ($k in $propMap.Keys) {
+        $cur = Get-MsiValue "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='$k'"
+        if ($cur -ne $propMap[$k]) {
+            Set-MsiCell "UPDATE ``Property`` SET ``Value``=? WHERE ``Property``='$k'" $propMap[$k]
+        }
+    }
+    # The bounds are PRIMARY KEY columns, so msiViewModifyUpdate cannot touch
+    # them and an `UPDATE ... SET VersionMin` view fails to execute at all.
+    # Same msiViewModifyReplace idiom the UpgradeCode re-key uses, and for the
+    # same reason.
+    foreach ($ap in @($upgradeBounds.Keys)) {
+        $want = $upgradeBounds[$ap]
+        $v = $db.OpenView("SELECT $upgradeColList FROM ``Upgrade`` WHERE ``ActionProperty``='$ap'")
+        [void]$v.Execute()
+        $r = $v.Fetch()
+        if ($null -ne $r) {
+            $r.StringData(2) = $want[0]
+            $r.StringData(3) = $want[1]
+            [void]$v.Modify($MODIFY_REPLACE, $r)
+        }
+        [void]$v.Close()
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($v)
+    }
+    Close-MsiDb
+    Write-Host "  identity p${pass}: $($wrong.Count) cell(s) re-asserted ($($wrong -join ', '))"
+    if ($pass -eq 3) {
+        Remove-Item -LiteralPath $Out -Force -ErrorAction SilentlyContinue
+        throw ('rewrite could not hold the identity cells after 3 passes (package deleted): ' +
+            ($wrong -join ', '))
+    }
+}
+
 # The package code lives in the summary stream rather than in a table, so it is
 # a separate open-write-persist, and it needs the database handle to be gone
 # first: `Database.SummaryInformation` on a live handle takes the process down
@@ -649,7 +766,11 @@ function Check([bool]$ok, [string]$what) {
 Check ((Get-MsiValue "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductCode'") -eq $newProduct) 'Property.ProductCode'
 Check ((Get-MsiValue "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='UpgradeCode'") -eq $newUpgrade) 'Property.UpgradeCode'
 Check ((Get-MsiValue "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductName'") -eq $Identity) 'Property.ProductName'
-Check ((Get-MsiValue "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductVersion'") -eq $version) 'Property.ProductVersion (clobbered)'
+# Without -ProductVersion this asks that the version was NOT clobbered by the
+# Upgrade edit; with it, that the requested one landed. `$version` is already
+# whichever of the two this run means.
+$versionAfter = Get-MsiValue "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='ProductVersion'"
+Check ($versionAfter -eq $version) "Property.ProductVersion (wanted $version, read '$versionAfter')"
 Check ((Get-MsiValue "SELECT ``DefaultDir`` FROM ``Directory`` WHERE ``Directory``='INSTALLDIR'") -like "*$Identity") 'Directory.INSTALLDIR'
 
 $upgradeAfter = Get-MsiRows "SELECT ``UpgradeCode``,``ActionProperty`` FROM ``Upgrade``" 2
@@ -658,6 +779,18 @@ foreach ($row in $upgradeAfter) { if ($row[0] -ne $newUpgrade) { $badUpgrade++ }
 Check ($badUpgrade -eq 0) "Upgrade.UpgradeCode ($badUpgrade row(s) still on another code)"
 # The row COUNT matters as much as the values: losing the OLDERVERSIONFOUND row
 # would quietly turn the major upgrade into a second side-by-side install.
+$boundsAfter = Get-MsiRows "SELECT ``ActionProperty``,``VersionMin``,``VersionMax`` FROM ``Upgrade``" 3
+$badBounds = @()
+foreach ($row in $boundsAfter) {
+    $want = $upgradeBounds[$row[0]]
+    if ($null -eq $want) { continue }
+    if ($row[1] -ne $want[0]) { $badBounds += "$($row[0]).VersionMin='$($row[1])'" }
+    if ($row[2] -ne $want[1]) { $badBounds += "$($row[0]).VersionMax='$($row[2])'" }
+}
+# A blanked bound is unbounded, and an unbounded NEWERVERSIONFOUND blocks every
+# install of this package with "a newer version is already installed" - a
+# package that is broken in a way nobody sees until they try to use it.
+Check ($badBounds.Count -eq 0) ("Upgrade version bounds: " + ($badBounds -join ', '))
 Check ($upgradeAfter.Count -eq $actionProps.Count) "Upgrade row count ($($upgradeAfter.Count), expected $($actionProps.Count))"
 
 $comps = Get-MsiRows "SELECT ``Component``,``ComponentId`` FROM ``Component``" 2

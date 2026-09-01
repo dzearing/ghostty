@@ -55,6 +55,10 @@ $realLocalAppData = $env:LOCALAPPDATA
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 $env:GHOZTTY_NO_STARTUP_ESCAPE = '1'
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+# The throwaway product identity, its packages and its processes - shared with
+# test\win32\update-graceful.ps1, which drives the same machinery through the
+# graceful close-and-reopen this harness stubs out.
+. (Join-Path $PSScriptRoot 'lib\ThrowawayProduct.ps1')
 # -ReleaseSandbox, not a bare suffix: everything this script launches is a
 # RELEASE build (it is a published package), so without the sandbox it would
 # dial the agent that owns the user's live sessions and stage its package into
@@ -67,8 +71,8 @@ New-Item -ItemType Directory -Force $work | Out-Null
 
 $oldVer = $OldTag -replace '^win-v', ''
 $newVer = $NewTag -replace '^win-v', ''
-$installDir = Join-Path $realLocalAppData "Programs\$Identity"
-$userInstallDir = Join-Path $realLocalAppData 'Programs\Ghoztty'
+$installDir = Get-ThrowawayInstallDir -RealLocalAppData $realLocalAppData -Identity $Identity
+$userInstallDir = Get-ThrowawayUserInstallDir -RealLocalAppData $realLocalAppData
 $stagingDir = Join-Path $env:LOCALAPPDATA 'ghoztty\updates'
 
 $script:pass = 0
@@ -79,89 +83,6 @@ function Assert([bool]$cond, [string]$label) {
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
 }
 function Skip([string]$label) { $script:skip++; Write-Host "SKIP  $label" -ForegroundColor Yellow }
-
-# Per-user MSI products register their Apps & Features entry through the
-# Windows Installer service, and depending on package platform and Windows
-# version the key lands in HKCU, HKLM 64-bit or HKLM WOW6432Node. Search all
-# three (the same three msi-upgrade.ps1 learned to search).
-$uninstRoots = @(
-    'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
-    'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
-    'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
-)
-function Get-TestUninstallEntries {
-    foreach ($root in $uninstRoots) {
-        Get-ChildItem $root -ErrorAction SilentlyContinue | Where-Object {
-            (Get-ItemProperty $_.PSPath -ErrorAction SilentlyContinue).DisplayName -eq $Identity
-        }
-    }
-}
-function Remove-TestProduct {
-    foreach ($e in @(Get-TestUninstallEntries)) {
-        $code = Split-Path $e.PSPath -Leaf
-        Start-Process msiexec.exe -ArgumentList @('/x', $code, '/qn') -Wait | Out-Null
-    }
-    if (Test-Path $installDir) {
-        Remove-Item $installDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-}
-function Get-UserPathEntryCount {
-    $p = [Environment]::GetEnvironmentVariable('PATH', 'User')
-    if (-not $p) { return 0 }
-    return @($p -split ';' | Where-Object { $_ -ne '' }).Count
-}
-function Get-TestProcesses([string[]]$Names) {
-    $out = @()
-    foreach ($name in $Names) {
-        foreach ($p in @(Get-Process -Name $name -ErrorAction SilentlyContinue)) {
-            $path = try { $p.Path } catch { $null }
-            if ($path -and $path.StartsWith($installDir, [StringComparison]::OrdinalIgnoreCase)) { $out += $p }
-        }
-    }
-    return $out
-}
-
-function Stop-TestInstances {
-    # Only processes running out of the THROWAWAY install directory. The user's
-    # Ghoztty is a different image in a different directory and is never a
-    # candidate - which is the same rule the repo applies to its own builds.
-    #
-    # -AppOnly leaves the agent and its per-session pty-host holders alone,
-    # which is what a real update does: the app closes, the holders keep the
-    # user's shells alive, and the installer renames their image aside rather
-    # than asking the Restart Manager to terminate them.
-    param([switch]$AppOnly)
-    $names = if ($AppOnly) { @('ghoztty') } else { @('ghoztty', 'ghoztty-agent') }
-    foreach ($name in $names) {
-        Get-Process -Name $name -ErrorAction SilentlyContinue | ForEach-Object {
-            $path = try { $_.Path } catch { $null }
-            if ($path -and $path.StartsWith($installDir, [StringComparison]::OrdinalIgnoreCase)) {
-                try { $_.Kill() } catch {}
-            }
-        }
-    }
-    Start-Sleep -Milliseconds 500
-}
-
-function Get-ExeVersion([string]$exe) {
-    # `+version` over a private endpoint (Set-GhozttyTestIsolation above), so
-    # the answer is about THIS binary and never about the user's running app.
-    #
-    # Ask the `.com` console twin when it is there: ghoztty.exe is
-    # GUI-subsystem in a release build and has no console to print to. And the
-    # banner still says "Ghostty" - the fork kept upstream's wording in
-    # src/cli/version.zig - so the version is read from the `- version:` line,
-    # which is spelled the same either way.
-    $com = [IO.Path]::ChangeExtension($exe, '.com')
-    $bin = if (Test-Path $com) { $com } else { $exe }
-    # Stringified before Out-String (T883): a merged stream handed to the
-    # formatter is wrapped at the HOST's width, so the `- version:` line can
-    # arrive folded and the match silently fails on a narrow console.
-    $out = & $bin +version 2>&1 | ForEach-Object { $_.ToString() } | Out-String
-    if ($out -match '(?m)^\s*-\s*version:\s*(\d+\.\d+\.\d+)') { return $Matches[1] }
-    if ($out -match '(?m)^Gho[sz]tty\s+(\d+\.\d+\.\d+)') { return $Matches[1] }
-    return ''
-}
 
 $pathBefore = Get-UserPathEntryCount
 $userInstallBefore = if (Test-Path $userInstallDir) {
@@ -176,25 +97,8 @@ try {
 # =========================================================== A. packages
 Write-Host "`n-- A. throwaway packages from the published releases --"
 
-function Get-TestPackage([string]$tag, [string]$ver) {
-    $published = Join-Path $work "Ghoztty-$ver-x64.msi"
-    $rewritten = Join-Path $work "test-$ver.msi"
-    if (-not (Test-Path $published)) {
-        Write-Host "  downloading $tag ..."
-        & gh release download $tag --repo dzearing/ghoztty --pattern '*.msi' --dir $work --clobber 2>&1 | Out-Null
-    }
-    if (-not (Test-Path $published)) { return $null }
-    if (-not (Test-Path $rewritten) -or
-        (Get-Item $rewritten).LastWriteTimeUtc -lt (Get-Item $published).LastWriteTimeUtc) {
-        & powershell -NoProfile -File (Join-Path $repo 'scripts\msi-test-identity.ps1') `
-            -Msi $published -Out $rewritten -Identity $Identity 2>&1 | Out-Null
-    }
-    if (-not (Test-Path $rewritten)) { return $null }
-    return $rewritten
-}
-
-$msiOld = Get-TestPackage $OldTag $oldVer
-$msiNew = Get-TestPackage $NewTag $newVer
+$msiOld = Get-ThrowawayPackage -Tag $OldTag -Version $oldVer -Work $work -Identity $Identity -Repo $repo
+$msiNew = Get-ThrowawayPackage -Tag $NewTag -Version $newVer -Work $work -Identity $Identity -Repo $repo
 
 if (-not $msiOld -or -not $msiNew) {
     # No network, or no `gh`. The published package IS the subject of this
@@ -210,28 +114,17 @@ Assert (Test-Path $msiNew) "A: $NewTag rewritten to the $Identity identity"
 # The two packages must share ONE UpgradeCode, or the newer one installs
 # beside the older instead of replacing it - which would pass every version
 # check below while testing the opposite of an upgrade.
-function Get-MsiProperty([string]$msi, [string]$name) {
-    $inst = New-Object -ComObject WindowsInstaller.Installer
-    $db = $inst.OpenDatabase($msi, 0)
-    $v = $db.OpenView("SELECT ``Value`` FROM ``Property`` WHERE ``Property``='$name'")
-    [void]$v.Execute()
-    $r = $v.Fetch()
-    $out = if ($null -eq $r) { '' } else { [string]$r.StringData(1) }
-    [void]$v.Close()
-    [void][Runtime.InteropServices.Marshal]::ReleaseComObject($v)
-    [void][Runtime.InteropServices.Marshal]::ReleaseComObject($db)
-    return $out
-}
-$upOld = Get-MsiProperty $msiOld 'UpgradeCode'
-$upNew = Get-MsiProperty $msiNew 'UpgradeCode'
+
+$upOld = Get-MsiProperty -Msi $msiOld -Name 'UpgradeCode'
+$upNew = Get-MsiProperty -Msi $msiNew -Name 'UpgradeCode'
 Assert ($upOld -eq $upNew -and $upOld -ne '') 'A: both packages share one throwaway UpgradeCode'
 Assert ($upOld -ne '{5EB02044-7F06-498B-B7A9-7EFD65486CFB}') "A: that UpgradeCode is NOT the shipping product's"
-Assert ((Get-MsiProperty $msiOld 'ProductName') -eq $Identity) 'A: the older package is the throwaway product'
+Assert ((Get-MsiProperty -Msi $msiOld -Name 'ProductName') -eq $Identity) 'A: the older package is the throwaway product'
 
 # ================================================ B. install the old release
 Write-Host "`n-- B. install $OldTag for real --"
-Stop-TestInstances
-Remove-TestProduct
+Stop-ThrowawayInstances -InstallDir $installDir -RealLocalAppData $realLocalAppData
+Remove-ThrowawayProduct -Identity $Identity -InstallDir $installDir -RealLocalAppData $realLocalAppData
 
 $installLog = Join-Path $work 'install-old.log'
 # LAUNCHAPP=0 so a successful install does not open a terminal window on the
@@ -244,9 +137,9 @@ Assert ($p.ExitCode -eq 0) "B: msiexec installed $OldTag (exit $($p.ExitCode))"
 $testExe = Join-Path $installDir 'ghoztty.exe'
 Assert (Test-Path $testExe) "B: ghoztty.exe is in $installDir"
 Assert (Test-Path (Join-Path $installDir 'ghoztty-agent.exe')) 'B: the agent came with it'
-$verInstalled = Get-ExeVersion $testExe
+$verInstalled = Get-ThrowawayExeVersion -Exe $testExe
 Assert ($verInstalled -eq $oldVer) "B: it reports $oldVer (got '$verInstalled')"
-Assert ((@(Get-TestUninstallEntries)).Count -ge 1) 'B: it registered as its own product in Apps & Features'
+Assert ((@(Get-ThrowawayUninstallEntries -Identity $Identity)).Count -ge 1) 'B: it registered as its own product in Apps & Features'
 
 # ============================================ C. the app stages the update
 Write-Host "`n-- C. the app finds $NewTag and stages its package --"
@@ -303,8 +196,8 @@ if ($staged) {
 # it is right to. Close the APP the way a real update does - and deliberately
 # leave the agent and its per-session pty-host holders running, because those
 # outliving the terminal is the whole feature the rename-aside design protects.
-$holdersBefore = @(Get-TestProcesses @('ghoztty-agent'))
-Stop-TestInstances -AppOnly
+$holdersBefore = @(Get-ThrowawayProcesses -InstallDir $installDir -Names @('ghoztty-agent'))
+Stop-ThrowawayInstances -InstallDir $installDir -RealLocalAppData $realLocalAppData -AppOnly
 
 # =============================================== D. the applier installs it
 Write-Host "`n-- D. the applier runs msiexec and the version moves --"
@@ -369,12 +262,12 @@ if (-not $staged) {
     }
 
     # The relaunch is a real terminal and it belongs to this harness now.
-    Stop-TestInstances
+    Stop-ThrowawayInstances -InstallDir $installDir -RealLocalAppData $realLocalAppData
 
-    $verAfter = Get-ExeVersion $testExe
+    $verAfter = Get-ThrowawayExeVersion -Exe $testExe
     Assert ($verAfter -eq $newVer) "D: the installed build now reports $newVer (got '$verAfter')"
 
-    $entries = @(Get-TestUninstallEntries)
+    $entries = @(Get-ThrowawayUninstallEntries -Identity $Identity)
     $displayed = if ($entries.Count -gt 0) {
         (Get-ItemProperty $entries[0].PSPath -ErrorAction SilentlyContinue).DisplayVersion
     } else { '' }
@@ -384,8 +277,8 @@ if (-not $staged) {
     # that the REGISTERED product moved from the old package's number to the
     # new one's. Anything else means the update installed beside the old
     # product rather than over it.
-    $prodOld = Get-MsiProperty $msiOld 'ProductVersion'
-    $prodNew = Get-MsiProperty $msiNew 'ProductVersion'
+    $prodOld = Get-MsiProperty -Msi $msiOld -Name 'ProductVersion'
+    $prodNew = Get-MsiProperty -Msi $msiNew -Name 'ProductVersion'
     Assert ($prodOld -ne $prodNew) "D: the two packages have different ProductVersions ($prodOld / $prodNew)"
     Assert ($displayed -eq $prodNew) "D: the registered product is now $prodNew, was $prodOld (got '$displayed')"
 }
@@ -425,7 +318,7 @@ for ($i = 0; $i -lt 30; $i++) {
     $oldLeft = @(Get-ChildItem $installDir -Filter '*.old-*' -File -Recurse -ErrorAction SilentlyContinue)
     if ($stagedLeft.Count -eq 0 -and $oldLeft.Count -eq 0) { $clean = $true; break }
 }
-Stop-TestInstances
+Stop-ThrowawayInstances -InstallDir $installDir -RealLocalAppData $realLocalAppData
 $leftNames = @()
 foreach ($f in @(Get-ChildItem $stagingDir -File -ErrorAction SilentlyContinue)) { $leftNames += $f.Name }
 foreach ($f in @(Get-ChildItem $installDir -Filter '*.old-*' -File -Recurse -ErrorAction SilentlyContinue)) { $leftNames += $f.Name }
@@ -446,12 +339,12 @@ Assert ($userExeVersionAfter -eq $userExeVersionBefore) 'E: the user''s ghoztty.
 } finally {
     if (-not $KeepInstall) {
         Write-Host "`n-- cleanup --"
-        Stop-TestInstances
-        Remove-TestProduct
+        Stop-ThrowawayInstances -InstallDir $installDir -RealLocalAppData $realLocalAppData
+        Remove-ThrowawayProduct -Identity $Identity -InstallDir $installDir -RealLocalAppData $realLocalAppData
         $pathAfter = Get-UserPathEntryCount
         Assert ($pathAfter -eq $pathBefore) "cleanup: the user PATH is back to $pathBefore entries (got $pathAfter)"
         Assert (-not (Test-Path $installDir)) 'cleanup: the throwaway install directory is gone'
-        Assert ((@(Get-TestUninstallEntries)).Count -eq 0) 'cleanup: no throwaway product left registered'
+        Assert ((@(Get-ThrowawayUninstallEntries -Identity $Identity)).Count -eq 0) 'cleanup: no throwaway product left registered'
         Remove-Item (Join-Path $env:LOCALAPPDATA 'ghoztty\updates') -Recurse -Force -ErrorAction SilentlyContinue
     } else {
         Write-Host "`n-- cleanup SKIPPED (-KeepInstall) --"

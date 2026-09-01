@@ -1083,7 +1083,30 @@ $GuardTable = @(
             'src\apprt\win32\update_install.zig',
             'scripts\msi-test-identity.ps1',
             'dist\windows-installer\build-msi.sh',
+            'test\win32\lib\ThrowawayProduct.ps1',
             'test\win32\update-real-msi.ps1'
+        )
+    },
+    # The JOIN the two harnesses either side of it each stub out (T1209): a real
+    # msiexec install driven by the IN-APP updater over a terminal that is
+    # RUNNING, closed the way the Restart Manager closes it, with a live session
+    # behind it. update-apply stops at msiexec's verdict; update-real-msi kills
+    # the app first and hands the applier a pid that has already exited;
+    # install-restart sends the close messages with no installer behind them.
+    # This one measures the close, the replace, the reopen and the surviving
+    # session as one sequence, which is the only order a user ever sees them in.
+    [pscustomobject]@{
+        Name   = 'update-graceful'
+        Script = 'test\win32\update-graceful.ps1'
+        Stamp  = 'test\win32\update-graceful.stamp.json'
+        Covers = @(
+            'src\apprt\win32\update_apply.zig',
+            'src\apprt\win32\update_install.zig',
+            'src\apprt\win32\install_prepare.zig',
+            'scripts\msi-test-identity.ps1',
+            'dist\windows-installer\build-msi.sh',
+            'test\win32\lib\ThrowawayProduct.ps1',
+            'test\win32\update-graceful.ps1'
         )
     },
     # The update download's own REPORT (T1195): does a consented download show

@@ -1,10 +1,12 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-01T11:57:22-07:00",
-    "commit":  "9aa532901",
+    "generated":  "2026-09-01T13:48:46-07:00",
+    "commit":  "2def60186",
     "uncommitted":  [
-                        "test/win32/rdp-session.ps1"
+                        "test/win32/lib/ThrowawayProduct.ps1",
+                        "test/win32/update-graceful.ps1",
+                        "test/win32/update-real-msi.ps1"
                     ],
     "files":  {
                   "docs/claude/testing.md":  "353e090f48ab5d8f8eee4042ac2689134b9f082800c4a067d625af97eec7f2c7",
@@ -178,6 +180,7 @@
                   "test/win32/lib/TestDesktop.ps1":  "c4a8dcf04991397f57f614c528aa505e2df94212ebac33e263ba4eb9735ffda8",
                   "test/win32/lib/TestReachAudit.ps1":  "3b2fb64aee74f3451127f4f9776141f5781dd210a6fdf0019410485664f0a840",
                   "test/win32/lib/TestScore.ps1":  "1bc571121b1b60ce5d9b63a0e1c8ebf23f6da575f8e9f7dab1a410cbc2888acc",
+                  "test/win32/lib/ThrowawayProduct.ps1":  "ae41da0116447e2a9d7beea82575bd9843cd819e6e007a17d89383abf68200b5",
                   "test/win32/lib/VerdictExitAudit.ps1":  "8a22b157dc4e93add59e9b3da93a0620c667644cefb1b3641dc2f6cd370f226e",
                   "test/win32/local-split-no-command-rerun.ps1":  "ee277b6308cdb172e153fe92d0624732f8b64743418134ce466da5534138fae2",
                   "test/win32/log-append.ps1":  "dbfc7cfcb11dddb0896c83d0d1c70ead785ec15a683da511df6fe630d6279fdf",
@@ -270,8 +273,9 @@
                   "test/win32/update-apply.ps1":  "f88873b05e0ef70adb64067e7ce1a4c1f54aca5409b0e427324e6266aa362453",
                   "test/win32/update-check.ps1":  "a30b6268ce08a7da0295566c914649e9190b4b77b980a5da7eeb155b5bbd9e21",
                   "test/win32/update-failure-visible.ps1":  "2aa609f410ee44f950354c01637ed81552791e88331178423f5b9686d5748c34",
+                  "test/win32/update-graceful.ps1":  "8dd249a5f108c2f129a2673c857e68808115c8fd963d67ffaef7ab43a3c70944",
                   "test/win32/update-progress.ps1":  "b8e99fafbc291da0a4b269b0102a3f934e08758be39f7b77e2e5086f71cd2e4b",
-                  "test/win32/update-real-msi.ps1":  "134c0f378f3c6dfec951e005ae4fa6e3b8d91cae13efcee691f7882b5c6bdcab",
+                  "test/win32/update-real-msi.ps1":  "a3518108e44ccc5efd0108d261343d5f10ddf3e6412ca80027a822bd2ee61014",
                   "test/win32/upgrade-no-fork.ps1":  "76264704b07c6d8267edda9d19349210a5462999cc8321b7c6b4d1f5e09df56c",
                   "test/win32/upgrade-resume-readiness.ps1":  "9df12a1d37c47dddc89f67af6056dd1c850a055e8b11b119ba272f24922e61f8",
                   "test/win32/upgrade-staleness.ps1":  "ca280a6b9c10b9a96d354f640b3c76b500ff9ae3f3af3e5723e942268cbd1be8",

@@ -9,6 +9,49 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-01: T1209 (+T1258, T1259, T1260 filed) - **"click update and my terminal comes back with my shells still in it" is now one measured sequence instead of three halves.** The in-app updater and the installer's Restart Manager handling landed separately (T1178, T1204, T1207) and each had a harness that stopped exactly where the other one started: `update-apply` runs the applier against a package msiexec rejects; `update-real-msi` gets a real msiexec to succeed but KILLS the app first and hands the applier a pid that has already exited; `install-restart` measures the app agreeing to a Restart Manager close with no installer behind the messages. Nobody had watched a running terminal be closed, replaced and reopened in one go.
+  `test\win32\update-graceful.ps1` is that run: the app is up with a live pane
+  when the applier is armed on its pid, it is closed with the two messages the
+  Restart Manager actually sends, the applier waits for the exit and drives a
+  real msiexec over the throwaway product, and then a terminal nobody started is
+  running again with its session still answering a typed command. 42 assertions,
+  ALL PASS.
+  The finding worth carrying forward came from the first run, which was RED and
+  right to be: the obvious pair (install win-v1.35.0, upgrade to win-v1.36.0)
+  cannot measure this at all, because **the build being REPLACED is the one that
+  has to know how to close, and 1.35.0 predates T1204**. The applier refused to
+  install over a live app and exited 1 - correct behaviour end to end. So the
+  first graceful update this fork ever performs will not be graceful; every one
+  after it will. That red run is kept as the harness's teeth check.
+  Both sides of the test are therefore the SAME published package, with the older
+  side registered at a lower ProductVersion by a new
+  `scripts\msi-test-identity.ps1 -ProductVersion`. Adding it exposed a latent
+  defect in the rewriter: writing `Property.ProductVersion` frees a string-pool
+  entry it shares with `Upgrade.VersionMin`/`VersionMax`, and both bounds read
+  back EMPTY - which nothing could see, since `Property|Value` is on the
+  intended-cell list and `Upgrade` is in `$skipTables`. A blank
+  `NEWERVERSIONFOUND.VersionMin` is unbounded, so every install of that package
+  would abort with "a newer version is already installed": a package broken in a
+  way nobody finds until they try to use it. Fixed with a fourth session that
+  re-asserts the identity cells and the version bounds after the repair pass,
+  plus a verification so it cannot come back quietly.
+  The throwaway-product machinery moved out of `update-real-msi.ps1` into
+  `test\win32\lib\ThrowawayProduct.ps1` and gained the refusal the private
+  copy never had - it REFUSES an install directory that is the user's Ghoztty
+  rather than merely filtering away from it. `update-real-msi` re-ran green (30
+  checks) on the shared library, so the extraction is proven by the harness it
+  came out of.
+  Three sweeps of the suite turned up pre-existing red that nothing was obliged
+  to notice, filed rather than fixed here: `skip-visibility` red with nine
+  scripts printing a SKIP their verdict never names (T1258); `asserted-nothing`
+  red with one script scoring green from an abort branch and the
+  uncounted-verdict ceiling passed by three (T1259); and the private-kill sweep
+  unable to see a kill written as `.Kill()`, which is why two harnesses have
+  carried one it never reported (T1260). The common cause of the first two is
+  that neither sweep has a row in `scripts\guard-due.ps1`, so nothing ever
+  reports them as due - every sibling sweep that does have one was green.
+  Next: the queue's next P1.
+
 - 2026-09-01: T1195 - **an update that has to download now shows you it is downloading.** With `auto-update = check`, clicking the update notification started tens of megabytes moving and said so exactly once, in a balloon: "Downloading the update...". Then silence, until the terminal either restarted into the new build or reported a failure. On a slow link that silence is minutes long, and a silence is the one thing a stall and a slow transfer look identical through. Mac has shown a progress bar for this stretch since Sparkle.
   What landed is a small modeless panel (`UpdateProgress.zig`, class
   `GhozttyUpdateProgress`) centered on the window whose dialog the user just
@@ -19224,7 +19267,8 @@ is that old, the desktop is encoded and shipped over a wire, and the DPI and
 monitor topology are the client's. Nobody had ever watched Ghoztty launch inside
 an RDP session.
 
-`test\win32dp-session.ps1` is the checklist for when somebody does. Six arms:
+`test\win32
+dp-session.ps1` is the checklist for when somebody does. Six arms:
 the session's own identity, a launch with no startup-failure dialog, the
 renderer's account of the OpenGL context and the implementation it drew with,
 `+list` over the remote session, frame pacing under a sustained stream, and a
