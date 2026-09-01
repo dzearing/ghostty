@@ -82,6 +82,7 @@ const git_run = @import("git_run.zig");
 const ViewerWorktreeProbe = @import("ViewerWorktreeProbe.zig");
 const ViewerDiffProbe = @import("ViewerDiffProbe.zig");
 const viewer_diff = @import("viewer_diff.zig");
+const viewer_image = @import("viewer_image.zig");
 const build_config = @import("../../build_config.zig");
 const ViewerTOCPanel = @import("ViewerTOCPanel.zig");
 const internal_os = @import("../../os/main.zig");
@@ -270,6 +271,24 @@ mode: content.Mode = .web,
 /// mode. Owned, and kept separately from `location` because the two differ
 /// whenever the location is a `file://` URL.
 file_path: ?[]u8 = null,
+
+/// The zoom state of an image pane (T1183). Meaningless in every other mode
+/// and reset by every navigation into image mode.
+///
+/// The pane holds this rather than the page because the RULES are
+/// `viewer_image.Geometry`'s: the page measures and gestures, this side
+/// decides, and one owner of the number is what keeps a resize mid-pinch from
+/// producing two answers. `image_fitting` is what makes a divider drag re-fit —
+/// and what any deliberate zoom clears, so a pane the user has zoomed does not
+/// snap back when the split moves.
+image_zoom: f64 = 1,
+image_fitting: bool = true,
+image_geometry: viewer_image.Geometry = .{},
+/// Bumped on every (re)load so the page's `<img>` src changes. An `<img>`
+/// pointed at a `src` it already has does not go back to the network, however
+/// hard the response says not to cache — which would make `+reload` on an
+/// image do nothing at all.
+image_revision: u64 = 0,
 
 /// The bundled viewer assets directory (`…/share/ghostty/viewer`), resolved
 /// once when the pane starts. Owned. Null on an installation whose resources
@@ -2357,6 +2376,7 @@ fn applyMessage(self: *ViewerPane, alloc: Allocator, message: bridge.Message) vo
         .quote => |q| self.acceptQuote(alloc, q),
         .selection => |text| self.setPageSelection(alloc, text),
         .link_menu => |href| self.armLinkMenu(alloc, href),
+        .image => |img| self.applyImageMessage(alloc, img),
     }
 }
 
@@ -3501,6 +3521,16 @@ fn renderFileContent(self: *ViewerPane) void {
         return;
     };
 
+    // A picture is handed over as a URL, not as bytes (T1183): the pane
+    // already serves the viewed file's own directory to the page, so the
+    // decode belongs to the image decoder the web view ships rather than to a
+    // base64 copy of the file inside a script. Whether it decoded comes back
+    // as an `image` message, which is also where the fit is computed.
+    if (self.mode == .image) {
+        self.startImage(alloc, path);
+        return;
+    }
+
     const bytes = std.fs.cwd().readFileAlloc(alloc, path, content.max_file_bytes) catch |err| {
         self.injectError(alloc, switch (err) {
             error.FileTooBig => content.error_too_large,
@@ -3533,11 +3563,141 @@ fn renderFileContent(self: *ViewerPane) void {
         ),
         // Neither has content to inject: a website is its own page, and so is a
         // rendered `.html` file (T601) — the web view loaded it directly. A
-        // diff answered above, before there was a file path to fail on.
-        .web, .html, .diff => return,
+        // diff and an image both answered above, before there was any text to
+        // read.
+        .web, .html, .diff, .image => return,
     } catch return;
     defer alloc.free(js);
     self.executeScript(alloc, js);
+}
+
+// -------------------------------------------------------------------------
+// Image mode (T1183)
+//
+// The picture is drawn by the page and the ZOOM is decided here. The page
+// reports what it measured and what the user did; `viewer_image.Geometry` —
+// pure, and asserted in the none lane — answers with a scale, which goes back
+// down as `setImageTransform`. Nothing about fit, 100% or the double-click
+// toggle is decided on the page side.
+// -------------------------------------------------------------------------
+
+/// Point the page at `path` and start from a clean zoom. The fit cannot be
+/// computed yet: nobody has measured the picture, and that answer arrives as
+/// the page's `loaded` message.
+fn startImage(self: *ViewerPane, alloc: Allocator, path: []const u8) void {
+    self.image_revision +%= 1;
+    self.image_zoom = 1;
+    self.image_fitting = true;
+    self.image_geometry = .{};
+
+    const url = content.imageUrl(alloc, self.image_revision) catch return;
+    defer alloc.free(url);
+    // The page is told whether this is vector art: it is served from a
+    // sentinel url with no extension, so the file's own name never reaches it.
+    const vector = std.ascii.eqlIgnoreCase(content.extension(path), "svg");
+    const js = content.setImageCall(alloc, url, std.fs.path.basename(path), vector) catch return;
+    defer alloc.free(js);
+    self.executeScript(alloc, js);
+}
+
+/// Act on one `image` message from the page.
+fn applyImageMessage(self: *ViewerPane, alloc: Allocator, msg: bridge.Image) void {
+    // A message from a pane that is not showing a picture is a page talking
+    // through a bridge that is open to any page. Nothing to answer.
+    if (self.mode != .image) return;
+
+    if (msg.event == .failed) {
+        // Same card every other file mode falls through to, rather than the
+        // blank matte an undecodable file would otherwise leave.
+        self.injectError(alloc, content.error_not_image, self.file_path orelse self.location orelse "");
+        return;
+    }
+
+    // The page always sends what it currently knows; a natural size of zero is
+    // a gesture message, not a picture that shrank to nothing.
+    var geom = self.image_geometry;
+    if (msg.natural_w > 0 and msg.natural_h > 0) {
+        geom.natural_w = msg.natural_w;
+        geom.natural_h = msg.natural_h;
+        geom.kind = if (msg.vector) .vector else .raster;
+    }
+    if (msg.viewport_w > 0 and msg.viewport_h > 0) {
+        geom.viewport_w = msg.viewport_w;
+        geom.viewport_h = msg.viewport_h;
+    }
+    if (msg.dpr > 0) geom.dpr = msg.dpr;
+    self.image_geometry = geom;
+
+    const zoom = switch (msg.event) {
+        // A fresh picture opens at best-fit.
+        .loaded => geom.fitZoom(),
+        // A pane resize (or a move to a display at another scale) re-fits only
+        // if the user had not chosen a zoom of their own. Otherwise their zoom
+        // is re-derived from the new geometry, because `unitScale` changed and
+        // 100% has to stay 100%.
+        .viewport => if (self.image_fitting) geom.fitZoom() else geom.clamp(self.image_zoom),
+        .toggle => geom.doubleClickZoom(self.image_zoom),
+        .zoom_in => geom.stepped(self.image_zoom, .zoom_in),
+        .zoom_out => geom.stepped(self.image_zoom, .zoom_out),
+        .reset => geom.stepped(self.image_zoom, .reset),
+        .failed => unreachable, // answered above
+    };
+    self.image_zoom = zoom;
+    self.image_fitting = geom.isFit(zoom);
+    self.pushImageTransform(alloc);
+
+    // The acceptance script's oracle (T1183): this pane is a browser surface
+    // on a background test desktop, so nothing can be read off the screen. The
+    // pane states what it decided instead — which is the whole of what the
+    // validation criteria assert.
+    log.info(
+        "viewer image pane={s} event={s} natural={d}x{d} viewport={d}x{d} dpr={d} kind={s} zoom={d:.4} fit={d:.4} fitting={} scale={d:.4}",
+        .{
+            self.paneId(),
+            @tagName(msg.event),
+            geom.natural_w,
+            geom.natural_h,
+            geom.viewport_w,
+            geom.viewport_h,
+            geom.dpr,
+            @tagName(geom.kind),
+            zoom,
+            geom.fitZoom(),
+            self.image_fitting,
+            geom.cssScale(zoom),
+        },
+    );
+}
+
+fn pushImageTransform(self: *ViewerPane, alloc: Allocator) void {
+    const js = content.setImageTransformCall(
+        alloc,
+        self.image_geometry.cssScale(self.image_zoom),
+        self.image_fitting,
+    ) catch return;
+    defer alloc.free(js);
+    self.executeScript(alloc, js);
+}
+
+/// A ctrl+plus / ctrl+minus / ctrl+0 chord landing on an image pane (T1183).
+/// Returns false when the pane is not showing a picture, which is the caller's
+/// cue to zoom the PAGE the way it always has.
+///
+/// The chord is routed back through the page rather than answered here so
+/// there is exactly one path from a request to a scale: the page re-measures
+/// its viewport on the way past, which a keyboard zoom taken straight out of
+/// stale geometry would skip.
+fn imageZoomChord(self: *ViewerPane, alloc: Allocator, action: viewer_accel.ZoomAction) bool {
+    if (self.mode != .image) return false;
+    const name = switch (action) {
+        .zoom_in => "zoom_in",
+        .zoom_out => "zoom_out",
+        .reset => "reset",
+    };
+    const js = std.fmt.allocPrint(alloc, "window.__viewer.imageZoom(\"{s}\")", .{name}) catch return true;
+    defer alloc.free(js);
+    self.executeScript(alloc, js);
+    return true;
 }
 
 fn injectError(self: *ViewerPane, alloc: Allocator, title: []const u8, detail: []const u8) void {
@@ -3609,6 +3769,15 @@ fn onWebResourceRequested(
         return com.S_OK;
     };
 
+    // The image pane's own picture (T1183), which is the viewed FILE rather
+    // than anything the 3-tier resolver could find: the sentinel path exists
+    // so a basename never has to survive a round trip through a URL, and
+    // `no_store` plus the revision query is what makes `+reload` re-fetch.
+    if (self.mode == .image and std.mem.eql(u8, rel, content.image_resource_path)) {
+        self.serveImage(env, a, alloc);
+        return com.S_OK;
+    }
+
     const resolved = self.resolveResource(alloc, rel) orelse {
         // Chromium asks every origin for a favicon it was never offered, so
         // that one miss is expected and would otherwise put a warning in the
@@ -3657,6 +3826,41 @@ const not_found_reason = std.unicode.utf8ToUtf16LeStringLiteral("Not Found");
 /// on screen, so a cached response is a wrong answer that looks exactly like a
 /// right one — and it is what lets a plain in-place reload (which keeps the
 /// reader's scroll) still show the bytes now on disk.
+/// Answer the image pane's request for its own picture (T1183) — the viewed
+/// file, straight off disk, with the MIME type its extension names.
+///
+/// A read failure is answered with a 404 rather than silently: the page's
+/// `<img>` fires `error`, which comes back up as `failed` and puts the same
+/// card on screen every other unreadable file gets.
+fn serveImage(
+    self: *ViewerPane,
+    env: *iface.ICoreWebView2Environment,
+    a: *iface.ICoreWebView2WebResourceRequestedEventArgs,
+    alloc: Allocator,
+) void {
+    const path = self.file_path orelse {
+        self.respond(env, a, alloc, "", "text/plain", 404, not_found_reason, .no_store);
+        return;
+    };
+    const bytes = std.fs.cwd().readFileAlloc(alloc, path, content.max_file_bytes) catch {
+        log.warn("viewer image is unreadable: {s}", .{path});
+        self.respond(env, a, alloc, "", "text/plain", 404, not_found_reason, .no_store);
+        return;
+    };
+    defer alloc.free(bytes);
+    const mime = content.mimeType(content.extension(path));
+    // The acceptance script's proof that the picture was FETCHED rather than
+    // rendered as text: a source view never asks for the file a second time
+    // through the page's own origin. The MIME rides along because
+    // `application/octet-stream` is a download, not a picture, and that is the
+    // failure an extension the table forgot would produce.
+    log.info(
+        "viewer image served pane={s} rev={d} bytes={d} mime={s}",
+        .{ self.paneId(), self.image_revision, bytes.len, mime },
+    );
+    self.respond(env, a, alloc, bytes, mime, 200, ok_reason, .no_store);
+}
+
 fn servePageResource(
     self: *ViewerPane,
     env: *iface.ICoreWebView2Environment,
@@ -4384,6 +4588,12 @@ fn pushZoom(self: *ViewerPane) void {
 /// Apply a ctrl+plus/minus/0 zoom chord: step the factor and push it to the
 /// page — Mac's `handleZoom`, with its exact step and clamp.
 fn handleZoom(self: *ViewerPane, action: viewer_accel.ZoomAction) void {
+    // An image pane zooms the PICTURE, not the document around it (T1183):
+    // page zoom would scale the matte and the scrollbars with it and would
+    // still have no idea what fit or 100% mean for this image.
+    if (self.pending) |p| {
+        if (self.imageZoomChord(p.alloc, action)) return;
+    }
     self.zoom_factor = viewer_accel.steppedZoom(self.zoom_factor, action);
     self.pushZoom();
 }

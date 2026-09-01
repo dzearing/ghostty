@@ -102,6 +102,52 @@ ghoztty +close --target=doc
   page-host response is `Cache-Control: no-store`, which is what lets a plain
   in-place reload still show the bytes now on disk. Acceptance:
   `test/win32/viewer-html.ps1`.
+- **Images** (`.png`, `.apng`, `.jpg`/`.jpeg`/`.jpe`/`.jfif`, `.gif`, `.webp`,
+  `.avif`, `.heic`/`.heif`, `.tif`/`.tiff`, `.bmp`, `.ico`, `.icns`, `.svg`):
+  shown as a **picture**, zoomable and pannable, not as bytes. The list is
+  fixed rather than "whatever this machine can decode", so what a `--view=`
+  path does is predictable from the path; `.svg` is on it because it is a
+  picture, and reading its source is what an editor is for.
+
+  Three rules decide everything a person can argue about, and they are the same
+  on both platforms:
+
+  - **100% is one image pixel per DEVICE pixel.** It is the only definition
+    under which nothing is resampled, and most of what these panes show is
+    screen capture — taken at device resolution, so 100% shows it at exactly
+    the size it was on screen.
+  - **Best-fit never upscales.** A 16px icon opens crisp at 16px rather than
+    blown across the pane.
+  - **The double-click toggle always toggles.** Fit ⇄ 100%, except where those
+    two coincide (any picture smaller than the pane), where the first
+    double-click goes to 200% instead — a gesture that visibly does nothing
+    reads as a broken gesture.
+
+  A pane that is still at best-fit re-fits when it is resized; one the user has
+  zoomed keeps their zoom, re-derived when the pane crosses to a display at
+  another scale so 100% stays 100%.
+
+  **Mac draws it on a native `NSScrollView`** (`ViewerImageView.swift`), because
+  AppKit's own gesture handling — pinch anchored at the gesture centroid,
+  elastic edges, momentum — is not reproducible in a page, and `WKWebView`'s
+  pinch is page magnification, which knows nothing about the image's natural
+  size. **Windows draws it in the bundled template** (`src/viewer/image.js`,
+  T1183): win32 has no elastic, momentum-y scroller to inherit, while a
+  Chromium scroll container brings precision-touchpad panning, inertia and
+  overlay scrollbars with it — and staying in the page keeps history, the
+  address, Home, `+list`'s url, session restore and the standard error card for
+  free. The ZOOM is not the page's to decide either way: the Windows page
+  reports what it measured and what the user did, and every scale it applies
+  came back from `src/apprt/win32/viewer_image.zig`, which asserts the three
+  rules above without a browser. The picture itself is served from a sentinel
+  path (`https://ghoztty-viewer/__image?v=<n>`) under the template's own host,
+  `no-store`, with the revision bumped per load — an `<img>` pointed at a `src`
+  it already has does not go back to disk, which would make `+reload` on an
+  image do nothing. Acceptance: `test/win32/viewer-image.ps1`.
+
+  Find, text selection and quoting are meaningless in a picture and are not
+  offered. An undecodable file gets the same in-page error card every other
+  file mode falls through to, rather than a blank matte.
 - **Text/code files** (anything else): syntax-highlighted by extension.
 - **Websites** (`http://`/`https://`): the pane navigates there directly.
 - **Git diffs** (`git-status:` / `git-diff:<revspec>`): see Git diff panes.

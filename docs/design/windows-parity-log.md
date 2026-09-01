@@ -18645,3 +18645,35 @@ ecord writes one row per boot to temp\go-loop-boots.jsonl, is idempotent on the 
   `release-artifacts-packaging`, due since an earlier packaging commit and
   untouched by this change: its section B is Docker-only and Docker is down,
   which T1187 tracks.
+- 2026-08-31: T1183 - an image opened in a Windows viewer pane is now a
+  PICTURE, fitted to the pane, instead of a wall of syntax-highlighted bytes.
+  `viewer_content` gains a fifth `Mode.image` over Mac's own extension table
+  (png/apng/jpg/jpeg/jpe/jfif/gif/webp/avif/heic/heif/tif/tiff/bmp/ico/icns/svg,
+  tested ahead of the markdown and `.html` tables so `.svg` reads as art rather
+  than markup), and a linked image now opens a viewer split like a linked `.md`
+  or `.html` does. The three rules anyone can argue about live in one new pure
+  module, `src/apprt/win32/viewer_image.zig`, asserted in the none lane: 100% is
+  one image pixel per DEVICE pixel (`1/dpr`, 1.0 for vector art), best-fit never
+  upscales, and the double-click toggle still toggles where fit and 100%
+  coincide (first click 200%, next back to fit). MECHANISM, and it is where the
+  port deliberately diverges: Mac draws on a native `NSScrollView` because
+  AppKit hands it centroid-anchored pinch, elastic edges and momentum for free,
+  and win32 has no such scroller to inherit - so Windows draws in the bundled
+  template, where a Chromium scroll container brings precision-touchpad panning,
+  inertia and overlay scrollbars with it, and where history, the address, Home,
+  `+list`'s url, session restore and the standard error card cost nothing extra.
+  What the page does NOT decide is the zoom: `src/viewer/image.js` measures and
+  forwards gestures, `applyImageMessage` answers with a scale, and Chromium's
+  own ctrl+wheel page zoom is taken so the picture zooms rather than the
+  document. The picture is served from a sentinel path
+  (`https://ghoztty-viewer/__image?v=<n>`, `no-store`, revision per load) so a
+  basename never has to survive a URL and `+reload` actually goes back to disk.
+  Floor: lib/none/win32/agent ALL LANES PASS, ipc-p1/p2/p3 ALL PASS, new
+  `test\win32\viewer-image.ps1` ALL PASS (40) with `-NegativeControl` scoring
+  exactly its declared 2 failures; `viewer-nav-pin` and the six harness audits
+  re-run and re-stamped. `-NoGuardDue` for `release-artifacts-packaging`, due
+  since an earlier packaging commit and untouched here: its section B is
+  Docker-only and Docker is down, which T1187 tracks. Filed T1233 (no harness on
+  this box ever delivers a real double-click or ctrl+wheel to an image pane) and
+  T1234 (HEIC/TIFF/ICNS decode depends on the box's codecs, so the same photo
+  can be a picture on one Windows machine and an error card on the next).

@@ -183,3 +183,48 @@ body.viewer-has-gutter .markdown-body {
   }
 }
 
+
+/* Image panes (T1183). The content host stops being a document column and
+ * becomes a full-pane matte with a scroll container in it: an image is
+ * measured against the PANE, not against a reading width, so none of the
+ * `.markdown-body` margins above apply while one is on screen.
+ *
+ * The matte is the page background — the same follow-the-appearance rule
+ * every other mode's background gets — rather than a checkerboard: most of
+ * what these panes show is screen capture, and a checkerboard behind an
+ * opaque screenshot is decoration nobody asked for. */
+.viewer-image-mode {
+  position: fixed;
+  inset: 0;
+  margin: 0;
+  padding: 0;
+  max-width: none;
+}
+
+.viewer-image-stage {
+  width: 100%;
+  height: 100%;
+  overflow: auto;
+  /* Centers a picture smaller than the pane on both axes. The canonical gap
+   * this closes is the same one Mac's `ViewerImageClipView` closes: a scroll
+   * container pins a small document to its top-left corner, which puts a
+   * fitted portrait image hard against one edge of a wide pane. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Chromium's own pinch-to-zoom and double-tap belong to the page, and this
+   * pane has its own; the wheel handler takes ctrl+wheel for the same reason. */
+  touch-action: pan-x pan-y;
+  overscroll-behavior: contain;
+}
+
+.viewer-image {
+  /* `flex-shrink: 0` or a picture wider than the pane is squeezed to fit
+   * instead of scrolling — which would quietly make every zoom above best-fit
+   * a lie. */
+  flex: 0 0 auto;
+  margin: auto;
+  display: block;
+  user-select: none;
+  -webkit-user-drag: none;
+}

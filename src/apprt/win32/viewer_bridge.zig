@@ -171,6 +171,49 @@ pub const Quote = struct {
     document_offset: ?u32 = null,
 };
 
+/// What an image pane's page reports (T1183). The page measures and gestures;
+/// every zoom it then applies came back down from `viewer_image.Geometry`.
+///
+/// One message shape rather than four, because three of the four fields are
+/// wanted by all of them: a resize carries a viewport, a load carries a natural
+/// size too, and a gesture carries where it landed. The page always sends what
+/// it currently knows, so a dropped message costs a frame rather than
+/// desynchronising the two sides.
+pub const Image = struct {
+    /// What happened. Unknown events are dropped by `parse` rather than
+    /// guessed at: the bridge is open to any page.
+    event: Event,
+    /// The `<img>`'s intrinsic size in its own units, 0 when unknown.
+    natural_w: f64 = 0,
+    natural_h: f64 = 0,
+    /// The scroll container's client area, in CSS pixels.
+    viewport_w: f64 = 0,
+    viewport_h: f64 = 0,
+    /// `window.devicePixelRatio` — what makes 100% one image pixel per DEVICE
+    /// pixel, and what changes when the pane crosses to a display at another
+    /// scale.
+    dpr: f64 = 1,
+    /// True for art with no pixel grid (an SVG with no intrinsic pixel size),
+    /// where 100% means the drawing's own size instead.
+    vector: bool = false,
+
+    pub const Event = enum {
+        /// The picture decoded and its natural size is known: fit it.
+        loaded,
+        /// The pane, or the display's scale factor, changed size.
+        viewport,
+        /// A double-click or two-finger double-tap: fit ⇄ 100%.
+        toggle,
+        /// A ctrl+wheel notch, or a keyboard zoom chord the page saw first.
+        zoom_in,
+        zoom_out,
+        /// Ctrl+0.
+        reset,
+        /// Nothing here could decode the file; show the error card instead.
+        failed,
+    };
+};
+
 /// The messages the injected blob posts. The first three are the shared JS's,
 /// which Mac's `handleTOCMessage` switches on by the same strings; the fourth
 /// is `selection_tracker_js`'s, which only win32 has (see its doc comment).
@@ -186,6 +229,11 @@ pub const Message = union(enum) {
     /// cleared. Null is a real value: it is how a click into the page takes
     /// yesterday's selection back out of the next report.
     selection: ?[]const u8,
+    /// An image pane reported something the zoom rules have to answer (T1183).
+    /// Only the bundled template's `image.js` sends these, and only while the
+    /// pane is in image mode — a website posting one finds a pane with no
+    /// picture in it, which answers nothing and changes nothing.
+    image: Image,
     /// A right-click landed on a link the native menu has actions for, and the
     /// page's own menu has already been suppressed (T826). The href is the
     /// DOM's absolute resolution of the attribute, so a relative link arrives
@@ -252,6 +300,9 @@ fn parseMessage(aa: Allocator, json_text: []const u8) ?Message {
         const raw = stringField(obj, "text") orelse "";
         return .{ .selection = nonEmpty(std.mem.trim(u8, raw, " \t\r\n")) };
     }
+    if (std.mem.eql(u8, kind, "image")) {
+        return .{ .image = parseImage(obj) orelse return null };
+    }
     if (std.mem.eql(u8, kind, "linkMenu")) {
         // No href is no link: the page suppressed its own menu for nothing, and
         // popping ours over an empty target would offer to open the void. The
@@ -309,6 +360,40 @@ fn parseQuote(obj: std.json.ObjectMap) ?Quote {
         .block_text = nonEmpty(stringField(obj, "blockText")),
         .offset_in_block = nonNegative(obj, "offsetInBlock"),
         .document_offset = nonNegative(obj, "documentOffset"),
+    };
+}
+
+fn parseImage(obj: std.json.ObjectMap) ?Image {
+    const event = std.meta.stringToEnum(Image.Event, blk: {
+        const raw = stringField(obj, "event") orelse return null;
+        break :blk raw;
+    }) orelse return null;
+    return .{
+        .event = event,
+        .natural_w = numberField(obj, "w"),
+        .natural_h = numberField(obj, "h"),
+        .viewport_w = numberField(obj, "vw"),
+        .viewport_h = numberField(obj, "vh"),
+        // A missing or nonsense ratio is 1, not 0: a `dpr` of zero would make
+        // 100% infinitely large, and the page's own default is 1 anyway.
+        .dpr = blk: {
+            const v = numberField(obj, "dpr");
+            break :blk if (v > 0) v else 1;
+        },
+        .vector = switch (obj.get("vector") orelse std.json.Value{ .bool = false }) {
+            .bool => |b| b,
+            else => false,
+        },
+    };
+}
+
+/// A JSON number field as an `f64`, 0 when absent or of the wrong type. JS
+/// hands whole values across as integers, so both cases have to be read.
+fn numberField(obj: std.json.ObjectMap, name: []const u8) f64 {
+    return switch (obj.get(name) orelse return 0) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => 0,
     };
 }
 
@@ -657,6 +742,69 @@ test "parse: a linkMenu with no href is dropped" {
         "{\"type\":\"linkMenu\"}",
         "{\"type\":\"linkMenu\",\"href\":\"\"}",
         "{\"type\":\"linkMenu\",\"href\":42}",
+    }) |case| {
+        if (parse(testing.allocator, case)) |p| {
+            p.deinit();
+            return error.MessageShouldHaveBeenIgnored;
+        }
+    }
+}
+
+test "parse: an image pane's measurements and gestures" {
+    {
+        const parsed = parse(testing.allocator,
+            \\{"type":"image","event":"loaded","w":4000,"h":3000,
+            \\ "vw":800.5,"vh":600,"dpr":2,"vector":false}
+        ).?;
+        defer parsed.deinit();
+        const img = parsed.message.image;
+        try testing.expectEqual(Image.Event.loaded, img.event);
+        // Whole values arrive as JSON integers and fractions as floats; both
+        // have to read back as the same f64 the geometry works in.
+        try testing.expectApproxEqAbs(@as(f64, 4000), img.natural_w, 1e-9);
+        try testing.expectApproxEqAbs(@as(f64, 3000), img.natural_h, 1e-9);
+        try testing.expectApproxEqAbs(@as(f64, 800.5), img.viewport_w, 1e-9);
+        try testing.expectApproxEqAbs(@as(f64, 600), img.viewport_h, 1e-9);
+        try testing.expectApproxEqAbs(@as(f64, 2), img.dpr, 1e-9);
+        try testing.expect(!img.vector);
+    }
+    {
+        // A gesture carries only the viewport; the sizes default to zero and
+        // the pane answers from what it already knows.
+        const parsed = parse(testing.allocator,
+            \\{"type":"image","event":"toggle","vw":900,"vh":700,"dpr":1}
+        ).?;
+        defer parsed.deinit();
+        try testing.expectEqual(Image.Event.toggle, parsed.message.image.event);
+        try testing.expectApproxEqAbs(@as(f64, 0), parsed.message.image.natural_w, 1e-9);
+    }
+    {
+        // A vector has no pixel grid, and says so.
+        const parsed = parse(testing.allocator,
+            \\{"type":"image","event":"loaded","w":24,"h":24,"vector":true}
+        ).?;
+        defer parsed.deinit();
+        try testing.expect(parsed.message.image.vector);
+        // No `dpr` at all is 1, never 0 — a zero would make 100% infinite.
+        try testing.expectApproxEqAbs(@as(f64, 1), parsed.message.image.dpr, 1e-9);
+    }
+    {
+        const parsed = parse(testing.allocator,
+            \\{"type":"image","event":"failed"}
+        ).?;
+        defer parsed.deinit();
+        try testing.expectEqual(Image.Event.failed, parsed.message.image.event);
+    }
+}
+
+test "parse: an image message with no event, or an invented one, is dropped" {
+    // Same rule as every other message here: the bridge is open to any page,
+    // so an unrecognized event is ignored rather than guessed at.
+    for ([_][]const u8{
+        "{\"type\":\"image\"}",
+        "{\"type\":\"image\",\"event\":\"\"}",
+        "{\"type\":\"image\",\"event\":\"explode\"}",
+        "{\"type\":\"image\",\"event\":7}",
     }) |case| {
         if (parse(testing.allocator, case)) |p| {
             p.deinit();

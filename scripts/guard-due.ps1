@@ -259,6 +259,23 @@ $GuardTable = @(
             'src\apprt\win32\ViewerNavBar.zig'
         )
     },
+    # Image panes (T1183): the only thing that proves the zoom rules reach a
+    # real picture. The none lane asserts the arithmetic exhaustively and
+    # cannot see whether the number ever left the process - the whole feature
+    # is a page, a served file and a bridge, none of which a unit test crosses.
+    # Covers the rules, the page that draws them, and both halves of the bridge
+    # between them.
+    [pscustomobject]@{
+        Name   = 'viewer-image'
+        Script = 'test\win32\viewer-image.ps1'
+        Stamp  = 'test\win32\viewer-image.stamp.json'
+        Covers = @(
+            'test\win32\viewer-image.ps1',
+            'src\apprt\win32\viewer_image.zig',
+            'src\viewer\image.js',
+            'src\viewer\viewer.js'
+        )
+    },
     # The viewer nav-bar PIN (T1131): which viewer flavors keep their address
     # bar on screen and which peek on hover. The unit lanes assert the policy
     # table and the pane's own record of it; only this script proves that a

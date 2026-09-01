@@ -246,6 +246,11 @@ test {
     // same no-OS-imports deal.
     _ = @import("apprt/win32/viewer_content.zig");
 
+    // Pure win32 image-viewer zoom rules — what 100% means, best-fit's refusal
+    // to upscale, the double-click toggle and the step/clamp (T1183), same
+    // no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_image.zig");
+
     // Pure win32 git-diff viewer logic — the `git-status:`/`git-diff:` spec,
     // the git invocations it shapes, the `-z` output parsing and the
     // `window.__viewer` diff calls (T463), same no-OS-imports deal.

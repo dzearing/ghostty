@@ -48,6 +48,11 @@ const view_arg = @import("../../cli/view_arg.zig");
 /// resolves per-declaration, and neither direction is reached at comptime.
 const viewer_diff = @import("viewer_diff.zig");
 
+/// The image extension table and the zoom rules (T1183). The table lives with
+/// the rules rather than here for the same reason the diff spec does: whoever
+/// changes what counts as a picture is changing how the picture is shown.
+pub const viewer_image = @import("viewer_image.zig");
+
 /// The synthetic origin file-mode panes load from. Everything under it is
 /// served by the pane's `WebResourceRequested` handler; nothing ever leaves
 /// the machine, and the host does not resolve in DNS.
@@ -106,6 +111,11 @@ pub const Mode = enum {
     /// CSS, scripts, images and fonts run exactly as they would if it were
     /// hosted. Mac's fourth `Mode` case, same extensions.
     html,
+    /// An image file, shown as a PICTURE in the bundled template rather than
+    /// as syntax-highlighted bytes (T1183; Mac's fifth `Mode` case, same
+    /// extension table). The zoom rules are `viewer_image.zig`'s; the page
+    /// only draws what they decide.
+    image,
     /// A git diff, rendered through the same bundled template (T463; Mac's
     /// `.diff(ViewerDiffSpec)`). The location is a `git-status:` /
     /// `git-diff:<revspec>` scheme rather than a path, and the content arrives
@@ -139,7 +149,15 @@ pub const Mode = enum {
     /// same — it is a third thing that one page can render, which is why the
     /// pane navigates to the template and pushes content into it afterwards.
     pub fn usesTemplate(self: Mode) bool {
-        return self == .markdown or self == .code or self == .diff;
+        return self == .markdown or self == .code or self == .diff or self == .image;
+    }
+
+    /// Whether this mode shows a PICTURE (T1183). The one mode where find,
+    /// text selection and quoting are meaningless, where the heading index is
+    /// always empty, and where the pane owns a zoom of its own rather than the
+    /// web view's page zoom.
+    pub fn isImage(self: Mode) bool {
+        return self == .image;
     }
 
     /// Whether the pane navigates like a browser here (Mac's `isLivePage`):
@@ -162,6 +180,10 @@ pub fn modeFor(location: []const u8) Mode {
     if (view_arg.isDiffView(std.mem.trim(u8, location, " \t\r\n"))) return .diff;
     if (ipc_args.viewMode(location) == .web) return .web;
     const ext = extension(location);
+    // A picture BEFORE the text tables (T1183), exactly as Mac's `mode(for:)`
+    // tests `imageExtensions` first: `.svg` is in both this table and the
+    // highlight one, and it is a picture.
+    if (viewer_image.isImage(ext)) return .image;
     for ([_][]const u8{ "md", "markdown", "mdown", "mkd", "mdwn" }) |m| {
         if (std.ascii.eqlIgnoreCase(ext, m)) return .markdown;
     }
@@ -564,6 +586,15 @@ pub fn mimeType(ext: []const u8) []const u8 {
         .{ "ico", "image/x-icon" },    .{ "txt", "text/plain" },
         .{ "md", "text/plain" },       .{ "markdown", "text/plain" },
         .{ "woff", "font/woff" },      .{ "woff2", "font/woff2" },
+        // The rest of the image table (T1183). An image pane is served through
+        // this same function, and `application/octet-stream` is a download
+        // rather than a picture — an `<img>` handed one renders nothing and
+        // says nothing.
+        .{ "apng", "image/apng" },     .{ "jpe", "image/jpeg" },
+        .{ "jfif", "image/jpeg" },     .{ "avif", "image/avif" },
+        .{ "heic", "image/heic" },     .{ "heif", "image/heif" },
+        .{ "tif", "image/tiff" },      .{ "tiff", "image/tiff" },
+        .{ "bmp", "image/bmp" },       .{ "icns", "image/x-icns" },
     };
     inline for (table) |row| {
         if (std.ascii.eqlIgnoreCase(ext, row[0])) return row[1];
@@ -618,6 +649,75 @@ pub fn setMarkdownCall(alloc: Allocator, source: []const u8) Allocator.Error![]u
 /// Mac's `lang ?? ""` passes.
 pub fn setCodeCall(alloc: Allocator, source: []const u8, lang: ?[]const u8) Allocator.Error![]u8 {
     return try call(alloc, "setCode", &.{ source, lang orelse "" });
+}
+
+/// The path an image pane's picture is served from (T1183), under the same
+/// synthetic origin every other file-mode resource uses.
+///
+/// A SENTINEL rather than the file's own basename, which would have been the
+/// obvious thing: a basename has to be percent-encoded to survive as a URL, an
+/// image whose name collides with a bundled asset (`viewer.css.png` is legal)
+/// would resolve to the wrong tier, and the pane already knows exactly which
+/// file it is showing. The leading underscores keep it out of the way of a real
+/// relative reference from a markdown document.
+pub const image_resource_path = "__image";
+
+/// `https://ghoztty-viewer/__image?v=<revision>` — the URL an image pane hands
+/// the page.
+///
+/// The revision is what makes a live reload actually re-fetch: the URL is the
+/// same file every time, and an `<img>` pointed at a `src` it already has does
+/// not go back to the network however hard the response says not to cache.
+/// Caller owns the result.
+pub fn imageUrl(alloc: Allocator, revision: u64) Allocator.Error![]u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        origin_prefix ++ "/" ++ image_resource_path ++ "?v={d}",
+        .{revision},
+    );
+}
+
+/// `window.__viewer.setImage("<url>", "<name>", <vector>)` — put a picture on
+/// screen (T1183). `name` is the file's basename, which is what the page uses
+/// for its alt text and its tooltip.
+///
+/// `vector` is passed rather than sniffed in the page because the page cannot
+/// tell: the picture is served from a SENTINEL url with no extension on it, so
+/// the file's own name — the only thing that says whether this is art with a
+/// pixel grid — never reaches the browser. Getting it wrong would make 100%
+/// mean the wrong thing for every SVG on a HiDPI display. Caller owns the
+/// result.
+pub fn setImageCall(
+    alloc: Allocator,
+    url: []const u8,
+    name: []const u8,
+    vector: bool,
+) Allocator.Error![]u8 {
+    const quoted = try call(alloc, "setImage", &.{ url, name });
+    defer alloc.free(quoted);
+    // The call builder only speaks strings, and a quoted "true" is not a
+    // boolean on the other side; splice the literal in ahead of the paren.
+    return try std.fmt.allocPrint(
+        alloc,
+        "{s}, {s})",
+        .{ quoted[0 .. quoted.len - 1], if (vector) "true" else "false" },
+    );
+}
+
+/// `window.__viewer.setImageTransform(<css scale>, <fit>)` — the answer to a
+/// gesture the page reported (T1183).
+///
+/// `scale` is the CSS transform for the `<img>`, already clamped by
+/// `viewer_image.Geometry`; `fit` says the picture is at best-fit, which is the
+/// page's cue to recenter rather than hold the gesture's anchor. Numbers, not
+/// strings, so the page never parses: a locale-independent `{d}` is what
+/// crosses, and JS reads it as a double.
+pub fn setImageTransformCall(alloc: Allocator, scale: f64, fit: bool) Allocator.Error![]u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        "window.__viewer.setImageTransform({d}, {s})",
+        .{ scale, if (fit) "true" else "false" },
+    );
 }
 
 /// `window.__viewer.setError("title", "detail")` — the in-page error card for
@@ -1082,15 +1182,17 @@ pub fn navCandidate(
 ///
 /// `.html` joined markdown on that side with T601: it renders here now, so
 /// handing it to the default app would open the user's browser for a page the
-/// pane next door was about to show them.
+/// pane next door was about to show them. `.image` joined for the same reason
+/// with T1183 — the screenshot a document links to opens beside it rather than
+/// launching Photos.
 pub const FileLinkAction = enum { viewer_split, default_app };
 
 pub fn fileLinkAction(path: []const u8) FileLinkAction {
     return switch (modeFor(path)) {
-        // A diff is a Ghoztty view like the other two, and it reaches here only
+        // A diff is a Ghoztty view like the others, and it reaches here only
         // from a document that LINKED to `git-diff:…` — which is a link to a
         // pane, not to a file the shell could open at all.
-        .markdown, .html, .diff => .viewer_split,
+        .markdown, .html, .diff, .image => .viewer_split,
         .code, .web => .default_app,
     };
 }
@@ -1107,6 +1209,11 @@ pub const error_unreadable = "Cannot read file";
 /// allocation driven by whatever path a caller passed. Mac has no cap and
 /// this is a deliberate, visible deviation rather than a silent one.
 pub const error_too_large = "File is too large to display";
+/// An image pane whose file no decoder here could read (T1183) — a truncated
+/// download, a `.png` that is not one, an `.avif` on a Windows build with no
+/// AV1 codec installed. The card is the same one every other file mode falls
+/// through to, rather than a blank matte that says nothing.
+pub const error_not_image = "Cannot display this image";
 
 /// The largest file a viewer will render. Generous by document standards
 /// (the largest file in this repo is two orders of magnitude smaller) and
@@ -1148,26 +1255,48 @@ test "modeFor: the Mac extension table, and web wins over it" {
     // Neighbours that only LOOK like it.
     try testing.expectEqual(Mode.code, modeFor("/site/index.html.tmpl"));
     try testing.expectEqual(Mode.code, modeFor("/site/x.xhtml"));
+
+    // T1183: a picture is a fifth mode. Before this a screenshot opened as a
+    // wall of syntax-highlighted bytes.
+    try testing.expectEqual(Mode.image, modeFor("C:\\shots\\bug.png"));
+    try testing.expectEqual(Mode.image, modeFor("/tmp/photo.JPEG"));
+    try testing.expectEqual(Mode.image, modeFor("file:///c:/shots/bug.png"));
+    // `.svg` is a picture even though it is markup, and it wins over both the
+    // highlight table and the `.html`-family test below it.
+    try testing.expectEqual(Mode.image, modeFor("/art/logo.svg"));
+    // A URL is still the web: the browser decodes its own images.
+    try testing.expectEqual(Mode.web, modeFor("https://example.com/a.png"));
+    // Neighbours that only look like pictures.
+    try testing.expectEqual(Mode.code, modeFor("/src/png.zig"));
+    try testing.expectEqual(Mode.code, modeFor("/notes/about-png"));
 }
 
 test "the three mode predicates split file, template and live page" {
     // The T601 split: `.html` has a file behind it AND is a live page, and is
     // the only mode for which those two are true at once. Everything that used
     // to key on `isFile` had to choose which of the two it meant.
-    for ([_]Mode{ .markdown, .code, .html }) |m| try testing.expect(m.isFile());
+    for ([_]Mode{ .markdown, .code, .html, .image }) |m| try testing.expect(m.isFile());
     try testing.expect(!Mode.web.isFile());
 
-    for ([_]Mode{ .markdown, .code }) |m| try testing.expect(m.usesTemplate());
+    for ([_]Mode{ .markdown, .code, .image }) |m| try testing.expect(m.usesTemplate());
     for ([_]Mode{ .web, .html }) |m| try testing.expect(!m.usesTemplate());
 
     for ([_]Mode{ .web, .html }) |m| try testing.expect(m.isLivePage());
-    for ([_]Mode{ .markdown, .code }) |m| try testing.expect(!m.isLivePage());
+    for ([_]Mode{ .markdown, .code, .image }) |m| try testing.expect(!m.isLivePage());
 
     // A diff (T463) is the mirror of `.html`: it uses the template and has no
     // file behind it, which is the combination nothing else has.
     try testing.expect(Mode.diff.usesTemplate());
     try testing.expect(!Mode.diff.isFile());
     try testing.expect(!Mode.diff.isLivePage());
+
+    // A picture (T1183) is a file on the template, like markdown — the one
+    // thing that separates it is that it is not TEXT, which is what `isImage`
+    // answers for find, quoting and the heading index.
+    try testing.expect(Mode.image.isImage());
+    for ([_]Mode{ .markdown, .code, .html, .web, .diff }) |m| {
+        try testing.expect(!m.isImage());
+    }
 }
 
 test "the diff schemes classify ahead of every path test" {
@@ -1589,6 +1718,58 @@ test "the __viewer calls are the shape the page exposes" {
     }
 }
 
+test "the image calls: a cache-busting url, and numbers that cross as numbers" {
+    const alloc = testing.allocator;
+    {
+        // The revision is what makes a live reload re-fetch — an `<img>` whose
+        // `src` did not change does not go back to the network.
+        const url = try imageUrl(alloc, 0);
+        defer alloc.free(url);
+        try testing.expectEqualStrings("https://ghoztty-viewer/__image?v=0", url);
+
+        const next = try imageUrl(alloc, 7);
+        defer alloc.free(next);
+        try testing.expectEqualStrings("https://ghoztty-viewer/__image?v=7", next);
+
+        // And it survives the request parser as the sentinel path, query and
+        // all — which is what routes it to the viewed file rather than to a
+        // relative resource named `__image`.
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        try testing.expectEqualStrings(image_resource_path, requestPath(&buf, next).?);
+    }
+    {
+        const js = try setImageCall(alloc, "https://ghoztty-viewer/__image?v=1", "bug shot.png", false);
+        defer alloc.free(js);
+        try testing.expectEqualStrings(
+            "window.__viewer.setImage(\"https://ghoztty-viewer/__image?v=1\", \"bug shot.png\", false)",
+            js,
+        );
+    }
+    {
+        // The vector flag is a BOOLEAN, not the string "true": the page cannot
+        // read the file's extension off a sentinel url, so this is the only
+        // thing that tells it what 100% means for an SVG.
+        const js = try setImageCall(alloc, "https://ghoztty-viewer/__image?v=2", "logo.svg", true);
+        defer alloc.free(js);
+        try testing.expectEqualStrings(
+            "window.__viewer.setImage(\"https://ghoztty-viewer/__image?v=2\", \"logo.svg\", true)",
+            js,
+        );
+    }
+    {
+        const js = try setImageTransformCall(alloc, 0.5, true);
+        defer alloc.free(js);
+        try testing.expectEqualStrings("window.__viewer.setImageTransform(0.5, true)", js);
+    }
+    {
+        // Not fitting, and a scale that is not round: still a bare JS number,
+        // never a quoted string the page would have to parse.
+        const js = try setImageTransformCall(alloc, 0.125, false);
+        defer alloc.free(js);
+        try testing.expectEqualStrings("window.__viewer.setImageTransform(0.125, false)", js);
+    }
+}
+
 test "appendJsString escapes what would break the literal" {
     const alloc = testing.allocator;
     var out: std.ArrayList(u8) = .empty;
@@ -1923,7 +2104,12 @@ test "fileLinkAction: what Ghoztty can render splits, the rest opens in its app"
     for ([_][]const u8{ "a.html", "site/b.HTM" }) |p| {
         try testing.expectEqual(FileLinkAction.viewer_split, fileLinkAction(p));
     }
-    for ([_][]const u8{ "a.zig", "a.png", "a.pdf", "Makefile", "a.txt" }) |p| {
+    // T1183: and so does a picture — the screenshot a document links to opens
+    // beside it rather than launching Photos.
+    for ([_][]const u8{ "a.png", "shots/b.JPG", "art/logo.svg" }) |p| {
+        try testing.expectEqual(FileLinkAction.viewer_split, fileLinkAction(p));
+    }
+    for ([_][]const u8{ "a.zig", "a.pdf", "Makefile", "a.txt" }) |p| {
         try testing.expectEqual(FileLinkAction.default_app, fileLinkAction(p));
     }
 }

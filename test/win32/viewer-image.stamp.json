@@ -1,0 +1,18 @@
+{
+    "guard":  "viewer-image",
+    "script":  "test/win32/viewer-image.ps1",
+    "generated":  "2026-08-31T23:12:27-07:00",
+    "commit":  "0bfb1d5ae",
+    "uncommitted":  [
+                        "src/apprt/win32/viewer_image.zig",
+                        "src/viewer/image.js",
+                        "src/viewer/viewer.js",
+                        "test/win32/viewer-image.ps1"
+                    ],
+    "files":  {
+                  "src/apprt/win32/viewer_image.zig":  "4c4b1f180d0acb94ed9eb36fe63e8c754de8eb775547bfd91398cb1520ac459d",
+                  "src/viewer/image.js":  "f6b373c9641514b955ad259eaa1a69dc101a94b9d2f7a983da6404a2265aa75e",
+                  "src/viewer/viewer.js":  "6cf8380c75e1d1a3a9abdde54a98ccd3edc06215865aa6a0cc78ab3e48614c86",
+                  "test/win32/viewer-image.ps1":  "c9cd6b45f00b3138dd1c93860e04f3705127ac8dde2c5a9005a13208b7f5bfde"
+              }
+}

@@ -53,6 +53,7 @@
    * re-rendering (live reload). */
   function setMarkdown(source) {
     const y = window.scrollY;
+    leaveImageMode();
     content.className = "markdown-body";
     // md.render emits raw HTML (html: true); sanitize before inserting so an
     // opened file can't inject <script>, onerror=, javascript: URLs, etc. The
@@ -71,6 +72,7 @@
    * file extension) when highlight.js knows it. */
   function setCode(source, lang) {
     const y = window.scrollY;
+    leaveImageMode();
     content.className = "markdown-body";
     const pre = document.createElement("pre");
     pre.className = "viewer-code";
@@ -93,6 +95,7 @@
 
   /* Show an error card (missing/unreadable file). */
   function setError(title, detail) {
+    leaveImageMode();
     content.className = "markdown-body";
     content.replaceChildren();
     const card = document.createElement("div");
@@ -364,15 +367,55 @@
    * contents to the file tree, using the same card.
    * ------------------------------------------------------------------- */
 
+  /* ---------------------------------------------------------------------
+   * Image mode (T1183)
+   *
+   * A picture is a fourth thing this one template can render, wired up the
+   * same way a diff is: the renderer is image.js (loaded before this file) and
+   * it shares this page's message bridge and its `#content` host. An image has
+   * no headings, so the index is cleared on entry.
+   *
+   * Mac renders images on a native surface instead and never calls any of
+   * this, so `window.__viewerImage` is allowed to be absent: a build without
+   * it renders every other mode exactly as before.
+   * ------------------------------------------------------------------- */
+
+  const image = window.__viewerImage
+    ? window.__viewerImage.init({ root: content, post: post })
+    : null;
+
+  function setImage(url, name, vector) {
+    if (!image) return;
+    clearHeadingIndex();
+    image.setImage(url, name, vector);
+  }
+
+  function setImageTransform(scale, fit) {
+    if (image) image.setImageTransform(scale, fit);
+  }
+
+  function imageZoom(action) {
+    if (image) image.zoom(action);
+  }
+
+  /* Called by every other mode's entry point: a document replacing a picture
+   * must not leave the decoded bitmap, the wheel handler or the resize
+   * listener behind. */
+  function leaveImageMode() {
+    if (image) image.clear();
+  }
+
   const diff = window.__viewerDiff.init({ root: content, post: post });
 
   function setDiffListing(payload) {
     clearHeadingIndex();
+    leaveImageMode();
     diff.setListing(payload);
   }
 
   function setDiffFile(payload) {
     clearHeadingIndex();
+    leaveImageMode();
     diff.setFile(payload);
   }
 
@@ -386,6 +429,10 @@
     // Called from the native diff panel and toolbar.
     setDiffListing: setDiffListing,
     setDiffFile: setDiffFile,
+    // Called from the native image pane (T1183); Mac never calls these.
+    setImage: setImage,
+    setImageTransform: setImageTransform,
+    imageZoom: imageZoom,
     setDiffStyle: diff.setStyle,
     diffNav: diff.nav,
     // Reached by tests driving the parser/highlighter directly.
