@@ -21,6 +21,9 @@
 #   5. real GitHub channel            -> check completes against the live
 #      releases list (available or up-to-date, whichever matches HEAD's
 #      version vs the published win-v tag)
+#   6. the check REPEATS on a timer (T1171): a release published while the
+#      app is running is found without a restart, and the version already
+#      offered is not re-announced on every tick
 param([string]$ExePath)
 
 # T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
@@ -145,7 +148,12 @@ $vp = Start-Process $exe -ArgumentList '+version' -RedirectStandardOutput $verOu
 if (-not $vp.WaitForExit(15000)) { try { $vp.Kill() } catch {}; Write-Host 'SETUP FAIL: +version hung'; exit 1 }
 $verText = [IO.File]::ReadAllText($verOut)
 $isChannel = $verText -match 'update check: on \(win-v channel\)'
-if (-not $isChannel -and $verText -notmatch 'update check: off \(dev build\)') {
+# The "off" reason is not fixed text: T1217 added "off (not the installed
+# release)" beside the older "off (dev build)", and this probe went on
+# demanding the older wording - which is why the whole scenario had been
+# SETUP FAILing against a perfectly good zig-out build. Only the on/off
+# verdict matters here; the parenthetical is the reason, not the answer.
+if (-not $isChannel -and $verText -notmatch 'update check: off \(') {
     Write-Host 'SETUP FAIL: +version printed no "update check" line'; exit 1
 }
 # Channel builds throttle automatic checks to one per hour via this
@@ -169,7 +177,61 @@ Assert ($log5 -notmatch 'update check failed') 'live: fetch + parse succeeded'
 # Once win-v1.4.1+ is published the scanner must actually find it:
 Assert ($log5 -match 'latest=win-v\d') 'live: a published win-v release was found'
 
+# -- 6. the check REPEATS while the app runs (T1171) ---------------------
+# The automatic check used to run once, at launch: a release published while
+# a window was open reached it only on the next restart. It now re-asks on a
+# timer, and the same version is offered ONCE - a deferred update must not
+# re-balloon (and must not re-download) every tick.
+#
+# GHOZTTY_UPDATE_RECHECK_MS (Debug builds only) shortens the ten-minute
+# cadence so a second tick is observable; the feed file is rewritten under the
+# running app to publish a newer release mid-session.
+$recheckFeed = Join-Path $feedDir 'recheck.json'
+[IO.File]::WriteAllText($recheckFeed, $feedNewer)
+$recheckUrl = 'file:///' + ($recheckFeed -replace '\\', '/')
+Kill-RepoInstances
+$errFile6 = Join-Path $env:TEMP 'ghoztty-t24-recheck.err.txt'
+Remove-Item $errFile6 -ErrorAction SilentlyContinue
+$env:GHOZTTY_UPDATE_URL = $recheckUrl
+$env:GHOZTTY_UPDATE_RECHECK_MS = '3000'
+$log6 = ''
+try {
+    $proc6 = Start-Process -FilePath $exe -ArgumentList '--session-persistence=false' `
+        -PassThru -RedirectStandardError $errFile6
+    $null = $proc6.Handle
+    # Two ticks at the launch version: the first re-check must find win-v9.9.9
+    # again and stay quiet about it.
+    Start-Sleep -Seconds 9
+    if ($proc6.HasExited) {
+        Write-Host "SETUP FAIL (recheck): GUI exited early (code $($proc6.ExitCode))"; exit 1
+    }
+    # Publish a newer release under the running app.
+    [IO.File]::WriteAllText($recheckFeed, '[{"tag_name":"win-v9.9.10"},{"tag_name":"win-v9.9.9"}]')
+    Start-Sleep -Seconds 9
+    Stop-Process -Id $proc6.Id -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+} finally {
+    Remove-Item Env:GHOZTTY_UPDATE_URL -ErrorAction SilentlyContinue
+    Remove-Item Env:GHOZTTY_UPDATE_RECHECK_MS -ErrorAction SilentlyContinue
+}
+if (Test-Path $errFile6) { $log6 = [IO.File]::ReadAllText($errFile6) }
+Assert ($log6 -match 'showing update balloon for win-v9\.9\.9') 'recheck: launch check offers win-v9.9.9'
+Assert ($log6 -match 'win-v9\.9\.9 already offered; not re-notifying') 'recheck: the check ran again and stayed quiet about the same version'
+Assert (([regex]::Matches($log6, 'showing update balloon for win-v9\.9\.9')).Count -eq 1) 'recheck: the deferred version is offered exactly once'
+Assert ($log6 -match 'update available: current=\S+ latest=win-v9\.9\.10') 'recheck: a release published mid-session is found without a restart'
+Assert ($log6 -match 'showing update balloon for win-v9\.9\.10') 'recheck: the newer release raises a fresh notification'
+
 Kill-RepoInstances
 Write-Host ''
+# --- stamp (T783) ----------------------------------------------------------
+# Only a clean run stamps, so a red harness stays due - which is the whole
+# point of the row this writes to: before T1171 nothing tied this script to
+# the code it covers, and it sat SETUP FAILing on a renamed `+version` string.
+if ($script:fail -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot '..\..\scripts\guard-due.ps1') `
+        update -Guard update-check -Repo $repo 2>&1 |
+        ForEach-Object { Write-Host "  $_" }
+}
+
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }
 else { Write-Host "$script:fail FAILED / $script:pass passed" -ForegroundColor Red; exit 1 }

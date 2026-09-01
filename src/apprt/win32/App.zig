@@ -233,6 +233,24 @@ const STALE_BUILD_CHECK_TIMER_ID: usize = 12;
 /// `stat` of a file already in the OS cache.
 const STALE_BUILD_CHECK_MS: u32 = 60_000;
 
+/// Timer ID 14: the periodic "has a newer release been published?" check
+/// (T1171). Repeating. The automatic update check used to run exactly once,
+/// at launch, which is the wrong cadence for a terminal that stays open for
+/// days: a release published at 08:00 reached the window the user was typing
+/// in only when they next restarted it. Timer 12 above answers the sibling
+/// question - "is a newer build already on THIS disk?" - and the two are
+/// deliberately separate, because one is about the network and one is about
+/// a file.
+const UPDATE_RECHECK_TIMER_ID: usize = 14;
+
+/// How often the running app re-asks the release channel. Ten minutes is a
+/// tick, not a fetch: `shouldRunUpdateCheck` still throttles the network to
+/// one request per `UPDATE_CHECK_INTERVAL_SECS`, so this only bounds how long
+/// a published release waits AFTER the throttle expires. Overridable with
+/// GHOZTTY_UPDATE_RECHECK_MS, which exists for test\win32\update-check.ps1 -
+/// an acceptance script cannot wait ten minutes for the second tick.
+const UPDATE_RECHECK_MS: u32 = 10 * 60 * 1000;
+
 /// How soon after launch to ask the first time. An MSI that closes and
 /// restarts us through the Restart Manager (T1204) lands here with a file
 /// newer than the process by a hair — inside `image_freshness.tolerance_ns`,
@@ -794,6 +812,14 @@ pub fn init(
     // and the answer must not wait a full cadence to arrive.
     if (self.msg_hwnd) |mh| {
         _ = w32.SetTimer(mh, STALE_BUILD_CHECK_TIMER_ID, STALE_BUILD_FIRST_MS, null);
+    }
+
+    // "Has a newer release been published?" (T1171). Repeating, so it needs no
+    // re-arm. The launch check above is the first ask; without this timer it
+    // was also the last, and a window left open across a publish never learned
+    // there was anything to take.
+    if (self.msg_hwnd) |mh| {
+        _ = w32.SetTimer(mh, UPDATE_RECHECK_TIMER_ID, self.updateRecheckIntervalMs(), null);
     }
 
     // Keep each pane's persisted SCREEN current (T922). Repeating, so it needs
@@ -7569,9 +7595,35 @@ fn startUpdateCheck(self: *App, trigger: UpdateTrigger) void {
             return;
         }
     }
-    _ = std.Thread.spawn(.{}, updateCheckThread, .{ self, trigger }) catch |err| {
+
+    // What the user has already been told about, copied HERE (T1171). The
+    // repeating check would otherwise re-offer the same release every hour,
+    // and the worker cannot read `update_latest_ver` itself: that field is the
+    // GUI thread's, written by `showUpdateNotification`, and a worker reading
+    // it while a later notification replaced it is a use-after-free rather
+    // than a stale answer. A manual check passes null on purpose - the user
+    // asked, so they get an answer even if it is one they have seen.
+    const already_offered: ?[]u8 = if (trigger == .automatic and self.update_latest_ver != null)
+        (self.core_app.alloc.dupe(u8, self.update_latest_ver.?) catch null)
+    else
+        null;
+
+    _ = std.Thread.spawn(.{}, updateCheckThread, .{ self, trigger, already_offered }) catch |err| {
         log.warn("failed to start update check thread: {}", .{err});
+        if (already_offered) |o| self.core_app.alloc.free(o);
     };
+}
+
+/// How long between automatic re-checks (T1171). Debug builds honor
+/// GHOZTTY_UPDATE_RECHECK_MS so the acceptance script can watch a second tick
+/// arrive; release builds always use `UPDATE_RECHECK_MS`.
+fn updateRecheckIntervalMs(self: *App) u32 {
+    const v = orphanEnvMs(
+        self.core_app.alloc,
+        "GHOZTTY_UPDATE_RECHECK_MS",
+        UPDATE_RECHECK_MS,
+    );
+    return @intCast(std.math.clamp(v, 500, std.math.maxInt(u32)));
 }
 
 /// Whether THIS exe may run an automatic update check (T1217).
@@ -7628,9 +7680,10 @@ fn shouldRunUpdateCheck(self: *App) bool {
 /// Background thread: fetch the releases list from GitHub, find the newest
 /// win-v release, compare with the current version, post a message if
 /// newer. Manual checks also post their up-to-date/failed outcome.
-fn updateCheckThread(app: *App, trigger: UpdateTrigger) void {
+fn updateCheckThread(app: *App, trigger: UpdateTrigger, already_offered: ?[]u8) void {
     const alloc = app.core_app.alloc;
     const manual = trigger == .manual;
+    defer if (already_offered) |o| alloc.free(o);
 
     var release = fetchLatestWinRelease(alloc) catch |err| switch (err) {
         error.NoWinRelease => {
@@ -7664,6 +7717,15 @@ fn updateCheckThread(app: *App, trigger: UpdateTrigger) void {
         release.version,
         release.asset_url orelse "(none published)",
     });
+
+    // Already offered this exact version, so say nothing (T1171). Returning
+    // before the pre-download matters as much as before the balloon: a
+    // deferred update would otherwise re-fetch its package every tick.
+    if (!update_check.shouldNotify(already_offered, release.version)) {
+        log.info("update check: win-v{s} already offered; not re-notifying", .{release.version});
+        release.deinit(alloc);
+        return;
+    }
 
     // `auto-update = download` (the default) fetches the package here, on the
     // worker, so the click that follows the balloon installs immediately
@@ -8381,6 +8443,9 @@ const orphan_rpc_timeout_ns: u64 = 5 * std.time.ns_per_s;
 /// Debug-only cadence/threshold override (acceptance seam). Release builds run
 /// the hard-coded policy — D18 ruled out config knobs, and these are not
 /// knobs: they exist so a test can watch a "24 hours later" story in seconds.
+///
+/// Named for the check it was written for; the update re-check (T1171) uses it
+/// too, for exactly the same reason and under the same debug-only rule.
 fn orphanEnvMs(alloc: Allocator, name: []const u8, default_val: i64) i64 {
     if (comptime !build_config.is_debug) return default_val;
     const v = std.process.getEnvVarOwned(alloc, name) catch return default_val;
@@ -9457,6 +9522,15 @@ fn msgWndProc(
     if (msg == w32.WM_TIMER and wparam == STALE_BUILD_CHECK_TIMER_ID) {
         _ = w32.SetTimer(hwnd, STALE_BUILD_CHECK_TIMER_ID, STALE_BUILD_CHECK_MS, null);
         app.checkStaleBuild();
+        return 0;
+    }
+
+    // Timer ID 14: the periodic release-channel re-check (T1171). Repeating;
+    // every gate the launch check answers to (install location, `auto-update =
+    // off`, the one-per-hour network throttle) is re-answered here, so a tick
+    // is usually a file read and nothing else.
+    if (msg == w32.WM_TIMER and wparam == UPDATE_RECHECK_TIMER_ID) {
+        app.startUpdateCheck(.automatic);
         return 0;
     }
 

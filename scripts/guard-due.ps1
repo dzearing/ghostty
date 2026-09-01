@@ -889,6 +889,25 @@ $GuardTable = @(
             'test\win32\update-apply.ps1'
         )
     },
+    # The release-channel check itself (T24, T1171): does the app find a newly
+    # published win-v release, and does it stay quiet about one it has already
+    # offered? Nothing tied this harness to the code under it, and it drifted
+    # into a SETUP FAIL nobody saw - T1217 renamed the `+version` "off" reason
+    # and the flavor probe went on demanding the old wording, so every run
+    # after it stopped at scenario 4. `App.zig` is out for the usual reason
+    # (a file every task touches leaves a row permanently due); the version
+    # line is in, because that string IS what the probe reads.
+    [pscustomobject]@{
+        Name   = 'update-check'
+        Script = 'test\win32\update-check.ps1'
+        Stamp  = 'test\win32\update-check.stamp.json'
+        Covers = @(
+            'src\apprt\win32\update_check.zig',
+            'src\apprt\win32\install_location.zig',
+            'src\cli\version.zig',
+            'test\win32\update-check.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'website-windows-links'
         Script = 'test\win32\website-windows-download.ps1'

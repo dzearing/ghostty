@@ -102,3 +102,34 @@ test "isNewer: dev pre-release is older than its release" {
     try testing.expect(isNewer(current, "1.9.0"));
     try testing.expect(!isNewer(current, "1.8.9"));
 }
+
+/// Whether a check that found `latest` should raise a notification, given
+/// `already_offered` — the version this app already told the user about.
+///
+/// T1171 made the automatic check REPEAT while the app runs (a terminal that
+/// stays open for days used to ask exactly once, at launch, so a release
+/// published at 08:00 was invisible until the next restart). Repeating a
+/// question repeats its answer, and an hourly balloon for a version the user
+/// has already seen — and possibly already declined with "Later" — is nagging,
+/// not delivery. So the offer is made once per VERSION: the same version stays
+/// quiet, and a newer one speaks up again.
+///
+/// `null` means nothing has been offered yet in this process, so anything
+/// newer is news. Manual checks never pass an offered version: an explicit
+/// "check for updates" deserves an answer even when it is the same answer.
+pub fn shouldNotify(already_offered: ?[]const u8, latest: []const u8) bool {
+    const offered = already_offered orelse return true;
+    return !std.mem.eql(u8, offered, latest);
+}
+
+test "shouldNotify: first offer of a version speaks, a repeat stays quiet" {
+    const testing = std.testing;
+    try testing.expect(shouldNotify(null, "1.5.0"));
+    try testing.expect(!shouldNotify("1.5.0", "1.5.0"));
+    // A newer release after the user deferred the last one is news again.
+    try testing.expect(shouldNotify("1.5.0", "1.6.0"));
+    // Text comparison, not semver: the check only ever passes a version it
+    // has already established is newer than the running build.
+    try testing.expect(shouldNotify("1.5.0", "1.4.0"));
+    try testing.expect(!shouldNotify("", ""));
+}
