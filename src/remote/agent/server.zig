@@ -1923,6 +1923,9 @@ pub const Server = struct {
         // could still age out of the file after a couple of restarts.
         rs.unclaimed_restarts = 0;
         rs.exit_code = null;
+        // The vanish sweep's strike count described the OLD pid (T1162); a
+        // respawned shell starts it over.
+        rs.vanish_strikes = 0;
         rs.last_activity_ms = self.clock.now();
         // The sampled foreground command described the OLD child's world; a
         // respawned session starts at a fresh prompt, and the sampler will

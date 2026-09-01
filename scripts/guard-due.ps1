@@ -411,6 +411,23 @@ $GuardTable = @(
             'src\remote\agent\pty_holder_child.zig'
         )
     },
+    # VANISHED sessions (T1162): the reaper's process-table sweep, the only thing
+    # that notices a persistent session whose shell exited with nothing reading
+    # it. Both directions are the point and neither is visible to a unit test on
+    # a synthetic map: a dead session must stop being offered, and a LIVE one
+    # must survive every sweep. A regression either way is silent - one leaks
+    # unusable sessions forever, the other kills panes the user is still using.
+    [pscustomobject]@{
+        Name   = 'session-vanished'
+        Script = 'test\win32\session-vanished.ps1'
+        Stamp  = 'test\win32\session-vanished.stamp.json'
+        Covers = @(
+            'test\win32\session-vanished.ps1',
+            'src\remote\agent\session.zig',
+            'src\remote\agent\proc.zig',
+            'src\remote\agent\descendants.zig'
+        )
+    },
     # Pane INGEST LAG (T1142): the only harness that measures how far behind its
     # own child a pane's SCREEN runs. Every other test asks whether output
     # ARRIVES; this one asks how fast, on both the agent-backed path and the

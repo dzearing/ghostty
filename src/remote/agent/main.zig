@@ -588,6 +588,18 @@ fn snapshotVolumeBytesFromEnv(alloc: Allocator) u64 {
     return std.fmt.parseInt(u64, t, 10) catch session.default_snapshot_volume_bytes;
 }
 
+/// Whether the reaper's vanished-child sweep runs (T1162). On unless
+/// `GHOZTTY_AGENT_VANISH_SWEEP=0` says otherwise — the escape hatch if the extra
+/// process walk ever misbehaves on a box, and the switch a control run flips to
+/// tell what the sweep contributes from what some other teardown path was going
+/// to do anyway. Anything else, a typo included, leaves it ON: a mistyped env
+/// var must not silently reinstate a permanent leak.
+fn vanishSweepFromEnv(alloc: Allocator) bool {
+    const v = std.process.getEnvVarOwned(alloc, "GHOZTTY_AGENT_VANISH_SWEEP") catch return true;
+    defer alloc.free(v);
+    return !std.mem.eql(u8, std.mem.trim(u8, v, " \t\r\n"), "0");
+}
+
 fn encodingFromEnv(alloc: Allocator) protocol.TransferEncoding {
     const v = std.process.getEnvVarOwned(alloc, "GHOZTTY_AGENT_ENCODING") catch return .raw;
     defer alloc.free(v);
@@ -1393,6 +1405,7 @@ fn runListen(
     // Snapshot on VOLUME as well as on the timer (T969), so a pane that prints
     // faster than the holder retains still has a recoverable window.
     store.snapshot_volume_bytes = snapshotVolumeBytesFromEnv(alloc);
+    store.vanish_sweep_enabled = vanishSweepFromEnv(alloc);
     // Cross-machine "Resume all" (§5.4, T18): opaque per-window layout blobs live
     // in a `layouts.json` beside the sessions file. Borrowed; freed after
     // `store.deinit` (LIFO defers).
@@ -1583,6 +1596,7 @@ fn runListenUnix(
     // Snapshot on VOLUME as well as on the timer (T969), so a pane that prints
     // faster than the holder retains still has a recoverable window.
     store.snapshot_volume_bytes = snapshotVolumeBytesFromEnv(alloc);
+    store.vanish_sweep_enabled = vanishSweepFromEnv(alloc);
     // Cross-machine "Resume all" (§5.4, T18): layout blobs in `layouts.json` beside it.
     const layouts_file = layoutsFileFor(alloc, sessions_file);
     defer if (layouts_file) |f| alloc.free(f);
@@ -1695,6 +1709,7 @@ fn runListenPipe(
     // Snapshot on VOLUME as well as on the timer (T969), so a pane that prints
     // faster than the holder retains still has a recoverable window.
     store.snapshot_volume_bytes = snapshotVolumeBytesFromEnv(alloc);
+    store.vanish_sweep_enabled = vanishSweepFromEnv(alloc);
     // Cross-machine "Resume all" (§5.4, T18): layout blobs in `layouts.json` beside it.
     const layouts_file = layoutsFileFor(alloc, sessions_file);
     defer if (layouts_file) |f| alloc.free(f);

@@ -56,6 +56,8 @@ const grid_snapshot = @import("grid_snapshot.zig");
 // externs it needs. Neither imports this module, so there is no cycle.
 const descendants = @import("descendants.zig");
 const proc = @import("proc.zig");
+// Only for the vanish sweep's own-pid control test (T1162).
+const builtin = @import("builtin");
 
 // -----------------------------------------------------------------------------
 // Caps (§7.1 "Resource caps & TTL")
@@ -690,6 +692,12 @@ pub const Session = struct {
     /// (the previous viewer's pushes died with its connection).
     has_descendants: ?bool = null,
 
+    /// Consecutive process-table sweeps that could not find `pid` (T1162). The
+    /// vanish sweep tombstones a session only on the SECOND consecutive miss, so
+    /// one truncated or racy enumeration can never kill a live pane. Guarded by
+    /// the store mutex; reset to 0 the moment the pid is seen again.
+    vanish_strikes: u8 = 0,
+
     /// Timestamps (ms). `last_activity_ms` drives the idle-TTL reaper (`startReaper`).
     created_ms: i64,
     last_activity_ms: i64,
@@ -1259,6 +1267,16 @@ pub const SessionStore = struct {
     /// on a real box.
     snapshot_volume_bytes: u64 = default_snapshot_volume_bytes,
 
+    /// Whether the reaper runs the vanished-child sweep (T1162). On by default —
+    /// it is the only thing that notices a session whose shell exited with no
+    /// reader attached. `false` (`GHOZTTY_AGENT_VANISH_SWEEP=0`) is the escape
+    /// hatch if the extra process walk ever misbehaves on a box, and the switch
+    /// that makes the sweep's contribution ATTRIBUTABLE on a real box: running
+    /// an acceptance arm with it off is how `test\win32\session-vanished.ps1`
+    /// established that killing a holder tears the session down by a different
+    /// route, which is why that script claims an outcome and not a mechanism.
+    vanish_sweep_enabled: bool = true,
+
     /// Floor between two snapshot passes made by the reaper, in milliseconds
     /// (T969). A snapshot rewrites each dirty ring WHOLE, so without a floor a
     /// pane printing at MB/s would turn the volume trigger into a disk hammer;
@@ -1370,11 +1388,20 @@ pub const SessionStore = struct {
     /// but not something to do every second on an idle box for no reason.
     const cwd_every_ticks: u32 = 10;
 
+    /// Vanished-child sweep cadence, in reaper ticks (T1162). Five seconds, and
+    /// two strikes on top of it, so a session nothing else can observe is
+    /// tombstoned within ~10 s of its shell exiting. Not every tick, because the
+    /// only sessions that depend on it are ones with no reader at all — for
+    /// everything else the output path answers in milliseconds — and each sweep
+    /// costs one process-table walk.
+    const vanish_every_ticks: u32 = 5;
+
     fn reaperLoop(self: *SessionStore) void {
         // Wake at most once a second (or on stop) to check for idle orphans.
         const tick_ns: u64 = 1 * std.time.ns_per_s;
         var ticks: u32 = 0;
         var cwd_ticks: u32 = 0;
+        var vanish_ticks: u32 = 0;
         while (true) {
             self.reaper_mutex.lock();
             if (!self.reaper_stop) self.reaper_cond.timedWait(&self.reaper_mutex, tick_ns) catch {};
@@ -1395,6 +1422,15 @@ pub const SessionStore = struct {
             // read at close time is only as good as its last sample, and a
             // command started seconds ago must not read as an idle prompt.
             self.sampleDescendants();
+            // Notice a shell that exited with nobody watching (T1162). Runs
+            // BEFORE `reapIdle` next tick rather than after it here for no reason
+            // beyond order of discovery: a session tombstoned by this sweep is
+            // reaped by the ordinary idle rules from then on.
+            vanish_ticks +%= 1;
+            if (self.vanish_sweep_enabled and vanish_ticks >= vanish_every_ticks) {
+                vanish_ticks = 0;
+                self.sweepVanishedChildren();
+            }
             // Track each live session's CURRENT working directory (T425) so the
             // value that outlives the agent is where the user actually IS, not
             // where the shell was spawned. Separate cadence from the ring
@@ -1580,6 +1616,109 @@ pub const SessionStore = struct {
         self.mutex.unlock();
 
         for (pushes.items) |p| p.f(p.ctx, p.channel, p.has);
+    }
+
+    /// How many consecutive sweeps must fail to find a session's shell before it
+    /// is tombstoned (T1162). Two, not one: a single truncated or racy process
+    /// enumeration must never be able to kill a live pane, and the cost of being
+    /// right is one extra sweep interval of latency on a session that is already
+    /// only reachable by this path.
+    const vanish_strikes_needed: u8 = 2;
+
+    /// Notice that a live session's shell is GONE, for the sessions nothing else
+    /// can notice it for (T1162).
+    ///
+    /// Exit detection normally rides the child's OUTPUT path: `onChildOutput` is
+    /// the ONLY caller of `markExited`, and the pty reader nudges it with a
+    /// zero-length call on EOF. That needs a reader. A detached pinned session
+    /// whose `--pty-host` holder is gone has none — no reader thread, no EOF, no
+    /// nudge — so when its shell exits, nothing observes it. Proven on the box:
+    /// six pinned sessions whose `cmd.exe` children had been killed were still
+    /// reported live by `+sessions` a minute later, and were still listed the
+    /// next day. Nothing polled, so the leak was permanent: `reapIdle` skips a
+    /// pinned+alive session by design, the record is written to `sessions.json`,
+    /// re-materialised on every agent restart, and the chooser keeps offering it
+    /// as resumable. A session whose process has exited is not a persistence case
+    /// at all — this is "notice the child is gone", never "age out live panes".
+    ///
+    /// Same shape and the same cost discipline as `sampleDescendants`: ONE
+    /// process-table snapshot answers every session at once, taken OUTSIDE the
+    /// store mutex (it is an OS enumeration, not a cheap syscall), then a locked
+    /// phase decides. A failed snapshot tombstones NOTHING — "we could not look"
+    /// must never read as "it exited".
+    pub fn sweepVanishedChildren(self: *SessionStore) void {
+        // The snapshot's instant, read before it is taken: a session created
+        // AFTER this cannot be judged by a table that predates its spawn.
+        const started_ms = self.now();
+        var map = proc.snapshotParents(self.table.alloc) orelse return;
+        defer map.deinit(self.table.alloc);
+        _ = self.sweepVanishedIn(&map, started_ms);
+    }
+
+    /// `sweepVanishedChildren`'s decision half, against a caller-supplied parent
+    /// table. Split out so the rules — two strikes, a pid the table cannot see,
+    /// a session younger than the snapshot — are testable against a synthetic
+    /// process tree rather than the test runner's own descendants. Returns how
+    /// many sessions this pass tombstoned.
+    pub fn sweepVanishedIn(
+        self: *SessionStore,
+        map: *const descendants.ParentMap,
+        snapshot_started_ms: i64,
+    ) usize {
+        const Push = struct {
+            f: *const fn (ctx: *anyopaque, channel: u128, code: i64, runtime_ms: u64) void,
+            ctx: *anyopaque,
+            channel: u128,
+            code: i64,
+            runtime_ms: u64,
+        };
+        var pushes: std.ArrayList(Push) = .empty;
+        defer pushes.deinit(self.table.alloc);
+
+        const now_ms = self.now();
+        var marked: usize = 0;
+        self.mutex.lock();
+        var it = self.table.by_id.valueIterator();
+        while (it.next()) |sp| {
+            const s = sp.*;
+            if (!s.alive) continue;
+            // A synthetic pid (fake children, and any session we never learned a
+            // real one for) is not answerable from the process table.
+            if (s.pid <= 0) continue;
+            // Born after the walk started: the table simply predates the spawn.
+            if (s.created_ms > snapshot_started_ms) continue;
+            if (descendants.contains(map, s.pid)) {
+                s.vanish_strikes = 0;
+                continue;
+            }
+            if (s.vanish_strikes < std.math.maxInt(u8)) s.vanish_strikes += 1;
+            if (s.vanish_strikes < vanish_strikes_needed) continue;
+            // The child is gone. `tryWait` is contractually a single non-blocking
+            // syscall, so it is safe under the lock (`onChildOutput` calls it the
+            // same way) — it answers for a child we still hold a handle on, and
+            // for the holder-less case there is nobody left to ask, so 0 stands
+            // in for "exited, code unknown".
+            const code = s.child.tryWait() orelse 0;
+            s.markExited(code, now_ms);
+            marked += 1;
+            const runtime: u64 = @intCast(@max(0, now_ms - s.created_ms));
+            if (s.bound) {
+                if (s.bridge_exit) |f| pushes.append(self.table.alloc, .{
+                    .f = f,
+                    .ctx = s.bridge_ctx.?,
+                    .channel = s.channel,
+                    .code = code,
+                    .runtime_ms = runtime,
+                }) catch {};
+            }
+        }
+        self.mutex.unlock();
+
+        // Outside the lock: the bridge takes the connection's writer lock, and
+        // `persistMeta` writes disk. Both follow `reapIdle`'s discipline.
+        for (pushes.items) |p| p.f(p.ctx, p.channel, p.code, p.runtime_ms);
+        if (marked > 0) self.persistMeta();
+        return marked;
     }
 
     /// Refresh every LIVE session's recorded working directory from its child, so
@@ -2051,6 +2190,9 @@ pub const SessionStore = struct {
         s.relaunchable = false;
         s.unclaimed_restarts = 0;
         s.exit_code = null;
+        // A revived session starts the vanish sweep's count over (T1162) — any
+        // strikes it carries describe the pid it had before, not this shell.
+        s.vanish_strikes = 0;
         s.last_activity_ms = self.now();
         if (s.holder_stamp) |old| self.table.alloc.free(old);
         s.holder_stamp = self.table.alloc.dupe(u8, stamp) catch null;
@@ -3043,6 +3185,129 @@ test "SessionStore.reapIdle: pinned+ALIVE survives fast-forward, unpinned reaped
     try testing.expect(fakes[2].terminated); // pinned-but-dead tombstone reaped too
     try testing.expect(!fakes[0].terminated); // pinned+alive child untouched
     _ = plain;
+}
+
+/// A synthetic parent table: `pairs` are `{pid, ppid}`. Lets the vanish rules be
+/// asserted against a KNOWN process table instead of whatever this test runner's
+/// own pids happen to be.
+fn testParentMap(alloc: Allocator, pairs: []const [2]i64) !descendants.ParentMap {
+    var map: descendants.ParentMap = .empty;
+    errdefer map.deinit(alloc);
+    for (pairs) |p| try map.put(alloc, p[0], p[1]);
+    return map;
+}
+
+test "SessionStore.sweepVanishedIn: a pinned session whose shell is gone is tombstoned and then reaped (T1162)" {
+    // The field failure: a detached pinned session has no reader, so nothing ever
+    // calls `markExited` — it stays `alive` against a dead pid forever, is
+    // written to sessions.json, and comes back on every agent restart.
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x1162);
+    var fakes: [2]FakeChild = .{ .{ .alloc = alloc }, .{ .alloc = alloc } };
+    defer for (&fakes) |*f| f.deinit();
+
+    var clock: MutClock = .{ .ms = 1000 };
+    const ttl_ms: i64 = 1000;
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, ttl_ms);
+    defer store.deinit();
+
+    // Two pinned, unbound sessions: one whose shell is still running, one whose
+    // shell has exited without anyone noticing.
+    const live = try store.table.create(fakes[0].child(), 4001, 24, 80, 1024, 1000);
+    const gone = try store.table.create(fakes[1].child(), 4002, 24, 80, 1024, 1000);
+    live.pinned = true;
+    gone.pinned = true;
+    const live_id = live.id;
+    const gone_id = gone.id;
+
+    // The process table holds 4001 and knows nothing of 4002.
+    var table = try testParentMap(alloc, &.{ .{ 4001, 1 }, .{ 5000, 4001 } });
+    defer table.deinit(alloc);
+
+    // ONE miss is not enough: a truncated enumeration must not kill a pane.
+    try testing.expectEqual(@as(usize, 0), store.sweepVanishedIn(&table, 1000));
+    try testing.expect(store.table.getById(gone_id).?.alive);
+
+    // The second consecutive miss tombstones it — and only it.
+    clock.ms = 2000;
+    try testing.expectEqual(@as(usize, 1), store.sweepVanishedIn(&table, 2000));
+    try testing.expect(!store.table.getById(gone_id).?.alive);
+    try testing.expect(store.table.getById(live_id).?.alive);
+
+    // Idempotent: an already-dead session is not swept again.
+    try testing.expectEqual(@as(usize, 0), store.sweepVanishedIn(&table, 2000));
+
+    // And the tombstone now falls to the ordinary idle rules, which is the half
+    // that makes the leak go away: `pinned` shields only LIVE sessions.
+    clock.ms = ttl_ms * 100;
+    store.reapIdle();
+    try testing.expect(store.table.getById(gone_id) == null);
+    try testing.expect(store.table.getById(live_id) != null);
+}
+
+test "SessionStore.sweepVanishedIn: strikes reset, young sessions and synthetic pids are exempt (T1162)" {
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x1163);
+    var fakes: [3]FakeChild = .{ .{ .alloc = alloc }, .{ .alloc = alloc }, .{ .alloc = alloc } };
+    defer for (&fakes) |*f| f.deinit();
+
+    var clock: MutClock = .{ .ms = 1000 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 1000);
+    defer store.deinit();
+
+    // flaky   — missing from one snapshot, back in the next: never tombstoned.
+    // young    — created AFTER the snapshot started: the table predates its spawn.
+    // synth    — pid 0 (a session we never learned a real pid for).
+    const flaky = try store.table.create(fakes[0].child(), 6001, 24, 80, 1024, 1000);
+    const young = try store.table.create(fakes[1].child(), 6002, 24, 80, 1024, 5000);
+    const synth = try store.table.create(fakes[2].child(), 0, 24, 80, 1024, 1000);
+
+    var without = try testParentMap(alloc, &.{.{ 9999, 1 }});
+    defer without.deinit(alloc);
+    var with = try testParentMap(alloc, &.{.{ 6001, 1 }});
+    defer with.deinit(alloc);
+
+    // Miss, then a hit: the strike is cleared, so the next miss starts over.
+    try testing.expectEqual(@as(usize, 0), store.sweepVanishedIn(&without, 1000));
+    try testing.expectEqual(@as(u8, 1), flaky.vanish_strikes);
+    try testing.expectEqual(@as(usize, 0), store.sweepVanishedIn(&with, 1000));
+    try testing.expectEqual(@as(u8, 0), flaky.vanish_strikes);
+    try testing.expectEqual(@as(usize, 0), store.sweepVanishedIn(&without, 1000));
+    try testing.expect(flaky.alive);
+
+    // The young session and the synthetic pid never took a strike at all, so no
+    // number of sweeps can accumulate one against them.
+    try testing.expectEqual(@as(u8, 0), young.vanish_strikes);
+    try testing.expectEqual(@as(u8, 0), synth.vanish_strikes);
+    try testing.expect(young.alive);
+    try testing.expect(synth.alive);
+}
+
+test "SessionStore.sweepVanishedChildren: a REAL process table never tombstones a running pid (T1162)" {
+    // The end-to-end path against this box's own process table, which is the one
+    // thing a synthetic map cannot prove: a session whose "shell" is this very
+    // process must survive every sweep. A false positive here is a live pane
+    // being declared dead, so this is the control that matters.
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x1164);
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+
+    const me: i64 = switch (builtin.os.tag) {
+        .windows => @intCast(std.os.windows.GetCurrentProcessId()),
+        else => @intCast(std.c.getpid()),
+    };
+
+    var clock: MutClock = .{ .ms = 1000 };
+    var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 1000);
+    defer store.deinit();
+    const s = try store.table.create(fc.child(), me, 24, 80, 1024, 0);
+
+    store.sweepVanishedChildren();
+    store.sweepVanishedChildren();
+    store.sweepVanishedChildren();
+    try testing.expect(s.alive);
+    try testing.expectEqual(@as(u8, 0), s.vanish_strikes);
 }
 
 test "persistMeta: an unclaimed reboot-floor tombstone ages out instead of living forever" {
