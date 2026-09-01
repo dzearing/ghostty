@@ -92,4 +92,16 @@ test {
     // answers it. The registration strings decide whether a link reaches this
     // build at all, so the lane checks them rather than only the grammar.
     _ = @import("win32/url_scheme.zig");
+    // The four modules T1191's reachability sweep found with tests that had
+    // never once executed. Each is imported and used by `App.zig`,
+    // `IpcHandlers.zig` or `Surface.zig` — which is exactly what makes the
+    // silence hard to see: they compile in every lane, they read as covered,
+    // and the lane skipped all sixteen of their tests. THIS LIST is the only
+    // thing that pulls them in, so they are named here and the sweep
+    // (`test/win32/test-reach-audit.ps1`) fails if any win32 module with
+    // tests drops off the chain again.
+    _ = @import("win32/AgentIntegrationsDialog.zig");
+    _ = @import("win32/ipc_agent_integration.zig");
+    _ = @import("win32/provenance.zig");
+    _ = @import("win32/restore_retry.zig");
 }

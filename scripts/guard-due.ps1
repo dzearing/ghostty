@@ -2182,6 +2182,25 @@ $GuardTable = @(
             'scripts\guard-due.ps1'
         )
     }
+
+    # T1191 - the reachability sweep. It covers `src\apprt\win32.zig` itself,
+    # which is unusual for a row and is the whole point: the file the rule is
+    # about is a hand-written list, and the moment somebody adds a win32 module
+    # without adding its line, this row goes due and the sweep says which one.
+    # It also covers the win32 module directory, because a NEW module with
+    # tests is exactly the case the rule exists for and nothing else notices it
+    # arriving.
+    [pscustomobject]@{
+        Name   = 'test-reach'
+        Script = 'test\win32\test-reach-audit.ps1'
+        Stamp  = 'test\win32\test-reach-audit.stamp.json'
+        Covers = @(
+            'test\win32\test-reach-audit.ps1',
+            'test\win32\lib\TestReachAudit.ps1',
+            'src\apprt\win32.zig',
+            'src\apprt\win32\*.zig'
+        )
+    }
 )
 
 function Get-RepoRelative([string]$full) {

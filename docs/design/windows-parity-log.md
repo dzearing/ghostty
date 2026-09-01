@@ -18753,3 +18753,49 @@ ecord writes one row per boot to temp\go-loop-boots.jsonl, is idempotent on the 
   each stamp nothing), plus gate-negatives, parity-tasks-seat, release-artifacts,
   docs-routing, merge-terminology and the six harness audits re-run and
   re-stamped.
+
+- **2026-09-01 - four win32 modules had unit tests that had never once run
+  (T1191).** Zig only executes a file's tests if that file's container is
+  REFERENCED from an analyzed one, and the hand-written
+  `test { _ = @import("win32/X.zig"); }` block in `src/apprt/win32.zig` is what
+  does the referencing - an ordinary import does not. So a module can be
+  imported and used by `App.zig`, compiled by every lane, carry a page of unit
+  tests, and be skipped in total silence; T1177 found that on
+  `startup_error.zig` only because someone broke one of its assertions on
+  purpose and the lane still went green. Nothing measured how many others were
+  in that state. **The number is four**, and they were carrying sixteen tests:
+  `AgentIntegrationsDialog` (8), `ipc_agent_integration` (3), `provenance` (2),
+  `restore_retry` (3). All sixteen pass now that they are listed - they were
+  correct, merely unexecuted, which is the part that makes this class hard to
+  notice.
+
+  The sweep that keeps it at zero (`test\win32\test-reach-audit.ps1`) asks the
+  COMPILER rather than modelling it. Zig names every test after the file it came
+  from (`apprt.win32.<module>.test.<name>`), those names are string data in the
+  test binary, and a test that was never analyzed contributes no name - so the
+  sweep builds the lane, reads the binary the lane actually ran, and compares
+  that set against every `src\apprt\win32\*.zig` with a `test` block. A first
+  draft did model Zig's reachability in PowerShell and scored **174 of 174
+  modules unreachable**, because `src/main.zig` references its entrypoint by
+  identifier rather than by a literal `@import` and `refAllDecls(@This())` is a
+  third shape again; a model that drifts from the compiler fails in exactly the
+  way this task exists to stop, so it was thrown away. The negative control
+  (`-TeethCheck`) deletes a line from the list, rebuilds, requires the sweep to
+  name that module, and asserts that the LANE still passes - which is the defect
+  restated. It found a second thing on the way: wounding `ConfirmDialog.zig`,
+  the oldest entry in the block, does NOT go red, because it is also reached
+  transitively; several entries in that list are redundant and reading it cannot
+  tell you which. Staleness is a `guard-due` row (`test-reach`) covering
+  `src\apprt\win32.zig` AND `src\apprt\win32\*.zig`, so a NEW win32 module with
+  tests makes the guard due and the sweep names it. T1237 filed to point the
+  same oracle at the rest of the tree - `src/os`, `src/remote`, `src/terminal`
+  and the agent lane have the same unmeasured silence.
+  Floor: lib/none/win32/agent ALL LANES PASS, `test-reach-audit.ps1` ALL PASS
+  (174 of 174 modules in the lane) and again with `-TeethCheck` (18 assertions),
+  plus the six audits its new file made due - isolation-meta, launch-preflight,
+  verdict-exit, cleanslate, stderr-capture and body-complete - re-run and
+  re-stamped. stderr-capture caught the sweep's own build redirect on the way
+  through: `zig build --verbose` prints to stderr, a PowerShell `*>` of that
+  formats every line as a host-width ErrorRecord, and this sweep reads the file
+  back as a text oracle - so the redirect goes through `cmd` (T883's
+  proven-good shape) instead.

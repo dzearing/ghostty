@@ -1,11 +1,11 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-09-01T02:10:45-07:00",
-    "commit":  "196672948",
+    "generated":  "2026-09-01T04:05:36-07:00",
+    "commit":  "cf68bc87c",
     "uncommitted":  [
-                        "test/win32/guard-due.ps1",
-                        "test/win32/release-artifacts.ps1"
+                        "test/win32/lib/TestReachAudit.ps1",
+                        "test/win32/test-reach-audit.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -174,6 +174,7 @@
                   "test/win32/lib/StderrCaptureAudit.ps1":  "69d0a25615d35acc06bf6c1471016186163ae1881ae70a12461425546ac4b7d8",
                   "test/win32/lib/TestClient.ps1":  "98b5449096d7103ec31d8eb19b2d0d84985c48fddc88a5871eeb641ec43091f8",
                   "test/win32/lib/TestDesktop.ps1":  "85ea603976e5086ecd0db2912e39212741600e6f1fb84e19cfd2ee40ef6f33de",
+                  "test/win32/lib/TestReachAudit.ps1":  "3b2fb64aee74f3451127f4f9776141f5781dd210a6fdf0019410485664f0a840",
                   "test/win32/lib/TestScore.ps1":  "1bc571121b1b60ce5d9b63a0e1c8ebf23f6da575f8e9f7dab1a410cbc2888acc",
                   "test/win32/lib/VerdictExitAudit.ps1":  "8a22b157dc4e93add59e9b3da93a0620c667644cefb1b3641dc2f6cd370f226e",
                   "test/win32/local-split-no-command-rerun.ps1":  "ee277b6308cdb172e153fe92d0624732f8b64743418134ce466da5534138fae2",
@@ -260,6 +261,7 @@
                   "test/win32/test-client-build.ps1":  "4151eff034e0de3acacf2e176c97702fd757f2c83f863476a115da9dc34e7b2b",
                   "test/win32/test-desktop-harness.ps1":  "36b2313c1f06d0b93533da6aa1661036af511c9d39d82e57cdb5a750572a1034",
                   "test/win32/test-desktop-spike.ps1":  "2b39b095c17ead46920c49c3dc066d5fede7fbc5814ab8d4fffb57a599868f58",
+                  "test/win32/test-reach-audit.ps1":  "9987988dde78037ac8545dd70de97e50d2d9312bca3e9c0ee89d0be955eb638e",
                   "test/win32/title-font.ps1":  "946fd12880bb0433a535283fb6146fb7d2a8fd1b2d1f0f74e00fa7ce1720dcb8",
                   "test/win32/title-jitter.ps1":  "305bd304faf09988c8852f7fa69f2c780212b639fb837085b5869ab5457acab7",
                   "test/win32/update-apply.ps1":  "22337598028ad72f60b50c9cd6272eb26b6e07ecd39d52e29ecdc328cee28111",
