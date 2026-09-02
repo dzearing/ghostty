@@ -19711,3 +19711,30 @@ Floor: lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS; update-progress
 ALL PASS (42 assertions) and update-apply, update-failure-visible,
 update-graceful and update-real-msi green, plus the eight harness audits the
 test edit made due.
+
+## 2026-09-01 - a commit can no longer be titled after somebody else's work (T1245)
+
+`git-commit-guard.ps1` proved which PATHS a commit contained and never asked
+whether its SUBJECT had been written for it. On 2026-09-01 a turn passed
+`-MessageFile temp\msg2.txt` without writing that file; the previous turn's copy
+was still sitting there, so the commit recording the sha that closed T1195 went
+out - and was pushed - titled "record the commit that closed T1170". The commit
+message is the dashboard's activity feed, so that is a feed item describing work
+the commit does not contain.
+
+The guard now refuses a `-MessageFile` that does not exist (`MESSAGE FILE
+MISSING`, with the path, exit 2, nothing staged or committed) and one that is
+empty or whitespace-only (`MESSAGE FILE EMPTY`). The refusal only has teeth
+because of the other half: a message file that HAS been committed is deleted
+once the commit is read back and proved, so a stale one cannot exist to be
+picked up. Inline `-Message` is unaffected - it cannot be stale.
+
+Demonstrated red before green, per go.md step 3: with the script reverted to
+HEAD the harness scored `4 FAILURE(S)` - W34 (missing file committed anyway),
+W36 (empty file), W39 (the message survived its commit) and W40 (the next turn
+inheriting the last turn's subject) - and ALL PASS with the fix. go.md step 6
+carries the rule.
+
+Floor: lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS; plus the six
+harness audits the test edit made due (isolation-meta, launch-preflight,
+verdict-exit, cleanslate, stderr-capture, desktop-launch).

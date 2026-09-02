@@ -387,6 +387,29 @@ switch ($Action) {
     'commit' {
         if (-not $Paths -or $Paths.Count -eq 0) { Fail "ERROR commit needs -Paths" 2 }
         if (-not $Message -and -not $MessageFile) { Fail "ERROR commit needs -Message or -MessageFile" 2 }
+
+        # T1245: the subject has to have been written for THIS commit. A
+        # -MessageFile the turn never wrote is not a missing message - a
+        # leftover from an earlier turn is sitting at that path, and git will
+        # happily commit somebody else's subject over this work. The commit
+        # message IS the dashboard's activity feed, so that is a feed item
+        # describing something the commit does not contain (e4824918e).
+        # git resolves a relative -F against its own cwd, which -C makes $Repo.
+        $mfResolved = $null
+        if ($MessageFile) {
+            $mfResolved = if ([System.IO.Path]::IsPathRooted($MessageFile)) { $MessageFile }
+                          else { Join-Path $Repo $MessageFile }
+            if (-not (Test-Path -LiteralPath $mfResolved -PathType Leaf)) {
+                Fail ("MESSAGE FILE MISSING: $mfResolved" + [Environment]::NewLine +
+                      "  Write the message for THIS commit before committing; nothing was committed.") 2
+            }
+            $mfText = ''
+            try { $mfText = [System.IO.File]::ReadAllText($mfResolved) } catch { $mfText = '' }
+            if (-not $mfText.Trim()) {
+                Fail ("MESSAGE FILE EMPTY: $mfResolved" + [Environment]::NewLine +
+                      "  A commit with no subject is not a commit anybody can read; nothing was committed.") 2
+            }
+        }
         $lp = Get-LockPath
         if (-not $lp) { Fail "ERROR not a git repo: $Repo" 2 }
 
@@ -454,6 +477,13 @@ switch ($Action) {
             exit 5
         }
         "COMMITTED $short ($($actual.Count) path(s), all requested)"
+
+        # T1245: consume the message so a later turn cannot inherit it. The
+        # missing-file refusal above only has teeth if a used message stops
+        # existing - staleness is what actually shipped the wrong subject.
+        if ($mfResolved) {
+            Remove-Item -LiteralPath $mfResolved -Force -ErrorAction SilentlyContinue
+        }
 
         # T1057: the push is not a switch any more. A commit that stays on this
         # box is invisible to the other seat and dies with the box, and the rule

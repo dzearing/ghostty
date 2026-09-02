@@ -1,10 +1,10 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-09-01T21:39:10-07:00",
-    "commit":  "d26d0f59b",
+    "generated":  "2026-09-01T22:14:50-07:00",
+    "commit":  "ffe010447",
     "uncommitted":  [
-                        "test/win32/update-progress.ps1"
+                        "test/win32/go-loop-guard.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -99,7 +99,7 @@
                   "test/win32/fork-identity.ps1":  "2a83e77b4f6fc5127e583e44175dc00a350ef16cacf5b9404c9e6e8fb388ab71",
                   "test/win32/gate-negatives.ps1":  "2f760aa588f0f18e7a1c26986dde9f8843c48e60c7d37d7abf02ace70528fd6d",
                   "test/win32/ghoztty-cleanup.ps1":  "81bfcb6cb5b018195e1056d6ce7203f18235763916bcec4cffcdafa811e73f76",
-                  "test/win32/go-loop-guard.ps1":  "e8d29ccf1b2cc0a85843ae13cdfcf4ac8f7111942a8e5908434cb281e63b83cd",
+                  "test/win32/go-loop-guard.ps1":  "556b89c9c29dec22c135b67114cfa0bf1038b464250ffbbcc4b979090ae36ee0",
                   "test/win32/go-loop-uptime.ps1":  "a97005d970a564088741646542ffaca3cb9ffe03d2eb30c55b96841607948b82",
                   "test/win32/guard-due.ps1":  "7d19009608a80312171a80eb68f9324dc2ff0ff248990c8a3ab4b4f43398c743",
                   "test/win32/gui-launch-command.ps1":  "92343e0db67fea906f08a1a8ef37ec38c4bd2ca90b859269451d543e33ec6202",

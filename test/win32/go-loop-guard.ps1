@@ -1523,6 +1523,44 @@ CG @('push') | Out-Null
 $r = WValidate @()
 Assert 'W33 validate goes green once the commit is pushed' ($r.Code -eq 0 -and $r.Out -notmatch 'UNPUSHED WORK')
 
+# --- T1245: the message file is written for THIS commit, or there is no commit
+# `-MessageFile temp\msg2.txt` was run on a turn that never wrote that file, and
+# a leftover from an earlier turn was sitting there: the guard proved the PATHS
+# and never asked whether the SUBJECT belonged to this work, so e4824918e went
+# out - and was pushed - titled after somebody else's task. A stale message is
+# worse than a missing one, because a missing one would have been noticed.
+$msgPath = Join-Path $wRepo 'temp\msg.txt'
+New-Item -ItemType Directory -Force (Split-Path $msgPath) | Out-Null
+Set-Content -Path (Join-Path $wRepo 'msg-missing.txt') -Value 'x'
+$headBefore = WHead
+$r = CG @('commit', '-Paths', 'msg-missing.txt', '-MessageFile', $msgPath)
+Assert 'W34 a -MessageFile that does not exist is REFUSED, and the path is named' `
+    ($r.Code -eq 2 -and $r.Out -match 'MESSAGE FILE MISSING' -and $r.Out -match 'msg\.txt')
+Assert 'W35 nothing was committed over the missing message' ((WHead) -eq $headBefore)
+
+[System.IO.File]::WriteAllText($msgPath, "   `r`n`t`r`n", (New-Object System.Text.UTF8Encoding $false))
+$r = CG @('commit', '-Paths', 'msg-missing.txt', '-MessageFile', $msgPath)
+Assert 'W36 an empty / whitespace-only message file is REFUSED' `
+    ($r.Code -eq 2 -and $r.Out -match 'MESSAGE FILE EMPTY')
+Assert 'W37 nothing was committed over the empty message' ((WHead) -eq $headBefore)
+
+# The remedy for staleness is that a message cannot survive its own commit.
+[System.IO.File]::WriteAllText($msgPath, "the subject written for this commit`n", (New-Object System.Text.UTF8Encoding $false))
+$r = CG @('commit', '-Paths', 'msg-missing.txt', '-MessageFile', $msgPath)
+Assert 'W38 a real message file commits normally' `
+    ($r.Code -eq 0 -and $r.Out -match 'COMMITTED' -and
+     (& git -C $wRepo log -1 --pretty=%s 2>$null) -match 'the subject written for this commit')
+Assert 'W39 the message file is consumed, so it cannot be reused stale' (-not (Test-Path $msgPath))
+
+# The 2026-09-01 shape end to end: a second turn commits with the same path and
+# never writes it. Before this it inherited the first turn's subject; now it is
+# the missing-file refusal, which is a stop rather than a wrong feed item.
+Set-Content -Path (Join-Path $wRepo 'msg-stale.txt') -Value 'second turn work'
+$headBefore = WHead
+$r = CG @('commit', '-Paths', 'msg-stale.txt', '-MessageFile', $msgPath)
+Assert 'W40 the next turn cannot inherit the last turn''s subject' `
+    ($r.Code -eq 2 -and (WHead) -eq $headBefore)
+
 # The one arm about THIS box: claim arms the guard every turn, so the real repo
 # should be wired right now. Read-only - nothing here reconfigures the real repo.
 $realHooks = (& git -C $Repo config --local --get core.hooksPath 2>$null)

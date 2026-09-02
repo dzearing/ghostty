@@ -558,6 +558,14 @@ Concretely, in order, with no stops in between:
    older than its ttl is cleared rather than obeyed, so a crashed holder cannot
    wedge the repo. Acceptance: section W of `test\win32\go-loop-guard.ps1`.
 
+   **The message file has to have been written for THIS commit** (T1245). A
+   `-MessageFile` that does not exist is REFUSED and the path is named, an
+   empty one is refused too, and a message that HAS been committed is deleted —
+   so a leftover from an earlier turn cannot be picked up silently. On
+   2026-09-01 a turn passed `-MessageFile temp\msg2.txt` without writing it,
+   and the previous turn's file was still sitting there: the commit recording
+   T1195's sha went out titled after T1170, into the activity feed, pushed.
+
    **That commit PUSHES on its own** (T1057) — `commit` pushes by default, and
    a rejected push is answered the way step 4 says to (pull with rebase, push
    again) rather than reported and left. `-NoPush -Reason "<why>"` is the only
