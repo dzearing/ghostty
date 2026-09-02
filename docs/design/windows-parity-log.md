@@ -20021,3 +20021,41 @@ colors change constantly), and a green run stamps it. Filed T1274 for the
 pre-existing case the restore steps aside on: on mid-luminance backgrounds the
 tint carries the band across the light/dark threshold, so its washes travel the
 opposite way from the release chrome's.
+
+## 2026-09-02 - T609: a remote window's link health is answerable without grepping the log
+
+Since T366 a cross-machine window has known whether its connection is healthy,
+retrying, or given up. Nothing outside the process could ask. The only way to
+read it was to grep the app log for a phrase like `remote reconnect: '<name>'
+dropped; attempt N/5` - a side effect of the implementation rather than a
+contract, which moves the moment somebody rewords a message. `+list --json` now
+carries it: `{"state":"connected"}`, `{"state":"reconnecting","attempt":2}`,
+`{"state":"disconnected","self_healable":true}`.
+
+Two shape choices, both borrowed from what the payload already does rather than
+invented. A LOCAL window carries no `connection` key at all - absence is what
+already distinguishes the two, so there is no `"state":"local"` to mis-handle -
+and a field a state does not carry is omitted rather than emitted empty, the way
+`banner` and `session_id` are. A `0` attempt on a healthy window is a number a
+script can read and believe; an absent key is not.
+
+The mapping lives beside the union it maps (`WindowState.listConnection`) and is
+exhaustive on purpose, so a ladder state added later cannot quietly go
+unreported - which is precisely how the log became the only oracle. The emitter
+gates on `hasRemotePill()`, the same predicate the T367 status pill uses, so the
+pill and the JSON cannot drift into disagreeing about which windows have a link.
+`+list`'s human output shows `[connection: ...]` on the window line too.
+
+Then the field earned its keep within the hour. `ipc-relay.ps1` gained section
+1b and an assertion in section 6, and section 6 printed what it read: three
+seconds after the agent is killed under a RELAY window, the ladder is already
+`disconnected` with `self_healable: false` - the terminal verdict, nothing
+re-dialing, the window never coming back. That is T366's reconnect feature not
+working on the path a user's second machine actually uses, and it was invisible
+until there was something to read. Filed as T1276 (P1, M1), with the
+`.unauthorized` short-circuit in `dialOnce`'s relay arm as the suspect: an
+offline device may be answering with the same 401 a rejected bearer does.
+
+T1275 carries the Mac half. T368, the reconnect acceptance script, was re-queued
+behind this task rather than written against log text and then rewritten - its
+own Details had said as much and nothing had acted on it.

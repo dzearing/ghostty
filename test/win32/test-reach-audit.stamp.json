@@ -1,11 +1,11 @@
 {
     "guard":  "test-reach",
     "script":  "test/win32/test-reach-audit.ps1",
-    "generated":  "2026-09-02T03:42:10-07:00",
-    "commit":  "e9f2084c1",
+    "generated":  "2026-09-02T04:26:31-07:00",
+    "commit":  "a9134df7c",
     "uncommitted":  [
-                        "src/apprt/win32/chrome_theme.zig",
-                        "src/apprt/win32/color_math.zig"
+                        "src/apprt/win32/IpcHandlers.zig",
+                        "src/apprt/win32/remote_reconnect.zig"
                     ],
     "files":  {
                   "src/apprt/win32.zig":  "7a666e06c809d420ef7b353e8c46cf6ef9bf365f324f5da8c13ffde07478c8ce",
@@ -85,7 +85,7 @@
                   "src/apprt/win32/ipc_agent_integration.zig":  "df7de6466f6d5036d5725e22d8d3913a03081c0b249931518f4a41c3a9d4cf80",
                   "src/apprt/win32/ipc_capture.zig":  "0de50daf7a4053a6baa55be4c5e020f28b477ebfb61a3ad58e4462192d522ef3",
                   "src/apprt/win32/ipc_hover.zig":  "07bbf74a9a035867d9843abcdf41c7c968b561c5868d6821ea149e613eced8be",
-                  "src/apprt/win32/IpcHandlers.zig":  "eb894023d2f52eee83d538bd1449bf3d3c9f2c2902830685d88c51095ce22dc1",
+                  "src/apprt/win32/IpcHandlers.zig":  "7b2019b6ed785ebd48b07d45e31f54a6842a5194d4e466c32c74e52134d538a4",
                   "src/apprt/win32/IpcRegistry.zig":  "5ebe2322ff50416cd1b825989ab10e1d4563955f497a445e3e00ea7f4c42fef6",
                   "src/apprt/win32/IpcServer.zig":  "2d07c784b46762ef1205a8113f0fbc68d10ada6b06b907dd90b524204fcc0d56",
                   "src/apprt/win32/job_escape.zig":  "70efff6eb21a668cdd18673b8573d38e2d9c3d26e5426586bfbcfb68a4986647",
@@ -126,7 +126,7 @@
                   "src/apprt/win32/relaunch_guard.zig":  "302310f04909122ef10884201d2756c4d6cbbd7c9e819175790b2779082ea660",
                   "src/apprt/win32/RelayAccountRow.zig":  "fbb3f7e392705c5fb1d8a2eaf1293571ef6ad34694cc8bc318e5ba3add12f9a9",
                   "src/apprt/win32/remote_pill.zig":  "45dc9bd8bf56063b608479bc78b527ea4aec4fc9502c2a8c833681a3bd8fddb8",
-                  "src/apprt/win32/remote_reconnect.zig":  "43cf48ab49763b89fe5be0befdfcd9887e1af32a612bf3a2cfdad126ecdace4d",
+                  "src/apprt/win32/remote_reconnect.zig":  "c8afba4f4129f89e49919ff2c01938b7f42beeeae6446ffd3792a2a924421a3c",
                   "src/apprt/win32/RemoteReconnect.zig":  "2419e5762badc4c4f25df3d123a226aa75155f2612f26576bc19d72fad4f347e",
                   "src/apprt/win32/RenameDialog.zig":  "54c71998495c287b98c4cd120dfc687e53e4734c1db952056931497d9b2f703c",
                   "src/apprt/win32/resize_paint.zig":  "d53ec8b8314a515a50eefaacb392f26717944d4e10a88c89e52390d05b3288d4",

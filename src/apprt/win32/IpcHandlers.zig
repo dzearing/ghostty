@@ -1812,6 +1812,13 @@ fn handleList(ctx: Context, request: Request) Allocator.Error!?[]u8 {
             .focused = window_active.isActive(activation, @intFromPtr(hwnd)),
             .tabs = tabs.items,
             .chrome = try windowChrome(arena, window),
+            // T609: a cross-machine window publishes its reconnect ladder's
+            // state; a local one has no link to report on, and the absent
+            // field is what says so.
+            .connection = if (window.hasRemotePill())
+                window.reconnect.ladder.listConnection()
+            else
+                null,
         });
     }
 

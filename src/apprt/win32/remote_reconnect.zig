@@ -39,6 +39,7 @@
 
 const std = @import("std");
 const connection = @import("../../remote/connection.zig");
+const List = @import("../ipc/list.zig").List;
 
 // =============================================================================
 // Schedule
@@ -109,6 +110,24 @@ pub const WindowState = union(enum) {
 
     pub fn isConnected(self: WindowState) bool {
         return self == .connected;
+    }
+
+    /// This state as `+list --json` publishes it (T609). The switch is
+    /// exhaustive on purpose: a ladder state added later cannot quietly go
+    /// unreported, which is the failure mode that made the log the only oracle
+    /// in the first place.
+    pub fn listConnection(self: WindowState) List.Connection {
+        return switch (self) {
+            .connected => .{ .state = "connected" },
+            .reconnecting => |r| .{
+                .state = "reconnecting",
+                .attempt = @intCast(r.attempt),
+            },
+            .disconnected => |d| .{
+                .state = "disconnected",
+                .self_healable = d.self_healable,
+            },
+        };
     }
 };
 
@@ -978,4 +997,28 @@ test "needsTick: only a window with something to wait for keeps the poller alive
     try testing.expect(needsTick(exhausted_state));
     // Terminal is waiting on the user, not on us.
     try testing.expect(!needsTick(terminal_state));
+}
+
+test "listConnection: every ladder state has a +list --json shape (T609)" {
+    const c = WindowState.listConnection(.connected);
+    try testing.expectEqualStrings("connected", c.state);
+    try testing.expect(c.attempt == null);
+    try testing.expect(c.self_healable == null);
+
+    // The attempt the yellow pill counts out is the number a script reads.
+    const r = WindowState.listConnection(.{ .reconnecting = .{ .attempt = 3 } });
+    try testing.expectEqualStrings("reconnecting", r.state);
+    try testing.expectEqual(@as(?i64, 3), r.attempt);
+    try testing.expect(r.self_healable == null);
+
+    // Exhausted-but-armed and terminal are one state to the pill and two to a
+    // caller deciding whether to keep waiting.
+    const healable = WindowState.listConnection(exhausted_state);
+    try testing.expectEqualStrings("disconnected", healable.state);
+    try testing.expectEqual(@as(?bool, true), healable.self_healable);
+    try testing.expect(healable.attempt == null);
+
+    const terminal = WindowState.listConnection(terminal_state);
+    try testing.expectEqualStrings("disconnected", terminal.state);
+    try testing.expectEqual(@as(?bool, false), terminal.self_healable);
 }

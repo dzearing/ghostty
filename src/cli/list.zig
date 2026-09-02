@@ -279,6 +279,26 @@ fn formatHumanReadable(alloc: Allocator, resp_body: []const u8, stdout: *std.Io.
         if (win_focused) {
             try stdout.writeAll(" (focused)");
         }
+
+        // T609: a cross-machine window says how its link is doing. Absent for
+        // a local window, which has no link, so nothing is printed there.
+        if (win_obj.get("connection")) |conn| {
+            if (conn == .object) {
+                const state = jsonStr(conn.object.get("state"));
+                if (state.len > 0) {
+                    try stdout.writeAll(" [connection: ");
+                    try stdout.writeAll(state);
+                    if (conn.object.get("attempt")) |att| {
+                        if (att == .integer) try stdout.print(" {d}", .{att.integer});
+                    }
+                    if (conn.object.get("self_healable")) |heal| {
+                        if (heal == .bool and !heal.bool)
+                            try stdout.writeAll(", needs attention");
+                    }
+                    try stdout.writeAll("]");
+                }
+            }
+        }
         try stdout.writeAll("\n");
 
         const tabs = (win_obj.get("tabs") orelse continue).array;

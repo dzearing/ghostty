@@ -1,10 +1,10 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-02T03:42:15-07:00",
-    "commit":  "e9f2084c1",
+    "generated":  "2026-09-02T04:26:36-07:00",
+    "commit":  "a9134df7c",
     "uncommitted":  [
-                        "test/win32/chrome-theme.ps1"
+                        "test/win32/ipc-relay.ps1"
                     ],
     "files":  {
                   "src/cli/ghostty.zig":  "ef54b501298cfda9306cfb958c1094db24ee30f355b25865656b3e2bc713bcd7",
@@ -131,7 +131,7 @@
                   "test/win32/ipc-p2.ps1":  "53fbae7e13398dd72417d4eadaba0357bcad893e86fcef82c7a951acdd185448",
                   "test/win32/ipc-p3.ps1":  "86a607dd5edd0407a87a5615ebb37958dd2ab77aa16874f5e34c53315f300b25",
                   "test/win32/ipc-read-race.ps1":  "ff6f89cab2e92dae0fa13e1ea2f9a89f2579175ddcc2b8b55c53b8b7f330bee6",
-                  "test/win32/ipc-relay.ps1":  "5f51afab95cc71404e236a0358359f410d68d852d187f5f189dd5e99bcabbe10",
+                  "test/win32/ipc-relay.ps1":  "dacee4939cca7128c386efa4d21fdb01252f2452a10373fe4567e737ad4167ea",
                   "test/win32/ipc-remote.ps1":  "861e93ef7522e4559ccd66cccea2cddc89f363df666bfe4b135da2bd143d0ea9",
                   "test/win32/ipc-send-keys-fidelity.ps1":  "ecd1a63052e0a9c52fdb10003f817026c4b95acd8fe76b4e2cff8a57a1ff2fd8",
                   "test/win32/ipc-startup-latency.ps1":  "f9696e3e450043659688926efca6912b1ddeb19113e1be8c2581e20a591196a6",

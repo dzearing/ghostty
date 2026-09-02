@@ -133,6 +133,28 @@ pub const List = struct {
         tab_strip: ?TabStrip = null,
     };
 
+    /// A cross-machine window's link health, as its reconnect ladder holds it
+    /// (T609). This is the ONE thing about a remote window that a caller could
+    /// previously learn only by grepping the app log — a side effect of the
+    /// implementation rather than a contract, which moves whenever a message is
+    /// reworded.
+    ///
+    /// The shape mirrors the ladder's own state rather than flattening it: a
+    /// field that is meaningless in a state is ABSENT in that state, the way
+    /// `banner` and `session_id` are absent rather than empty. So `attempt` is
+    /// present only while retrying, and `self_healable` only while down.
+    pub const Connection = struct {
+        /// `"connected"` | `"reconnecting"` | `"disconnected"`.
+        state: []const u8,
+        /// 1-based fast-ladder attempt; only while `state == "reconnecting"`.
+        attempt: ?i64 = null,
+        /// Only while `state == "disconnected"`: true when the fast ladder is
+        /// spent but a slow background re-dial is still armed (the link may yet
+        /// come back on its own), false for a terminal verdict that needs the
+        /// user.
+        self_healable: ?bool = null,
+    };
+
     pub const Window = struct {
         id: []const u8,
         title: []const u8,
@@ -142,6 +164,11 @@ pub const List = struct {
         /// T231. Windows-only for now (the Mac half is filed); null omits the
         /// field entirely, so the golden Mac shape below is unchanged.
         chrome: ?Chrome = null,
+        /// T609. Present only for a cross-machine window — a local window has
+        /// no link to report on, and absence is what already distinguishes the
+        /// two. Additive: null omits the field, so every existing consumer and
+        /// the golden Mac shape below are unchanged.
+        connection: ?Connection = null,
     };
 
     /// A leaf for an empty tree, matching the Mac server's placeholder.
@@ -217,6 +244,23 @@ pub const List = struct {
         for (w.tabs) |t| try writeTab(jws, t);
         try jws.endArray();
         if (w.chrome) |c| try writeChrome(jws, c);
+        if (w.connection) |c| try writeConnection(jws, c);
+        try jws.endObject();
+    }
+
+    fn writeConnection(jws: *std.json.Stringify, c: Connection) !void {
+        try jws.objectField("connection");
+        try jws.beginObject();
+        try jws.objectField("state");
+        try jws.write(c.state);
+        if (c.attempt) |a| {
+            try jws.objectField("attempt");
+            try jws.write(a);
+        }
+        if (c.self_healable) |h| {
+            try jws.objectField("self_healable");
+            try jws.write(h);
+        }
         try jws.endObject();
     }
 
@@ -702,4 +746,82 @@ test "List: golden shape — window with split tab" {
             "\"focused\":false,\"exit_code\":null,\"type\":\"terminal\",\"url\":null}}}}]}]}}",
         json,
     );
+}
+
+test "List: connection is additive and absent for a local window (T609)" {
+    const testing = std.testing;
+
+    const leaf: List.Node = .{ .leaf = List.empty_terminal };
+    const tabs = [_]List.Tab{.{
+        .id = "0",
+        .title = "pwsh",
+        .index = 0,
+        .selected = true,
+        .splits = &leaf,
+    }};
+    const windows = [_]List.Window{.{
+        .id = "1",
+        .title = "pwsh",
+        .target = null,
+        .focused = true,
+        .tabs = &tabs,
+    }};
+
+    const json = try (List{ .windows = &windows }).serializeResponse(testing.allocator);
+    defer testing.allocator.free(json);
+
+    // A local window carries no `connection` key at all — absence is what
+    // distinguishes it, exactly as for `chrome` and `banner`.
+    try testing.expect(std.mem.indexOf(u8, json, "connection") == null);
+}
+
+test "List: connection reports the ladder's three states (T609)" {
+    const testing = std.testing;
+
+    const leaf: List.Node = .{ .leaf = List.empty_terminal };
+    const tabs = [_]List.Tab{.{
+        .id = "0",
+        .title = "pwsh",
+        .index = 0,
+        .selected = true,
+        .splits = &leaf,
+    }};
+
+    const cases = [_]struct { conn: List.Connection, want: []const u8 }{
+        .{
+            .conn = .{ .state = "connected" },
+            .want = "\"connection\":{\"state\":\"connected\"}",
+        },
+        .{
+            .conn = .{ .state = "reconnecting", .attempt = 2 },
+            .want = "\"connection\":{\"state\":\"reconnecting\",\"attempt\":2}",
+        },
+        .{
+            .conn = .{ .state = "disconnected", .self_healable = true },
+            .want = "\"connection\":{\"state\":\"disconnected\",\"self_healable\":true}",
+        },
+        .{
+            .conn = .{ .state = "disconnected", .self_healable = false },
+            .want = "\"connection\":{\"state\":\"disconnected\",\"self_healable\":false}",
+        },
+    };
+
+    for (cases) |c| {
+        const windows = [_]List.Window{.{
+            .id = "1",
+            .title = "pwsh",
+            .target = "box",
+            .focused = true,
+            .tabs = &tabs,
+            .connection = c.conn,
+        }};
+        const json = try (List{ .windows = &windows }).serializeResponse(testing.allocator);
+        defer testing.allocator.free(json);
+        try testing.expect(std.mem.indexOf(u8, json, c.want) != null);
+        // The field a state does not carry is omitted, never emitted empty.
+        if (c.conn.attempt == null)
+            try testing.expect(std.mem.indexOf(u8, json, "attempt") == null);
+        if (c.conn.self_healable == null)
+            try testing.expect(std.mem.indexOf(u8, json, "self_healable") == null);
+    }
 }

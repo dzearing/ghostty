@@ -98,7 +98,7 @@ function Stop-TestProcs {
 
 Stop-TestProcs
 
-# T441: this run's own IPC endpoint, before any CLI call — otherwise the
+# T441: this run's own IPC endpoint, before any CLI call - otherwise the
 # Run-Cli calls below inherit the caller pane's baked `$GHOZTTY_IPC_SOCKET` and
 # open relay windows in (and +send-keys into) the user's installed release.
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
@@ -226,6 +226,35 @@ Start-Sleep -Seconds 2
 $code = Run-Cli '+list' 'list1.txt'
 Assert "relay window registered under --name" ((Get-Out 'list1.txt') -match '\[target: relwin\]')
 
+"== 1b: +list --json publishes the remote window's connection state (T609)"
+# The oracle T368 asserts the reconnect ladder against. Before this the ONLY way
+# to read a remote window's link health from outside the process was to grep the
+# app log, which is a side effect of the implementation rather than a contract.
+Run-Cli '+list --json' 'list1json.txt' | Out-Null
+$j1 = $null
+try { $j1 = (Get-Out 'list1json.txt') | ConvertFrom-Json } catch { }
+$relwin = $null; $relbase = $null
+if ($j1 -and $j1.data -and $j1.data.windows) {
+    $relwin  = $j1.data.windows | Where-Object { $_.target -eq 'relwin' }  | Select-Object -First 1
+    $relbase = $j1.data.windows | Where-Object { $_.target -eq 'relbase' } | Select-Object -First 1
+}
+Assert "the relay window is in +list --json" ($null -ne $relwin)
+Assert "it reports connection.state = connected" (
+    $null -ne $relwin -and $relwin.PSObject.Properties.Name -contains 'connection' -and
+    $relwin.connection.state -eq 'connected')
+# A healthy link carries neither of the conditional fields: a value that is
+# meaningless in a state is absent, not emitted empty.
+Assert "a connected window reports no attempt and no self_healable" (
+    $null -ne $relwin -and $null -ne $relwin.connection -and
+    ($relwin.connection.PSObject.Properties.Name -notcontains 'attempt') -and
+    ($relwin.connection.PSObject.Properties.Name -notcontains 'self_healable'))
+# Absence is what distinguishes a local window; there is no "state": "local".
+Assert "the LOCAL base window has no connection field at all" (
+    $null -ne $relbase -and $relbase.PSObject.Properties.Name -notcontains 'connection')
+if ($null -eq $relwin -or $relwin.connection.state -ne 'connected') {
+    "    +list --json said: $((Get-Out 'list1json.txt').Trim())"
+}
+
 "== 2: terminal round-trip through relay + agent"
 $code = Run-Cli '+send-keys --target=relwin "echo relay-roundtrip-ok" Enter' 'sk.txt'
 Assert "send-keys exit 0" ($code -eq 0)
@@ -265,6 +294,25 @@ $code = Run-Cli '+list' 'list2.txt' 15
 Assert "+list still answers after agent death" ($null -ne $code -and $code -eq 0)
 if ($code -ne 0) { Show-LastCli }
 Assert "app still alive (base window listed)" ((Get-Out 'list2.txt') -match '\[target: relbase\]')
+
+# T609: the field TRACKS the drop rather than being a constant. The ladder paces
+# its first attempts over seconds, so this asserts only that the window has left
+# `connected` - which of `reconnecting`/`disconnected` it is sitting in at this
+# instant is timing, and the full connected -> reconnecting(N) -> connected walk
+# is T368's.
+Run-Cli '+list --json' 'list2json.txt' 15 | Out-Null
+$j2 = $null
+try { $j2 = (Get-Out 'list2json.txt') | ConvertFrom-Json } catch { }
+$dropped = $null
+if ($j2 -and $j2.data -and $j2.data.windows) {
+    $dropped = $j2.data.windows | Where-Object { $_.target -eq 'relwin' } | Select-Object -First 1
+}
+Assert "connection.state left 'connected' once the agent died" (
+    $null -ne $dropped -and $null -ne $dropped.connection -and
+    $dropped.connection.state -in @('reconnecting', 'disconnected'))
+if ($null -ne $dropped -and $null -ne $dropped.connection) {
+    "    connection: $($dropped.connection | ConvertTo-Json -Compress)"
+}
 
 "== 7: +close tears the dead relay window down cleanly (no hang)"
 $code = Run-Cli '+close --target=relwin' 'close1.txt' 20
