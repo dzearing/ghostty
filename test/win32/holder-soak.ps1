@@ -41,6 +41,10 @@ param(
 
 $ErrorActionPreference = 'Continue'
 . (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
+# T1239: every launch below - the GUI and the CLI verbs that talk to it - goes
+# through the harness, so the windows land on a background desktop instead of
+# across whatever the user is reading.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
 . (Join-Path $PSScriptRoot 'lib\PaneLiveness.ps1')
@@ -87,17 +91,19 @@ function Stop-Everything {
 
 # --- CLI plumbing ------------------------------------------------------------
 
-# ghoztty.exe is GUI-subsystem, so a pipe reads empty; redirect through cmd and
-# bound the wait, or a wedged server hangs the script instead of failing it.
+# T1239: every CLI verb runs on the TEST DESKTOP, so a verb that auto-launches
+# the app cannot throw a window across what the user is reading. The old shape
+# was a `cmd /c "... > file"` dance, which existed only because a GUI-subsystem
+# exe writes nothing to a PowerShell redirect (T245) - the harness captures both
+# handles to a file itself, so the dance goes with it. The wait is still bounded,
+# or a wedged server hangs the script instead of failing it.
 function Run-Cli([string]$argsLine, [string]$out, [int]$timeoutSec = 20) {
-    $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
-        -ArgumentList "/c `"`"$Exe`" $argsLine > `"$out`" 2>&1`""
-    $null = $p.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
-    if (-not $p.WaitForExit($timeoutSec * 1000)) {
-        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-        return $null
-    }
-    return $p.ExitCode
+    $argv = @($argsLine -split '\s+' | Where-Object { $_ -ne '' })
+    $r = Invoke-OnTestDesktop -Exe $Exe -Arguments $argv -TimeoutSec $timeoutSec
+    $text = if ($null -ne $r.Output) { $r.Output } else { '' }
+    [System.IO.File]::WriteAllText($out, $text)
+    if ($r.TimedOut) { return $null }
+    return $r.ExitCode
 }
 function Out-Text([string]$f) { if (Test-Path $f) { return (Get-Content $f -Raw) } return '' }
 
@@ -161,6 +167,7 @@ $tmp = Join-Path $root 'run'
 $savedLocalAppData = $env:LOCALAPPDATA
 $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 $savedHolderFlag = $env:GHOZTTY_AGENT_PTY_HOLDER
+$td = New-TestDesktop
 
 try {
     New-Item -ItemType Directory -Force $tmp | Out-Null
@@ -179,12 +186,12 @@ try {
     Say "== A: $Panes persistent panes, every one of them holder-backed"
     # ========================================================================
     # persistence: on (default) - an agent-backed pane is the whole subject.
-    $app = Start-Process -FilePath $Exe -WindowStyle Minimized -PassThru `
-        -ArgumentList @('--title=soak909', '--window-width=90', '--window-height=24')
+    $app = Start-OnTestDesktop -Exe $Exe -Arguments @(
+        '--title=soak909', '--window-width=90', '--window-height=24')
     $ready = $false
     $deadline = (Get-Date).AddSeconds(60)
     while ((Get-Date) -lt $deadline) {
-        if ($app.HasExited) { break }
+        if ($null -eq (Get-Process -Id $app.Pid -ErrorAction SilentlyContinue)) { break }
         if ((Get-GhozttyListRaw -Exe $Exe) -match '"') { $ready = $true; break }
         Start-Sleep -Milliseconds 500
     }
@@ -277,6 +284,7 @@ try {
     $script:failures++
 } finally {
     Stop-Everything
+    Remove-TestDesktop | Out-Null
     $env:LOCALAPPDATA = $savedLocalAppData
     if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
     else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }

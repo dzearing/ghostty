@@ -120,6 +120,10 @@ if (-not (Test-Path $AgentExe)) {
 
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
 Assert-GhozttyIsolatedBuild -Exe $Exe | Out-Null
+# T1239: every launch below - the GUI and the CLI verbs that talk to it - goes
+# through the harness, so the windows land on a background desktop instead of
+# across whatever the user is reading.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 # --- process helpers: ONLY ever the binaries under test ----------------------
 
@@ -161,17 +165,19 @@ function Wait-NewAgent($excludePids, $timeoutSec = 45) {
 
 # --- CLI plumbing ------------------------------------------------------------
 
-# ghoztty.exe is GUI-subsystem, so a pipe reads empty; redirect through cmd and
-# bound the wait, or a wedged server hangs the script instead of failing it.
+# T1239: every CLI verb runs on the TEST DESKTOP, so a verb that auto-launches
+# the app cannot throw a window across what the user is reading. The old shape
+# was a `cmd /c "... > file"` dance, which existed only because a GUI-subsystem
+# exe writes nothing to a PowerShell redirect (T245) - the harness captures both
+# handles to a file itself, so the dance goes with it. The wait is still bounded,
+# or a wedged server hangs the script instead of failing it.
 function Run-Cli([string]$argsLine, [string]$out, [int]$timeoutSec = 15) {
-    $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
-        -ArgumentList "/c `"`"$Exe`" $argsLine > `"$out`" 2>&1`""
-    $null = $p.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
-    if (-not $p.WaitForExit($timeoutSec * 1000)) {
-        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-        return $null
-    }
-    return $p.ExitCode
+    $argv = @($argsLine -split '\s+' | Where-Object { $_ -ne '' })
+    $r = Invoke-OnTestDesktop -Exe $Exe -Arguments $argv -TimeoutSec $timeoutSec
+    $text = if ($null -ne $r.Output) { $r.Output } else { '' }
+    [System.IO.File]::WriteAllText($out, $text)
+    if ($r.TimedOut) { return $null }
+    return $r.ExitCode
 }
 function Run-CliArgs([string[]]$argv, [string]$out, [int]$timeoutSec = 15) {
     return Run-Cli ($argv -join ' ') $out $timeoutSec
@@ -269,6 +275,7 @@ $savedDurable = $env:GHOZTTY_AGENT_DURABLE_ACK
 $savedReplay = $env:GHOZTTY_AGENT_HOLDER_REPLAY_BYTES
 $savedVolume = $env:GHOZTTY_AGENT_SNAPSHOT_VOLUME_BYTES
 $savedRing = $env:GHOSTTY_AGENT_RING_BYTES
+$td = New-TestDesktop
 
 try {
     Stop-Everything
@@ -301,8 +308,8 @@ try {
     Say "== A: baseline - a holder-backed pane, and ring snapshots proven live"
     # ========================================================================
     $before = @((Get-TestAgents) | ForEach-Object { [int]$_.ProcessId })
-    Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @(
-        '--title=t969-volume', '--window-width=100', '--window-height=30') | Out-Null
+    [void](Start-OnTestDesktop -Exe $Exe -Arguments @(
+        '--title=t969-volume', '--window-width=100', '--window-height=30'))
 
     $appPid = 0
     $deadline = (Get-Date).AddSeconds(45)
@@ -417,14 +424,20 @@ try {
     $recorded = 0
     $typed = 0
     $markerSecs = -1
-    # The control arm cannot measure: with the volume trigger off nothing
-    # rewrites the snapshot file during section B, by design. It types the same
-    # chunk and dwells instead - long enough for the same flood to have gone
-    # through the pane, and short enough that the 30-second periodic pass cannot
-    # write the marker and make the control a measurement of the clock. A dwell
-    # too short for this box announces itself: the control KEEPS the marker.
-    $ControlDwellSec = 10
-    $maxChunks = if ($NegativeControl) { 1 } else { 8 }
+    # T1239: how long a chunk is given before the next one is typed. Long enough
+    # for 256 lines to print, short enough that several chunks' output is still
+    # unsaved at once.
+    $ChunkDwellSec = 2
+    # BOTH ARMS TYPE THE SAME FLOOD. The control used to type ONE chunk and
+    # dwell, which worked only while a rendering ConPTY inflated that chunk past
+    # the holder's 64 KB retention on the user's desktop; off the input desktop
+    # a chunk is about its own size, 20 KB never overruns the holder, and the
+    # control KEPT the marker for a reason that had nothing to do with the
+    # trigger it is controlling for. It now floods exactly as the measured arm
+    # does - the trigger being off is the only difference between them - and
+    # finishes well inside the 30-second periodic pass, so the clock still
+    # cannot write the marker and be mistaken for the volume.
+    $maxChunks = 8
     for ($c = 1; $c -le $maxChunks; $c++) {
         # The end marker is assembled from two halves inside the pane's command so
         # the contiguous string cannot appear in the shell's echo of the command
@@ -441,24 +454,48 @@ try {
         # Watch the ring grow (and watch for the marker landing on disk, which is
         # what B4 scores). Bounded, so a pane that prints nothing fails rather
         # than hangs.
-        $chunkDeadline = (Get-Date).AddSeconds($(if ($NegativeControl) { $ControlDwellSec } else { 60 }))
+        # T1239: the chunks go BACK TO BACK. The old shape waited up to 60 s on
+        # every one of them - longer than the agent's 30-second periodic pass -
+        # so each chunk's output was written out (and the unsaved counter reset
+        # to zero) before the next chunk arrived, and no amount of flooding
+        # could reach the volume threshold by accumulation. That was invisible
+        # while the script ran on the user's own desktop: a rendering ConPTY
+        # re-renders a scrolling flood into ~17x its payload, so ONE chunk
+        # cleared the 32 KB trigger on its own. Off the input desktop nothing
+        # re-renders, a chunk arrives at about the size it says it is, and
+        # 20 KB sits just under the trigger - measured, both ways, on box. The
+        # short dwell is what lets unsaved output PILE UP, which is the
+        # condition the trigger exists to notice. Patience for a slow box moved
+        # to the settle loop after the flood, where waiting cannot suppress the
+        # very thing being measured.
+        $chunkDeadline = (Get-Date).AddSeconds($ChunkDwellSec)
         while ((Get-Date) -lt $chunkDeadline) {
             Start-Sleep -Milliseconds 700
             if ($markerSecs -lt 0 -and (Ring-Has $tmp $marker)) {
                 $markerSecs = [int]((Get-Date) - $snapshotAt).TotalSeconds
             }
-            if ($NegativeControl) { continue }
             $recorded = (Ring-LenFor $tmp $sessionId) - $ringLenBefore
             if ($recorded -ge $floodTarget -or $recorded -ge $floodCeiling) { break }
         }
         $typed += $FloodChunkLines * $FloodWidth
         $secs = [Math]::Round(((Get-Date) - $t0).TotalSeconds, 1)
-        if ($NegativeControl) {
-            Say "    chunk $c (control) : $($FloodChunkLines * $FloodWidth) B typed, dwelt $secs s"
-            break
-        }
-        Say "    chunk $c : $($FloodChunkLines * $FloodWidth) B typed; ring has recorded $recorded B in $secs s"
+        $arm = if ($NegativeControl) { ' (control)' } else { '' }
+        Say "    chunk $c$arm : $($FloodChunkLines * $FloodWidth) B typed; ring has recorded $recorded B in $secs s"
         if ($recorded -ge $floodTarget -or $recorded -ge $floodCeiling) { break }
+    }
+    # T1239: settle. The chunks were typed back to back, so the pane can still
+    # be printing when the last one is sent - wait for the ring to reach the
+    # target rather than scoring it at the instant the typing stopped. Waiting
+    # HERE cannot mask the trigger the way the old per-chunk wait did: the
+    # output that has to cross the threshold is already through the pane.
+    $settleDeadline = (Get-Date).AddSeconds(30)
+    while (-not $NegativeControl -and (Get-Date) -lt $settleDeadline) {
+        if ($recorded -ge $floodTarget -or $recorded -ge $floodCeiling) { break }
+        Start-Sleep -Milliseconds 700
+        if ($markerSecs -lt 0 -and (Ring-Has $tmp $marker)) {
+            $markerSecs = [int]((Get-Date) - $snapshotAt).TotalSeconds
+        }
+        $recorded = (Ring-LenFor $tmp $sessionId) - $ringLenBefore
     }
     $floodSecs = [int]((Get-Date) - $snapshotAt).TotalSeconds
     Say "    (flood done $floodSecs s after the last snapshot; the periodic pass is 30 s)"
@@ -532,6 +569,7 @@ try {
     Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Stop-Everything
+    Remove-TestDesktop | Out-Null
     $env:LOCALAPPDATA = $savedLocalAppData
     if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
     else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }

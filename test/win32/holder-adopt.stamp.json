@@ -1,11 +1,14 @@
 {
     "guard":  "holder-adopt",
     "script":  "test/win32/holder-adopt.ps1",
-    "generated":  "2026-08-21T00:23:17-07:00",
-    "commit":  "a905a5363",
+    "generated":  "2026-09-01T18:20:36-07:00",
+    "commit":  "f8bb7f773",
+    "uncommitted":  [
+                        "test/win32/holder-adopt.ps1"
+                    ],
     "files":  {
                   "src/remote/agent/holder_adopt.zig":  "c94413cc4f7107cec2c783cc4168e36ff7b889f63ce68ea49421c09b58832efe",
                   "src/remote/agent/session_meta.zig":  "e4ed838dea2d904f1c095c50fbb84b9f32c76441c39a0543896e5f092df6624b",
-                  "test/win32/holder-adopt.ps1":  "851ec480e8d062783ea82e871c56f98bd6489425820138e2c2b96b58a44a7383"
+                  "test/win32/holder-adopt.ps1":  "d635bd7fa24d0818bf3160338f15415b28af2a7065221ab6670d01b17569107b"
               }
 }

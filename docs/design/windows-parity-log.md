@@ -19565,3 +19565,49 @@ back - so the migration only made a live defect reproducible on demand.
 Floor: lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS; plus every harness
 the edit made due - isolation-meta, launch-preflight, verdict-exit, cleanslate,
 stderr-capture, test-desktop, desktop-launch - all green.
+
+## 2026-09-01 - the persistent-session tests stopped opening windows on the user's desktop (T1239)
+
+The five pty-holder acceptance scripts - `holder-adopt`, `holder-durable`,
+`holder-soak`, `holder-volume` and `pty-holder` - started the app from a process
+sitting on the user's own desktop, so running any of them threw a terminal
+window across whatever they were reading. All five now launch through the
+harness (`Start-OnTestDesktop` / `Invoke-OnTestDesktop`), which names a
+background desktop in the child's STARTUPINFO, and their CLI verbs go the same
+way - which also retires the `cmd /c "... > file"` dance each of them carried
+because a GUI-subsystem exe writes nothing to a PowerShell redirect (T245).
+[[T1193]]'s pending-migration list went 33 -> 28.
+
+Four were the mechanical recipe and are green unchanged. `holder-volume` was
+not, and what it turned up is worth more than the migration: **a background
+desktop does not just cost pixels, it costs OUTPUT VOLUME.** On the user's
+desktop the app renders every frame, so a ConPTY answers a scrolling flood by
+re-rendering it - 20 KB of payload reached the agent's ring as ~348 KB, about
+17x. Off the input desktop nothing re-renders and the same flood arrives at
+about its own size, ~27 KB. The script's premise, "more output than the holder
+can hold", was being met by that amplification rather than by the payload, and
+the 32 KB volume trigger it exists to measure never fired; the 30-second
+periodic pass wrote the marker instead and B4 went red. Its own shape made that
+worse: it waited up to 60 s on EVERY chunk, longer than the periodic pass, so
+each chunk was written out and the unsaved counter reset before the next chunk
+arrived - no amount of flooding could ever accumulate past the threshold.
+
+So the chunks now go back to back (a 2 s dwell), with the patience moved to a
+settle loop AFTER the flood, where waiting cannot suppress the thing being
+measured. The marker now reaches disk 3 s after the previous snapshot instead
+of 30, which is the volume trigger being measured rather than the clock. The
+negative control needed the same fix from the other side: it typed ONE chunk,
+which without amplification never overran the holder's 64 KB retention, so the
+marker was NOT lost and the control failed for a reason that had nothing to do
+with the trigger it controls for. Both arms now type the same flood and the
+trigger being off is the only difference between them.
+
+Filed [[T1266]]: any acceptance script whose premise is a volume of terminal
+output may have been passing on amplification it no longer gets, and that
+failure is silent - the assertion still runs, still passes, and measures a
+smaller thing than it claims.
+
+Floor: lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS; the five scripts
+green (24/15/9/17/25 assertions) plus `holder-volume -NegativeControl`; and
+every harness the edit made due - isolation-meta, launch-preflight, verdict-exit,
+cleanslate, stderr-capture, test-desktop, desktop-launch - green.

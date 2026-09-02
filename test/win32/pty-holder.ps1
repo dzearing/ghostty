@@ -60,6 +60,18 @@ if (-not (Test-Path $AgentExe)) {
 
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
 Assert-GhozttyIsolatedBuild -Exe $Exe | Out-Null
+# T1239: every launch below - the GUI and the CLI verbs that talk to it - goes
+# through the harness, so the windows land on a background desktop instead of
+# across whatever the user is reading.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
+# One line of CLI plumbing: run a `+verb` on the test desktop and hand back the
+# result object (ExitCode / Output / TimedOut). It captures stdout and stderr to
+# a file itself, so the `2>$null | Out-String` shape a GUI-subsystem exe needs
+# (T245) goes with it.
+function Ghoz([string[]]$argv, [int]$timeoutSec = 15) {
+    return Invoke-OnTestDesktop -Exe $Exe -Arguments $argv -TimeoutSec $timeoutSec
+}
 
 # --- process helpers: ONLY ever the binaries under test ----------------------
 
@@ -130,7 +142,7 @@ function Wait-SessionsFile([string]$root, [int]$timeoutSec = 40) {
 # holder is still alive, the shell is still its child - and only shows up when
 # somebody asks what the reported number actually names (T355).
 function Get-PaneShellPid {
-    $json = & $Exe +list --json 2>$null | Out-String
+    $json = (Ghoz @('+list', '--json')).Output
     if (-not $json) { return 0 }
     try { $tree = $json | ConvertFrom-Json } catch { return 0 }
     $root = if ($tree.PSObject.Properties.Name -contains 'data') { $tree.data } else { $tree }
@@ -188,12 +200,12 @@ function Invoke-Arm([bool]$HolderOn, [string]$Tag) {
     $before = @((Get-TestAgents) | ForEach-Object { [int]$_.ProcessId })
 
     # persistence: on (default) - an agent-backed pane is the whole subject.
-    $app = Start-Process -FilePath $Exe -ArgumentList @("--title=holder-$Tag") -PassThru
+    $app = Start-OnTestDesktop -Exe $Exe -Arguments @("--title=holder-$Tag")
     $ready = $false
     $deadline = (Get-Date).AddSeconds(40)
     while ((Get-Date) -lt $deadline) {
-        if (-not (Test-Alive $app.Id)) { break }
-        $out = (& $Exe +list 2>$null) | Out-String
+        if (-not (Test-Alive $app.Pid)) { break }
+        $out = (Ghoz @('+list')).Output
         if ($out -match '\S') { $ready = $true; break }
         Start-Sleep -Milliseconds 500
     }
@@ -218,7 +230,7 @@ function Invoke-Arm([bool]$HolderOn, [string]$Tag) {
     return [pscustomobject]@{
         Root       = $root
         Ready      = $ready
-        AppPid     = $app.Id
+        AppPid     = $app.Pid
         AgentPid   = $agentPid
         MetaPath   = $metaPath
         HolderPipe = $holderPipe
@@ -231,6 +243,7 @@ $savedAgentBin = $env:GHOSTTY_LOCAL_AGENT_BIN
 $savedHolderFlag = $env:GHOZTTY_AGENT_PTY_HOLDER
 $savedPipe = $env:GHOZTTY_PIPE_SUFFIX
 $savedSocket = $env:GHOZTTY_IPC_SOCKET
+$td = New-TestDesktop
 
 # A private endpoint so nothing here can reach the user's terminal. The suffix
 # OUTRANKS the baked GHOZTTY_IPC_SOCKET inherited from the pane this was
@@ -333,6 +346,7 @@ try {
     Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Stop-TestProcs
+    Remove-TestDesktop | Out-Null
     $env:LOCALAPPDATA = $savedLocalAppData
     if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
     else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }
