@@ -3468,20 +3468,41 @@ for exactly that reason.
 
 A trivially small window is exempt: a 16x16 tool window really can be one
 color, and a guard that fires on it is noise.
+
+THE GRID IS DENSITY-BOUNDED, NOT COUNT-BOUNDED (T1282). `-Samples` alone makes
+the step proportional to the window, so the bigger the window the coarser the
+look - and the one thing this guard must never do is miss the painted part of a
+capture that has one. A MAXIMIZED ghoztty window is the case that broke it: at
+3858x2118 the fixed 24x24 grid steps 160x88 px, the only GDI-painted region is
+the 40 px caption band across the top (the rest is the terminal's flat fill,
+which is a documented limit and not a failure), and NOT ONE sample row landed
+inside the band. `caption-bar.ps1` section 6 therefore died with "the capture is
+UNIFORM" every run - a harness blind spot wearing a caption regression's
+clothes, which is the class of red that costs a turn every time it is believed.
+
+So `-MaxStep` caps the stride regardless of size: nothing thicker than it can
+hide between sample lines. 16 px is the number because the smallest thing the
+suite asserts on is the 32 DIP caption band, which is 32 px at 100% scale - two
+sample rows inside it at the worst scale, three at this box's 1.25. The cost is
+paid only when the capture really is flat: the scan returns on the FIRST
+disagreeing sample, so a healthy capture still ends after a handful of pixels,
+and the dense sweep only runs to completion on the path that was going to throw
+anyway.
 #>
 function Test-TestCaptureUniform {
     param(
         [Parameter(Mandatory = $true)]$Shot,
         [int]$Inset = 8,
         [int]$MinSide = 64,
-        [int]$Samples = 24
+        [int]$Samples = 24,
+        [int]$MaxStep = 16
     )
     if ($Shot.Width -lt $MinSide -or $Shot.Height -lt $MinSide) { return $false }
     $x1 = $Shot.Width - $Inset
     $y1 = $Shot.Height - $Inset
     if ($x1 -le $Inset -or $y1 -le $Inset) { return $false }
-    $stepX = [math]::Max(1, [int](($x1 - $Inset) / $Samples))
-    $stepY = [math]::Max(1, [int](($y1 - $Inset) / $Samples))
+    $stepX = [math]::Min($MaxStep, [math]::Max(1, [int](($x1 - $Inset) / $Samples)))
+    $stepY = [math]::Min($MaxStep, [math]::Max(1, [int](($y1 - $Inset) / $Samples)))
     $first = $null
     for ($y = $Inset; $y -lt $y1; $y += $stepY) {
         for ($x = $Inset; $x -lt $x1; $x += $stepX) {
@@ -3604,7 +3625,10 @@ function Get-TestWindowPixels {
                    "bitmap that 'is it dark?' assertions pass against for free (T303). The usual cause " +
                    "is a WinUI/XAML window - Settings, Task Manager, most of the Win11 shell - which " +
                    "composites through DirectComposition and never paints into the window DC: " +
-                   "PrintWindow sees GDI, not composition. A Win11 app therefore cannot be a pixel " +
+                   "PrintWindow sees GDI, not composition. What this is NOT any more is a window that " +
+                   "is mostly flat with a thin painted band - the grid is density-bounded since T1282, " +
+                   "so a 32 DIP caption band cannot hide between sample rows however big the window is. " +
+                   "A Win11 app therefore cannot be a pixel " +
                    "REFERENCE at all; measure Windows metrics through SystemParametersInfoForDpi / " +
                    "GetSystemMetrics / uxtheme / DWM instead, and cite Fluent as documentation rather " +
                    "than as a measurement. The other cause is a window that had not painted yet, which " +

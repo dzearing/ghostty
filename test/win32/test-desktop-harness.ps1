@@ -328,6 +328,32 @@ if (Test-Path -LiteralPath $refPng) {
 } else {
     Assert $false "the committed hero screenshot is missing ($refPng)"
 }
+
+# --- the thin-band capture (T1282) ------------------------------------------
+# A MAXIMIZED ghoztty window, to scale: 3858x2118, black terminal glass over
+# almost all of it (PrintWindow cannot read that surface - documented limit),
+# and the 40 px caption band across the top, which is the ONLY GDI-painted
+# region and the one caption-bar.ps1 section 6 measures.
+#
+# The old count-bounded grid stepped 160x88 px here and put not one sample row
+# inside the band, so `Get-TestWindowPixels` threw "the capture is UNIFORM" on a
+# capture that was perfectly good - the red read as a caption regression for as
+# long as anyone believed it. Both halves are asserted: the guard must pass this
+# shot, AND the old grid must be shown to have missed it, or the fix is a number
+# nobody can tell from the one it replaced.
+$band = New-Object System.Drawing.Bitmap 3858, 2118
+$g = [System.Drawing.Graphics]::FromImage($band)
+$g.Clear([System.Drawing.Color]::FromArgb(0, 0, 0))
+$br = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(20, 20, 20))
+$g.FillRectangle($br, 9, 9, 3840, 40)   # client origin 9,9; 40 px band (32 DIP @ 1.25)
+$br.Dispose(); $g.Dispose()
+$bandShot = New-FakeShot $band
+Assert (-not (Test-TestCaptureUniform -Shot $bandShot)) `
+    'the uniform guard PASSES a maximized-window capture whose only painted region is the 40 px caption band'
+Assert (Test-TestCaptureUniform -Shot $bandShot -MaxStep 100000) `
+    'and the count-bounded grid it replaced called that same capture UNIFORM (the red T1282 re-attributed)'
+$band.Dispose()
+
 $flat.Dispose(); $near.Dispose(); $busy.Dispose()
 
 Kill-RepoInstances

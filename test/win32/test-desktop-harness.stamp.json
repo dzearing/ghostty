@@ -1,15 +1,15 @@
 {
     "guard":  "test-desktop",
     "script":  "test/win32/test-desktop-harness.ps1",
-    "generated":  "2026-09-02T08:53:52-07:00",
-    "commit":  "43fb9f1de",
+    "generated":  "2026-09-02T09:05:57-07:00",
+    "commit":  "a566113be",
     "uncommitted":  [
                         "test/win32/lib/TestDesktop.ps1",
                         "test/win32/test-desktop-harness.ps1"
                     ],
     "files":  {
                   "test/win32/lib/DesktopCapability.ps1":  "a4fbf1c197f5b0eb6a052ea00151c8f8d36cb569baa6ee3006770f975b202700",
-                  "test/win32/lib/TestDesktop.ps1":  "6df92c65c6965d6d7da4855aeb31a0a6b9cc729c2682c73aa68810d7c85c22a3",
-                  "test/win32/test-desktop-harness.ps1":  "e05fb80fa90938b4b77844e9f3de8a7152fe111167acadfd7ab1e882be51e4c3"
+                  "test/win32/lib/TestDesktop.ps1":  "6995c775850f6a64c84d19d1e10c9a2717d2474c21de37d627783b4243f494a0",
+                  "test/win32/test-desktop-harness.ps1":  "f14b6c0c52ba9c6f2d4ffbbb4a3153f001c60f6698f99ffadd7a87a7b060bc46"
               }
 }
