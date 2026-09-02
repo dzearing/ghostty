@@ -27,6 +27,8 @@
 # of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
 # test never wants the caller pane's endpoint.
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+# T1241: the GUI launches on the background test desktop, not the user's.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 $ErrorActionPreference = 'Stop'
 # T675: suppress the app's startup job self-escape - this harness tracks the
 # pids it launches, and a pane-launched app would otherwise hand its work to
@@ -88,13 +90,16 @@ function Launch-Gui([string]$healEnv) {
         # in a row; with it on, each launch writes the manifest the NEXT one
         # restores, so the later arms start with panes the self-heal check never
         # asked for (T158).
-        $proc = Start-Process -FilePath $exe -ArgumentList '--session-persistence=false' -PassThru
+        # T1241: on the TEST desktop, so the window this throws up does not land
+        # across whatever the user is reading. The env var above still reaches it -
+        # StartProcess passes a null lpEnvironment, so the child inherits ours.
+        $app = Start-OnTestDesktop -Exe $exe -Arguments @('--session-persistence=false')
     } finally {
         Remove-Item Env:GHOZTTY_PATH_SELFHEAL -ErrorAction SilentlyContinue
     }
     Start-Sleep -Seconds 3
-    $alive = -not $proc.HasExited
-    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    $alive = -not $app.Process.HasExited
+    Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue
     return $alive
 }
 
@@ -106,6 +111,8 @@ function Wait-PathContains([string]$needle, [int]$secs) {
     }
     return $false
 }
+
+$td = New-TestDesktop
 
 $orig = Get-UserPathRaw
 if ($null -eq $orig.Kind) {
@@ -161,6 +168,7 @@ try {
     Kill-RepoInstances
     Set-UserPathRaw $orig.Value $orig.Kind
     Remove-Item Env:GHOZTTY_T70_DIR -ErrorAction SilentlyContinue
+    Remove-TestDesktop | Out-Null
 }
 
 $restored = Get-UserPathRaw

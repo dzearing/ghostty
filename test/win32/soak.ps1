@@ -254,6 +254,8 @@ while ($true) {
 # "fresh" — a soak that inherits the previous run's persisted pane is soaking
 # a pane nobody just created, with hours of its own scrollback already in it.
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+# T1241: the auto-launch below goes to the background test desktop.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 # T350: -AllowReleaseBuild, said out loud. This harness's SUBJECT is the release
 # build (its whole point is grading what ships), so it is the one caller that
 # legitimately runs an exe whose endpoints are not the -debug ones. The run-unique
@@ -263,14 +265,24 @@ Reset-GhozttyTestState -Exe $exe -SettleMs 500 -AllowReleaseBuild | Out-Null
 
 # Auto-launch flow: +new-window spawns the GUI (detached) when no soak
 # instance answers, and names the window.
-& $exe +new-window --target=soak --shell=cmd | Out-Null
+#
+# T1241: the CLI runs on the BACKGROUND test desktop, and the app it auto-spawns
+# inherits that desktop - so a soak no longer parks four load-generating panes
+# across whatever the user is reading. -AllowReleaseBuild for the same reason
+# Reset-GhozttyTestState above takes it: the release build IS this harness's
+# subject.
+$td = New-TestDesktop
+[void](Invoke-OnTestDesktop -Exe $exe -Arguments @('+new-window', '--target=soak', '--shell=cmd') `
+    -AllowReleaseBuild -TimeoutSec 60)
 Start-Sleep -Seconds 3
 $gui = @(Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
     Where-Object { $_.ExecutablePath -eq $exe } |
     Where-Object { $_.ProcessId -ne $PID })
+# The window is on the test desktop, so .NET's MainWindowHandle - which
+# enumerates the CALLER's desktop - reads 0 for every one of these processes.
+# Ask the desktop that actually has the window.
 $gui = @($gui | Where-Object {
-    $p = Get-Process -Id $_.ProcessId -ErrorAction SilentlyContinue
-    $p -and $p.MainWindowHandle -ne 0 })
+    (Get-TestWindow -ProcessId $_.ProcessId -Class 'GhozttyWindow') -ne [IntPtr]::Zero })
 # An ABORT after the GUI exists used to `exit 1` straight past the teardown at
 # the bottom of this script, leaving the three load generators pinning the box
 # and the sandbox agent running. On 2026-08-31 that turned one aborted setup
@@ -282,6 +294,7 @@ function Abort-Soak([string]$why) {
     & $exe +close --target=soak 2>$null | Out-Null
     Start-Sleep -Seconds 1
     try { [void](Stop-RepoGhoztty -Exe $exe -SettleMs 1500) } catch { Rep "  (teardown: $_)" }
+    try { Remove-TestDesktop | Out-Null } catch { }
     exit 1
 }
 
@@ -571,6 +584,7 @@ if ($procAlive) {
 # repo, so this can only ever reach zig-out-release's own processes - never the
 # installed agent holding the user's panes.
 [void](Stop-RepoGhoztty -Exe $exe -SettleMs 1500)
+Remove-TestDesktop | Out-Null
 
 # --- T1158: the bystander check ------------------------------------------------
 # The point of the whole sandbox, asserted rather than assumed. Read the user's

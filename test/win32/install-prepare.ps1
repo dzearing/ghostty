@@ -65,6 +65,9 @@ Set-StrictMode -Off
 
 . (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
+# T1241: section L's holder and prepare steps run on the background test
+# desktop, not the user's.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 $script:passes = 0
 $script:failures = 0
@@ -311,6 +314,7 @@ if (-not (Test-Path -LiteralPath $Exe)) {
     $root = Join-Path ([System.IO.Path]::GetTempPath()) ("install-prepare-live-" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $root | Out-Null
     $holder = $null
+    $td = New-TestDesktop
     try {
         # The throwaway "install": a copy of the agent under the name an
         # installer would replace, plus a stale sideline for the sweep control.
@@ -324,9 +328,9 @@ if (-not (Test-Path -LiteralPath $Exe)) {
         # rather than of a file lock we invented. Its pipe is named for a
         # per-run session id, so it cannot collide with the user's sessions.
         $sid = 't1207-' + [guid]::NewGuid().ToString('N').Substring(0, 12)
-        $holder = Start-Process -FilePath $agentPath `
-            -ArgumentList @('--pty-host', "--session-id=$sid") `
-            -WindowStyle Hidden -PassThru
+        $holderApp = Start-OnTestDesktop -Exe $agentPath `
+            -Arguments @('--pty-host', "--session-id=$sid")
+        $holder = $holderApp.Process
         $deadline = (Get-Date).AddSeconds(10)
         while ((Get-Date) -lt $deadline -and -not $holder.HasExited) {
             # The holder is up as soon as it has the image mapped, which is
@@ -345,9 +349,12 @@ if (-not (Test-Path -LiteralPath $Exe)) {
             # that measured the directory before the step had run would be a
             # coin flip. (The exit code is read off the waited-on object, never
             # off $LASTEXITCODE, which is empty for a Start-Process child.)
-            $prep = Start-Process -FilePath $Exe `
-                -ArgumentList @('--install-prepare', "--install-dir=$root") `
-                -WindowStyle Hidden -Wait -PassThru
+            # T1241: on the TEST desktop. `--install-prepare` opens no window
+            # of its own, but ghoztty.exe is a GUI-subsystem image and a step
+            # that ever did would put it on the user's screen. Invoke-OnTestDesktop
+            # waits the way -Wait did and hands back the same exit code.
+            $prep = Invoke-OnTestDesktop -Exe $Exe `
+                -Arguments @('--install-prepare', "--install-dir=$root") -TimeoutSec 120
             $prepExit = $prep.ExitCode
 
             $sidelined = @(Get-ChildItem -LiteralPath $root -Filter 'ghoztty-agent.exe.old-*' -File |
@@ -375,9 +382,8 @@ if (-not (Test-Path -LiteralPath $Exe)) {
             # holder is still running out of it, so the sweep must leave it be.)
             $sidelinesBefore = @(Get-ChildItem -LiteralPath $root -Filter 'ghoztty-agent.exe.old-*' -File |
                 ForEach-Object { $_.Name } | Sort-Object)
-            $prep2 = Start-Process -FilePath $Exe `
-                -ArgumentList @('--install-prepare', "--install-dir=$root") `
-                -WindowStyle Hidden -Wait -PassThru
+            $prep2 = Invoke-OnTestDesktop -Exe $Exe `
+                -Arguments @('--install-prepare', "--install-dir=$root") -TimeoutSec 120
             $sidelinesAfter = @(Get-ChildItem -LiteralPath $root -Filter 'ghoztty-agent.exe.old-*' -File |
                 ForEach-Object { $_.Name } | Sort-Object)
             Assert 'L6 an unlocked image is left alone (no churn on a normal install)' `
@@ -393,6 +399,7 @@ if (-not (Test-Path -LiteralPath $Exe)) {
         }
         Start-Sleep -Milliseconds 300
         Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-TestDesktop | Out-Null
     }
 }
 

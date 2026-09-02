@@ -29,6 +29,11 @@ param(
 # a respawned twin mid-test.
 $env:GHOZTTY_NO_STARTUP_ESCAPE = '1'
 
+# T1241: the crasher is started on the background test desktop rather than the
+# user's - see the launch below.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+$td = New-TestDesktop
+
 # isolation: none - this script never launches ghoztty and never runs a CLI
 # verb; it builds a scratch crasher (av.exe), reads the Application event log,
 # and runs floor-lane's self-test. There is no IPC endpoint to isolate.
@@ -106,10 +111,12 @@ Check 'crasher built' (Test-Path $exe) "$buildOut"
 
 if (Test-Path $exe) {
     $since = (Get-Date).AddSeconds(-2)
-    $p = Start-Process -FilePath $exe -PassThru -Wait -WindowStyle Hidden
-    # Cache the handle before the child exits or ExitCode reads empty.
-    $null = $p.Handle
-    $code = $p.ExitCode
+    # T1241: the crasher runs on the BACKGROUND test desktop, so nothing it
+    # throws up (a console, a WER dialog) lands on the user's screen. The
+    # helper waits and hands back the raw Win32 exit code, so the 0xC0000005
+    # assertions below read exactly what Start-Process's ExitCode read.
+    $r = Invoke-OnTestDesktop -Exe $exe -TimeoutSec 60
+    $code = $r.ExitCode
     Check 'a real AV exits with 0xC0000005' ($code -eq -1073741819) "got $code"
     Check 'that code truncates to the 5 zig prints' ((($code -band 0xFF)) -eq 5) "got $($code -band 0xFF)"
 
@@ -163,6 +170,7 @@ Check 'floor-lane self-test still passes with the diagnostic wired in' ($laneTex
 
 # --------------------------------------------------------------------- cleanup
 
+Remove-TestDesktop | Out-Null
 Remove-Item $logDir -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item $crashDir -Recurse -Force -ErrorAction SilentlyContinue
 

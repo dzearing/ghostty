@@ -37,12 +37,17 @@ param([string]$ExePath)
 $env:GHOZTTY_NO_STARTUP_ESCAPE = '1'
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+# T1241: every launch below - the app and the applier copy - goes to the
+# background test desktop.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 [void](Set-GhozttyTestIsolation -Tag 't1178')
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
 if ($ExePath) { $exe = $ExePath }
 if (-not (Test-Path $exe)) { Write-Host "SETUP FAIL: $exe missing (zig build first)"; exit 1 }
 Assert-GhozttyIsolatedBuild -Exe $exe | Out-Null
+
+$td = New-TestDesktop
 
 $script:pass = 0
 $script:fail = 0
@@ -58,47 +63,21 @@ function Kill-RepoInstances {
 # T1206: a non-zero msiexec now raises Ghoztty's own modal and HOLDS it until it
 # is read, so the applier no longer exits on its own after a rejection. That
 # message is `update-failure-visible.ps1`'s subject; here it is just something
-# to dismiss so the choreography this script tests can finish. WM_CLOSE is
-# posted, not sent - the target is another process's modal loop.
-if (-not ('Ghoztty.ApplierDialog' -as [type])) {
-    Add-Type -TypeDefinition @'
-using System;
-using System.Collections.Generic;
-using System.Runtime.InteropServices;
-using System.Text;
+# to dismiss so the choreography this script tests can finish.
 
-namespace Ghoztty {
-    public class ApplierDialog {
-        delegate bool EnumProc(IntPtr hwnd, IntPtr lp);
-        [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr lp);
-        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        static extern int GetClassNameW(IntPtr h, StringBuilder buf, int max);
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        static extern bool PostMessageW(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
-
-        public static int CloseAll(int procId, string cls) {
-            var hits = new List<IntPtr>();
-            EnumWindows((h, lp) => {
-                uint owner; GetWindowThreadProcessId(h, out owner);
-                if (owner != (uint)procId) return true;
-                var sb = new StringBuilder(256);
-                GetClassNameW(h, sb, sb.Capacity);
-                if (sb.ToString() == cls) hits.Add(h);
-                return true;
-            }, IntPtr.Zero);
-            foreach (var h in hits) PostMessageW(h, 0x0010, IntPtr.Zero, IntPtr.Zero);
-            return hits.Count;
-        }
-    }
-}
-'@
-}
-
+# T1241: the dialog is on the TEST desktop now, where the private EnumWindows
+# P/Invoke this used to call cannot see it - enumeration is per-desktop and runs
+# on the caller's. The harness enumerates and closes on its own worker thread,
+# which IS bound to that desktop, so the same "find every confirm dialog this pid
+# owns and close it" is being done, one desktop over.
 function Close-ApplierDialog([int]$procId, [int]$timeoutMs = 30000) {
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
     while ($sw.ElapsedMilliseconds -lt $timeoutMs) {
-        if ([Ghoztty.ApplierDialog]::CloseAll($procId, 'GhozttyConfirmDialog') -gt 0) { return $true }
+        $found = @(Get-TestWindows -ProcessId $procId -Class 'GhozttyConfirmDialog')
+        if ($found.Count -gt 0) {
+            foreach ($w in $found) { [void](Send-TestWindowClose -Window ([IntPtr]$w.Hwnd)) }
+            return $true
+        }
         Start-Sleep -Milliseconds 200
     }
     return $false
@@ -178,8 +157,11 @@ function Run-Scenario([string]$label, [string]$updateUrl, [string[]]$extraArgs =
         $args = @('--session-persistence=false') + $extraArgs
         $proc = $null
         foreach ($attempt in 1, 2) {
-            $proc = Start-Process -FilePath $exe -ArgumentList $args -PassThru -RedirectStandardError $errFile
-            $null = $proc.Handle
+            # T1241: on the TEST desktop, so ten scenario launches do not throw
+            # ten windows across the user's screen. -StdErr is the same capture
+            # -RedirectStandardError was, and it is what every Assert reads.
+            $app = Start-OnTestDesktop -Exe $exe -Arguments $args -StdErr $errFile
+            $proc = $app.Process
             $deadline = (Get-Date).AddSeconds($waitSecs)
             while ((Get-Date) -lt $deadline -and -not $proc.HasExited) { Start-Sleep -Milliseconds 500 }
             if (-not $proc.HasExited) { break }
@@ -273,8 +255,11 @@ Copy-Item $exe $applier -Force
 $errFile = Join-Path $work 'applier-bad.err.txt'
 $env:GHOZTTY_UPDATE_APPLY = 'this is not a spec'
 try {
-    $p = Start-Process -FilePath $applier -PassThru -RedirectStandardError $errFile
-    $null = $p.Handle
+    # T1241: the applier goes on the test desktop too. It is a COPY of
+    # ghoztty.exe, so the analyzer's `$exe` rule never saw this launch - but a
+    # copy relaunches a real terminal window in section 8 all the same.
+    $pa = Start-OnTestDesktop -Exe $applier -StdErr $errFile
+    $p = $pa.Process
     $exited = $p.WaitForExit(20000)
 } finally {
     Remove-Item Env:GHOZTTY_UPDATE_APPLY -ErrorAction SilentlyContinue
@@ -301,12 +286,12 @@ New-FakePackage $applyMsi
 $errFile = Join-Path $work 'applier-run.err.txt'
 $env:GHOZTTY_UPDATE_APPLY = "$deadPid|$applyMsi|$exe"
 try {
-    $p = Start-Process -FilePath $applier -PassThru -RedirectStandardError $errFile
-    $null = $p.Handle
+    $pa = Start-OnTestDesktop -Exe $applier -StdErr $errFile
+    $p = $pa.Process
     # The rejection raises the T1206 dialog and the applier waits on it; dismiss
     # it, then let the process finish the way it does once a user has read the
     # message.
-    $dismissed = Close-ApplierDialog $p.Id
+    $dismissed = Close-ApplierDialog $pa.Pid
     $exited = $p.WaitForExit(120000)
 } finally {
     Remove-Item Env:GHOZTTY_UPDATE_APPLY -ErrorAction SilentlyContinue
@@ -332,8 +317,8 @@ Kill-RepoInstances
 $errFile = Join-Path $work 'applier-inside.err.txt'
 $env:GHOZTTY_UPDATE_APPLY = "$deadPid|$applyMsi|$exe"
 try {
-    $p = Start-Process -FilePath $exe -PassThru -RedirectStandardError $errFile
-    $null = $p.Handle
+    $pi = Start-OnTestDesktop -Exe $exe -StdErr $errFile
+    $p = $pi.Process
     $exited = $p.WaitForExit(60000)
 } finally {
     Remove-Item Env:GHOZTTY_UPDATE_APPLY -ErrorAction SilentlyContinue
@@ -376,6 +361,7 @@ Assert ($verSrc -match 'install_location\.autoUpdateCheckEnabled\(uc_arena\.allo
     'gate: +version reports the same answer too'
 
 Clear-Staging
+Remove-TestDesktop | Out-Null
 Write-Host ''
 # The captured stderr IS the evidence for most of these assertions, so it only
 # goes away on a clean run - a red that deletes its own diagnostics costs the

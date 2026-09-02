@@ -27,42 +27,25 @@ function Assert([bool]$cond, [string]$label) {
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
 }
 
-Add-Type @'
-using System;
-using System.Text;
-using System.Runtime.InteropServices;
-public class WheelDrv {
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindowExW(IntPtr parent, IntPtr after, string cls, string title);
-    [DllImport("user32.dll")] public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr w, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
+# T1241: the app launches ON THE TEST DESKTOP, so the window and the surface it
+# posts wheel notches at both live there. That costs the private WheelDrv
+# P/Invoke this script used to carry: EnumWindows and PostMessageW run on the
+# caller's desktop, which is no longer where the app is. Wait-TestWindow /
+# Get-TestChildWindow find the same two windows on the worker thread bound to
+# the test desktop, and Send-TestRawMessage posts the SAME WM_MOUSEWHEEL - the
+# wparam below is the identical detent encoding the old Notch() built.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
-    public static IntPtr FindTop(uint pid) {
-        IntPtr found = IntPtr.Zero;
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            if (p == pid && IsWindowVisible(h)) {
-                var sb = new StringBuilder(64);
-                GetClassNameW(h, sb, 64);
-                if (sb.ToString() == "GhozttyWindow") { found = h; return false; }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return found;
-    }
-
-    // Post one WM_MOUSEWHEEL with the given detent delta (+120 up, -120
-    // down) straight to the surface HWND. The handler only reads the
-    // delta from wParam, so lParam coords and focus do not matter.
-    public static void Notch(IntPtr surface, int delta) {
-        IntPtr w = (IntPtr)((long)((uint)((delta & 0xFFFF) << 16)));
-        PostMessageW(surface, 0x020A, w, IntPtr.Zero);
-    }
+function Notch([IntPtr]$Surface, [int]$Delta) {
+    # The detent goes in the HIGH word, unsigned - the same value the old
+    # C# `(uint)((delta & 0xFFFF) << 16)` produced. The shift is done as
+    # MULTIPLICATION in Int64 on purpose: PowerShell's -shl is an Int32 op, so
+    # a down notch (0xFF88 << 16) overflows to -7864320 and the [uint32] cast
+    # then throws rather than wrapping the way C# does.
+    $w = [IntPtr]([int64][uint32]([int64]($Delta -band 0xFFFF) * 65536))
+    [void](Send-TestRawMessage -Window $Surface -Message 0x020A -WParam $w)
 }
-'@
+
 
 # The expected lines-per-notch: mouse-scroll-multiplier discrete default.
 $wheelLines = 3
@@ -86,13 +69,15 @@ Assert-GhozttyPrivateEndpoint -Exe $exe
 # persistence: off. The wheel assertions want the ONE pane this launch opens; a
 # restored second window would take the foreground and the scroll would land in
 # it (T158).
-$proc = Start-Process -FilePath $exe -ArgumentList '--session-persistence=false' -PassThru
+$td = New-TestDesktop
+$app = Start-OnTestDesktop -Exe $exe -Arguments @('--session-persistence=false')
+$proc = $app.Process
 Start-Sleep -Seconds 3
-if ($proc.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
+if ($proc.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; Remove-TestDesktop | Out-Null; exit 1 }
 Assert-GhozttyIsolated -Exe $exe
-$top = [WheelDrv]::FindTop([uint32]$proc.Id)
-$surface = [WheelDrv]::FindWindowExW($top, [IntPtr]::Zero, 'GhozttyTerminal', $null)
-if ($top -eq [IntPtr]::Zero -or $surface -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: windows not found'; exit 1 }
+$top = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyWindow'
+$surface = if ($top -ne [IntPtr]::Zero) { Get-TestChildWindow -Window $top -Class 'GhozttyTerminal' } else { [IntPtr]::Zero }
+if ($top -eq [IntPtr]::Zero -or $surface -eq [IntPtr]::Zero) { Write-Host 'SETUP FAIL: windows not found'; Remove-TestDesktop | Out-Null; exit 1 }
 
 $listJson = & $exe +list --json | ConvertFrom-Json
 $pane = $listJson.data.windows[0].tabs[0].splits.terminal.name
@@ -129,15 +114,15 @@ for ($i = 0; $i -lt 40 -and -not $ready; $i++) {
     if ($tail -match 'COUNTERREADY') { $ready = $true }
 }
 Assert $ready 'counter entered alt screen (COUNTERREADY visible)'
-if (-not $ready) { Stop-Process -Id $proc.Id -Force; exit 1 }
+if (-not $ready) { Stop-Process -Id $proc.Id -Force; Remove-TestDesktop | Out-Null; exit 1 }
 
 # --- Drive: 1 notch up, 2 notches down ---------------------------------------
 Start-Sleep -Milliseconds 300
-[WheelDrv]::Notch($surface, 120)
+Notch $surface 120
 Start-Sleep -Milliseconds 300
-[WheelDrv]::Notch($surface, -120)
+Notch $surface -120
 Start-Sleep -Milliseconds 300
-[WheelDrv]::Notch($surface, -120)
+Notch $surface -120
 
 # Wait for the counter's 10s window to finish and the summary to print.
 $result = $null
@@ -162,6 +147,7 @@ if ($result) {
 Start-Sleep -Milliseconds 500
 if (-not $proc.HasExited) { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue }
 Remove-Item $counter -ErrorAction SilentlyContinue
+Remove-TestDesktop | Out-Null
 
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }
 else { Write-Host "$script:fail FAILURE(S) of $($script:pass + $script:fail)"; exit 1 }

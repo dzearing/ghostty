@@ -332,7 +332,11 @@ function Wait-Tail([string]$paneId, [string]$needle, [int]$secs = 10) {
 function New-ProxyWindow([string]$target, [string]$proxy, [string]$proxyArg = '', [string]$ready = 'rc>') {
     $u = To-Unix (Join-Path $work $proxy)
     $cmd = if ($proxyArg) { "bash $u '$proxyArg'" } else { "bash $u" }
-    & $exe +new-window --target=$target --shell="$bash" --command=$cmd | Out-Null
+    # T1241: through the test desktop. `+new-window` is the one verb that
+    # auto-launches, and the window it opens lands on the desktop of whoever
+    # ran the CLI - so on the user's screen, every time this helper was called.
+    [void](Invoke-OnTestDesktop -Exe $exe `
+        -Arguments @('+new-window', "--target=$target", "--shell=$bash", "--command=$cmd"))
     $pane = $null
     for ($t = 0; $t -lt 40 -and -not $pane; $t++) { $pane = Pane-Of $target; if (-not $pane) { Start-Sleep -Milliseconds 250 } }
     if (-not $pane) { Write-Host "SETUP FAIL: no pane for $target"; exit 1 }
@@ -378,12 +382,16 @@ Kill-RepoInstances
 # at the user's installed release by an inherited `$GHOZTTY_IPC_SOCKET` it
 # would clear a live Claude session.
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+# T1241: the GUI and every +new-window below run on the background test desktop.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 [void](Set-GhozttyTestIsolation -Tag 'resetctx')
 Assert-GhozttyPrivateEndpoint -Exe $exe
 
-$proc = Start-Process $exe -ArgumentList '--session-persistence=false' -PassThru
+$td = New-TestDesktop
+$app = Start-OnTestDesktop -Exe $exe -Arguments @('--session-persistence=false')
+$proc = $app.Process
 Start-Sleep -Seconds 3
-if ($proc.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; exit 1 }
+if ($proc.HasExited) { Write-Host 'SETUP FAIL: GUI died at launch'; Remove-TestDesktop | Out-Null; exit 1 }
 Assert-GhozttyIsolated -Exe $exe
 
 try {
@@ -579,6 +587,7 @@ try {
     foreach ($w in @('rc1', 'rc2', 'rc3', 'rc4', 'rc5', 'rc6', 'rc7')) { & $exe +close --target=$w 2>$null | Out-Null }
     Start-Sleep -Milliseconds 500
     Kill-RepoInstances
+    Remove-TestDesktop | Out-Null
 }
 
 # --- stamp (T783) ---------------------------------------------------------

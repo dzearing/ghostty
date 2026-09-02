@@ -9,6 +9,37 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-01: T1241 - **The last of the install, update and diagnostics acceptance scripts stopped opening windows on the user's desktop.** Batch 4 of T1193's four, and the one that closes the list: `clipboard-retry`, `crash-diagnostics`, `install-prepare`, `path-selfheal`, `reset-context`, `soak`, `update-apply`, `update-check`, `wheel-scroll`. GUI launches went to `Start-OnTestDesktop`, waited CLI steps to `Invoke-OnTestDesktop`, and the declaration list in `lib\TestDesktop.ps1` is down from 10 pending to 1 - `session-relaunch.ps1`, which T1265 holds behind T1264. Every script ran green individually on the box.
+  Two of the nine were not mechanical, and both failed the same way: **a private
+  P/Invoke that enumerates the CALLER's desktop.** `wheel-scroll.ps1` carried its
+  own `WheelDrv` (EnumWindows to find the window, PostMessageW to post the
+  notch) and `update-apply.ps1` its own `ApplierDialog.CloseAll` (EnumWindows to
+  find the confirm dialog, PostMessageW to close it). Window enumeration is
+  per-desktop and runs on the calling thread, so the moment the app moves both
+  helpers find nothing and report it as "no window" rather than as "wrong
+  desktop". Both are now harness calls - `Wait-TestWindow` /
+  `Get-TestChildWindow` / `Send-TestRawMessage`, and `Get-TestWindows` /
+  `Send-TestWindowClose` - which do the same work on the worker thread that IS
+  bound to the test desktop. `soak.ps1` had the third face of it without a
+  P/Invoke: it filtered its candidate processes on `.MainWindowHandle -ne 0`,
+  and .NET computes that by enumerating the caller's desktop too, so every
+  candidate read 0 and the setup would have aborted.
+  One PowerShell trap worth the line: `-shl` is an **Int32** operation, so the
+  wheel's `(delta & 0xFFFF) << 16` for a DOWN notch overflows to -7864320 and
+  the `[uint32]` cast then THROWS, where the C# it replaced wrapped silently.
+  Multiplying in Int64 (`* 65536`) reproduces the original value exactly.
+  Also migrated, though the sweep never asked: `update-apply.ps1` spawns a COPY
+  of ghoztty.exe as the updater, and section 8's applier relaunches a real
+  terminal. Three more windows on the user's screen that the analyzer could not
+  see, because its ghoztty-reference rule keys on the `$Exe` variable and a copy
+  has another name. Noted on T1267, which is already the task for asking the box
+  instead of the source.
+  Floor: all four lanes PASS (the `none` lane's one FAIL was two floor-lane runs
+  sharing a zig cache after a backgrounded invocation was resurrected; re-run
+  alone it passes in 151s), ipc-p1/p2/p3 ALL PASS, and the eight harnesses these
+  edits made due - suite-run, isolation-meta, launch-preflight, verdict-exit,
+  cleanslate, stderr-capture, test-desktop, desktop-launch - all green, leaving
+  guard-due at exit 0 with only its two standing advisory rows.
 - 2026-09-01: T1240 (+T1267 filed) - **Eighteen more acceptance scripts stopped throwing terminal windows across the user's screen.** Batch 3 of T1193's four: `auto-launch-cwd`, `cli-argv-fidelity`, `cli-launch-cwd`, `conformance`, `gui-launch-command`, `ipc-list-session-id`, `ipc-remote`, `ipc-send-keys-fidelity`, `ipc-under-load`, `ipc-when-idle`, `layout-blobs`, `pane-id`, `rearrange-session-drop`, `registration-sites`, `send-keys-bracketed`, `send-keys-soak`, `target-staleness`, `window-name-env`. GUI launches went to `Start-OnTestDesktop`, CLI calls to `Invoke-OnTestDesktop` behind a local `Ghoz` helper, and every `cmd /c "... > file"` dance went with them - the harness captures both streams, which is what that dance was for. Each ran green individually; the declaration list is down from 28 pending to 10, so the sweep is what proves it rather than this paragraph.
   The turn's value was not the mechanical part. `cli-launch-cwd.ps1` went 7-red
   after its migration and stayed red until two spawn facts were measured rather

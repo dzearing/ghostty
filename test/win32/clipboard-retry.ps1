@@ -75,13 +75,14 @@ function Assert($name, $cond) {
 $root = Join-Path $env:TEMP "ghoztty-clipboard-retry-$PID"
 New-Item -ItemType Directory -Force $root | Out-Null
 $errlog = Join-Path $root 'app-stderr.log'
-$outlog = Join-Path $root 'app-stdout.log'
 $holderPs1 = Join-Path $root 'holder.ps1'
 $holderReady = Join-Path $root 'holder-ready'
 $holderStop = Join-Path $root 'holder-stop'
 
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
+# T1241: the app launches on the background test desktop, not the user's.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 Add-Type -AssemblyName System.Windows.Forms
 
@@ -232,12 +233,16 @@ Stop-TestProcs
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 $savedClip = Get-ClipText
+$td = New-TestDesktop
 
 try {
-    $app = Start-Process -FilePath $Exe -PassThru `
-        -ArgumentList '--session-persistence=false' `
-        -RedirectStandardError $errlog -RedirectStandardOutput $outlog
-    $null = $app.Handle
+    # T1241: on the TEST desktop, so this launch does not throw a window across
+    # whatever the user is reading. The clipboard is unaffected by the move - it
+    # is scoped to the WINDOW STATION, which both desktops share, which is the
+    # same reason the header says it cannot be isolated. -StdErr points stdout
+    # and stderr at one file, so the arm below that greps $errlog still sees the
+    # app's whole output.
+    $app = Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false') -StdErr $errlog
 
     $pane = $null
     $deadline = (Get-Date).AddSeconds(60)
@@ -407,8 +412,8 @@ try {
             [void][T992Probe.Clip]::GetWindowThreadProcessId($owner, [ref]$ownerPid)
             # The window must be the APP's, not some other process that happened
             # to write the clipboard in the meantime.
-            Assert "D3 the owner window belongs to the app under test (owner pid $ownerPid, app pid $($app.Id))" `
-                ($ownerPid -eq $app.Id)
+            Assert "D3 the owner window belongs to the app under test (owner pid $ownerPid, app pid $($app.Pid))" `
+                ($ownerPid -eq $app.Pid)
         }
     }
 
@@ -417,6 +422,7 @@ try {
     Stop-TestProcs
     if ($null -ne $savedClip -and $savedClip -ne '') { [void](Set-ClipText $savedClip) }
     Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+    Remove-TestDesktop | Out-Null
 }
 
 # A clean green run stamps the covered files (T783) so scripts\guard-due.ps1 can

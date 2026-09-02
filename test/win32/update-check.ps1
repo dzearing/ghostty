@@ -39,6 +39,8 @@ $ErrorActionPreference = 'Stop'
 # launches or dials. This replaces the old per-scenario set/remove of
 # GHOZTTY_PIPE_SUFFIX, which left gaps and reused a fixed name across runs.
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
+# T1241: every GUI launch below goes to the background test desktop.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 [void](Set-GhozttyTestIsolation -Tag 't24')
 $repo = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
 $exe = Join-Path $repo 'zig-out\bin\ghoztty.exe'
@@ -62,6 +64,8 @@ function Kill-RepoInstances {
     # zig-out-release (T53b), and every copy answered "does the agent go too" alone.
     [void](Stop-RepoGhoztty -Exe $exe -AppOnly -SettleMs 500)
 }
+
+$td = New-TestDesktop
 
 $feedDir = Join-Path $env:TEMP 'ghoztty-t24-feeds'
 New-Item -ItemType Directory -Force $feedDir | Out-Null
@@ -91,11 +95,12 @@ function Run-Scenario([string]$label, [string]$updateUrl, [int]$waitSecs = 8) {
             # it on every later scenario restores the windows the earlier ones
             # left - and the update banner would be looked for in a pane this
             # run never opened (T158).
-            $proc = Start-Process -FilePath $exe -ArgumentList '--session-persistence=false' `
-                -PassThru -RedirectStandardError $errFile
-            # Before any HasExited poll, or the exit code in the SETUP FAIL
-            # message below reads back empty (lib\ExitCodeAudit.ps1).
-            $null = $proc.Handle
+            # T1241: on the TEST desktop, so a scenario that launches the GUI
+            # five times does not throw five windows across the user's screen.
+            # -StdErr is the same capture -RedirectStandardError was: the app's
+            # log is what every Assert below reads.
+            $app = Start-OnTestDesktop -Exe $exe -Arguments @('--session-persistence=false') -StdErr $errFile
+            $proc = $app.Process
             $deadline = (Get-Date).AddSeconds($waitSecs)
             while ((Get-Date) -lt $deadline -and -not $proc.HasExited) { Start-Sleep -Milliseconds 500 }
             if (-not $proc.HasExited) { break }
@@ -144,9 +149,10 @@ Assert ($log3 -notmatch 'showing update balloon') 'older: no balloon'
 # section prints).
 $verOut = Join-Path $env:TEMP 'ghoztty-t24-version.txt'
 # persistence: n/a - a CLI invocation, which opens no window.
-$vp = Start-Process $exe -ArgumentList '+version' -RedirectStandardOutput $verOut -NoNewWindow -PassThru
-if (-not $vp.WaitForExit(15000)) { try { $vp.Kill() } catch {}; Write-Host 'SETUP FAIL: +version hung'; exit 1 }
-$verText = [IO.File]::ReadAllText($verOut)
+$vr = Invoke-OnTestDesktop -Exe $exe -Arguments @('+version') -TimeoutSec 15
+if ($vr.TimedOut) { Write-Host 'SETUP FAIL: +version hung'; exit 1 }
+[IO.File]::WriteAllText($verOut, $vr.Output)
+$verText = $vr.Output
 $isChannel = $verText -match 'update check: on \(win-v channel\)'
 # The "off" reason is not fixed text: T1217 added "off (not the installed
 # release)" beside the older "off (dev build)", and this probe went on
@@ -196,9 +202,8 @@ $env:GHOZTTY_UPDATE_URL = $recheckUrl
 $env:GHOZTTY_UPDATE_RECHECK_MS = '3000'
 $log6 = ''
 try {
-    $proc6 = Start-Process -FilePath $exe -ArgumentList '--session-persistence=false' `
-        -PassThru -RedirectStandardError $errFile6
-    $null = $proc6.Handle
+    $app6 = Start-OnTestDesktop -Exe $exe -Arguments @('--session-persistence=false') -StdErr $errFile6
+    $proc6 = $app6.Process
     # Two ticks at the launch version: the first re-check must find win-v9.9.9
     # again and stay quiet about it.
     Start-Sleep -Seconds 9
@@ -222,6 +227,7 @@ Assert ($log6 -match 'update available: current=\S+ latest=win-v9\.9\.10') 'rech
 Assert ($log6 -match 'showing update balloon for win-v9\.9\.10') 'recheck: the newer release raises a fresh notification'
 
 Kill-RepoInstances
+Remove-TestDesktop | Out-Null
 Write-Host ''
 # --- stamp (T783) ----------------------------------------------------------
 # Only a clean run stamps, so a red harness stays due - which is the whole
