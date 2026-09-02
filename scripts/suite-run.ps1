@@ -19,6 +19,7 @@
   contract (`test\win32\lib\TestScore.ps1`):
 
       exit 0 + "ALL PASS"     => pass
+      exit 0 + "SKIP ALL: ..." => skip     (the box cannot answer this question)
       exit 1 + "N FAILURE(S)" => fail
       exit 2                  => nothing   (ASSERTED NOTHING / TOO LITTLE)
       killed at the timeout   => stall
@@ -353,6 +354,17 @@ function Get-RunVerdict {
     switch ($ExitCode) {
         0 {
             if ($line -match 'ALL PASS') { return @{ Kind = 'pass'; Line = $line } }
+            # A whole-script SKIP (T1100): the box could not answer the question
+            # this script asks - no composited pixels on a background desktop, no
+            # SendInput off the input desktop, an input lock owning the
+            # foreground. It asserted nothing and it did not fail, so it is
+            # neither `pass` nor red: scored apart, counted apart, and NOT
+            # re-run by the confirm pass, which exists to separate a product
+            # defect from an isolation artefact and has no such question to ask
+            # here. The capability is named in the line by
+            # lib\DesktopCapability.ps1, so the one line anybody reads says what
+            # could not be asked.
+            if ($line -match '^\s*SKIP ALL') { return @{ Kind = 'skip'; Line = $line } }
             # Exit 0 with no pass verdict: either a script with no verdict at
             # all, or the fall-through shape T221 exists to catch.
             return @{ Kind = 'error'; Line = $(if ($line) { $line } else { '(exit 0, no verdict line)' }) }
@@ -557,7 +569,7 @@ function Invoke-ScoredScript {
 
 $VerdictTag = @{
     pass = 'PASS   '; fail = 'FAIL   '; stall = 'STALL  '
-    nothing = 'NOTHING'; error = 'ERROR  '
+    nothing = 'NOTHING'; error = 'ERROR  '; skip = 'SKIP   '
 }
 
 function Write-ResultLine {
@@ -567,10 +579,31 @@ function Write-ResultLine {
     $leak = ''
     if ($Row.Leaked -gt 0) { $leak = " [leaked $($Row.Leaked)]" }
     $color = 'Green'
-    if ($Row.Verdict -ne 'pass') { $color = 'Red' }
+    if ($Row.Verdict -eq 'skip') { $color = 'Yellow' }
+    elseif ($Row.Verdict -ne 'pass') { $color = 'Red' }
     $msg = ('[{0,3}/{1}] {2} {3,7}  {4,-42} {5}{6}' -f `
             $Index, $Total, $tag, (Format-Duration $Row.Seconds), $Row.Name, $Row.Line, $leak)
     Write-Host $msg -ForegroundColor $color
+}
+
+<#
+The skipped table (T1100).
+
+A skip is not a failure and it is not a pass either, and the difference from a
+pass is the whole point: this script asked nothing today. Listed by name with
+the capability it wanted, so a sweep's reader can see at a glance which
+questions this box could not put to the product - and notice when the list
+grows, which is the failure mode a silent skip has.
+#>
+function Write-SkippedTable {
+    param([object[]]$Rows)
+    $skipped = @(@($Rows) | Where-Object { $_.Verdict -eq 'skip' })
+    if ($skipped.Count -eq 0) { return }
+    ''
+    "  skipped ($($skipped.Count) script(s) - the box could not answer these, they are not failures):"
+    foreach ($x in $skipped) {
+        '    {0,-42} {1}' -f $x.Name, $x.Line
+    }
 }
 
 <#
@@ -581,10 +614,14 @@ on its own, because that is the line that decides how the row gets written up:
 `green alone` is a harness or isolation defect and is not a user-facing outage,
 `reproduced` is a product-defect candidate, and `not re-run` says nobody asked -
 which is a third thing and must not read as the first.
+
+A skip is not in this table at all: it is not a non-pass row in the sense this
+table means, and putting it here would make the list of things to file longer
+by exactly the rows nobody should file.
 #>
 function Write-NotGreenTable {
     param([object[]]$Rows)
-    $red = @(@($Rows) | Where-Object { $_.Verdict -ne 'pass' })
+    $red = @(@($Rows) | Where-Object { $_.Verdict -notin @('pass', 'skip') })
     if ($red.Count -eq 0) { return }
     ''
     '  not green:'
@@ -695,7 +732,7 @@ function Invoke-ConfirmPass {
     # carries rows that were confirmed on the run before it, and re-running them
     # would spend the suite's most expensive minutes re-deriving a verdict that
     # is already in the file.
-    $red = @($Rows | Where-Object { ($_.Verdict -ne 'pass') -and (-not $_.Reproduced) })
+    $red = @($Rows | Where-Object { ($_.Verdict -notin @('pass', 'skip')) -and (-not $_.Reproduced) })
     if ($red.Count -eq 0) { return $Rows }
 
     $byName = @{}
@@ -833,7 +870,7 @@ if ($Action -eq 'confirm') {
     foreach ($x in @($summary.results)) { $rowsC += (ConvertTo-SummaryRow -Row $x) }
 
     $all = @(Get-SuiteScript -Root $TestRoot -SetName 'all' -Inc @())
-    $selected = @($rowsC | Where-Object { $_.Verdict -ne 'pass' })
+    $selected = @($rowsC | Where-Object { $_.Verdict -notin @('pass', 'skip') })
     if ($IncludeList) {
         $selected = @($selected | Where-Object { $n = $_.Name; @($IncludeList | Where-Object { $n -like $_ }).Count -gt 0 })
     }
@@ -997,15 +1034,19 @@ if (-not $NoConfirm) {
 }
 
 $byKind = @{}
-foreach ($k in @('pass', 'fail', 'stall', 'nothing', 'error')) {
+foreach ($k in @('pass', 'skip', 'fail', 'stall', 'nothing', 'error')) {
     $byKind[$k] = @($results | Where-Object { $_.Verdict -eq $k }).Count
 }
-$red = $results.Count - $byKind['pass']
+# A skip is not red (T1100): the box could not answer that script's question, so
+# counting it as a failure would make the suite's colour a property of the
+# desktop the run happened on rather than of the product.
+$red = $results.Count - $byKind['pass'] - $byKind['skip']
 
 ''
 '---- suite summary ----------------------------------------------------------'
 "  scripts      : $($results.Count)"
 "  pass         : $($byKind['pass'])"
+"  skipped      : $($byKind['skip'])"
 "  fail         : $($byKind['fail'])"
 "  stall        : $($byKind['stall'])"
 "  asserted-none: $($byKind['nothing'])"
@@ -1029,14 +1070,17 @@ if ($modalRows.Count -gt 0) {
 foreach ($x in @($results | Sort-Object Seconds -Descending | Select-Object -First 8)) {
     '    {0,8}  {1}' -f (Format-Duration $x.Seconds), $x.Name
 }
+if ($byKind['skip'] -gt 0) { Write-SkippedTable -Rows $results }
 if ($red -gt 0) { Write-NotGreenTable -Rows $results }
 ''
 "  summary: $summaryPath"
 ''
 
 if ($red -eq 0) {
-    Write-Host "SUITE ALL PASS ($($results.Count) scripts, $(Format-Duration $suiteSw.Elapsed.TotalSeconds))" -ForegroundColor Green
+    $skipNote = if ($byKind['skip'] -gt 0) { ", $($byKind['skip']) SKIPPED" } else { '' }
+    Write-Host "SUITE ALL PASS ($($results.Count) scripts$skipNote, $(Format-Duration $suiteSw.Elapsed.TotalSeconds))" -ForegroundColor Green
     exit 0
 }
-Write-Host "SUITE $red FAILURE(S) of $($results.Count) scripts ($(Format-Duration $suiteSw.Elapsed.TotalSeconds))" -ForegroundColor Red
+$skipNote = if ($byKind['skip'] -gt 0) { ", $($byKind['skip']) SKIPPED" } else { '' }
+Write-Host "SUITE $red FAILURE(S) of $($results.Count) scripts$skipNote ($(Format-Duration $suiteSw.Elapsed.TotalSeconds))" -ForegroundColor Red
 exit 1

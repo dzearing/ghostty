@@ -132,6 +132,103 @@ function Measure-TitlebarLuminance([IntPtr]$Window) {
     } finally { Close-TestWindowPixels $shot }
 }
 
+# ---------------------------------------------------------------------
+# Z. the capability declaration (T1100).
+#
+# Everything above is about what the background desktop CAN do. This section
+# is about the harness saying, before a run starts, what it CANNOT - so a
+# script whose oracle needs composited pixels or real input reports a SKIP
+# naming the missing capability instead of a red the product has to answer
+# for. The T1094 sweep produced a cluster of exactly those reds.
+#
+# Run BEFORE the desktop is created: these are answers about a desktop, not
+# calls into one, and the section must not depend on the fixture below it.
+# ---------------------------------------------------------------------
+. (Join-Path $PSScriptRoot 'lib\DesktopCapability.ps1')
+Write-Host ''
+Write-Host '-- Z. desktop capability declaration'
+
+$capBg = @{}
+foreach ($n in @('chrome-pixels', 'surface-pixels', 'screen-pixels', 'real-input', 'foreground')) {
+    $capBg[$n] = Get-TestDesktopCapability -Name $n
+    Write-Host ("  background/{0,-14} available={1} - {2}" -f $n, $capBg[$n].Available, $capBg[$n].Reason)
+}
+Assert ($capBg['chrome-pixels'].Available) 'chrome pixels ARE declared available on the background desktop'
+# The three the desktop cannot do, each measured elsewhere in this file or in
+# test-desktop-spike.ps1. Asserted together because the value of the
+# declaration is that it is COMPLETE - one capability quietly reading
+# available is how a script scores itself against a flat fill.
+Assert (-not $capBg['surface-pixels'].Available) 'surface pixels are declared UNAVAILABLE on the background desktop'
+Assert (-not $capBg['screen-pixels'].Available) 'screen pixels are declared UNAVAILABLE on the background desktop'
+Assert (-not $capBg['real-input'].Available) 'real input is declared UNAVAILABLE on the background desktop'
+Assert (-not $capBg['foreground'].Available) 'a foreground window is declared UNAVAILABLE on the background desktop'
+# A refusal with no reason is a refusal nobody can act on: the SKIP line a
+# script prints is built out of this text.
+Assert (@($capBg.Values | Where-Object { -not $_.Reason }).Count -eq 0) 'every capability answer carries a reason'
+
+# The interactive side is PROBED rather than declared - an input lock can take
+# real input away on the input desktop too, which is the second half of the
+# sweep's reds ('could not take the foreground').
+$capFg = Get-TestDesktopCapability -Name real-input -Interactive
+Write-Host ("  interactive/real-input available={0} measured={1} - {2}" -f $capFg.Available, $capFg.Measured, $capFg.Reason)
+Assert ($capFg.Measured) 'the interactive answer is MEASURED on the box, not assumed'
+
+# A typo must not read as 'available': a silent answer to a question nobody
+# asked is how a probe scores itself green against a capability that does not
+# exist.
+$capThrew = $false
+try { $null = Get-TestDesktopCapability -Name 'not-a-capability' } catch { $capThrew = $true }
+Assert $capThrew 'an unknown capability name throws instead of reading available'
+
+# THE DEMONSTRATION THAT THE SKIP PATH FIRES. A capability check that has only
+# ever said 'available' is indistinguishable from one that cannot say anything
+# else, so the missing case is CONSTRUCTED and the whole exit path is driven in
+# a child process - Assert-TestDesktopCapability exits, so it cannot be called
+# in-process here.
+$capProbe = Join-Path $env:TEMP ("ghoztty-cap-probe-$PID.ps1")
+$capOut = Join-Path $env:TEMP ("ghoztty-cap-probe-$PID.log")
+Set-Content -LiteralPath $capProbe -Encoding ASCII -Value @(
+    ". (Join-Path '$PSScriptRoot' 'lib\DesktopCapability.ps1')",
+    'Assert-TestDesktopCapability -Name real-input -Interactive',
+    "'REACHED THE END'"
+)
+# Written flat rather than inside a try/finally: a top-level try with no catch
+# is an unwind path to a green verdict (body-complete-audit.ps1 rule D), and the
+# only state worth unwinding here is one env var that is cleared on the next
+# line but one - while an unwind at this depth kills the script outright, which
+# prints no verdict at all.
+$env:GHOZTTY_TEST_FORCE_MISSING_CAPS = 'real-input'
+$pc = Start-Process -FilePath 'powershell.exe' -PassThru -NoNewWindow -Wait `
+    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $capProbe) `
+    -RedirectStandardOutput $capOut
+Remove-Item Env:GHOZTTY_TEST_FORCE_MISSING_CAPS -ErrorAction SilentlyContinue
+$capText = ''
+if (Test-Path -LiteralPath $capOut) { $capText = (Get-Content -LiteralPath $capOut -Raw) }
+if ($null -eq $capText) { $capText = '' }
+Write-Host "  forced-missing probe: exit $($pc.ExitCode) text=$($capText.Trim())"
+Assert ($capText -match 'SKIP ALL: real-input is not available here') `
+    'a missing capability prints SKIP ALL naming the capability'
+# Exit 0 on purpose: nothing failed. The runner scores the LINE, and
+# scripts\suite-run.ps1 section S is the other end of this contract.
+Assert ($pc.ExitCode -eq 0) "and exits 0 (got $($pc.ExitCode))"
+Assert ($capText -notmatch 'REACHED THE END') 'and stops the run rather than carrying on'
+
+# The other half, and the one that keeps the check from being a blanket skip:
+# with the capability present the assert is silent and the body runs.
+Set-Content -LiteralPath $capProbe -Encoding ASCII -Value @(
+    ". (Join-Path '$PSScriptRoot' 'lib\DesktopCapability.ps1')",
+    'Assert-TestDesktopCapability -Name chrome-pixels',
+    "'REACHED THE END'"
+)
+$pc2 = Start-Process -FilePath 'powershell.exe' -PassThru -NoNewWindow -Wait `
+    -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $capProbe) `
+    -RedirectStandardOutput $capOut
+$capText2 = ''
+if (Test-Path -LiteralPath $capOut) { $capText2 = (Get-Content -LiteralPath $capOut -Raw) }
+if ($null -eq $capText2) { $capText2 = '' }
+Assert (($pc2.ExitCode -eq 0) -and ($capText2 -match 'REACHED THE END') -and ($capText2 -notmatch 'SKIP ALL')) `
+    'a capability that IS available lets the run continue, silently'
+Remove-Item -LiteralPath $capProbe, $capOut -Force -ErrorAction SilentlyContinue
 Kill-RepoInstances
 Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive

@@ -315,6 +315,12 @@ Rep "isolated log: $profLog"
 # previous run — a pane with its own scrollback and its own warmed-up state,
 # which is not the cold instance these numbers are supposed to describe.
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+# T1100: injection timing IS the measurement here, so this script needs the
+# input desktop's real input and a window it can hold in the foreground. Asked
+# before the instance is launched: a box that cannot supply them makes this run
+# a declared SKIP, not a red that reads as a latency regression.
+. (Join-Path $PSScriptRoot 'lib\DesktopCapability.ps1')
+Assert-TestDesktopCapability -Name real-input, foreground -Interactive
 Reset-GhozttyTestState -Exe $exe -SettleMs 500 | Out-Null
 
 & $exe +new-window --target=prof --shell=cmd | Out-Null
@@ -339,7 +345,12 @@ if (-not $pane) { Rep 'ABORT: pane name not found in +list'; exit 1 }
 Rep "pane: $pane"
 
 $f = [ProfDrv]::Focus($top, $surface)
-if ($f -ne 'OK') { Rep "ABORT: cannot acquire focus ($f) - box in use?"; exit 1 }
+if ($f -ne 'OK') {
+    # T1100: an answer about the BOX, not about the app's latency - something
+    # else owns the foreground. Skips with the capability named.
+    Rep "cannot acquire focus ($f) - box in use?"
+    Exit-TestSkip -Capability foreground -Reason "could not acquire focus for the timed pane ($f)"
+}
 
 # Positive control for the whole key path: a typed token must reach the PTY.
 $ctl = LatencyProbe $pane 'keyctl1' 5000

@@ -20116,3 +20116,52 @@ Filed: T1280 (the spike's posted-input assertions flake, 1 red in 3 runs on the
 same commit - a flaky certificate for the harness ~50 scripts now run on),
 T1281 (audit the other pixel assertions for the same mixed-region oracle defect,
 which has now landed twice in two days with T363).
+
+## 2026-09-02 - T1100: a check the box cannot run reports SKIP, with the capability named
+
+The acceptance suite moved onto a background desktop so it stops stealing the
+user's foreground, and that desktop composes no pixels and accepts no SendInput.
+Both facts were measured a month ago; neither was ever DECLARED, so a script
+whose oracle needed one of them failed there and the failure was
+indistinguishable from a broken feature. The 2026-08-22 sweep duly produced a
+cluster of those - `SETUP FAIL ... could not take the foreground`, a capture that
+is one colour over its whole interior - and a permanently-red script teaches
+everyone to ignore the colour, which costs more than the assertion was worth.
+
+`test\win32\lib\DesktopCapability.ps1` names five capabilities -
+`chrome-pixels`, `surface-pixels`, `screen-pixels`, `real-input`, `foreground` -
+and answers each for the background desktop and for the input desktop, every
+answer carrying the reason a skip line is built out of. The background answers
+are the measured facts (T1115's capture split, the spike's INPUT-1
+ACCESS_DENIED); the two input answers are PROBED on the box, because an input
+lock takes real input away on the interactive desktop too, which is the second
+half of the sweep's reds. `Assert-TestDesktopCapability` goes at the top of a
+script, `Exit-TestSkip` covers what only setup can discover, and both print
+`SKIP ALL: <capability> is not available here - <reason>` at exit 0.
+
+`scripts\suite-run.ps1` scores that as a new verdict kind. A skip is not a pass
+and is not red: counted on its own line, listed by name with its reason, left
+alone by the confirm pass - which exists to separate a product defect from an
+isolation artefact, and a skip poses neither question. So the suite's colour
+means "the product is right" rather than "the box we ran on happened to be able
+to look".
+
+The input question this task also owed was already answered and only needed
+saying: the spike asserts SendInput is ACCESS_DENIED on a background desktop (0
+of 12 accepted) with the posted-message replacement landing beside it, and no
+desktop or window-station attachment changes it.
+
+Re-attributed, both ENVIRONMENT and both now skipping with the capability named:
+`context-menu-real-input.ps1` and `profile-latency.ps1`. Validation: section Z of
+`test-desktop-harness.ps1` ALL PASS (44 assertions), which FORCES a capability
+missing and checks the skip line, the exit code and that the run really stopped;
+section S of `test\win32\suite-run.ps1` ALL PASS (97 assertions), including that
+a real failure still reddens a run that also skipped. Floor: four zig lanes,
+P1-P3, and the seven audits guard-due named for the edit.
+
+Filed: T1282 (caption-bar's uniform capture - chrome IS capturable there, so the
+helper reaching for CopyFromScreen is the defect), T1283 (split-dim /
+split-dim-viewer measure an empty colour off a GDI-painted overlay), T1284 (the
+chooser close-chord fails its own positive control). Those three are the reds
+whose cause is not settled, and guessing at them here would have been the thing
+this task exists to stop.

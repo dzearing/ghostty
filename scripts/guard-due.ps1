@@ -2233,6 +2233,11 @@ $GuardTable = @(
         Stamp  = 'test\win32\test-desktop-harness.stamp.json'
         Covers = @(
             'test\win32\lib\TestDesktop.ps1',
+            # T1100: the capability declaration is the same foundation asked the
+            # other way round - what the desktop CANNOT do, and therefore which
+            # scripts skip rather than fail. Section Z of the harness is the only
+            # thing that drives its skip path.
+            'test\win32\lib\DesktopCapability.ps1',
             'test\win32\test-desktop-harness.ps1'
         )
     },

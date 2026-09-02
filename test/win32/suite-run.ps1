@@ -39,6 +39,10 @@
     P. The confirm pass - every non-pass script is re-run once on its own, and
        what the second run said is recorded on the row. A red row that is green
        alone is a harness defect, not a broken feature (T1137).
+    S. Whole-script SKIP - a script the BOX cannot answer (no composited pixels
+       on a background desktop, no SendInput off the input desktop) is scored
+       apart from both pass and fail, counted apart, listed by name, and not
+       re-run by the confirm pass (T1100).
 
   Prints a single ALL PASS / N FAILURE(S) line, like every other script here.
 
@@ -786,6 +790,56 @@ exit 1
     Check 'P18 and names them as harness defects' `
         ($rC2.Text -match 'none of 1 reproduced alone') $rC2.Text
 
+    # --- S. the whole-script SKIP (T1100) ----------------------------------
+    Write-Host ''
+    Write-Host '-- S. a script the box cannot answer is skipped, not failed'
+
+    # WHY THIS KIND EXISTS. Some acceptance scripts ask a question the desktop
+    # a run happens on cannot answer at all - the terminal surface does not
+    # compose on a background desktop, SendInput is ACCESS_DENIED off the input
+    # desktop, an input lock owns the foreground. Scored as failures they are
+    # permanently red, and a permanently-red script teaches everyone to ignore
+    # the colour. So the script declares the missing capability
+    # (lib\DesktopCapability.ps1), prints SKIP ALL and exits 0, and the runner
+    # scores that apart from both pass and fail.
+    Set-Content -LiteralPath $RunLog -Value '' -Encoding ASCII
+    Set-FixtureScript 's-skip.ps1' @'
+"SKIP ALL: real-input is not available here - SendInput accepted 0 of 1 events"
+exit 0
+'@
+
+    $dirS = Join-Path $Fixture 'runS'
+    $rS = Invoke-Runner @('-Include', 's-skip.ps1,b-pass.ps1', '-OutDir', $dirS, '-TimeoutSec', '60')
+    $sS = Get-Summary $dirS
+    # Without this kind the row scored `error` - exit 0 with no ALL PASS - which
+    # is the T221 shape and reads as a script that fell through its own body.
+    Check 'S1 SKIP ALL at exit 0 scores skip' ((Get-Verdict $sS 's-skip.ps1') -eq 'skip') (Get-Verdict $sS 's-skip.ps1')
+    Check 'S2 a skip is not counted red: the suite still exits 0' ($rS.Exit -eq 0) "exit $($rS.Exit)"
+    Check 'S3 and the verdict line says how many were skipped' `
+        ($rS.Text -match 'SUITE ALL PASS \(2 scripts, 1 SKIPPED') $rS.Text
+    Check 'S4 the summary counts skips on their own line' `
+        ($rS.Text -match '(?m)^\s*skipped\s*:\s*1\s*$') $rS.Text
+    # Named, because the failure mode of a skip is that it goes unnoticed: the
+    # reason it could not run has to be in front of whoever reads the sweep.
+    Check 'S5 the skipped script is listed with its reason' `
+        (($rS.Text -match 's-skip\.ps1') -and ($rS.Text -match 'real-input is not available here')) $rS.Text
+    Check 'S6 a skip is NOT a pass' ((Get-Verdict $sS 'b-pass.ps1') -eq 'pass') (Get-Verdict $sS 'b-pass.ps1')
+    # The confirm pass separates a product defect from an isolation artefact,
+    # and a skip poses neither question - re-running it only spends the sweep's
+    # most expensive minutes re-deriving 'the box still cannot do this'.
+    Check 'S7 the confirm pass does not re-run a skip' `
+        ((Get-InvocationCount 's-skip.ps1') -eq 1) "invocations=$(Get-InvocationCount 's-skip.ps1')"
+
+    # A skip beside a real failure: the failure still decides the colour, and
+    # the skip is still reported. A runner that let one hide the other would
+    # make the suite's colour a property of the desktop it ran on.
+    $dirS2 = Join-Path $Fixture 'runS2'
+    $rS2 = Invoke-Runner @('-Include', 's-skip.ps1,c-fail.ps1', '-OutDir', $dirS2, '-TimeoutSec', '60', '-NoConfirm')
+    Check 'S8 a real failure still reddens a run that also skipped' `
+        (($rS2.Exit -eq 1) -and ($rS2.Text -match 'SUITE 1 FAILURE\(S\) of 2 scripts, 1 SKIPPED')) `
+        "exit $($rS2.Exit)"
+    Check 'S9 and the skip is not in the not-green table' `
+        ($rS2.Text -notmatch '(?m)^\s*skip\s+s-skip\.ps1') $rS2.Text
     # --- J. the duration in the report ------------------------------------
     Write-Host ''
     Write-Host '-- J. Format-Duration'

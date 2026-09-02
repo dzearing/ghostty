@@ -44,6 +44,16 @@ param([string]$ExePath, [switch]$NegativeControl)
 # of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
 # test never wants the caller pane's endpoint.
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+# T1100: this script's whole oracle is a PHYSICAL right-click, so it needs the
+# input desktop's two capabilities - SendInput actually landing, and a window it
+# can bring to the foreground. Neither exists on a background desktop, and on the
+# interactive one an input lock can take them away (that is what the T1094 sweep
+# recorded here as `SETUP FAIL ... could not take the foreground`, which reads
+# like the context menu is broken). Asked BEFORE anything is launched: when the
+# answer is no, this run is a declared SKIP with the capability named, never a
+# red the product has to answer for.
+. (Join-Path $PSScriptRoot 'lib\DesktopCapability.ps1')
+Assert-TestDesktopCapability -Name real-input, foreground -Interactive
 # T675: suppress the app's startup job self-escape - this harness tracks the
 # pids it launches, and a pane-launched app would otherwise hand its work to
 # a respawned twin mid-test.
@@ -210,9 +220,13 @@ function Start-Gui([string]$label, [string[]]$extraArgs) {
     $pane = [CtxRealInput]::FindChild($top, 'GhozttyTerminal')
     if ($pane -eq [IntPtr]::Zero) { Write-Host "SETUP FAIL ($label): pane not found"; exit 1 }
     if (-not [CtxRealInput]::Foreground($top)) {
-        Write-Host "SETUP FAIL ($label): could not take the foreground (a fullscreen app or an input lock owns it)"
+        # T1100: the capability was there when this run started (asserted at the
+        # top) and is not there now - a lock screen, a fullscreen app, another
+        # window grabbing back. Still an answer about the BOX, so it skips with
+        # the capability named rather than failing setup.
         Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-        exit 1
+        Exit-TestSkip -Capability foreground `
+            -Reason "could not take the foreground for '$label' (a fullscreen app or an input lock owns it)"
     }
     # Throws unless the instance answering on the private endpoint is the one
     # just launched - so the +read assertions below can never grade, or leak,
