@@ -477,6 +477,29 @@ pub const SwapGuard = struct {
 // Driving cadence
 // =============================================================================
 
+/// Which bearer a relay re-dial should carry (T1276).
+///
+/// `live` is what the credential store answers RIGHT NOW — the signed-in
+/// account's relay session token, renewed as needed, else `GHOSTTY_RELAY_TOKEN`.
+/// `recorded` is the bearer this window was actually dialed with, kept on the
+/// window since T1276.
+///
+/// The live one wins when there is one: it is the renewable tier, and a window
+/// opened hours ago can be holding a token the relay has since expired. The
+/// recorded one is the FALLBACK, and it is the whole point of this function: a
+/// window opened by `+new-remote-window --token=…` (every scripted dial, and
+/// every test fixture) leaves the store empty, and before T1276 the ladder read
+/// that as SIGNED OUT and went terminal on its first attempt — three seconds
+/// after the far agent died, without one dial ever reaching the relay.
+///
+/// Null ⇒ genuinely no credential anywhere, which stays terminal: retrying
+/// cannot sign anyone in.
+pub fn chooseRelayToken(live: ?[]const u8, recorded: ?[]const u8) ?[]const u8 {
+    if (live) |t| if (t.len > 0) return t;
+    if (recorded) |t| if (t.len > 0) return t;
+    return null;
+}
+
 /// Whether a window in this state still needs the reconnect poller ticking.
 ///
 /// A `connected` window does not: its link-state observer is what wakes the
@@ -1021,4 +1044,23 @@ test "listConnection: every ladder state has a +list --json shape (T609)" {
     const terminal = WindowState.listConnection(terminal_state);
     try testing.expectEqualStrings("disconnected", terminal.state);
     try testing.expectEqual(@as(?bool, false), terminal.self_healable);
+}
+
+test "chooseRelayToken: the recorded bearer is the fallback, not the loser (T1276)" {
+    // Signed in: the renewable tier wins, so a long-lived window re-dials with
+    // a token the relay still accepts rather than the one it was opened with.
+    try testing.expectEqualStrings(
+        "live",
+        chooseRelayToken("live", "recorded").?,
+    );
+    // The defect this closes: a window dialed with an explicit `--token` and no
+    // account/env credential. Before T1276 this answered null and the ladder
+    // went terminal on attempt 1 without ever reaching the relay.
+    try testing.expectEqualStrings("recorded", chooseRelayToken(null, "recorded").?);
+    // Empty is absent — a store that answers with an empty string is not a
+    // credential, and must not shadow the one the window is holding.
+    try testing.expectEqualStrings("recorded", chooseRelayToken("", "recorded").?);
+    try testing.expect(chooseRelayToken("", "") == null);
+    // No credential anywhere is still terminal: retrying cannot sign anyone in.
+    try testing.expect(chooseRelayToken(null, null) == null);
 }

@@ -5368,7 +5368,7 @@ pub fn openRelayWindow(
         return error.DialFailed;
     };
     var opts_with_machine = opts;
-    opts_with_machine.machine = .{ .relay = .{ .base = relay_base, .device = device } };
+    opts_with_machine.machine = .{ .relay = .{ .base = relay_base, .device = device, .token = token } };
     return self.openDialedWindow(.{ .relay = dialed }, opts_with_machine);
 }
 
@@ -5732,7 +5732,7 @@ pub fn resumeRelaySession(
     log.info("resume session: attaching remote session id={s} device={s}", .{ session_id, device });
     return self.openDialedWindow(.{ .relay = dialed }, .{
         .session_id = session_id,
-        .machine = .{ .relay = .{ .base = relay_base, .device = device } },
+        .machine = .{ .relay = .{ .base = relay_base, .device = device, .token = token } },
     });
 }
 

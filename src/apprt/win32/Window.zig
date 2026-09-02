@@ -60,7 +60,19 @@ pub const RemoteDialed = union(enum) {
 /// owned (duped by `setRemoteMachine`, freed in `deinit`).
 pub const RemoteMachine = union(enum) {
     tcp: struct { host: []const u8, port: u16 },
-    relay: struct { base: []const u8, device: []const u8 },
+    relay: struct {
+        base: []const u8,
+        device: []const u8,
+        /// The bearer this window was actually dialed with (T1276), or null
+        /// when the dialer had none to record. It is the FALLBACK credential
+        /// for a re-dial — `remote_reconnect.chooseRelayToken` prefers whatever
+        /// the account/env store answers now, because that tier renews — and it
+        /// exists because a window opened by `+new-remote-window --token=…`
+        /// leaves that store empty: the reconnect ladder read the emptiness as
+        /// SIGNED OUT and went terminal on its first attempt, three seconds
+        /// after the far agent died and without one dial reaching the relay.
+        token: ?[]const u8 = null,
+    },
 
     pub fn deinitFree(self: RemoteMachine, alloc: std.mem.Allocator) void {
         switch (self) {
@@ -68,6 +80,7 @@ pub const RemoteMachine = union(enum) {
             .relay => |r| {
                 alloc.free(r.base);
                 alloc.free(r.device);
+                if (r.token) |t| alloc.free(t);
             },
         }
     }
@@ -1567,9 +1580,14 @@ pub fn setRemoteMachine(self: *Window, machine: RemoteMachine) Allocator.Error!v
         .relay => |r| relay: {
             const base = try alloc.dupe(u8, r.base);
             errdefer alloc.free(base);
+            const device = try alloc.dupe(u8, r.device);
+            errdefer alloc.free(device);
             break :relay .{ .relay = .{
                 .base = base,
-                .device = try alloc.dupe(u8, r.device),
+                .device = device,
+                // Duped like the rest: the caller's token is usually an arena
+                // string that dies with the dial that produced it (T1276).
+                .token = if (r.token) |t| try alloc.dupe(u8, t) else null,
             } };
         },
     };

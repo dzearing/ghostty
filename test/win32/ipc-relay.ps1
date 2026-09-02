@@ -295,11 +295,19 @@ Assert "+list still answers after agent death" ($null -ne $code -and $code -eq 0
 if ($code -ne 0) { Show-LastCli }
 Assert "app still alive (base window listed)" ((Get-Out 'list2.txt') -match '\[target: relbase\]')
 
-# T609: the field TRACKS the drop rather than being a constant. The ladder paces
-# its first attempts over seconds, so this asserts only that the window has left
-# `connected` - which of `reconnecting`/`disconnected` it is sitting in at this
-# instant is timing, and the full connected -> reconnecting(N) -> connected walk
-# is T368's.
+# T609: the field TRACKS the drop rather than being a constant.
+#
+# T1276 tightened this from "has left `connected`" to the state the ladder is
+# actually supposed to be in three seconds after a drop: `reconnecting`, or a
+# `disconnected` that is still SELF-HEALABLE. The loose version accepted the
+# defect - a terminal `{"state":"disconnected","self_healable":false}` at t+3s,
+# which is the ladder giving up before it has dialed once - and stayed green
+# through it for as long as it existed. `self_healable:false` this early is the
+# one reading that means "nothing will bring this window back", and nothing
+# reachable in three seconds justifies it.
+#
+# The full connected -> reconnecting(N) -> connected walk, and the 401 rule that
+# is allowed to be terminal, are `test\win32\remote-reconnect-relay.ps1`'s.
 Run-Cli '+list --json' 'list2json.txt' 15 | Out-Null
 $j2 = $null
 try { $j2 = (Get-Out 'list2json.txt') | ConvertFrom-Json } catch { }
@@ -310,6 +318,10 @@ if ($j2 -and $j2.data -and $j2.data.windows) {
 Assert "connection.state left 'connected' once the agent died" (
     $null -ne $dropped -and $null -ne $dropped.connection -and
     $dropped.connection.state -in @('reconnecting', 'disconnected'))
+Assert "and the window is still recoverable (climbing, or waiting on a re-dial)" (
+    $null -ne $dropped -and $null -ne $dropped.connection -and (
+        $dropped.connection.state -eq 'reconnecting' -or
+        $dropped.connection.self_healable -eq $true))
 if ($null -ne $dropped -and $null -ne $dropped.connection) {
     "    connection: $($dropped.connection | ConvertTo-Json -Compress)"
 }

@@ -94,6 +94,23 @@ pane ids, and both panes LIVE across the swap; the automatic arm as the
 control), plus section 4 of `test/win32/remote-pill.ps1` (the pill goes green
 again).
 
+**A relay re-dial carries the bearer the window was opened with** (T1276).
+Credentials resolve in the same order everywhere else does — the signed-in
+account's relay session token first, because that tier renews, then
+`GHOSTTY_RELAY_TOKEN` — and since T1276 the window's OWN dial token is the
+fallback behind both (`Window.RemoteMachine.relay.token`, chosen by
+`remote_reconnect.chooseRelayToken`). Without it every window opened by
+`+new-remote-window --relay=… --token=…` was un-reconnectable: the store is
+empty on that path, the ladder read the emptiness as SIGNED OUT, and the window
+went terminal about three seconds after the far agent died without ever opening
+a socket. Genuinely no credential anywhere is still terminal — retrying cannot
+sign anyone in — and so is a relay that REJECTS the bearer (401/403, one attempt,
+no ladder). "The device is offline" is not that: the relay answers a dead device
+409/502, which is an ordinary unreachable-machine retry. Acceptance:
+`test/win32/remote-reconnect-relay.ps1` (climb, recovery onto the same session,
+and the 401 arm), plus section 6 of `test/win32/ipc-relay.ps1`, which now
+asserts the window is still recoverable rather than merely no longer connected.
+
 macOS renders this as Mac's machine pill plus a separate status capsule
 (`MachinePillView.swift`); Windows merges the two into one capsule in the
 caption band (T367) — the band already hosts the "…" button, so the affordance

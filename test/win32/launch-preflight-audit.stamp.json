@@ -1,10 +1,11 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-09-02T04:22:22-07:00",
-    "commit":  "a9134df7c",
+    "generated":  "2026-09-02T05:24:16-07:00",
+    "commit":  "cdf47065c",
     "uncommitted":  [
-                        "test/win32/ipc-relay.ps1"
+                        "test/win32/ipc-relay.ps1",
+                        "test/win32/remote-reconnect-relay.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -130,7 +131,7 @@
                   "test/win32/ipc-p2.ps1":  "53fbae7e13398dd72417d4eadaba0357bcad893e86fcef82c7a951acdd185448",
                   "test/win32/ipc-p3.ps1":  "86a607dd5edd0407a87a5615ebb37958dd2ab77aa16874f5e34c53315f300b25",
                   "test/win32/ipc-read-race.ps1":  "ff6f89cab2e92dae0fa13e1ea2f9a89f2579175ddcc2b8b55c53b8b7f330bee6",
-                  "test/win32/ipc-relay.ps1":  "dacee4939cca7128c386efa4d21fdb01252f2452a10373fe4567e737ad4167ea",
+                  "test/win32/ipc-relay.ps1":  "5e55a8d6d5f9f19117fe416ad0324129cca2296f30267f6df4c578f3506a7de0",
                   "test/win32/ipc-remote.ps1":  "861e93ef7522e4559ccd66cccea2cddc89f363df666bfe4b135da2bd143d0ea9",
                   "test/win32/ipc-send-keys-fidelity.ps1":  "ecd1a63052e0a9c52fdb10003f817026c4b95acd8fe76b4e2cff8a57a1ff2fd8",
                   "test/win32/ipc-startup-latency.ps1":  "f9696e3e450043659688926efca6912b1ddeb19113e1be8c2581e20a591196a6",
@@ -222,6 +223,7 @@
                   "test/win32/remote-inherit.ps1":  "50b2a9d36a10d0e677963fbb7d155e3dbc45261111214c1ab8b6454f025e24da",
                   "test/win32/remote-pill.ps1":  "76ffee269bac8ababf6ead9bba303664e9ff20615ea8b738f8fbd362cb345f41",
                   "test/win32/remote-reconnect-fresh.ps1":  "57b43deff08f9c6e056ea8eac4d8ced8134fd30f528b81d3b645132b29d971d1",
+                  "test/win32/remote-reconnect-relay.ps1":  "b185af19d8563f4151f1b5ec11e5e1084eb755773c208abe4b01a3b1f7cf2c32",
                   "test/win32/reset-context.ps1":  "fea3d6af59f82fe015cbe5ce4fd85fa7c431da0267ecf98e1d33a361c07761ac",
                   "test/win32/reset-window-size.ps1":  "163ab9bfcf216a224adcd886da9787dc33e5d1d3ed078a541028e3116918526c",
                   "test/win32/resize-flicker.ps1":  "8d0d9d900dcd249a42f0aabde5790bae5bc5e4beec46a9f27d4bff5a2d2d72f7",

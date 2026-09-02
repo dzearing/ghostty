@@ -459,11 +459,19 @@ fn startAttempt(app: *App, window: *Window) void {
         } },
         .relay => |r| blk: {
             // Credentials are resolved HERE: the account store is the GUI
-            // thread's. Signed out is terminal until the user signs in, and says
-            // so rather than blaming the network.
+            // thread's. The store's answer wins because it renews, and the
+            // bearer this window was DIALED with is the fallback (T1276) — a
+            // window opened by `+new-remote-window --token=…` leaves the store
+            // empty, and reading that emptiness as signed-out took the ladder
+            // terminal on attempt 1 without ever dialing. Genuinely no
+            // credential anywhere is still terminal until the user signs in,
+            // and says so rather than blaming the network.
             var arena_state = std.heap.ArenaAllocator.init(alloc);
             defer arena_state.deinit();
-            const token = IpcHandlers.resolveToken(arena_state.allocator()) orelse {
+            const token = policy.chooseRelayToken(
+                IpcHandlers.resolveToken(arena_state.allocator()),
+                r.token,
+            ) orelse {
                 log.warn(
                     "remote reconnect: '{s}' needs a relay credential (signed out)",
                     .{windowName(window)},

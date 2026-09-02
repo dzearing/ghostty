@@ -104,7 +104,7 @@ pub const Job = struct {
     /// window so T68's "New Window" re-dials the same one. Borrows this job's
     /// strings; `setRemoteMachine` dupes them.
     pub fn machine(self: *const Job) Window.RemoteMachine {
-        return .{ .relay = .{ .base = self.base, .device = self.device } };
+        return .{ .relay = .{ .base = self.base, .device = self.device, .token = self.token } };
     }
 
     /// Whether one of our panes already holds a session this window wants, per

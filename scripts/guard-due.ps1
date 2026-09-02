@@ -1247,6 +1247,25 @@ $GuardTable = @(
             'test\win32\agent-relay-session-e2e.ps1'
         )
     },
+    # The reconnect ladder ON THE RELAY PATH (T1276). The pure policy is unit
+    # tested and the ladder's driver has an on-box script for the TCP case
+    # (remote-reconnect-fresh), so what nothing else covered is the path a
+    # user's second machine actually uses: the credential a relay re-dial
+    # carries, and the difference between "the machine is unreachable" (climb)
+    # and "the bearer was rejected" (terminal). The defect this closes lived
+    # entirely in that gap and every other harness stayed green through it.
+    [pscustomobject]@{
+        Name   = 'remote-reconnect-relay'
+        Script = 'test\win32\remote-reconnect-relay.ps1'
+        Stamp  = 'test\win32\remote-reconnect-relay.stamp.json'
+        Covers = @(
+            'src\apprt\win32\RemoteReconnect.zig',
+            'src\apprt\win32\remote_reconnect.zig',
+            'src\remote\relay_dial.zig',
+            'test\win32\lib\FakeRelay.ps1',
+            'test\win32\remote-reconnect-relay.ps1'
+        )
+    },
     # Standalone-install adoption (T549) only fires on a box that still has
     # the old agent MSI, so the whole flow - idle-stop, the deny-terminate
     # shield around the uninstall, the Run-key repair - is invisible to the
