@@ -22,16 +22,37 @@
 # survived" is equally consistent with the keystroke never arriving - which is
 # exactly how a confident, wrong negative gets recorded.
 #
+# THE CONTROL HAS A PRECONDITION OF ITS OWN (T1284). Ctrl+W over a terminal
+# closes the pane only when that pane's shell is descendant-free; a busy shell
+# gets `Surface.close`'s confirmation dialog instead (T41), which is MODAL. On
+# 2026-09-02 this script scored three reds inside the suite and ALL PASS on the
+# re-run alone, and the filed suspicion was that a posted chord cannot reach a
+# background desktop. It can: the reproduction is a forced confirmation
+# (`--confirm-close-surface=always`), which produces that suite log assertion
+# for assertion - the pane count frozen at 2, the chooser still opening because
+# a posted message ignores the modal's EnableWindow, and the owner window never
+# re-enabling. So the control now WAITS for the shells to go idle, and reads
+# the dialog back rather than inferring a missing keystroke from a pane that
+# did not close. Harness defect, not a desktop capability gap.
+#
 # -NegativeControl inverts assertion (1) to expect the chooser to SURVIVE
 # Ctrl+W, which is the pre-T603 behavior and MUST fail; it is how a run proves
 # this script discriminates rather than riding a green desktop.
+#
+# -ForceConfirm reproduces the 2026-09-02 suite red on demand (see T1284): it
+# runs the app with `confirm-close-surface = always`, so the positive control's
+# Ctrl+W raises the modal instead of closing. It MUST fail, at the dialog
+# assertion and the pane count, and it must fail THERE ONLY - that is the
+# demonstration that the dialog is now named and dismissed rather than left
+# standing to redden two more sections.
 #
 #   powershell -NoProfile -File test\win32\chooser-close-chord.ps1
 #
 # Only touches ghoztty processes running from this repo's zig-out.
 param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
-    [switch]$NegativeControl
+    [switch]$NegativeControl,
+    [switch]$ForceConfirm
 )
 
 # T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
@@ -48,6 +69,11 @@ if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 $env:GHOZTTY_PIPE_SUFFIX = "-t603$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+# T1284: the idle oracle and the confirm-dialog reader. The positive control
+# below closes a pane, and a close only happens outright when the pane's shell
+# is descendant-free - otherwise it raises a MODAL confirmation, and that is
+# what this script actually scored (three reds) inside the suite on 2026-09-02.
+. (Join-Path $PSScriptRoot 'lib\PaneIdle.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -103,6 +129,13 @@ function Get-PaneCount {
 # this one never opened (T158).
 function Launch-Gui($errlog) {
     $args = @('--window-width=100', '--window-height=30', '--session-persistence=false')
+    # -ForceConfirm: the T1284 reproduction. `confirm-close-surface = always` is
+    # the one branch `Surface.shellIsIdle` refuses to answer "idle" for whatever
+    # the process table says, so it stands in for a busy shell deterministically.
+    # The run MUST go red, and it must go red at the two NEW assertions - the
+    # dialog reader and, once the modal is dismissed, the pane that did not
+    # close - rather than dragging sections 2 and 3 down with it.
+    if ($ForceConfirm) { $args += '--confirm-close-surface=always' }
     $app = Start-OnTestDesktop -Exe $Exe -Arguments $args -StdErr $errlog
     Start-Sleep -Seconds 3
     if ($app.Process -and $app.Process.HasExited) { return $null }
@@ -139,8 +172,28 @@ try {
 
     $pane = Get-TestChildWindow -Window $g.Top -Class 'GhozttyTerminal'
     Assert ($pane -ne [IntPtr]::Zero) 'a terminal pane is there to aim the chord at'
+
+    # WAIT FOR THE SHELLS TO SETTLE FIRST (T1284). A close asks
+    # `Surface.shellIsIdleNow`, and a shell that still has descendants - which
+    # is what a freshly split pane looks like for as long as its shell takes to
+    # start, and that is a function of box load - raises the confirmation
+    # dialog instead of closing. So the state this control depends on is now
+    # waited for and asserted rather than assumed after a flat 2-second sleep.
+    $idle = Wait-PanesIdle -Exe $Exe -TimeoutMs 20000
+    Assert $idle.Idle "both panes' shells are idle before the chord ($($idle.Text))"
+
     [void](Send-TestKeys -Window $g.Top -Target $pane -Modifiers ctrl -Key W)
     Start-Sleep -Seconds 2
+
+    # And READ THE DIALOG BACK, because a confirmation is the one other thing
+    # Ctrl+W can do here, and it is indistinguishable from a chord that never
+    # arrived if nobody looks. It is also modal: left standing it disables the
+    # owner window for the rest of the run, which is how one wrong assertion
+    # became three on 2026-09-02. Named, then dismissed.
+    $confirm = Get-CloseConfirmDialog -ProcessId $g.Pid
+    Assert ($confirm -eq [IntPtr]::Zero) 'the close went through without a confirmation dialog (the shell was idle)'
+    if ($confirm -ne [IntPtr]::Zero) { [void](Clear-CloseConfirmDialog -ProcessId $g.Pid) }
+
     $afterPane = Get-PaneCount
     Assert ($afterPane -eq ($before - 1)) "Ctrl+W closed one pane ($before -> $afterPane)"
     Assert (Test-TestWindowExists -Window $g.Top) 'and the window itself survived (one pane was left)'
