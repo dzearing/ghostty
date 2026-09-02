@@ -665,6 +665,15 @@ try {
     Stop-TestForegroundWatch | Out-Null
 }
 
+# A green run stamps the covered files (T783/T364) so guard-due can answer
+# "has this harness been run against the color math as it now stands?". Red
+# leaves the stamp alone: red stays due. A negative-control run is red by
+# construction, so it never stamps.
+if ($script:fail -eq 0 -and -not $NegativeControl) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard chrome-theme -Repo $repo 2>&1 | ForEach-Object { "  $_" }
+}
+
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }
 else { Write-Host "$script:fail FAILURE(S) of $($script:pass + $script:fail)" -ForegroundColor Red }

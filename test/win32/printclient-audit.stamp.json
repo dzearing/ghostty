@@ -1,10 +1,11 @@
 {
     "guard":  "printclient-audit",
     "script":  "test/win32/printclient-audit.ps1",
-    "generated":  "2026-09-01T21:38:55-07:00",
-    "commit":  "d26d0f59b",
+    "generated":  "2026-09-02T03:37:50-07:00",
+    "commit":  "e9f2084c1",
     "uncommitted":  [
-                        "src/apprt/win32/update_install.zig"
+                        "src/apprt/win32/chrome_theme.zig",
+                        "src/apprt/win32/color_math.zig"
                     ],
     "files":  {
                   "src/apprt/win32/activity_actions.zig":  "9f5cfa4c1238fd023d5c8a1d80790ae21751be5f7389662e2fe1b790fef8ad63",
@@ -44,7 +45,7 @@
                   "src/apprt/win32/chooser_rows.zig":  "22429346bc431d82a1c5091e240962f613f385c829b257ed80d2532192971fff",
                   "src/apprt/win32/chooser_session_sort.zig":  "1316bcd3df281a34b77aeeb86ca107e651f41702b6d16df8422cd878d2c0b7a3",
                   "src/apprt/win32/chooser_sessions.zig":  "de267bf5e49cea23f0e9e304b718a9169038b159bf185318923b522a2fd48b66",
-                  "src/apprt/win32/chrome_theme.zig":  "2106f67038ddde8b0a6346e36904c365ad0d4590d6a5c4e43900a921dda993bd",
+                  "src/apprt/win32/chrome_theme.zig":  "3dbebfd48bd5f0b2a0a23d805e107bdd0e180f94f6c72386c87827f11e3b807f",
                   "src/apprt/win32/class_redraw.zig":  "fe65e8f95a15d18a581c8bbdcdb00e1820d53e837c6a69645173eaae2545a04a",
                   "src/apprt/win32/claude_plugin_manifest.zig":  "a0812c8b3cb533065274a5b9be19a18df4fe2f0efd0932972e082748debf7b89",
                   "src/apprt/win32/claude_plugin_migration.zig":  "09ae22a00d446fce29cf1b98c2bb30b97a90395bdb2f0869af8172ca9ee6e28d",
@@ -52,7 +53,7 @@
                   "src/apprt/win32/ClaudeHookSpec.zig":  "1f1b3c306da5bddc1ab165f3a7e99d3e22f8f444c974a639e0e33c57ecff6038",
                   "src/apprt/win32/clipboard_image.zig":  "2feb8e5a035d1d2044d6737fb9527b59045512ba4098de328e6b55137c90e713",
                   "src/apprt/win32/clipboard_open.zig":  "97d4c0fdc4216f5071f9dfb87067be04c7687c2a1a0a48f74dfe70f20d700815",
-                  "src/apprt/win32/color_math.zig":  "62ae5b2aaeaab3691e52899ccb9a91b363a7d1143d6986a6ae5d651482454384",
+                  "src/apprt/win32/color_math.zig":  "144ee567f70e4bffa1fb09b174d8685dfd316da3aa519cfa414d6edef8ebddce",
                   "src/apprt/win32/com.zig":  "5bdb6803e4056d79ba1a1390ff939e62c4fca87688ff1516cffb19cf9ecc3f54",
                   "src/apprt/win32/commands.zig":  "d209e69397689f010dc4adade13dd7a8711851c7b6f8285fe986767735ab88b6",
                   "src/apprt/win32/ConfirmDialog.zig":  "fee6d2a926498f670761adb5d79fd69f67022c5ae2030617033753b9e03145e0",

@@ -2373,6 +2373,29 @@ $GuardTable = @(
             'test\win32\lib\TestDesktop.ps1',
             'src\cli\ghostty.zig'
         )
+    },
+    # T364 - the chrome's COLOR math, which nothing in the four lanes scores
+    # against a painted pixel. chrome-theme.ps1 is the one harness that reads
+    # the band, the hover and the panel surfaces off the screen and compares
+    # them to values it DERIVES from these two modules, so an edit here is
+    # exactly the kind that a green unit-test suite and a green build both miss.
+    # The oracle library is covered with them: it mirrors the Zig, and a mirror
+    # that drifts is the failure this harness cannot catch on its own.
+    #
+    # Deliberately NARROW. The painters that consume these colors
+    # (Window.zig, tab_shape.zig) are not here - they change constantly, and a
+    # row that is always due is a row nobody reads.
+    [pscustomobject]@{
+        Name   = 'chrome-theme'
+        Script = 'test\win32\chrome-theme.ps1'
+        Stamp  = 'test\win32\chrome-theme.stamp.json'
+        Covers = @(
+            'src\apprt\win32\chrome_theme.zig',
+            'src\apprt\win32\color_math.zig',
+            'src\apprt\win32\panel_theme.zig',
+            'test\win32\lib\ColorMath.ps1',
+            'test\win32\chrome-theme.ps1'
+        )
     }
 )
 

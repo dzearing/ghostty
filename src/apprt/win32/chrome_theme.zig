@@ -125,6 +125,24 @@ pub const debug_tint_amount: f64 = 0.35;
 /// against the untinted one to count as marked.
 pub const debug_min_delta: u16 = 48;
 
+/// The most of the chrome's wash STEP the marker is allowed to cost (T364).
+///
+/// Every separation this chrome draws above the bar — an inactive tab, a
+/// hovered tab, an icon button's hover fill — is a fixed FRACTION of the
+/// distance from the bar to white (`color_math.wash`). So the size of the step
+/// depends on how dark the bar is, and mixing amber into a dark base makes it
+/// much lighter: on `--background=#000000` the inactive tab's lift fell from
+/// 14 levels to 9, a debug-only erosion of exactly the separation T206 exists
+/// to create. `debugChromeBase` now puts that room back (see there), and this
+/// is how much it is allowed to leave behind.
+///
+/// Not zero, because it cannot be: only pure black is as far from white as
+/// pure black, so a marker on a near-black background HAS to spend some of the
+/// room to be a color at all. 10% is a step of 12.6 where the release paints
+/// 14 — under a level of difference on the surface a dev is looking at, and
+/// far inside the 35% that made this a task.
+pub const debug_max_step_loss: f64 = 0.10;
+
 fn channelDistance(a: Rgb, b: Rgb) u16 {
     const d = struct {
         fn f(x: u8, y: u8) u16 {
@@ -159,9 +177,33 @@ fn channelDistance(a: Rgb, b: Rgb) u16 {
 /// inequality no background can be within `debug_min_delta / debug_tint_amount`
 /// (137) of both — asserted in the sweep below rather than argued.
 pub fn debugChromeBase(base: Rgb) Rgb {
-    const amber = color_math.mix(base, debug_tint, debug_tint_amount);
+    const amber = markedBase(base, debug_tint);
     if (channelDistance(amber, base) >= debug_min_delta) return amber;
-    return color_math.mix(base, debug_tint_fallback, debug_tint_amount);
+    return markedBase(base, debug_tint_fallback);
+}
+
+/// The marked base for one hue: the tint, with the wash room it costs put back
+/// (T364).
+///
+/// The tint itself is unchanged — `mix(base, hue, debug_tint_amount)` is still
+/// what decides the COLOR. What follows it is a move along the axis `wash`
+/// travels, which restores the distance to the wash target without touching
+/// the hue that distance is now carrying. On a dark base that means the marked
+/// band comes back DARKER than the plain mix, so the washes above it step as
+/// far as they do in the release build; on a light one it comes back lighter,
+/// for the same reason in the other direction.
+///
+/// T43 still comes first. A restored base that no longer clears
+/// `debug_min_delta` — or that has crossed the light/dark line the washes take
+/// their direction from — loses to the plain tint: a band that steps perfectly
+/// and does not say "this is not the release" fails the only thing the marker
+/// is for.
+fn markedBase(base: Rgb, hue: Rgb) Rgb {
+    const tinted = color_math.mix(base, hue, debug_tint_amount);
+    const restored = color_math.restoreWashHeadroom(tinted, base, 1.0 - debug_max_step_loss);
+    if (channelDistance(restored, base) >= debug_min_delta and
+        color_math.isLight(restored) == color_math.isLight(base)) return restored;
+    return tinted;
 }
 
 /// Decode the DWORD Windows stores for the accent color. It is **ABGR**
@@ -621,15 +663,102 @@ test "debugChromeBase: no background can defeat both marker hues" {
 
     // And the preferred hue really is preferred: a neutral background gets
     // amber, not the fallback, so "the debug band is amber" stays learnable.
+    // The expectation is the amber construction in full — the tint plus the
+    // wash room T364 puts back — so this still fails if the fallback hue is
+    // reached for on a background amber can mark.
     for ([_]Rgb{ surface_light, surface_dark, .{ .r = 0x1E, .g = 0x1E, .b = 0x2E } }) |bg| {
-        try testing.expectEqual(color_math.mix(bg, debug_tint, debug_tint_amount), debugChromeBase(bg));
+        const marked = debugChromeBase(bg);
+        try testing.expectEqual(markedBase(bg, debug_tint), marked);
+        // And it leans amber rather than violet, which is the part a reader of
+        // the band can check without the arithmetic.
+        try testing.expect(marked.r > marked.b);
     }
     // A background that IS the marker hue takes the fallback instead of coming
     // back unmarked — the whole reason there are two.
     try testing.expectEqual(
-        color_math.mix(debug_tint, debug_tint_fallback, debug_tint_amount),
+        markedBase(debug_tint, debug_tint_fallback),
         debugChromeBase(debug_tint),
     );
+}
+
+test "debugChromeBase: the marker cannot cost the chrome its wash steps (T364)" {
+    // The number this task exists for, as ONE ratio. Every separation above
+    // the bar is `alpha * washHeadroom` — an inactive tab, a hovered tab, an
+    // icon button's hover fill — so a base that keeps its headroom keeps all
+    // of them, whatever their alphas are, and a sweep of bases is the whole
+    // proof.
+    const floor: f64 = 1.0 - debug_max_step_loss;
+    var v: u16 = 0;
+    while (v <= 255) : (v += 1) {
+        const c: u8 = @intCast(v);
+        for ([_]Rgb{
+            .{ .r = c, .g = c, .b = c },
+            .{ .r = c, .g = @intCast(255 - v), .b = 0x40 },
+            .{ .r = 0x20, .g = c, .b = @intCast(255 - v) },
+            .{
+                .r = @intCast(@min(255, @as(u16, c) + 128)),
+                .g = @intCast((@as(u16, c) * 176) / 255),
+                .b = c / 4,
+            },
+        }) |bg| {
+            const marked = debugChromeBase(bg);
+            const want: f64 = @floatFromInt(color_math.washHeadroom(bg, bg));
+            const have: f64 = @floatFromInt(color_math.washHeadroom(marked, bg));
+
+            if (color_math.isLight(marked) == color_math.isLight(bg)) {
+                // The ordinary case, and the guarantee: the marked band washes
+                // the same way the plain one does and keeps its room to do it.
+                try testing.expect(have >= want * floor);
+            } else {
+                // The tint crossed the light/dark line, so `markedBase` kept
+                // the plain tint rather than push a band onto the far side of
+                // the line its washes take their direction from. Restoring
+                // headroom cannot help there, and it does not make it worse:
+                // the measured floor over this sweep is 0.8933, on
+                // `#208679` — one rounding step under the guarantee, not a
+                // separate policy.
+                try testing.expect(have >= want * 0.89);
+            }
+        }
+    }
+}
+
+test "debugChromeBase: the #000000 regression, as the two step tables (T364)" {
+    // T364's own table, which is what a dev on a dark theme actually sees: the
+    // bar the marker paints on a pure black background, and the inactive tab
+    // lifted off it. Measured before this task: 9 / 11 / 14 against a release
+    // chrome that steps 14 / 14 / 14, because the marked bar was `(102,77,20)`
+    // where the release paints `(20,20,20)`.
+    const black: Rgb = .{ .r = 0, .g = 0, .b = 0 };
+    // `tab_shape.INACTIVE_LIFT`, which is `banner_card.FILL_LIGHTEN`. Named
+    // here rather than imported: this module is the bottom of the chrome's
+    // color stack and does not depend on the painters above it.
+    const inactive_lift: f32 = 0.06;
+
+    const plain_bar = color_math.wash(black, bar_wash);
+    const marked_bar = color_math.wash(debugChromeBase(black), bar_wash);
+    const plain = color_math.wash(plain_bar, inactive_lift);
+    const marked = color_math.wash(marked_bar, inactive_lift);
+
+    try testing.expectEqual(@as(u8, 14), plain.r - plain_bar.r);
+    try testing.expectEqual(@as(u8, 14), plain.g - plain_bar.g);
+    try testing.expectEqual(@as(u8, 14), plain.b - plain_bar.b);
+
+    // 11 / 13 / 14 now. The red channel is the one that cannot come all the
+    // way back: amber IS 255 red, so on a black base the marker has to spend
+    // that channel's room to be amber at all — spending less of it takes the
+    // band under `debug_min_delta` and stops it being a marker.
+    try testing.expect(marked.r - marked_bar.r >= 11);
+    try testing.expect(marked.g - marked_bar.g >= 13);
+    try testing.expect(marked.b - marked_bar.b >= 14);
+
+    // And the aggregate, which is the guarantee rather than the table: 0.899
+    // of the release chrome's step, where it used to be 0.803.
+    const have: f64 = @floatFromInt(color_math.washHeadroom(marked_bar, plain_bar));
+    const want: f64 = @floatFromInt(color_math.washHeadroom(plain_bar, plain_bar));
+    // `- 1.5` is the rounding slack of a u8 bar washed off a u8 base, not a
+    // softened bar: 634 against a guarantee of 634.5.
+    try testing.expect(have >= want * (1.0 - debug_max_step_loss) - 1.5);
 }
 
 test "debugChromeBase: the marker survives resolve with every floor intact" {

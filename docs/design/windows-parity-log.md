@@ -19976,3 +19976,48 @@ strays either time. `-NegativeControl` on the new arm is 1 FAILURE / 29 passed,
 exit 1, no stamp, and the planted stray swept afterwards. Floor: lib/none/win32/
 agent ALL LANES PASS; P1/P2/P3 ALL PASS. The seven suite-wide audits that read
 every test script re-ran green over the new library and re-stamped.
+
+
+## 2026-09-02 - T364: the debug marker stops flattening the chrome it marks
+
+A dev build tints its window chrome amber so it can never be mistaken for the
+installed app. On a dark theme that tint was also quietly costing the chrome its
+separation: every surface above the bar - an inactive tab, a hovered tab, an
+icon button's hover fill - is `color_math.wash(bar, k)`, a fixed FRACTION of the
+bar's distance to white, and an amber-tinted bar is a much lighter bar. On
+`--background=#000000` the inactive tab lifted 9 levels off the marked bar where
+the release chrome lifts 14. A dev was judging tab separation against a chrome
+that had lost a third of it.
+
+The tint still decides the COLOR. What is new is what happens next: the marked
+base is pushed back along the axis `wash` itself travels until it keeps at least
+90% of the untinted base's distance to the wash target, so the hue survives and
+the room underneath it comes back. Two primitives carry it -
+`color_math.washHeadroom` (the quantity every wash step is proportional to) and
+`restoreWashHeadroom` (a bisection along that axis, clamping per channel). T43
+still wins ties: a restored base that stops clearing `debug_min_delta`, or that
+crosses the light/dark line the washes take their direction from, falls back to
+the plain tint rather than trade the marker for the step.
+
+Nothing that SHIPS moved. The wash amounts, `tab_shape.INACTIVE_LIFT` and
+`chrome_theme.hover_wash` are untouched - the third candidate in the task file
+(absolute-stepped washes) was rejected for exactly that reason: it would change
+the release chrome to fix a surface only a dev sees.
+
+Evidence: on `#000000` the inactive step goes 9/11/14 -> 11/13/14 against a
+release 14/14/14, and the bar keeps 0.899 of the release chrome's wash headroom
+where it kept 0.803. A sweep of 1024 backgrounds asserts the >=90% floor
+directly; the red channel is the one that cannot come all the way back, because
+amber IS 255 red and spending less of that channel takes the band under
+`debug_min_delta`. `test\win32\chrome-theme.ps1` ALL PASS (64) - its oracle
+derives the marked band the same way the app does, so the real painted pixel is
+what scored it - and `tab-strip.ps1` ALL PASS (70). Floor: lib/none/win32/agent
+ALL LANES PASS; P1/P2/P3 ALL PASS.
+
+The chrome's color math had no `guard-due` row, which is how an edit like this
+one could have gone unrun against the only harness that reads it off the screen;
+`chrome-theme` is now a row (narrow on purpose - the painters that consume these
+colors change constantly), and a green run stamps it. Filed T1274 for the
+pre-existing case the restore steps aside on: on mid-luminance backgrounds the
+tint carries the band across the light/dark threshold, so its washes travel the
+opposite way from the release chrome's.

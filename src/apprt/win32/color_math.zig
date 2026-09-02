@@ -111,6 +111,91 @@ fn washChannel(c: u8, toward: f32, a: f32) u8 {
     return @intFromFloat(std.math.clamp(@round(v + (toward - v) * a), 0.0, 255.0));
 }
 
+/// The total room a `wash` has to move `c`, measured in the direction `wash`
+/// would take `reference`.
+///
+/// `wash(x, a)` moves every channel `a` of the way to 255 (a dark background)
+/// or to 0 (a light one), so the SIZE of the step it takes is exactly `a`
+/// times this number. That is what makes it the quantity to hold fixed when a
+/// color is SUBSTITUTED underneath chrome that washes off it: two bases with
+/// the same wash headroom lift their bar, their inactive tabs and their hovers
+/// by the same amount, however different the two bases look (T364).
+///
+/// The direction comes from `reference`, not from `c`, so a substitution is
+/// always measured against the original's own side of the light/dark line —
+/// asking `c` would silently compare two different quantities the moment a
+/// substitution crossed it.
+pub fn washHeadroom(c: Rgb, reference: Rgb) u16 {
+    const toward: i16 = if (isLight(reference)) 0 else 255;
+    const d = struct {
+        fn f(x: u8, t: i16) u16 {
+            const v: i16 = x;
+            return @intCast(if (t > v) t - v else v - t);
+        }
+    }.f;
+    return d(c.r, toward) + d(c.g, toward) + d(c.b, toward);
+}
+
+/// Push `c` back along its wash-headroom axis until it keeps at least
+/// `fraction` of `reference`'s headroom.
+///
+/// This is the inverse of what a tint costs the chrome above it: mixing a hue
+/// into a dark base LIGHTENS it, every wash taken off it afterwards is a fixed
+/// fraction of a now-shorter distance to white, and so every separation the
+/// chrome draws with a wash gets smaller (T364 measured a 35% loss on
+/// `--background=#000000`). Scaling the distance to the wash target puts that
+/// back without undoing the tint: each channel moves by the same factor along
+/// the axis `wash` itself travels, so the hue survives and only the room
+/// underneath it is restored.
+///
+/// Channels that run out of room clamp, so a headroom that is not reachable at
+/// all — only pure black is as far from white as pure black — comes back as
+/// the closest color on the axis rather than as an error. Callers that need
+/// the result to still satisfy some other property (a debug marker that must
+/// stay visible) check it themselves; this function only ever moves toward
+/// `reference`'s wash target being farther away.
+pub fn restoreWashHeadroom(c: Rgb, reference: Rgb, fraction: f64) Rgb {
+    const have: f64 = @floatFromInt(washHeadroom(c, reference));
+    const target: f64 = @as(f64, @floatFromInt(washHeadroom(reference, reference))) *
+        std.math.clamp(fraction, 0.0, 1.0);
+    if (have >= target) return c;
+
+    const toward: f64 = if (isLight(reference)) 0.0 else 255.0;
+
+    // Headroom is monotone in the scale factor, so bisect it. 8x is past the
+    // point where every channel has clamped, which is all the room this axis
+    // has to give.
+    var lo: f64 = 1.0;
+    var hi: f64 = 8.0;
+    var i: usize = 0;
+    while (i < 32) : (i += 1) {
+        const mid = (lo + hi) / 2.0;
+        if (headroomAtScale(c, toward, mid) >= target) hi = mid else lo = mid;
+    }
+    return scaledFromWashTarget(c, toward, hi);
+}
+
+fn scaledFromWashTarget(c: Rgb, toward: f64, f: f64) Rgb {
+    const s = struct {
+        fn ch(v: u8, t: f64, k: f64) u8 {
+            const x: f64 = @floatFromInt(v);
+            return @intFromFloat(std.math.clamp(@round(t + (x - t) * k), 0.0, 255.0));
+        }
+    }.ch;
+    return .{ .r = s(c.r, toward, f), .g = s(c.g, toward, f), .b = s(c.b, toward, f) };
+}
+
+fn headroomAtScale(c: Rgb, toward: f64, f: f64) f64 {
+    const v = scaledFromWashTarget(c, toward, f);
+    const d = struct {
+        fn g(x: u8, t: f64) f64 {
+            const y: f64 = @floatFromInt(x);
+            return if (t > y) t - y else y - t;
+        }
+    }.g;
+    return d(v.r, toward) + d(v.g, toward) + d(v.b, toward);
+}
+
 /// Alpha-composite `fg` over `bg` at `alpha`. The sibling of `wash`: `wash`
 /// picks its own destination from the background's luminance, `mix` is told
 /// one. GDI has no alpha for flat fills, so every such blend is resolved up
@@ -877,6 +962,77 @@ test "wash: direction follows the background, and a light background darkens" {
     try testing.expectEqual(dark, wash(dark, 0.0));
     try testing.expectEqual(Rgb{ .r = 255, .g = 255, .b = 255 }, wash(dark, 1.0));
     try testing.expectEqual(Rgb{ .r = 0, .g = 0, .b = 0 }, wash(light, 1.0));
+}
+
+test "washHeadroom: it is the size of a wash step, divided by its alpha" {
+    // The whole reason the function exists: `wash` moves each channel a fixed
+    // fraction of this distance, so holding it fixed holds every wash step
+    // fixed. Asserted as the identity rather than described (T364).
+    for ([_]Rgb{
+        .{ .r = 0, .g = 0, .b = 0 },
+        .{ .r = 0x20, .g = 0x20, .b = 0x20 },
+        .{ .r = 0xF3, .g = 0xF3, .b = 0xF3 },
+        .{ .r = 0x1E, .g = 0x50, .b = 0xC8 },
+    }) |bg| {
+        const a: f32 = 0.08;
+        const w = wash(bg, a);
+        const moved: u16 = @as(u16, @intCast(@abs(@as(i16, w.r) - @as(i16, bg.r)))) +
+            @as(u16, @intCast(@abs(@as(i16, w.g) - @as(i16, bg.g)))) +
+            @as(u16, @intCast(@abs(@as(i16, w.b) - @as(i16, bg.b))));
+        const predicted = @as(f32, @floatFromInt(washHeadroom(bg, bg))) * a;
+        try testing.expect(@abs(predicted - @as(f32, @floatFromInt(moved))) <= 1.5);
+    }
+
+    // Black is as far from white as anything can be, and white is as far from
+    // black — the two extremes of the same number.
+    try testing.expectEqual(@as(u16, 765), washHeadroom(
+        .{ .r = 0, .g = 0, .b = 0 },
+        .{ .r = 0, .g = 0, .b = 0 },
+    ));
+    try testing.expectEqual(@as(u16, 765), washHeadroom(
+        .{ .r = 255, .g = 255, .b = 255 },
+        .{ .r = 255, .g = 255, .b = 255 },
+    ));
+}
+
+test "restoreWashHeadroom: it puts back what a tint took, and never overshoots" {
+    // The sweep is the point: the caller (`chrome_theme.debugChromeBase`) runs
+    // on whatever background the user configured, so a hand-picked pair proves
+    // nothing about the one that matters.
+    const amber: Rgb = .{ .r = 0xFF, .g = 0xB0, .b = 0x00 };
+    var v: u16 = 0;
+    while (v <= 255) : (v += 1) {
+        const c: u8 = @intCast(v);
+        for ([_]Rgb{
+            .{ .r = c, .g = c, .b = c },
+            .{ .r = c, .g = @intCast(255 - v), .b = 0x40 },
+            .{ .r = 0x20, .g = c, .b = @intCast(255 - v) },
+        }) |bg| {
+            const tinted = mix(bg, amber, 0.35);
+            const restored = restoreWashHeadroom(tinted, bg, 0.9);
+
+            // It only ever ADDS room — a restore that could take some away
+            // would be a worse answer than not calling it.
+            try testing.expect(washHeadroom(restored, bg) >= washHeadroom(tinted, bg));
+
+            // It reaches the target, or it ran out of axis: only pure black is
+            // as far from white as pure black, so a base near an extreme
+            // cannot be marked AND fully restored.
+            const target = @as(f64, @floatFromInt(washHeadroom(bg, bg))) * 0.9;
+            const have = @as(f64, @floatFromInt(washHeadroom(restored, bg)));
+            if (have < target) {
+                // The only excuse is a clamped channel: at the answer it gave,
+                // one channel is already sitting on the far end.
+                const toward: u8 = if (isLight(bg)) 0 else 255;
+                try testing.expect(restored.r == toward or restored.g == toward or
+                    restored.b == toward);
+            }
+
+            // And it does not overshoot: a fraction already satisfied is a
+            // no-op, not a move.
+            try testing.expectEqual(tinted, restoreWashHeadroom(tinted, bg, 0.0));
+        }
+    }
 }
 
 test "wash: on a dark background it lands within a few levels of `bg + 20`" {

@@ -32,6 +32,7 @@ $DEBUG_TINT = @(0xFF, 0xB0, 0x00)           # chrome_theme.debug_tint
 $DEBUG_TINT_FALLBACK = @(0x7B, 0x2F, 0xF7)  # chrome_theme.debug_tint_fallback
 $DEBUG_TINT_AMOUNT = 0.35                   # chrome_theme.debug_tint_amount
 $DEBUG_MIN_DELTA = 48                       # chrome_theme.debug_min_delta
+$DEBUG_MAX_STEP_LOSS = 0.10                 # chrome_theme.debug_max_step_loss
 
 # --- primitives -------------------------------------------------------------
 
@@ -83,10 +84,63 @@ function Get-ChannelDistance([int[]]$A, [int[]]$B) {
     return [Math]::Abs($A[0] - $B[0]) + [Math]::Abs($A[1] - $B[1]) + [Math]::Abs($A[2] - $B[2])
 }
 
+# color_math.washHeadroom: the total room a wash has to move $C, measured in
+# the direction a wash would take $Reference. Every wash step is this number
+# times the wash amount, which is why the marker below holds it fixed.
+function Get-WashHeadroom([int[]]$C, [int[]]$Reference) {
+    $toward = if (Test-IsLight $Reference[0] $Reference[1] $Reference[2]) { 0 } else { 255 }
+    return [Math]::Abs($toward - $C[0]) + [Math]::Abs($toward - $C[1]) + [Math]::Abs($toward - $C[2])
+}
+
+function Get-ScaledFromWashTarget([int[]]$Rgb, [double]$Toward, [double]$F) {
+    # NOT `$c` for the loop variable: PowerShell variable names are
+    # case-insensitive, so it would be the same cell as an [int[]]$C parameter
+    # and the array would be gone on the second iteration.
+    $out = @()
+    foreach ($ch in $Rgb) {
+        $v = $Toward + ([double]$ch - $Toward) * $F
+        $out += [int][Math]::Max(0, [Math]::Min(255, [Math]::Round($v, [MidpointRounding]::AwayFromZero)))
+    }
+    return , $out
+}
+
+# color_math.restoreWashHeadroom: push $C back along its wash-headroom axis
+# until it keeps at least $Fraction of $Reference's headroom. Same bisection as
+# the Zig, so the two agree on the clamped cases as well as the easy ones.
+function Get-RestoredWashHeadroom([int[]]$C, [int[]]$Reference, [double]$Fraction) {
+    $have = Get-WashHeadroom $C $Reference
+    $target = (Get-WashHeadroom $Reference $Reference) * $Fraction
+    if ($have -ge $target) { return , $C }
+    $toward = if (Test-IsLight $Reference[0] $Reference[1] $Reference[2]) { 0.0 } else { 255.0 }
+    $lo = 1.0
+    $hi = 8.0
+    for ($i = 0; $i -lt 32; $i++) {
+        $mid = ($lo + $hi) / 2.0
+        $v = Get-ScaledFromWashTarget $C $toward $mid
+        $h = [Math]::Abs($toward - $v[0]) + [Math]::Abs($toward - $v[1]) + [Math]::Abs($toward - $v[2])
+        if ($h -ge $target) { $hi = $mid } else { $lo = $mid }
+    }
+    return , (Get-ScaledFromWashTarget $C $toward $hi)
+}
+
+# chrome_theme.markedBase (T364): the tint, with the wash room it costs put
+# back - unless doing so stops the band reading as marked or moves it across
+# the light/dark line the washes take their direction from.
+function Get-MarkedChromeBase([int[]]$Base, [int[]]$Hue) {
+    $tinted = Get-Mix $Base $Hue $DEBUG_TINT_AMOUNT
+    $restored = Get-RestoredWashHeadroom $tinted $Base (1.0 - $DEBUG_MAX_STEP_LOSS)
+    $sameSide = (Test-IsLight $restored[0] $restored[1] $restored[2]) -eq
+                (Test-IsLight $Base[0] $Base[1] $Base[2])
+    if (((Get-ChannelDistance $restored $Base) -ge $DEBUG_MIN_DELTA) -and $sameSide) {
+        return , $restored
+    }
+    return , $tinted
+}
+
 function Get-DebugChromeBase([int[]]$Base) {
-    $amber = Get-Mix $Base $DEBUG_TINT $DEBUG_TINT_AMOUNT
+    $amber = Get-MarkedChromeBase $Base $DEBUG_TINT
     if ((Get-ChannelDistance $amber $Base) -ge $DEBUG_MIN_DELTA) { return , $amber }
-    return , (Get-Mix $Base $DEBUG_TINT_FALLBACK $DEBUG_TINT_AMOUNT)
+    return , (Get-MarkedChromeBase $Base $DEBUG_TINT_FALLBACK)
 }
 
 # --- WCAG -------------------------------------------------------------------
