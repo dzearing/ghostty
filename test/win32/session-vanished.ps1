@@ -144,17 +144,18 @@ function Stop-Everything {
 
 # --- CLI plumbing ------------------------------------------------------------
 
-# ghoztty.exe is GUI-subsystem, so a pipe reads empty; redirect through cmd and
-# bound the wait, or a wedged server hangs the script instead of failing it.
+# T1238: the CLI runs ON THE TEST DESKTOP. It also captures stdout and stderr to
+# a file itself, which is what the `cmd /c "... > file 2>&1"` dance was for -
+# ghoztty.exe is GUI-subsystem, so a PowerShell pipe reads empty (T245) - and it
+# bounds the wait, so a wedged server still fails the script instead of hanging
+# it.
 function Run-Cli([string]$argsLine, [string]$out, [int]$timeoutSec = 15) {
-    $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
-        -ArgumentList "/c `"`"$Exe`" $argsLine > `"$out`" 2>&1`""
-    $null = $p.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
-    if (-not $p.WaitForExit($timeoutSec * 1000)) {
-        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-        return $null
-    }
-    return $p.ExitCode
+    $argv = @($argsLine -split '\s+' | Where-Object { $_ -ne '' })
+    $r = Invoke-OnTestDesktop -Exe $Exe -Arguments $argv -TimeoutSec $timeoutSec
+    $text = if ($null -ne $r.Output) { $r.Output } else { '' }
+    [System.IO.File]::WriteAllText($out, $text)
+    if ($r.TimedOut) { return $null }
+    return $r.ExitCode
 }
 function Run-CliArgs([string[]]$argv, [string]$out, [int]$timeoutSec = 15) {
     return Run-Cli ($argv -join ' ') $out $timeoutSec
@@ -231,8 +232,8 @@ function Get-Tree([string]$tag) {
 
 # Bring the app up and wait for it to answer IPC. Returns its pid, or 0.
 function Start-TestApp([string]$title, [int]$timeoutSec = 45) {
-    Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @(
-        "--title=$title", '--window-width=100', '--window-height=30') | Out-Null
+    [void](Start-OnTestDesktop -Exe $Exe -Arguments @(
+        "--title=$title", '--window-width=100', '--window-height=30'))
     $deadline = (Get-Date).AddSeconds($timeoutSec)
     while ((Get-Date) -lt $deadline) {
         $rc = Run-Cli '+list --json' "$tmp\list-up-$title.json" 10
@@ -295,6 +296,12 @@ try {
     . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
     [void](Set-GhozttyTestIsolation -Tag 'vanish1162')
     Assert-GhozttyPrivateEndpoint -Exe $Exe
+
+    # T1238: the GUI and every CLI call below start on a background test desktop,
+    # so this script no longer throws a window across the user's screen.
+    . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+    $td = New-TestDesktop
+
 
     # ========================================================================
     Say '== A: baseline - a live, agent-backed, holder-served pane'
@@ -413,6 +420,7 @@ try {
     Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Stop-Everything
+    Remove-TestDesktop | Out-Null
     $env:LOCALAPPDATA = $savedLocalAppData
     if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
     else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }

@@ -77,22 +77,23 @@ function Stop-GuiOnly {
 }
 
 # Run a zig-out ghoztty +command with a hard timeout; stdout+stderr -> $out.
+# T1238: on the TEST DESKTOP. The `cmd /c "... > file"` dance this replaced
+# existed because a GUI-subsystem exe writes nothing to a PowerShell redirect
+# (T245); the harness captures both handles to a file itself.
 function Run-Cli($argsLine, $out, $timeoutSec = 15) {
-    $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
-        -ArgumentList "/c `"`"$Exe`" $argsLine > `"$out`" 2>&1`""
-    $null = $p.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
-    if (-not $p.WaitForExit($timeoutSec * 1000)) {
-        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-        return $null
-    }
-    return $p.ExitCode
+    $argv = @($argsLine -split '\s+' | Where-Object { $_ -ne '' })
+    $r = Invoke-OnTestDesktop -Exe $Exe -Arguments $argv -TimeoutSec $timeoutSec
+    $text = if ($null -ne $r.Output) { $r.Output } else { '' }
+    [System.IO.File]::WriteAllText($out, $text)
+    if ($r.TimedOut) { return $null }
+    return $r.ExitCode
 }
 function Out-Text($f) { if (Test-Path $f) { Get-Content $f -Raw } else { '' } }
 
 function Start-App($title) {
     # persistence: on (default) - session persistence IS this script's subject.
-    Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @(
-        "--title=$title", '--window-width=100', '--window-height=30') | Out-Null
+    [void](Start-OnTestDesktop -Exe $Exe -Arguments @(
+        "--title=$title", '--window-width=100', '--window-height=30'))
 }
 
 # --- the agent's session roster ---------------------------------------------
@@ -236,6 +237,11 @@ $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 [void](Set-GhozttyTestIsolation -Tag 'crashrec')
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
+# T1238: the GUI and every CLI call below start on a background test desktop,
+# so this script no longer throws a window across whatever the user is reading.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+$td = New-TestDesktop
+
 try {
 
 Assert "agent binary exists in zig-out" (Test-Path $AgentExe)
@@ -370,6 +376,7 @@ if ($script:failures -gt 0) {
 } finally {
     "== cleanup"
     Stop-TestProcs
+    Remove-TestDesktop | Out-Null
     $env:LOCALAPPDATA = $savedLocalAppData
     if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
     else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }

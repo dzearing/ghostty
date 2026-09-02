@@ -98,18 +98,19 @@ function Run-Cli($argv, $out, $instance, $lad, $bundled, $timeoutSec = 30) {
     else { $env:GHOZTTY_AGENT_BUNDLED_VERSION = $bundled }
     # persistence: a CLI invocation - it opens no window, so there is nothing to
     # restore. (Repeated by the launch statement so the sweep sees it.)
-    $p = Start-Process -FilePath $Exe -WindowStyle Hidden -PassThru `
-        -ArgumentList $argv -RedirectStandardOutput $out -RedirectStandardError "$out.err"
-    $null = $p.Handle
+    # T1238: through the harness, so the CLI process sits on the test desktop.
+    # Nothing here can open a window (`+sessions` never auto-launches), but the
+    # rule is the launch site, not the verb that happens to be passed today.
+    $r = Invoke-OnTestDesktop -Exe $Exe -Arguments $argv -TimeoutSec $timeoutSec
     if ($null -eq $savedInst) { Remove-Item env:GHOZTTY_AGENT_INSTANCE -ErrorAction SilentlyContinue }
     else { $env:GHOZTTY_AGENT_INSTANCE = $savedInst }
     $env:LOCALAPPDATA = $savedLad
     if ($null -eq $savedBundled) { Remove-Item env:GHOZTTY_AGENT_BUNDLED_VERSION -ErrorAction SilentlyContinue }
     else { $env:GHOZTTY_AGENT_BUNDLED_VERSION = $savedBundled }
-    $code = $null
-    if ($p.WaitForExit($timeoutSec * 1000)) { $p.WaitForExit(); $code = $p.ExitCode }
-    else { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
-    return $code
+    $text = if ($null -ne $r.Output) { $r.Output } else { '' }
+    [System.IO.File]::WriteAllText($out, $text)
+    if ($r.TimedOut) { return $null }
+    return $r.ExitCode
 }
 function Out-Text($f) { if (Test-Path $f) { (Get-Content $f -Raw) -replace "`0", '' } else { '' } }
 
@@ -122,6 +123,10 @@ function Row($text, $key) {
 }
 
 $null = Assert-GhozttyIsolatedBuild -Exe $Exe
+
+# T1238: the CLI runs on a background desktop rather than the user's.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+$td = New-TestDesktop
 
 New-Item -ItemType Directory -Force $root | Out-Null
 $saved = @{
@@ -261,6 +266,7 @@ if ($null -ne $json) {
     foreach ($id in $script:mine) {
         Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
     }
+    Remove-TestDesktop | Out-Null
     if ($null -eq $saved.lad) { Remove-Item env:LOCALAPPDATA -ErrorAction SilentlyContinue } else { $env:LOCALAPPDATA = $saved.lad }
     if ($null -eq $saved.bin) { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue } else { $env:GHOSTTY_LOCAL_AGENT_BIN = $saved.bin }
     if ($null -eq $saved.inst) { Remove-Item env:GHOZTTY_AGENT_INSTANCE -ErrorAction SilentlyContinue } else { $env:GHOZTTY_AGENT_INSTANCE = $saved.inst }

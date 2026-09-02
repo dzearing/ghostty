@@ -19520,3 +19520,48 @@ Floor: lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS;
 gate-negatives, parity-tasks-seat, go-loop-guard, suite-run, agent-autostart,
 isolation-meta, launch-preflight, verdict-exit, cleanslate, stderr-capture,
 body-complete, desktop-launch - all green.
+
+## 2026-09-01 - ten more acceptance scripts stopped throwing windows across the user's screen (T1238)
+
+The session and agent lifecycle scripts started the app from a process sitting on
+the user's own desktop, so running the suite - which the loop does on essentially
+every task - put terminal windows on top of whatever the user was reading. Ten of
+the thirteen in T1193's first batch now launch through the harness
+(`Start-OnTestDesktop` / `Invoke-OnTestDesktop`), which names a background desktop
+in the child's STARTUPINFO: `agent-autostart`, `agent-handoff`, `agent-recovery`,
+`session-close`, `session-crash-recover`, `session-open`, `session-persistence`,
+`session-vanished`, `sessions-agent-build`, `single-instance-join`. Each one is
+ALL PASS on the box, asserting exactly what it asserted before. The audit's
+pending list went 45 -> 33.
+
+Three of them needed more than the mechanical recipe, and each would otherwise
+have kept passing while measuring nothing:
+
+- `single-instance-join.ps1` found its confirm dialog with `FindWindowW` on the
+  HOST's desktop. Two of its assertions are that the dialog is ABSENT, and those
+  would have gone green for the wrong reason the moment the app moved.
+- `session-persistence.ps1` carried a private EnumWindows/MoveWindow driver for
+  the window-geometry section; same blindness, plus it owned the process's DPI
+  awareness (the harness does both now).
+- `agent-recovery.ps1`'s oracle is a SET of terminal surfaces before and after a
+  rebuild - and an empty set equals an empty set, so a host-desktop enumeration
+  would have made every "the surfaces were replaced" check unfalsifiable.
+
+Two scripts are now DECLARED EXCEPTIONS rather than pending, with a measured
+reason: `agent-job-escape.ps1` and `relaunch-guard.ps1` assert that a process the
+app spawns lands outside a kill-on-close job. From a pane's shell job chain the
+breakaway tier is refused (`err=.ACCESS_DENIED`), so the escape that actually
+happens is the shell-parent hop - and a background desktop has no shell window.
+Migrated, the app logs `shell-parent spawn unavailable err=error.NoShellWindow`
+and spawns inside the job, turning a correct build red. That measurement needs a
+desktop with a shell, and the declaration says so instead of "pending migration".
+
+The thirteenth, `session-relaunch.ps1`, is deferred to [[T1265]] behind
+[[T1264]]: migrated, its section A goes red because the
+`--- session restarted ---` divider never arrives. Its section B asserts the same
+thing and is ALREADY red on an unmodified checkout - measured twice, back to
+back - so the migration only made a live defect reproducible on demand.
+
+Floor: lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS; plus every harness
+the edit made due - isolation-meta, launch-preflight, verdict-exit, cleanslate,
+stderr-capture, test-desktop, desktop-launch - all green.

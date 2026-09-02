@@ -66,49 +66,35 @@ function Assert($name, $cond) {
     if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
 }
 
-# ---- Win32 driver: DPI-aware window enumeration + programmatic resize ------
-Add-Type @'
-using System;
-using System.Collections.Generic;
-using System.Text;
-using System.Runtime.InteropServices;
-public class SPDrv {
-    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
-    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
-    [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassNameW(IntPtr h, StringBuilder sb, int max);
-    [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int hh, bool repaint);
-    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
-    [StructLayout(LayoutKind.Sequential)] public struct RECT { public int left, top, right, bottom; }
-    [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
-    public delegate bool EnumProc(IntPtr h, IntPtr l);
+# ---- window enumeration + programmatic resize ------------------------------
+# T1238: through the harness, which marshals every call onto the test desktop's
+# own thread. The private EnumWindows/MoveWindow driver this replaced ran on the
+# HOST's desktop and would answer zero for windows that are plainly there once
+# the app launches onto the test desktop - so C2's "resized both app windows"
+# would fail and E's minimize would silently do nothing. The harness also makes
+# the process DPI-aware, which is what the old driver's SetProcessDPIAware call
+# was for: geometry here is in physical pixels, like the app's.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
-    // All visible GhozttyWindow top-levels belonging to zig-out ghoztty pids.
-    public static IntPtr[] TopWindows(uint[] pids) {
-        var wins = new List<IntPtr>();
-        EnumWindows((h, l) => {
-            uint p; GetWindowThreadProcessId(h, out p);
-            foreach (var want in pids) {
-                if (p == want && IsWindowVisible(h)) {
-                    var sb = new StringBuilder(64);
-                    GetClassNameW(h, sb, 64);
-                    if (sb.ToString() == "GhozttyWindow") wins.Add(h);
-                }
-            }
-            return true;
-        }, IntPtr.Zero);
-        return wins.ToArray();
+# All GhozttyWindow top-levels belonging to this run's app pids.
+function Top-Windows($appPids) {
+    $wins = @()
+    foreach ($procId in @($appPids)) {
+        foreach ($w in @(Get-TestWindows -ProcessId ([int]$procId) -Class 'GhozttyWindow')) {
+            $wins += [IntPtr]$w.Hwnd
+        }
     }
-
-    public static int[] Rect(IntPtr h) {
-        RECT r;
-        if (!GetWindowRect(h, out r)) return new int[] { 0, 0, 0, 0 };
-        return new int[] { r.left, r.top, r.right - r.left, r.bottom - r.top };
-    }
+    # Returned UNWRAPPED on purpose: every caller is `@(Top-Windows ...)`, and a
+    # `return , $wins` would arrive there as ONE element that happens to be an
+    # array - which reads as "found 1 window" and fails C2 against two real ones.
+    return $wins
 }
-'@
-[void][SPDrv]::SetProcessDPIAware()  # match the app's physical-pixel space
+
+# left, top, WIDTH, HEIGHT - the shape the assertions below index into.
+function Win-Rect($hwnd) {
+    $r = Get-TestWindowRect -Window $hwnd
+    return @($r.Left, $r.Top, $r.Width, $r.Height)
+}
 
 # ---- process helpers (zig-out lineage only) --------------------------------
 function App-Pids {
@@ -131,26 +117,28 @@ function Relaunch-App {
     $env:LOCALAPPDATA = $script:tmp
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
     # persistence: on (default) - session persistence IS this script's subject.
-    Start-Process -FilePath $Exe | Out-Null
+    [void](Start-OnTestDesktop -Exe $Exe)
 }
 
-# ---- CLI helpers (timeout-guarded via cmd.exe redirect) --------------------
+# ---- CLI helpers (timeout-guarded, on the test desktop) --------------------
+# T1238: `Invoke-OnTestDesktop` replaces a `cmd /c "... > file 2>&1"` dance. It
+# captures stdout AND stderr to the file itself - which is what the dance was for
+# (a GUI-subsystem exe writes nothing to a PowerShell redirect, T245) - and it
+# TERMINATES the child on timeout, which is the other thing that mattered here: a
+# CLI left alive holding the redirect target open made every later probe fail at
+# ~35ms with no output, and turned 2 real timeouts into 26 fake failures in a
+# T111b run.
 function Run-Cli($argsLine, $out, $timeoutSec = 15) {
-    $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
-        -ArgumentList "/c `"`"$Exe`" $argsLine > `"$out`" 2>&1`""
-    $null = $p.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
-    if (-not $p.WaitForExit($timeoutSec * 1000)) {
-        # Kill the TREE, not just cmd.exe. Stop-Process leaves the ghoztty CLI
-        # child alive, and that orphan keeps the redirect target ($out) open --
-        # so EVERY later probe writing the same file dies at ~35ms with exit 1
-        # and no output, because cmd cannot open the file, not because the
-        # server failed. That artifact turned 2 real timeouts into 26 fake
-        # failures in a T111b run and is exactly the kind of harness defect
-        # that gets mis-filed as a product bug.
-        & taskkill /F /T /PID $p.Id 2>&1 | Out-Null
-        return $null
-    }
-    return $p.ExitCode
+    $argv = @($argsLine -split '\s+' | Where-Object { $_ -ne '' })
+    $r = Invoke-OnTestDesktop -Exe $Exe -Arguments $argv -TimeoutSec $timeoutSec
+    $text = if ($null -ne $r.Output) { $r.Output } else { '' }
+    [System.IO.File]::WriteAllText($out, $text)
+    if ($r.TimedOut) { return $null }
+    return $r.ExitCode
+}
+# The argv form, for a call whose arguments carry spaces or quotes of their own.
+function Ghoz([string[]]$GhozArgs, [int]$TimeoutSec = 20) {
+    return Invoke-OnTestDesktop -Exe $Exe -Arguments $GhozArgs -TimeoutSec $TimeoutSec
 }
 function Out-Text($f) { if (Test-Path $f) { Get-Content $f -Raw } else { '' } }
 
@@ -294,7 +282,7 @@ $script:ws_n = 0
 function Probe-Cols($pane, $tag) {
     $script:ws_n++
     $tok = "WSTK$($PID)N$($script:ws_n)"
-    & $Exe +send-keys --target=$pane "echo $tok & mode con" Enter 2>&1 | Out-Null
+    [void](Ghoz @('+send-keys', "--target=$pane", "echo $tok & mode con", 'Enter'))
     $deadline = (Get-Date).AddSeconds(12)
     while ((Get-Date) -lt $deadline) {
         $txt = Read-Pane $pane 120 "ws-$tag"
@@ -326,17 +314,17 @@ function Wait-Cols($pane, $tag, $pred, $timeoutSec = 15) {
 function Minimize-AppWindows {
     $pids = @(App-Pids | ForEach-Object { [uint32]$_ })
     if ($pids.Count -eq 0) { return 0 }
-    $wins = @([SPDrv]::TopWindows($pids))
-    foreach ($hw in $wins) { [void][SPDrv]::ShowWindow($hw, 6) }  # SW_MINIMIZE
+    $wins = @(Top-Windows $pids)
+    foreach ($hw in $wins) { [void](Send-TestSysCommand -Window $hw -Command 'minimize') }
     return $wins.Count
 }
 function Resize-AllWindows($w, $h) {
     $pids = @(App-Pids | ForEach-Object { [uint32]$_ })
     if ($pids.Count -eq 0) { return 0 }
-    $wins = @([SPDrv]::TopWindows($pids))
+    $wins = @(Top-Windows $pids)
     $x = 60
     foreach ($hw in $wins) {
-        [void][SPDrv]::MoveWindow($hw, $x, 60, $w, $h, $true)
+        [void](Set-TestWindowPos -Window $hw -X $x -Y 60 -Width $w -Height $h)
         $x += 80  # stagger so windows don't fully overlap
     }
     return $wins.Count
@@ -394,8 +382,12 @@ try {
 
 # The check is mechanism-free: if anything already answers on the endpoint this
 # exe will use, we are not hermetic, full stop.
-& $Exe +list 2>&1 | Out-Null
-if ($LASTEXITCODE -eq 0) {
+# T1238: the desktop comes up before the first CLI call, because that call - the
+# hermeticity guard below - launches nothing but every later one can.
+$td = New-TestDesktop
+
+$preflight = Ghoz @('+list')
+if ($preflight.ExitCode -eq 0) {
     Write-Host ""
     Write-Host "ABORT: a Ghoztty instance is ALREADY answering on the endpoint '$Exe' uses." -ForegroundColor Red
     Write-Host "  This harness would drive that instance instead of its own (and its +close" -ForegroundColor Red
@@ -415,7 +407,7 @@ $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 "== A: build the 2-window / 5-pane scenario with distinct ratios"
 # ============================================================================
 # persistence: on (default) - session persistence IS this script's subject.
-Start-Process -FilePath $Exe | Out-Null
+[void](Start-OnTestDesktop -Exe $Exe)
 $n = Wait-Windows 'a0' 1 30
 Assert "A1 startup window opened" ($n -eq 1)
 # T441's safety oracle: the instance answering is the exe under test, and the
@@ -464,10 +456,9 @@ Assert "A6 identified the unnamed panes P0/P3" ($null -ne $p0 -and $null -ne $p3
 $layoutA = '{"direction":"horizontal","ratio":30,"left":{"pane":"' + $p0 + '"},' +
     '"right":{"direction":"vertical","ratio":70,"left":{"pane":"spA"},"right":{"pane":"spB"}}}'
 $layoutB = '{"direction":"horizontal","ratio":40,"left":{"pane":"' + $p3 + '"},"right":{"pane":"spC"}}'
-& $Exe +rearrange --target=winA ('--layout=' + ($layoutA -replace '"', '\"')) 2>&1 | Out-Null
-$raOk = ($LASTEXITCODE -eq 0)
-& $Exe +rearrange --target=winB ('--layout=' + ($layoutB -replace '"', '\"')) 2>&1 | Out-Null
-Assert "A7 +rearrange applied to both windows" ($raOk -and $LASTEXITCODE -eq 0)
+$raA = Ghoz @('+rearrange', '--target=winA', ('--layout=' + ($layoutA -replace '"', '\"')))
+$raB = Ghoz @('+rearrange', '--target=winB', ('--layout=' + ($layoutB -replace '"', '\"')))
+Assert "A7 +rearrange applied to both windows" ($raA.ExitCode -eq 0 -and $raB.ExitCode -eq 0)
 Start-Sleep -Seconds 2
 $baseRatios = @(All-Ratios 'a7')
 Assert "A8 baseline ratios are the rearranged 0.3/0.4/0.7" (
@@ -578,11 +569,11 @@ $framesBack = $false
 $deadline = (Get-Date).AddSeconds(15)
 while ((Get-Date) -lt $deadline) {
     $pids = @(App-Pids | ForEach-Object { [uint32]$_ })
-    $wins = @([SPDrv]::TopWindows($pids))
+    $wins = @(Top-Windows $pids)
     if ($wins.Count -eq 2) {
         $good = 0
         foreach ($hw in $wins) {
-            $r = [SPDrv]::Rect($hw)
+            $r = Win-Rect $hw
             if ([math]::Abs($r[2] - 1000) -le 10 -and [math]::Abs($r[3] - 640) -le 10) { $good++ }
         }
         if ($good -eq 2) { $framesBack = $true; break }
@@ -608,7 +599,7 @@ Assert "C8 live post-restore resize reached the ConPTY (cols $refCols -> $liveCo
 # app is DEAD (agent-only), and output DURING the ATTACH replay. Every value
 # must land in scrollback exactly in order.
 $gtok = "GPF$($PID)Q"
-& $Exe +send-keys --target=spA "for /L %i in (1,1,60) do @(echo $gtok-%i & ping -n 2 127.0.0.1 >nul)" Enter 2>&1 | Out-Null
+[void](Ghoz @('+send-keys', '--target=spA', "for /L %i in (1,1,60) do @(echo $gtok-%i & ping -n 2 127.0.0.1 >nul)", 'Enter'))
 $started = Wait-PaneToken 'spA' "$gtok-5" 30 'd-start'
 Assert "D1 flood running (reached seq 5 pre-kill)" $started
 
@@ -686,7 +677,7 @@ Assert "D7 no runaway duplication (no value seen 3+ times; bad=$dupBad)" ($dupBa
 # resumes from was written by an OPEN-era launch. Everything from D1-D7 repeats
 # with a fresh sequence, and D10b is the assertion that would have gone red.
 $gtok2 = "GPF2$($PID)Q"
-& $Exe +send-keys --target=spA "for /L %i in (1,1,60) do @(echo $gtok2-%i & ping -n 2 127.0.0.1 >nul)" Enter 2>&1 | Out-Null
+[void](Ghoz @('+send-keys', '--target=spA', "for /L %i in (1,1,60) do @(echo $gtok2-%i & ping -n 2 127.0.0.1 >nul)", 'Enter'))
 $started2 = Wait-PaneToken 'spA' "$gtok2-5" 30 'd2-start'
 Assert "D8 second flood running (reached seq 5 pre-kill)" $started2
 
@@ -732,10 +723,10 @@ $stormFile = Join-Path $root 'storm.txt'
 $sb = [System.Text.StringBuilder]::new()
 1..25000 | ForEach-Object { [void]$sb.AppendLine("storm-payload $_ " + ('z' * 60)) }
 [System.IO.File]::WriteAllText($stormFile, $sb.ToString())
-& $Exe +split --target=winB --name=stormP --direction=down --shell=cmd `
-    "--command=for /l %i in (1,1,400) do @type $stormFile" 2>&1 | Out-Null
-& $Exe +split --target=winA --name=echoP --direction=down --shell=cmd `
-    "--command=for /l %i in (1,1,4000000) do @echo tiny-write-storm %i zzzzzzzzzzzzzzzzzzzzzzzzzzzz" 2>&1 | Out-Null
+[void](Ghoz @('+split', '--target=winB', '--name=stormP', '--direction=down', '--shell=cmd',
+    "--command=for /l %i in (1,1,400) do @type $stormFile"))
+[void](Ghoz @('+split', '--target=winA', '--name=echoP', '--direction=down', '--shell=cmd',
+    '--command=for /l %i in (1,1,4000000) do @echo tiny-write-storm %i zzzzzzzzzzzzzzzzzzzzzzzzzzzz'))
 Minimize-AppWindows
 Start-Sleep -Seconds 3
 $stormIds = @(Wait-AliveIds 'e-setup' 7 20)
@@ -817,6 +808,7 @@ Assert "E12 +close echo-storm pane returns in $($sw.ElapsedMilliseconds)ms < 10s
 # ============================================================================
 "== cleanup"
 Stop-TestProcs
+Remove-TestDesktop | Out-Null
 $env:LOCALAPPDATA = $savedLocalAppData
 if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
 else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }

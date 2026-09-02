@@ -228,19 +228,9 @@
 # @user-desktop-launch: profile-latency.ps1 -- (T53b) already interactive-by-design above: injection timing is the measurement, and it can only be taken where input is injected.
 # @user-desktop-launch: go-loop-guard.ps1 -- (T1193) the ONE bare launch is the fallback taken when New-TestDesktop throws - a desktop we cannot create must not cost the whole suite, and the fallback says so loudly before it runs.
 #
-# @user-desktop-launch: agent-autostart.ps1 -- pending migration, T1238.
-# @user-desktop-launch: agent-handoff.ps1 -- pending migration, T1238.
-# @user-desktop-launch: agent-job-escape.ps1 -- pending migration, T1238.
-# @user-desktop-launch: agent-recovery.ps1 -- pending migration, T1238.
-# @user-desktop-launch: relaunch-guard.ps1 -- pending migration, T1238.
-# @user-desktop-launch: session-close.ps1 -- pending migration, T1238.
-# @user-desktop-launch: session-crash-recover.ps1 -- pending migration, T1238.
-# @user-desktop-launch: session-open.ps1 -- pending migration, T1238.
-# @user-desktop-launch: session-persistence.ps1 -- pending migration, T1238.
-# @user-desktop-launch: session-relaunch.ps1 -- pending migration, T1238.
-# @user-desktop-launch: session-vanished.ps1 -- pending migration, T1238.
-# @user-desktop-launch: sessions-agent-build.ps1 -- pending migration, T1238.
-# @user-desktop-launch: single-instance-join.ps1 -- pending migration, T1238.
+# @user-desktop-launch: agent-job-escape.ps1 -- (T1238) its SUBJECT is the agent escaping a kill-on-close job, and the only escape tier that works from the pane-shell job chain is the shell-parent hop: measured on box, breakaway is ACCESS_DENIED and a background desktop has no shell window, so the app logs 'shell-parent spawn unavailable err=error.NoShellWindow' and spawns INSIDE the job. The measurement needs a desktop that has a shell.
+# @user-desktop-launch: relaunch-guard.ps1 -- (T1238) same measured reason as agent-job-escape.ps1 above: its section F asserts the relaunched app lands OUTSIDE a kill-on-close job, and that escape needs the shell-parent hop, which needs a desktop with a shell window.
+# @user-desktop-launch: session-relaunch.ps1 -- pending migration, T1265 (blocked on T1264: migrated, its section A goes red because the '--- session restarted ---' divider never arrives - the defect T1264 tracks, already red in section B here).
 # @user-desktop-launch: holder-adopt.ps1 -- pending migration, T1239.
 # @user-desktop-launch: holder-durable.ps1 -- pending migration, T1239.
 # @user-desktop-launch: holder-soak.ps1 -- pending migration, T1239.

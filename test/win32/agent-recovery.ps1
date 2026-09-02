@@ -99,39 +99,30 @@ function Show-Agents($tmp, $tag) {
     foreach ($a in (Get-RunAgents $tmp)) { "      pid=$($a.ProcessId) $($a.CommandLine)" }
 }
 
+# T1238: every CLI call runs ON THE TEST DESKTOP, and the harness captures the
+# child's stdout AND stderr to $out itself - which is what the old `cmd /c
+# "... > file 2>&1"` wrapper was for (a GUI-subsystem exe writes nothing to a
+# PowerShell redirect, T245).
 function Run-Cli($argsLine, $out, $timeoutSec = 15) {
-    $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
-        -ArgumentList "/c `"`"$Exe`" $argsLine > `"$out`" 2>&1`""
-    $null = $p.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
-    if (-not $p.WaitForExit($timeoutSec * 1000)) {
-        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-        return $null
-    }
-    return $p.ExitCode
+    $argv = @($argsLine -split '\s+' | Where-Object { $_ -ne '' })
+    $r = Invoke-OnTestDesktop -Exe $Exe -Arguments $argv -TimeoutSec $timeoutSec
+    $text = if ($null -ne $r.Output) { $r.Output } else { '' }
+    [System.IO.File]::WriteAllText($out, $text)
+    if ($r.TimedOut) { return $null }
+    return $r.ExitCode
 }
 
-# Same, but the arguments are passed as a real ARRAY straight to the exe.
-# `cmd /c` re-parses the whole line and eats the inner quotes, so an argument
-# containing a space (`+send-keys ... "echo MARKER"`) arrives split in two —
-# which is how the first run of this script reported a healthy pane as
-# unresponsive. Nothing that carries a space may go through Run-Cli.
+# Same, but the arguments are passed as a real ARRAY. The distinction outlived
+# the `cmd /c` wrapper it was written against: an argument containing a space
+# (`+send-keys ... "echo MARKER"`) must arrive as ONE argument, which is how the
+# first run of this script reported a healthy pane as unresponsive.
 function Run-CliArgs($argv, $out, $timeoutSec = 15) {
     # persistence: on (default) - the agent under test only owns sessions when persistence is on.
-    $p = Start-Process -FilePath $Exe -WindowStyle Hidden -PassThru `
-        -ArgumentList $argv -RedirectStandardOutput $out -RedirectStandardError "$out.err"
-    # Touching .Handle caches the process handle, and it has to happen HERE:
-    # after the timed wait below has returned, the child has already exited and
-    # PowerShell reads ExitCode back empty - which every caller scores as a
-    # failure. See lib\ExitCodeAudit.ps1.
-    $null = $p.Handle
-    if (-not $p.WaitForExit($timeoutSec * 1000)) {
-        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-        return $null
-    }
-    # The TIMED WaitForExit can return before the Process object has published
-    # ExitCode; the argument-less overload is what makes it readable.
-    $p.WaitForExit()
-    return $p.ExitCode
+    $r = Invoke-OnTestDesktop -Exe $Exe -Arguments $argv -TimeoutSec $timeoutSec
+    $text = if ($null -ne $r.Output) { $r.Output } else { '' }
+    [System.IO.File]::WriteAllText($out, $text)
+    if ($r.TimedOut) { return $null }
+    return $r.ExitCode
 }
 function Out-Text($f) { if (Test-Path $f) { Get-Content $f -Raw } else { '' } }
 
@@ -271,19 +262,7 @@ public static class GhozttyRecoveryNative {
     [DllImport("kernel32.dll", SetLastError = true)] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
     [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr h);
 
-    delegate bool EnumProc(IntPtr hwnd, IntPtr lparam);
-    [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr lparam);
-    [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr parent, EnumProc cb, IntPtr lparam);
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr hwnd, StringBuilder buf, int max);
-    [DllImport("user32.dll")] static extern int GetWindowThreadProcessId(IntPtr hwnd, out int pid);
-
     const int PROCESS_SUSPEND_RESUME = 0x0800;
-
-    static string ClassOf(IntPtr h) {
-        StringBuilder sb = new StringBuilder(256);
-        int n = GetClassName(h, sb, sb.Capacity);
-        return n > 0 ? sb.ToString() : "";
-    }
 
     // 0 on success. -1 means the process could not be opened at all (gone, or
     // no PROCESS_SUSPEND_RESUME right), which is a different failure from a
@@ -296,25 +275,6 @@ public static class GhozttyRecoveryNative {
         return rc;
     }
 
-    // Every window of class `cls` owned by `pid` - top-levels and all their
-    // descendants - sorted, so two samples compare as sets.
-    public static long[] WindowsOfClass(int pid, string cls) {
-        List<long> acc = new List<long>();
-        EnumWindows(delegate(IntPtr top, IntPtr lp) {
-            int owner;
-            GetWindowThreadProcessId(top, out owner);
-            if (owner == pid) {
-                if (ClassOf(top) == cls) acc.Add(top.ToInt64());
-                EnumChildWindows(top, delegate(IntPtr child, IntPtr lp2) {
-                    if (ClassOf(child) == cls) acc.Add(child.ToInt64());
-                    return true;
-                }, IntPtr.Zero);
-            }
-            return true;
-        }, IntPtr.Zero);
-        acc.Sort();
-        return acc.ToArray();
-    }
 }
 '@
 }
@@ -340,8 +300,20 @@ function Wait-ProcGone($procId, $timeoutSec = 20) {
 }
 # Unary comma: every caller does arithmetic on .Count, and PowerShell unwraps a
 # one-element array return into a scalar whose .Count is $null.
+# T1238: enumerated on the TEST DESKTOP. The private EnumWindows below (still
+# used for suspend/resume, which is desktop-agnostic) runs on the HOST's desktop
+# and would return an EMPTY set once the app launches onto the test desktop -
+# and an empty set compares equal to another empty set, so every "the surfaces
+# were replaced" assertion would have passed without measuring anything.
 function Get-TerminalSurfaces($procId) {
-    return , @([GhozttyRecoveryNative]::WindowsOfClass([int]$procId, 'GhozttyTerminal'))
+    $acc = @()
+    foreach ($top in @(Get-TestWindows -ProcessId ([int]$procId) -Class '*' -AllowHidden)) {
+        if ($top.Class -eq 'GhozttyTerminal') { $acc += [int64]$top.Hwnd }
+        foreach ($c in @(Get-TestChildWindows -Window ([IntPtr]$top.Hwnd) -Class 'GhozttyTerminal')) {
+            $acc += [int64]$c.Hwnd
+        }
+    }
+    return , @($acc | Sort-Object)
 }
 
 # The settled surface set after a rebuild. The departing surfaces are destroyed
@@ -417,6 +389,11 @@ $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 [void](Set-GhozttyTestIsolation -Tag 'agentrec')
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
+# T1238: the GUI and every CLI call below start on a background test desktop,
+# so this script no longer throws a window across whatever the user is reading.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+$td = New-TestDesktop
+
 # ============================================================================
 "== A: baseline - a 2-pane agent-backed window, both panes responsive"
 # ============================================================================
@@ -426,8 +403,7 @@ Assert-GhozttyPrivateEndpoint -Exe $Exe
 # FILE, never a pipe: nothing here drains a pipe, and a full one would block the
 # app's logger.
 $appLog = Join-Path $tmp 'app.err'
-Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @('--title=t145-recovery') `
-    -RedirectStandardOutput (Join-Path $tmp 'app.out') -RedirectStandardError $appLog | Out-Null
+[void](Start-OnTestDesktop -Exe $Exe -Arguments @('--title=t145-recovery') -StdErr $appLog)
 
 $appProc = $null
 $deadline = (Get-Date).AddSeconds(30)
@@ -931,6 +907,7 @@ Assert "J7 the topology survived: one window, 2 terminals, the viewer intact" (
 
 # ============================================================================
 Stop-TestProcs
+Remove-TestDesktop | Out-Null
 $env:LOCALAPPDATA = $savedLocalAppData
 if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
 else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }

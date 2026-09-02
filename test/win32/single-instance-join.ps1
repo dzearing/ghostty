@@ -117,8 +117,7 @@ function Wait-WindowCount($pipe, $count, $timeoutSec = 40) {
 function Launch($suffix, $launchArgs) {
     $saved = $env:GHOZTTY_PIPE_SUFFIX
     $env:GHOZTTY_PIPE_SUFFIX = $suffix
-    Start-Process -FilePath $Exe -WindowStyle Minimized `
-        -ArgumentList (@('--session-persistence=false') + $launchArgs) | Out-Null
+    [void](Start-OnTestDesktop -Exe $Exe -Arguments (@('--session-persistence=false') + $launchArgs))
     $env:GHOZTTY_PIPE_SUFFIX = $saved
 }
 
@@ -148,6 +147,11 @@ Assert 'ghoztty exe exists in zig-out' (Test-Path $Exe)
 $suffixA = $env:GHOZTTY_PIPE_SUFFIX
 $pipeA = Get-GhozttyPipeName -Suffix $suffixA
 Assert-GhozttyPrivateEndpoint -Exe $Exe
+
+# T1238: the GUI and every CLI call below start on a background test desktop,
+# so this script no longer throws a window across whatever the user is reading.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+$td = New-TestDesktop
 
 if (-not (Test-Path $Exe)) {
     'ABORT: no zig-out build to test.'
@@ -321,24 +325,17 @@ Assert 'C10 a launch that already asked still gets the caveat on the reply' (
 # launch CLAIM another build, which is exactly the input the comparison takes.
 # The dialog is answered by posting its own WM_COMMAND (IDOK / IDCANCEL): no
 # SendInput, so this arm works on the background test desktop.
-if (-not ('GhozttyTestDlg' -as [type])) {
-    Add-Type -TypeDefinition @'
-using System;
-using System.Runtime.InteropServices;
-public static class GhozttyTestDlg {
-    [DllImport("user32.dll", CharSet=CharSet.Unicode)]
-    public static extern IntPtr FindWindowW(string cls, string title);
-    [DllImport("user32.dll")]
-    public static extern bool PostMessageW(IntPtr h, uint msg, IntPtr wp, IntPtr lp);
-}
-'@
-}
-
-# [NullString]::Value, never $null: a $null bound to a .NET string parameter
-# arrives as "", and FindWindowW then matches only a window whose title is
-# empty - which the dialog's never is.
+# T1238: the dialog is found and answered ON THE TEST DESKTOP. A `FindWindowW`
+# from this host thread searches the desktop the HOST sits on, so once the app
+# launches onto the test desktop that finder answers zero for a dialog that is
+# plainly there - and D0/D11, which assert ABSENCE, would pass for the wrong
+# reason. The harness marshals both calls onto the desktop's own thread.
+# -AllowHidden so an absence assertion cannot be satisfied by a dialog that
+# merely has not painted yet.
 function Find-Prompt {
-    return [GhozttyTestDlg]::FindWindowW('GhozttyConfirmDialog', [NullString]::Value)
+    $w = @(Get-TestWindows -ProcessId 0 -Class 'GhozttyConfirmDialog' -AllowHidden)
+    if ($w.Count -eq 0) { return [IntPtr]::Zero }
+    return [IntPtr]$w[0].Hwnd
 }
 function Wait-Prompt($timeoutSec = 40) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
@@ -352,7 +349,7 @@ function Wait-Prompt($timeoutSec = 40) {
 function Answer-Prompt($hwnd, $id) {
     # WM_COMMAND with BN_CLICKED in the high word, the control id in the low
     # word - the shape the dialog's own buttons send.
-    [void][GhozttyTestDlg]::PostMessageW($hwnd, 0x0111, [IntPtr]$id, [IntPtr]::Zero)
+    [void](Send-TestRawMessage -Window $hwnd -Message 0x0111 -WParam ([IntPtr]$id) -LParam ([IntPtr]::Zero))
 }
 function Wait-PromptGone($timeoutSec = 20) {
     $deadline = (Get-Date).AddSeconds($timeoutSec)
@@ -374,8 +371,7 @@ function Launch-AsBuild($suffix, $version, $commit, $mode, $launchArgs) {
     $env:GHOZTTY_HANDOFF_VERSION = $version
     $env:GHOZTTY_HANDOFF_COMMIT = $commit
     if ($mode) { $env:GHOZTTY_HANDOFF_PROMPT = $mode } else { $env:GHOZTTY_HANDOFF_PROMPT = $null }
-    Start-Process -FilePath $Exe -WindowStyle Minimized `
-        -ArgumentList (@('--session-persistence=false') + $launchArgs) | Out-Null
+    [void](Start-OnTestDesktop -Exe $Exe -Arguments (@('--session-persistence=false') + $launchArgs))
     $env:GHOZTTY_PIPE_SUFFIX = $savedSuffix
     $env:GHOZTTY_HANDOFF_VERSION = $savedVersion
     $env:GHOZTTY_HANDOFF_COMMIT = $savedCommit
@@ -434,6 +430,7 @@ Assert 'D11 ...and put no question on screen' ((Find-Prompt) -eq [IntPtr]::Zero)
 # ============================================================================
 "== cleanup"
 Stop-TestProcs
+Remove-TestDesktop | Out-Null
 $env:LOCALAPPDATA = $savedLocalAppData
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
 

@@ -82,15 +82,16 @@ function Stop-GuiOnly {
     [void](Stop-RepoGhoztty -Exe $Exe -AppOnly -SettleMs 800)
 }
 
+# T1238: on the TEST DESKTOP. The `cmd /c "... > file"` dance this replaced
+# existed because a GUI-subsystem exe writes nothing to a PowerShell redirect
+# (T245); the harness captures both handles to a file itself.
 function Run-Cli($argsLine, $out, $timeoutSec = 15) {
-    $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
-        -ArgumentList "/c `"`"$Exe`" $argsLine > `"$out`" 2>&1`""
-    $null = $p.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
-    if (-not $p.WaitForExit($timeoutSec * 1000)) {
-        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-        return $null
-    }
-    return $p.ExitCode
+    $argv = @($argsLine -split '\s+' | Where-Object { $_ -ne '' })
+    $r = Invoke-OnTestDesktop -Exe $Exe -Arguments $argv -TimeoutSec $timeoutSec
+    $text = if ($null -ne $r.Output) { $r.Output } else { '' }
+    [System.IO.File]::WriteAllText($out, $text)
+    if ($r.TimedOut) { return $null }
+    return $r.ExitCode
 }
 function Out-Text($f) { if (Test-Path $f) { Get-Content $f -Raw } else { '' } }
 
@@ -136,8 +137,7 @@ function Start-Gui($label) {
     New-Item -ItemType Directory -Force (Join-Path $tmp 'ghoztty\local-agent-debug') | Out-Null
     $env:LOCALAPPDATA = $tmp
     # persistence: on (default) - a launch with persistence off never autostarts an agent, which is the subject.
-    $p = Start-Process -FilePath $Exe -PassThru -WindowStyle Minimized `
-        -ArgumentList @('--title=t89h-agent-autostart')
+    $p = Start-OnTestDesktop -Exe $Exe -Arguments @('--title=t89h-agent-autostart')
     return @{ Tmp = $tmp; Proc = $p }
 }
 
@@ -155,6 +155,11 @@ Assert "agent binary exists in zig-out" (Test-Path $AgentExe)
 # Throws (and so aborts the run) if anything already answers on the private
 # suffix, or if $Exe is a release build on the user's own endpoints (T350).
 Assert-GhozttyPrivateEndpoint -Exe $Exe
+
+# T1238: the GUI and every CLI call below start on a background test desktop,
+# so this script no longer throws a window across whatever the user is reading.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+$td = New-TestDesktop
 
 $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 
@@ -345,8 +350,7 @@ $env:GHOZTTY_AGENT_AUTOSTART = 'gate'
 $tmpE = Join-Path $root 'e'
 New-Item -ItemType Directory -Force (Join-Path $tmpE 'ghoztty\local-agent-debug') | Out-Null
 $env:LOCALAPPDATA = $tmpE
-$pe = Start-Process -FilePath $outsideExe -PassThru -WindowStyle Minimized `
-    -ArgumentList @('--title=t1146-outside')
+$pe = Start-OnTestDesktop -Exe $outsideExe -Arguments @('--title=t1146-outside')
 $runCmdE = $null
 $deadline = (Get-Date).AddSeconds(25)
 while ((Get-Date) -lt $deadline) {
@@ -367,6 +371,7 @@ $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
 # Cleanup
 # ============================================================================
 Stop-TestProcs
+Remove-TestDesktop | Out-Null
 Remove-ItemProperty -Path $runKey -Name $valueName -ErrorAction SilentlyContinue
 if ($null -ne $savedRunValue) { Set-ItemProperty -Path $runKey -Name $valueName -Value $savedRunValue }
 $env:LOCALAPPDATA = $savedLocalAppData

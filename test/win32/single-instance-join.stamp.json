@@ -1,11 +1,14 @@
 {
     "guard":  "single-instance-join",
     "script":  "test/win32/single-instance-join.ps1",
-    "generated":  "2026-08-21T20:22:26-07:00",
-    "commit":  "8340e815a",
+    "generated":  "2026-09-01T16:57:28-07:00",
+    "commit":  "6f894ea1d",
+    "uncommitted":  [
+                        "test/win32/single-instance-join.ps1"
+                    ],
     "files":  {
                   "src/apprt/win32/IpcServer.zig":  "2d07c784b46762ef1205a8113f0fbc68d10ada6b06b907dd90b524204fcc0d56",
                   "src/os/ipc_handoff.zig":  "de2234b02c6e1f63a17431620e7b7b228e2a44559618359e39aec445c3989c3e",
-                  "test/win32/single-instance-join.ps1":  "f60cd3dace224521956cc5fc1274fac3bb2dd6b151fde169dc9fd414ab25c37d"
+                  "test/win32/single-instance-join.ps1":  "d276a7d97773c26b7cc622fe3ae14c735381f5e15c7ce137cfb44d84aa249039"
               }
 }

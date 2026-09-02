@@ -136,17 +136,17 @@ function Wait-NewAgent($excludePids, $timeoutSec = 45) {
     return $null
 }
 
-# --- CLI plumbing (ghoztty.exe is GUI-subsystem: redirect through cmd) --------
+# --- CLI plumbing (T1238: on the test desktop; the harness captures both
+# --- handles to a file, which is what the old `cmd /c` redirect was for -
+# --- ghoztty.exe is GUI-subsystem and writes nothing to a PowerShell pipe) ----
 
 function Run-Cli([string]$argsLine, [string]$out, [int]$timeoutSec = 15) {
-    $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
-        -ArgumentList "/c `"`"$Exe`" $argsLine > `"$out`" 2>&1`""
-    $null = $p.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
-    if (-not $p.WaitForExit($timeoutSec * 1000)) {
-        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-        return $null
-    }
-    return $p.ExitCode
+    $argv = @($argsLine -split '\s+' | Where-Object { $_ -ne '' })
+    $r = Invoke-OnTestDesktop -Exe $Exe -Arguments $argv -TimeoutSec $timeoutSec
+    $text = if ($null -ne $r.Output) { $r.Output } else { '' }
+    [System.IO.File]::WriteAllText($out, $text)
+    if ($r.TimedOut) { return $null }
+    return $r.ExitCode
 }
 function Run-CliArgs([string[]]$argv, [string]$out, [int]$timeoutSec = 15) {
     return Run-Cli ($argv -join ' ') $out $timeoutSec
@@ -236,8 +236,8 @@ function Start-AppAndWait([string]$title, [string]$paneName, [string]$stateTag, 
     $env:LOCALAPPDATA = $state
 
     $before = @((Get-TestAgents) | ForEach-Object { [int]$_.ProcessId })
-    Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @(
-        "--title=$title", '--window-width=100', '--window-height=30') | Out-Null
+    [void](Start-OnTestDesktop -Exe $Exe -Arguments @(
+        "--title=$title", '--window-width=100', '--window-height=30'))
 
     $appPid = 0
     $deadline = (Get-Date).AddSeconds($timeoutSec)
@@ -292,6 +292,11 @@ try {
     . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
     [void](Set-GhozttyTestIsolation -Tag 'hndof907')
     Assert-GhozttyPrivateEndpoint -Exe $Exe
+
+    # T1238: the GUI and every CLI call below start on a background test desktop,
+    # so this script no longer throws a window across the user's screen.
+    . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+    $td = New-TestDesktop
     Stop-Everything
 
     # ========================================================================
@@ -497,6 +502,7 @@ try {
     Complete-TestBody  # T1039: the run reached the end of its body
 } finally {
     Stop-Everything
+    Remove-TestDesktop | Out-Null
     $env:LOCALAPPDATA = $savedLocalAppData
     if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
     else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }

@@ -51,15 +51,16 @@ function Stop-GuiOnly {
 
 # Run a zig-out ghoztty +command with a hard timeout; stdout+stderr -> $out.
 # Returns exit code, or $null on timeout. Inherits the current (hermetic) env.
+# T1238: on the TEST DESKTOP. The `cmd /c "... > file"` dance this replaced
+# existed because a GUI-subsystem exe writes nothing to a PowerShell redirect
+# (T245); the harness captures both handles to a file itself.
 function Run-Cli($argsLine, $out, $timeoutSec = 15) {
-    $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
-        -ArgumentList "/c `"`"$Exe`" $argsLine > `"$out`" 2>&1`""
-    $null = $p.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
-    if (-not $p.WaitForExit($timeoutSec * 1000)) {
-        Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-        return $null
-    }
-    return $p.ExitCode
+    $argv = @($argsLine -split '\s+' | Where-Object { $_ -ne '' })
+    $r = Invoke-OnTestDesktop -Exe $Exe -Arguments $argv -TimeoutSec $timeoutSec
+    $text = if ($null -ne $r.Output) { $r.Output } else { '' }
+    [System.IO.File]::WriteAllText($out, $text)
+    if ($r.TimedOut) { return $null }
+    return $r.ExitCode
 }
 function Out-Text($f) { if (Test-Path $f) { Get-Content $f -Raw } else { '' } }
 
@@ -153,7 +154,7 @@ function Start-Gui($label, $agentBin, $extraArgs) {
     else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }
     $argList = @('--title=t89d-session-open') + $extraArgs
     # persistence: on (default) - session persistence IS this script's subject.
-    $p = Start-Process -FilePath $Exe -PassThru -WindowStyle Minimized -ArgumentList $argList
+    $p = Start-OnTestDesktop -Exe $Exe -Arguments $argList
     return @{ Tmp = $tmp; Proc = $p }
 }
 
@@ -172,6 +173,11 @@ Assert "ghoztty exe exists in zig-out" (Test-Path $Exe)
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
 [void](Set-GhozttyTestIsolation -Tag 'sessopen')
 Assert-GhozttyPrivateEndpoint -Exe $Exe
+
+# T1238: the GUI and every CLI call below start on a background test desktop,
+# so this floor no longer throws windows across whatever the user is reading.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+$td = New-TestDesktop
 
 # ============================================================================
 "== A: persistence ON -> initial pane is agent-backed"
@@ -340,6 +346,7 @@ Stop-TestProcs
 # ============================================================================
 "== cleanup"
 Stop-TestProcs
+Remove-TestDesktop | Out-Null
 $env:LOCALAPPDATA = $savedLocalAppData
 if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
 else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }
