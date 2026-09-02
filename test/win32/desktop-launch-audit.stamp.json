@@ -1,11 +1,10 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-02T10:00:43-07:00",
-    "commit":  "f67155b6f",
+    "generated":  "2026-09-02T10:12:54-07:00",
+    "commit":  "c5b0d99bb",
     "uncommitted":  [
-                        "test/win32/split-dim.ps1",
-                        "test/win32/split-dim-viewer.ps1"
+                        "test/win32/chooser-close-chord.ps1"
                     ],
     "files":  {
                   "src/cli/ghostty.zig":  "ef54b501298cfda9306cfb958c1094db24ee30f355b25865656b3e2bc713bcd7",
@@ -42,7 +41,7 @@
                   "test/win32/build-mode-guard.ps1":  "cd0e27e13a471649f9ee233d62a1ca4d25aacd9df04d39f82a522baac3c26047",
                   "test/win32/caller-anchor.ps1":  "72086c4371d49dfea4a53bab3bbc7b7caa1ffff09ee79b07c4fe5467c618e557",
                   "test/win32/caption-bar.ps1":  "795c8ea4afc40b830122de881dc9f6fc3c45b15354d7f2e4e249aa2f4866e162",
-                  "test/win32/chooser-close-chord.ps1":  "70497b30e84e690acc614f7b500b1cf101b21f57c3452d60324201532c03fff8",
+                  "test/win32/chooser-close-chord.ps1":  "37c31aca341ab4cfd67bad399e9e812a4e2d2b2f83b0769e53794795cf315545",
                   "test/win32/chooser-conn-pool.ps1":  "ab6693a92f6217745b2a4b0da20b679f1f2c9c227980c9dc4aaa9b92741c78a8",
                   "test/win32/chooser-controls.ps1":  "69a8d25a53eba9af41871bfebc202b015c83baebe4df8caa8a33ad7cb991a7d5",
                   "test/win32/chooser-link-hover.ps1":  "9de29beaeb0ae0194f458a30bc0bb10e570decc4610dc3784f9e21629ed1e6d5",
