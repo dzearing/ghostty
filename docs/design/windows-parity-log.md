@@ -20069,3 +20069,50 @@ offline device may be answering with the same 401 a rejected bearer does.
 T1275 carries the Mac half. T368, the reconnect acceptance script, was re-queued
 behind this task rather than written against log text and then rewritten - its
 own Details had said as much and nothing had acted on it.
+
+## 2026-09-02 - T1115: the background-desktop capture question, settled by region
+
+`test-desktop-spike.ps1` had been red on `PrintWindow(PW_RENDERFULLCONTENT)
+returns real content (meanLum=51, distinct=60)` since the T1094 sweep, and it is
+the spike the whole background-desktop harness is certified on. The failure line
+was misleading in both directions: the capture was never broken, and the answer
+the script had been asserting since July was already wrong.
+
+The old oracle scored MEAN LUMINANCE over the WHOLE window and required it to be
+bright. That cannot separate the two outcomes it exists to separate - the
+terminal surface is dark by design and fills most of the window, so "light
+chrome over a flat, uncomposed client area" scores about the same as "the whole
+window captured". It read green in July and red later because the chrome shrank
+relative to the surface; nothing about the box changed.
+
+Re-scored by region on a background desktop: chrome band mean 79 / **103
+distinct**, everything below the chrome mean 41 / **2 distinct** - a flat fill,
+sampled full width so it cannot be a rect-mapping artefact, with the chrome
+reading serving as the positive control for the sampler. An interactive-desktop
+control run with the same call over the same region returned **102 distinct**,
+so the flat surface is desktop-dependent rather than a property of PrintWindow.
+`PW_RENDERFULLCONTENT` is not the deciding factor either: `flags=0` reads the
+same on both desktops.
+
+The correction itself was not new - `lib\TestDesktop.ps1` measured and wrote it
+down on 2026-07-30, and the harness has been built on it ever since. What had
+gone unreconciled for a month was the spike, which kept asserting the answer the
+library had already revised. The header now defers to the library as the source
+of truth and records the numbers; six assertions state the chrome/surface split
+where one asserted a capability the script did not have.
+
+The decision it produces, for T1100: a probe of TERMINAL CONTENT pixels cannot
+run on a background desktop (all three capture routes measured, no fourth to
+look for); a probe of CHROME pixels can, via PrintWindow into a memory DC. So
+T1100 needs two capability flags rather than one, and `caption-bar.ps1`'s
+uniform capture is a fixable helper problem rather than a dead end.
+
+ALL PASS (16 assertions), green through `suite-run.ps1` with the leak sweep and
+no leak - the leak from the 2026-08-22 sweep was already fixed by T1127's
+build-scoped teardown, which this run confirms. Floor: all four zig lanes PASS,
+P1-P3 ALL PASS, the six audits guard-due named for the edit ALL PASS.
+
+Filed: T1280 (the spike's posted-input assertions flake, 1 red in 3 runs on the
+same commit - a flaky certificate for the harness ~50 scripts now run on),
+T1281 (audit the other pixel assertions for the same mixed-region oracle defect,
+which has now landed twice in two days with T363).

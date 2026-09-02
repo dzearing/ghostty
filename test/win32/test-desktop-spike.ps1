@@ -10,26 +10,102 @@
 #      app? (asserted end-to-end: ctrl+shift+t must add a tab, read back over
 #      IPC from the normal desktop.)
 #   3. CAPTURE   - is anything COMPOSED there? DWM composes only the input
-#      desktop, so the 6 pixel-probe scripts are the known risk. Both capture
+#      desktop, so the 6 pixel-probe scripts are the known risk. Three capture
 #      paths are measured: BitBlt from the desktop DC (what
-#      Graphics.CopyFromScreen does) and PrintWindow(PW_RENDERFULLCONTENT).
+#      Graphics.CopyFromScreen does), PrintWindow(PW_RENDERFULLCONTENT), and
+#      PrintWindow with no flags. Each is scored BY REGION - see below.
 #
 # The app is launched with --window-theme=light on purpose: a light window is
 # bright, so "capture returned black" is unambiguous rather than a plausible
 # dark-terminal reading.
 #
-# ANSWERS (measured on box 2026-07-30; the assertions below encode them, so
-# this script doubles as the regression test for the T211 harness):
+# ANSWERS (isolation/input measured on box 2026-07-30; capture re-measured
+# 2026-09-02 by T1115, which overturned the original reading - see below. The
+# assertions encode them, so this script doubles as the regression test for the
+# T211 harness):
 #   isolation - total. Not enumerable on the interactive desktop, never
 #               foreground there.
 #   input     - SendInput is BLOCKED (0 events accepted, ACCESS_DENIED); a
 #               background desktop is not the input desktop. Posted
 #               WM_KEYDOWN works, and modifier chords work when the key state
 #               is set on the input queue we share via AttachThreadInput.
-#   capture   - CopyFromScreen/BitBlt is dead (DWM composes only the input
-#               desktop), but PrintWindow(PW_RENDERFULLCONTENT) returns real
-#               content. The pixel probes can migrate; they just cannot
-#               screenshot.
+#   capture   - SPLIT, and the split is the whole answer. The window CHROME is
+#               captured faithfully by PrintWindow; the TERMINAL SURFACE is not
+#               captured at all. CopyFromScreen/BitBlt is dead outright.
+#
+# ---- T1115: how the capture answer changed, and why the old one was wrong ----
+#
+# The correction itself is not new. `lib\TestDesktop.ps1` measured and wrote it
+# down on 2026-07-30 ("REVISES T207's answer ... the spike's 'PrintWindow
+# returns real content' was reading the tab strip it had enabled, not the
+# terminal"), and the harness has been built on that ever since. What went
+# unreconciled for a month is THIS FILE, which kept asserting the answer the
+# library had already overturned. T1115 is that reconciliation, plus the
+# measurement below of what the oracle was actually doing wrong.
+#
+# Until 2026-09-02 this script asserted "PrintWindow(PW_RENDERFULLCONTENT)
+# returns real content" by scoring mean luminance over the WHOLE window and
+# requiring it to be bright. That oracle cannot distinguish the two outcomes it
+# exists to tell apart: the terminal surface is dark by design and fills most of
+# the window, so a capture consisting of light chrome over a flat dark client
+# area scores about the same as a capture of the whole thing. It read as a pass
+# in July and as a fail later only because the chrome shrank relative to the
+# surface - the underlying behavior never changed.
+#
+# Scored BY REGION on this box (2026-09-02, Debug zig-out, 984x639 window,
+# GhozttyTerminal child at 9,160 782x431):
+#
+#   route                              chrome band        below chrome
+#   ---------------------------------  -----------------  -----------------
+#   BitBlt off the desktop DC          BitBlt returns FALSE - nothing at all
+#   PrintWindow(PW_RENDERFULLCONTENT)  mean 79 dist 103   mean 41 dist 2
+#   PrintWindow(flags=0)               mean ~80 dist ~100 mean ~40 dist ~2
+#
+# distinct==2 over the entire client area is a flat fill: the surface was never
+# composed. The chrome reading is the positive control - the same bitmap, the
+# same sampler, 103 distinct colors - so "the surface is flat" is a measurement
+# and not a broken capture.
+#
+# The INTERACTIVE-desktop control (same build, same call - PrintWindow on the
+# TOP-LEVEL window, then the child's rect sampled out of that bitmap - one-off
+# probe run 2026-09-02 alongside this script, 800x600 window, GhozttyTerminal
+# child at 9,40 782x551):
+#
+#   route                              chrome band        SURFACE rect
+#   ---------------------------------  -----------------  -----------------
+#   PrintWindow(PW_RENDERFULLCONTENT)  mean 203 dist 35   mean 45 dist 102
+#   PrintWindow(flags=0)               mean 207 dist 55   mean 45 dist 102
+#   BitBlt off the desktop DC          (whole window: mean 55 dist 406)
+#
+# So the SAME call over the SAME region returns 102 distinct colors on the
+# interactive desktop and 1-2 on the background one. The flat surface is
+# therefore DESKTOP-dependent, not an unconditional property of PrintWindow.
+#
+# HOW THAT SITS WITH `lib\TestDesktop.ps1`, WHICH IS THE SOURCE OF TRUTH HERE.
+# That file's CAPTURE LIMIT and its general rule (T303: "PrintWindow sees GDI,
+# not composition") already state the operative conclusion, and this spike does
+# not overturn them - it had simply never been reconciled with them. Note the
+# difference in what was measured, so the two are not read as contradicting:
+# TestDesktop.ps1 measured PrintWindow on the GhozttyTerminal CHILD hwnd (1
+# distinct color, and a black-vs-white --background reading the same), which is
+# a different call from the top-level capture measured here. Both agree on the
+# thing that matters: on a BACKGROUND desktop the terminal surface cannot be
+# asserted, and Get-TestWindowPixels is right to throw on a uniform interior.
+#
+# THE DECISION THIS SPIKE PRODUCES, for T1100 and the pixel-probe scripts:
+#
+#   * A probe that asserts TERMINAL CONTENT pixels (glyph colors, cursor,
+#     selection highlight, anything the renderer draws into the terminal
+#     surface) CANNOT run on a background desktop. All three capture routes
+#     were measured here; there is no fourth to go looking for.
+#   * A probe that asserts CHROME pixels (title bar, tab strip, banner, the
+#     window's own painted controls) CAN run there, via PrintWindow into a
+#     memory DC. It just cannot use CopyFromScreen.
+#   * Screenshotting the desktop as a whole is unavailable either way.
+#   * For a terminal-content probe that must survive, do NOT invent a route
+#     here: `lib\TestDesktop.ps1` carries the decided ladder (route 0 asks the
+#     app for its own pixels over the debug `capture-pane` IPC action, then
+#     three fallbacks, then interactive-by-design). Follow it there.
 #
 # This script is SAFE to run while the user is working - that is the entire
 # point of it. It asserts that itself (P3/P4).
@@ -154,6 +230,20 @@ public class DeskSpike {
     public static int BitBltDistinct = -1;
     public static int PrintMeanLum = -1;
     public static int PrintDistinct = -1;
+    // T1115: the whole-window mean above is dominated by the terminal surface,
+    // which is dark by design, so it never answered the question it was asked.
+    // These three sample the bitmap by REGION instead, plus the un-flagged
+    // PrintWindow as an in-script negative control.
+    public static int PrintSurfaceMeanLum = -1;   // the GhozttyTerminal child's rect
+    public static int PrintSurfaceDistinct = -1;
+    public static int PrintChromeMeanLum = -1;    // the band above that child
+    public static int PrintChromeDistinct = -1;
+    public static int PrintBelowMeanLum = -1;     // everything below the chrome band
+    public static int PrintBelowDistinct = -1;
+    public static int PrintPlainMeanLum = -1;     // PrintWindow(flags=0), no RENDERFULLCONTENT
+    public static int PrintPlainDistinct = -1;
+    public static bool PrintPlainOk = false;
+    public static bool PrintFullOk = false;
     public static bool ChordSent = false;
     public static int SendInputAccepted = -1;
     public static int SendInputLastError = -1;
@@ -181,10 +271,16 @@ public class DeskSpike {
     // A capture of a desktop that is not composed comes back uniformly black:
     // mean ~0 AND distinct == 1. Real window content is neither.
     static void Sample(IntPtr hdcMem, int w, int h, out int meanLum, out int distinct) {
+        SampleRect(hdcMem, 0, 0, w, h, out meanLum, out distinct);
+    }
+
+    // The same measurement over an arbitrary sub-rect of the bitmap, so the
+    // terminal surface and the chrome band can be scored separately (T1115).
+    static void SampleRect(IntPtr hdcMem, int x0, int y0, int w, int h, out int meanLum, out int distinct) {
         double sum = 0; int n = 0;
         var seen = new System.Collections.Generic.HashSet<uint>();
-        for (int y = 2; y < h; y += 4) {
-            for (int x = 2; x < w; x += 4) {
+        for (int y = y0 + 2; y < y0 + h; y += 4) {
+            for (int x = x0 + 2; x < x0 + w; x += 4) {
                 uint c = GetPixel(hdcMem, x, y);
                 if (c == 0xFFFFFFFF) continue; // CLR_INVALID
                 uint r = c & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
@@ -306,14 +402,62 @@ public class DeskSpike {
                 SelectObject(hdcMem, old); DeleteObject(hbmp); DeleteDC(hdcMem); ReleaseDC(IntPtr.Zero, hdcScreen);
 
                 // --- capture path 2: PrintWindow(PW_RENDERFULLCONTENT)
+                //
+                // Scored by REGION, not by overall brightness (T1115). The
+                // terminal surface is dark by design and fills most of the
+                // window, so a whole-window mean is dark whether or not the
+                // client area was rendered - which is exactly the thing this
+                // measurement has to tell apart. What discriminates is
+                // UNIFORMITY: an uncomposed capture is one flat color.
+                IntPtr surfEarly = FindChildClass(top, "GhozttyTerminal");
+                RECT sr = new RECT();
+                bool haveSurf = (surfEarly != IntPtr.Zero) && GetWindowRect(surfEarly, out sr);
+
                 IntPtr hdcWin = GetDC(top);
                 IntPtr hdcMem2 = CreateCompatibleDC(hdcWin);
                 IntPtr hbmp2 = CreateCompatibleBitmap(hdcWin, WinW, WinH);
                 IntPtr old2 = SelectObject(hdcMem2, hbmp2);
                 bool pok = PrintWindow(top, hdcMem2, 2 /*PW_RENDERFULLCONTENT*/);
+                PrintFullOk = pok;
                 note("PrintWindow(PW_RENDERFULLCONTENT) ok=" + pok);
-                if (pok) { int m, d; Sample(hdcMem2, WinW, WinH, out m, out d); PrintMeanLum = m; PrintDistinct = d; }
-                SelectObject(hdcMem2, old2); DeleteObject(hbmp2); DeleteDC(hdcMem2); ReleaseDC(top, hdcWin);
+                if (pok) {
+                    int m, d; Sample(hdcMem2, WinW, WinH, out m, out d); PrintMeanLum = m; PrintDistinct = d;
+                    if (haveSurf) {
+                        // child rect is in screen coords; the bitmap is window-relative.
+                        int sx = sr.left - r.left, sy = sr.top - r.top;
+                        int sw = sr.right - sr.left, sh = sr.bottom - sr.top;
+                        note("GhozttyTerminal rect in window coords " + sx + "," + sy + " " + sw + "x" + sh);
+                        if (sw > 8 && sh > 8) {
+                            int sm, sd; SampleRect(hdcMem2, sx, sy, sw, sh, out sm, out sd);
+                            PrintSurfaceMeanLum = sm; PrintSurfaceDistinct = sd;
+                        }
+                        if (sy > 8) {
+                            int cm, cd; SampleRect(hdcMem2, 0, 0, WinW, sy, out cm, out cd);
+                            PrintChromeMeanLum = cm; PrintChromeDistinct = cd;
+                            // Everything below the chrome, full width - so a
+                            // flat reading cannot be blamed on the child rect
+                            // being mapped a few pixels wrong.
+                            int bm, bd; SampleRect(hdcMem2, 0, sy, WinW, WinH - sy, out bm, out bd);
+                            PrintBelowMeanLum = bm; PrintBelowDistinct = bd;
+                        }
+                    }
+                }
+                SelectObject(hdcMem2, old2); DeleteObject(hbmp2); DeleteDC(hdcMem2);
+
+                // --- capture path 3: PrintWindow with NO flags. This is the
+                // negative control for the oracle above: without
+                // PW_RENDERFULLCONTENT the DWM-rendered client area is not
+                // redirected into the DC, so a working oracle must score this
+                // one differently from path 2 on the very same window.
+                IntPtr hdcMem3 = CreateCompatibleDC(hdcWin);
+                IntPtr hbmp3 = CreateCompatibleBitmap(hdcWin, WinW, WinH);
+                IntPtr old3 = SelectObject(hdcMem3, hbmp3);
+                bool pok0 = PrintWindow(top, hdcMem3, 0);
+                PrintPlainOk = pok0;
+                note("PrintWindow(flags=0) ok=" + pok0);
+                if (pok0) { int m, d; Sample(hdcMem3, WinW, WinH, out m, out d); PrintPlainMeanLum = m; PrintPlainDistinct = d; }
+                SelectObject(hdcMem3, old3); DeleteObject(hbmp3); DeleteDC(hdcMem3);
+                ReleaseDC(top, hdcWin);
             }
 
             IntPtr surf = FindChildClass(top, "GhozttyTerminal");
@@ -483,16 +627,44 @@ Assert ([DeskSpike]::ChordSent -and $tabs -ge 2) `
 # CAPTURE: the question the whole option was said to hang on.
 $bl = [DeskSpike]::BitBltMeanLum; $bd = [DeskSpike]::BitBltDistinct
 $pl = [DeskSpike]::PrintMeanLum;  $pd = [DeskSpike]::PrintDistinct
+$sl = [DeskSpike]::PrintSurfaceMeanLum; $sd = [DeskSpike]::PrintSurfaceDistinct
+$cl = [DeskSpike]::PrintChromeMeanLum;  $cd = [DeskSpike]::PrintChromeDistinct
+$zl = [DeskSpike]::PrintPlainMeanLum;   $zd = [DeskSpike]::PrintPlainDistinct
 Write-Host "CAPTURE  BitBlt(desktop DC): meanLum=$bl distinct=$bd"
 Write-Host "CAPTURE  PrintWindow(FULLCONTENT): meanLum=$pl distinct=$pd"
+Write-Host "CAPTURE    terminal surface region: meanLum=$sl distinct=$sd"
+Write-Host "CAPTURE    chrome band region:      meanLum=$cl distinct=$cd"
+$wl = [DeskSpike]::PrintBelowMeanLum;   $wd = [DeskSpike]::PrintBelowDistinct
+Write-Host "CAPTURE    everything below chrome:  meanLum=$wl distinct=$wd"
+Write-Host "CAPTURE  PrintWindow(flags=0):     meanLum=$zl distinct=$zd (negative control)"
 $bitbltReal = ($bl -gt 60 -and $bd -gt 4)
-$printReal  = ($pl -gt 60 -and $pd -gt 4)
 # CAP-1: CopyFromScreen/BitBlt is dead there - DWM composes only the input
 # desktop, exactly as the task predicted. Recorded so it is not re-tried.
 Assert (-not $bitbltReal) "CopyFromScreen/BitBlt off the desktop DC is dead on a background desktop"
-# CAP-2: but PrintWindow(PW_RENDERFULLCONTENT) returns REAL content, so the
-# pixel probes can migrate after all - they just cannot screenshot.
-Assert ($printReal) "PrintWindow(PW_RENDERFULLCONTENT) returns real content (meanLum=$pl, distinct=$pd)"
+
+# CAP-2..5 (T1115) replace a single "PrintWindow returns real content" assertion
+# that scored the WHOLE window on brightness. That oracle could not tell the two
+# outcomes apart: a window whose chrome was captured over a flat client area
+# scores the same as one captured whole, because the terminal surface is dark by
+# design and fills most of the window. Scored by region, the answer is not the
+# one the original ANSWERS block recorded - see the header.
+Assert ([DeskSpike]::PrintFullOk) "PrintWindow(PW_RENDERFULLCONTENT) succeeds on a background desktop"
+# CAP-3: the CHROME is captured faithfully. This is also the positive control
+# for the sampler and the bitmap: if this were flat, CAP-4 would prove nothing.
+Assert ($cd -gt 4) `
+    "PrintWindow returns the window CHROME on a background desktop (meanLum=$cl, distinct=$cd)"
+# CAP-4: the terminal SURFACE does not come back. Scored over everything below
+# the chrome band, full width, so it cannot be a rect-mapping artefact.
+Assert ($wd -ge 0 -and $wd -le 2) `
+    "the terminal SURFACE comes back flat on a background desktop (meanLum=$wl, distinct=$wd - uncomposed)"
+# CAP-5: and the two readings are far apart, so CAP-3/CAP-4 are measuring a real
+# split rather than a sampler that has quietly degenerated.
+Assert ($cd -gt ($wd * 8)) `
+    "chrome and surface differ by an order of magnitude (chrome=$cd vs surface=$wd)"
+# CAP-6: PW_RENDERFULLCONTENT buys nothing here - the un-flagged PrintWindow
+# returns the same shape. Recorded so the flag is not blamed for the outcome.
+Assert ([DeskSpike]::PrintPlainOk) `
+    "PrintWindow(flags=0) also succeeds, so the flag is not what decides this (meanLum=$zl, distinct=$zd)"
 
 if ($spikePid -gt 0) { Stop-Process -Id $spikePid -Force -ErrorAction SilentlyContinue }
 Kill-SpikeInstances
