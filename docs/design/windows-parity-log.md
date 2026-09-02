@@ -19738,3 +19738,51 @@ carries the rule.
 Floor: lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS; plus the six
 harness audits the test edit made due (isolation-meta, launch-preflight,
 verdict-exit, cleanslate, stderr-capture, desktop-launch).
+
+## 2026-09-01 - the portable ZIP stopped telling people to click a button that isn't there (T1246)
+
+T1246 asked for a code signing certificate. Decision D87 answered it, and the
+answer was the option that closes the task without buying anything: ship
+unsigned and explain the warning honestly. So the certificate is deliberately
+not being bought, T1246 closes as `skipped`, and the signing pipeline T1203
+built stays where it is - dormant, and one pair of secrets away from working if
+the call is ever reversed.
+
+What D87 does ask for is that the explanation be RIGHT everywhere a user meets
+the warning, and it was not. The portable ZIP's READ-ME-FIRST still said
+
+    3. SmartScreen may say "Windows protected your PC" because this build is
+       unsigned. Click "More info" -> "Run anyway".
+
+which is the exact wording the website note was corrected away from in T1203,
+after the user ran the MSI on a clean machine and got **Run anyway** and
+**Don't run** with no *More info* link at all. A file that tells someone to
+look for a control that is not on their screen reads as instructions for a
+different program - and this is the first paragraph anyone unzipping Ghoztty
+reads. It now leads with the button that is always present, offers *More info*
+as the conditional second shape, and says plainly that clicking it tells
+Windows to run something it does not recognize, so only do it for a copy you
+downloaded yourself. Same three rules the page follows.
+
+The release banner said the unsigned state was "expected until a code signing
+certificate is added to the repo secrets", which after D87 describes a plan
+nobody is executing. It now names the decision, so a future turn reads a
+standing choice rather than an open TODO and does not re-file the buy-a-
+certificate task.
+
+Neither text had any coverage: `test\win32\release-artifacts.ps1` unpacked the
+ZIP and checked that READ-ME-FIRST *existed*. It now reads it - B4b names the
+dialog, B4b2 requires *Run anyway* before *More info*, B4b3 says the build is
+unsigned, B4b4 requires the override framing. Demonstrated red before green per
+go.md step 3: with the script reverted to HEAD the harness scored B4b2 and B4b4
+as FAILURES, and ALL PASS with the fix.
+
+Filed T1270 for the one thing left unfixed: the download page still says "not
+code-signed **yet**", which after D87 implies a promise nobody is keeping. The
+word is a one-character edit in the in-repo mirror, but nothing publishes that
+mirror's PROSE to gh-pages - `publish-windows-links.sh` clones the deployed page
+and rewrites only the version anchors - so the edit would break section F of
+`website-windows-download.ps1` (mirror == deployed) until somebody hand-pushed
+the public site. That is a gap worth naming rather than a word worth sneaking in.
+
+Floor: lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS.

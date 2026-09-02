@@ -116,7 +116,10 @@ No installer. Just run the terminal:
   1. Keep this whole "Ghoztty" folder together (exe + agent + share + gl).
   2. Double-click  ghoztty.exe
   3. SmartScreen may say "Windows protected your PC" because this build is
-     unsigned. Click "More info" -> "Run anyway".
+     not code-signed. Choose "Run anyway" -- on some versions of Windows
+     that button is behind "More info" first. That tells Windows to run
+     something it does not recognize, so only do it for a copy you
+     downloaded from the Ghoztty releases page yourself.
 
 Tip: copy this folder to a local disk first so it does not run off a
 network share.

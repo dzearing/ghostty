@@ -319,6 +319,9 @@ if (-not $builtZip) {
     $comEntry = $za.Entries | Where-Object { $_.FullName -eq 'Ghoztty/ghoztty.com' }
     $comOut = Join-Path $work 'ghoztty.com'
     if ($comEntry) { [IO.Compression.ZipFileExtensions]::ExtractToFile($comEntry, $comOut, $true) }
+    $readmeEntry = $za.Entries | Where-Object { $_.FullName -eq 'Ghoztty/READ-ME-FIRST.txt' }
+    $readmeOut = Join-Path $work 'READ-ME-FIRST.txt'
+    if ($readmeEntry) { [IO.Compression.ZipFileExtensions]::ExtractToFile($readmeEntry, $readmeOut, $true) }
     $za.Dispose()
     Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
     foreach ($need in @('Ghoztty/ghoztty.exe', 'Ghoztty/ghoztty.com', 'Ghoztty/ghoztty-agent.exe',
@@ -336,6 +339,31 @@ if (-not $builtZip) {
         AssertEq "B4 portable ZIP console twin is console-subsystem" 3 (Get-PeSubsystem $comOut)
     } else {
         Assert "B4 portable ZIP console twin is console-subsystem" $false
+    }
+
+    # B4b: the READ-ME-FIRST's SmartScreen caveat. Decision D87 chose to ship
+    # unsigned and EXPLAIN the warning, which makes this text a shipped
+    # feature rather than a footnote -- and until now nothing checked it. It
+    # still said 'Click "More info" -> "Run anyway"', the wording the website
+    # note was corrected away from in T1203 after the user ran the MSI on a
+    # clean machine and got Run anyway and Don't run with no More info link at
+    # all. Same three rules as the page (website-windows-download.ps1 A15c/e):
+    # lead with the button that is always there, offer More info as the
+    # conditional second shape, and frame the click as an override rather than
+    # a blessing.
+    if (Test-Path -LiteralPath $readmeOut) {
+        $rm = Get-Content -LiteralPath $readmeOut -Raw
+        Assert "B4b READ-ME-FIRST names SmartScreen and the dialog wording" `
+            ($rm -match 'SmartScreen' -and $rm -match 'Windows protected your PC')
+        Assert "B4b2 it leads with Run anyway, not More info" `
+            ($rm -match 'Run anyway' -and $rm -match 'More info' -and
+             $rm.IndexOf('Run anyway') -lt $rm.IndexOf('More info'))
+        Assert "B4b3 it says the build is not signed" `
+            ($rm -match 'not code-signed|unsigned')
+        Assert "B4b4 it frames the click as an override, not trust" `
+            ($rm -match 'does not recognize|override')
+    } else {
+        Assert "B4b READ-ME-FIRST names SmartScreen and the dialog wording" $false
     }
 }
 # -- B5-B7: the WXS the MSI is compiled from is well-formed, checked WITHOUT

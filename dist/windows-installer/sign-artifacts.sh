@@ -77,9 +77,11 @@ if [[ -z "$PFX_B64" ]]; then
     echo "==> code signing: NOT CONFIGURED (no \$WINDOWS_SIGN_PFX_BASE64)"
     echo "    These artifacts are UNSIGNED. Windows SmartScreen will show"
     echo "    'Windows protected your PC' with an unknown publisher the first"
-    echo "    time a downloaded copy is run. That is expected until a code"
-    echo "    signing certificate is added to the repo secrets (T1203); it is"
-    echo "    not a build failure."
+    echo "    time a downloaded copy is run. That is DELIBERATE, not a build"
+    echo "    failure: decision D87 chose to ship unsigned and explain the"
+    echo "    warning instead of buying a certificate. This pipeline stays in"
+    echo "    place so reversing that call is only a matter of adding the two"
+    echo "    secrets (T1203)."
     for f in "$@"; do echo "    unsigned: $f"; done
     exit 0
 fi

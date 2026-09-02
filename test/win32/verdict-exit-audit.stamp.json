@@ -1,10 +1,10 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-09-01T22:14:50-07:00",
-    "commit":  "ffe010447",
+    "generated":  "2026-09-01T23:10:13-07:00",
+    "commit":  "30c910f03",
     "uncommitted":  [
-                        "test/win32/go-loop-guard.ps1"
+                        "test/win32/release-artifacts.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -216,7 +216,7 @@
                   "test/win32/registration-sites.ps1":  "c634ca739f7e0afdff7a0ea269d9f27d300ed7f095b5585ec909b7f76eebaea3",
                   "test/win32/relaunch-guard.ps1":  "784140b66081be866d4cae5cb2858ef00c9979cdce73dc6f0e4fd5a95aa1628f",
                   "test/win32/relay-account.ps1":  "8dee3165d569d5069208dee6975b251d6bb3444434e4993e5d4bda207e80250f",
-                  "test/win32/release-artifacts.ps1":  "a77199ddcb5b7d9823976b743a10409c338cc94a00654335e607e2cefd47741a",
+                  "test/win32/release-artifacts.ps1":  "af4b706b7d86065a59d29f4d813cfb62c2988891cd20ad7085f0bee86e51466f",
                   "test/win32/release-parity.ps1":  "92babe2c0e154c766dd02f9578073f6a04ec281ee706aa8a8dc83c505d579f9f",
                   "test/win32/remote-inherit.ps1":  "50b2a9d36a10d0e677963fbb7d155e3dbc45261111214c1ab8b6454f025e24da",
                   "test/win32/remote-pill.ps1":  "76ffee269bac8ababf6ead9bba303664e9ff20615ea8b738f8fbd362cb345f41",
