@@ -203,7 +203,29 @@ fn fetch(arena: Allocator, url: []const u8, progress: ?Progress) ![]u8 {
         body.items.len += bytes_read;
         if (progress) |p| p.emit(body.items.len, total);
     }
+
+    // A connection that dies mid-transfer ends the loop exactly the way a
+    // finished one does — `InternetReadFile` succeeds and reports 0 bytes —
+    // so the only thing that can tell the two apart is the length the server
+    // promised. Without this check a short body reaches `looksLikeMsi`, which
+    // only inspects the leading compound-file signature, and a half-downloaded
+    // package is staged and handed to msiexec after the app quits (T1243).
+    if (isTruncated(body.items.len, total)) {
+        log.warn(
+            "update download: got {d} of {d} bytes from {s}; the transfer was cut short",
+            .{ body.items.len, total, url },
+        );
+        return error.Truncated;
+    }
     return body.items;
+}
+
+/// Whether a finished read loop got less than the server said it would send.
+/// `total` of 0 is "no Content-Length" — an unknown, never a claim of zero —
+/// and nothing can be concluded about a body measured against it.
+pub fn isTruncated(received: u64, total: u64) bool {
+    if (total == 0) return false;
+    return received < total;
 }
 
 /// Delete what a previous update left behind: the applier copy, sidelined
@@ -617,4 +639,25 @@ test "every image an update replaces is considered for sidelining" {
         }
         try testing.expect(found);
     }
+}
+
+test "a body short of its Content-Length is truncated" {
+    // The exact shape the fix exists for: the server promised 12 MB, the
+    // connection died after 2 MB, and the read loop ended cleanly.
+    try testing.expect(isTruncated(2 * 1024 * 1024, 12 * 1024 * 1024));
+    try testing.expect(isTruncated(0, 1));
+}
+
+test "a complete body is not truncated" {
+    try testing.expect(!isTruncated(12 * 1024 * 1024, 12 * 1024 * 1024));
+    // More than promised is somebody else's problem — a package that verifies
+    // is still a package, and calling this truncated would be a lie.
+    try testing.expect(!isTruncated(13, 12));
+}
+
+test "no Content-Length means nothing to compare against" {
+    // `total == 0` is "the server would not say", not "the server said zero",
+    // so no body measured against it can be called short.
+    try testing.expect(!isTruncated(0, 0));
+    try testing.expect(!isTruncated(12 * 1024 * 1024, 0));
 }

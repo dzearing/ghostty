@@ -19670,3 +19670,44 @@ Floor: lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS; the five scripts
 green (24/15/9/17/25 assertions) plus `holder-volume -NegativeControl`; and
 every harness the edit made due - isolation-meta, launch-preflight, verdict-exit,
 cleanslate, stderr-capture, test-desktop, desktop-launch - green.
+
+## 2026-09-01 - a download the network cuts off can no longer be handed to msiexec (T1243)
+
+An update download that died half way through looked exactly like one that
+finished. `fetch()` ended its read loop on `bytes_read == 0`, which is what
+WinINet reports both when a body is complete and when the connection went
+away, and nothing compared what arrived against the `Content-Length` the same
+function had already read for the progress bar. A short body then reached
+`looksLikeMsi`, which only inspects the leading compound-file signature of an
+OLE file - a truncated MSI still has one - so a half-downloaded package was
+staged, and the applier handed it to msiexec after the app quit. The user's
+symptom was a terminal that closed itself for an update that could not install.
+
+The fix is one comparison and a name for it: `isTruncated(received, total)`,
+where `total == 0` means "the server would not say" rather than "the server
+said zero", so a length-less transfer behaves exactly as it did. A body short
+of a known length is now `error.Truncated`, which the download thread already
+turns into a visible failure - the progress panel says the download failed and
+the build the user has is kept.
+
+The acceptance side is where this became provable. `test\win32\update-progress.ps1`'s
+asset server could already stop mid-body for the stall case; it learned to close
+the connection instead of holding it, and to omit `Content-Length` entirely.
+Section 4 cuts a 12 MB promise off after 2 MB and asserts the run failed as
+`Truncated`, that nothing was staged, and that the panel said so. Section 5
+serves a length-less body and asserts the opposite: it ran to the end and
+failed the PACKAGE check, so an unknown length is never mistaken for a short
+read. Neither assertion could have passed before this change.
+
+Filed on the way past: [[T1268]] - section 8 of `update-apply.ps1` arms the
+applier with the REAL `zig-out\bin` as its install directory, so a locked
+`ghoztty.exe` gets renamed aside and, since the fake package is always
+rejected, never written back; it stranded this turn's build once and every
+later script failed for a reason unrelated to what it tested. And [[T1269]] -
+`update-real-msi.ps1` went red on a 120 s poll and passed 30/30 on an immediate
+re-run, with no capture of what the app was doing in between.
+
+Floor: lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS; update-progress
+ALL PASS (42 assertions) and update-apply, update-failure-visible,
+update-graceful and update-real-msi green, plus the eight harness audits the
+test edit made due.

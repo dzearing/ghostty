@@ -89,7 +89,7 @@ $staging = Join-Path $env:LOCALAPPDATA 'ghoztty\updates-debug'
 # download needs from a server is a status line, a Content-Length and a body
 # it can be made to deliver slowly.
 $serverScript = {
-    param($Port, $TotalBytes, $ChunkBytes, $DelayMs, $StopAfterBytes, $HangSeconds)
+    param($Port, $TotalBytes, $ChunkBytes, $DelayMs, $StopAfterBytes, $HangSeconds, $NoLength)
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, [int]$Port)
     $listener.Start()
     try {
@@ -102,9 +102,13 @@ $serverScript = {
                 $stream.ReadTimeout = 5000
                 try { [void]$stream.Read($buf, 0, $buf.Length) } catch {}
 
+                # A server that will not say how long the body is: the client
+                # then has nothing to measure a short read against, which is
+                # the case the truncation check must leave alone.
+                $lengthHeader = if ([int]$NoLength -eq 1) { '' } else { "Content-Length: $TotalBytes`r`n" }
                 $head = "HTTP/1.1 200 OK`r`n" +
                         "Content-Type: application/octet-stream`r`n" +
-                        "Content-Length: $TotalBytes`r`n" +
+                        $lengthHeader +
                         "Connection: close`r`n`r`n"
                 $headBytes = [Text.Encoding]::ASCII.GetBytes($head)
                 $stream.Write($headBytes, 0, $headBytes.Length)
@@ -136,9 +140,9 @@ $serverScript = {
 }
 
 $script:serverJob = $null
-function Start-AssetServer([int]$Port, [int]$TotalBytes, [int]$ChunkBytes, [int]$DelayMs, [int]$StopAfterBytes = 0, [int]$HangSeconds = 0) {
+function Start-AssetServer([int]$Port, [int]$TotalBytes, [int]$ChunkBytes, [int]$DelayMs, [int]$StopAfterBytes = 0, [int]$HangSeconds = 0, [int]$NoLength = 0) {
     Stop-AssetServer
-    $script:serverJob = Start-Job -ScriptBlock $serverScript -ArgumentList $Port, $TotalBytes, $ChunkBytes, $DelayMs, $StopAfterBytes, $HangSeconds
+    $script:serverJob = Start-Job -ScriptBlock $serverScript -ArgumentList $Port, $TotalBytes, $ChunkBytes, $DelayMs, $StopAfterBytes, $HangSeconds, $NoLength
     # Give the listener a moment to bind before anything dials it.
     Start-Sleep -Milliseconds 700
     return ($script:serverJob.State -ne 'Failed')
@@ -341,6 +345,57 @@ Assert ((Get-AppLog) -match 'update pre-download failed|update download:') `
     'CONTROL: the background download actually ran (so the absence above means something)'
 Assert ((Get-AppLog) -notmatch 'update progress:') `
     'the background download reported no progress lines either'
+
+Stop-AssetServer
+Stop-DebugGhoztty
+
+# ------------------------------------- 4: a transfer cut short is not a package
+Write-Host '== 4: a download the network cuts off is refused, not staged (T1243)'
+$port4 = Get-FreePort
+# 12 MB promised, 2 MB delivered, then the connection closes. The read loop
+# ends exactly the way a complete transfer ends, so only the Content-Length
+# can tell the two apart.
+Assert (Start-AssetServer -Port $port4 -TotalBytes (12 * 1024 * 1024) -ChunkBytes (64 * 1024) `
+        -DelayMs 5 -StopAfterBytes (2 * 1024 * 1024) -HangSeconds 0) `
+    'asset server listening (cut-off mode)'
+$assetUrl4 = "http://127.0.0.1:$port4/download/win-v9.9.9/Ghoztty-9.9.9-x64.msi"
+$feed4 = New-Feed 'cutoff.json' $assetUrl4
+
+Assert (Start-App $feed4 @('--auto-update=check')) 'app up for the cut-off scenario'
+Assert (Wait-Log 'showing update balloon for win-v9\.9\.9') 'the app offered the release (cut-off scenario)'
+Assert (Invoke-ConsentedDownload) 'consented to the download that will be cut off'
+Assert (Wait-Log 'the transfer was cut short' 30000) `
+    'the short body was recognised as a cut-off transfer, not a finished one'
+Assert ((Get-AppLog) -match 'update download failed: error\.Truncated') `
+    'it failed as Truncated - the length check, not the package check, caught it'
+Assert ((Get-AppLog) -notmatch 'update download: staged') `
+    'nothing was staged, so no half-package can reach msiexec'
+Assert ((Get-AppLog) -match 'update progress: The download failed') `
+    'the panel said the download FAILED rather than "Download complete."'
+
+Stop-AssetServer
+Stop-DebugGhoztty
+
+# ------------------------------- 5: a server with no Content-Length is unchanged
+Write-Host '== 5: a server that sends no Content-Length still downloads (T1243)'
+$port5 = Get-FreePort
+Assert (Start-AssetServer -Port $port5 -TotalBytes (4 * 1024 * 1024) -ChunkBytes (64 * 1024) `
+        -DelayMs 5 -NoLength 1) `
+    'asset server listening (no Content-Length)'
+$assetUrl5 = "http://127.0.0.1:$port5/download/win-v9.9.9/Ghoztty-9.9.9-x64.msi"
+$feed5 = New-Feed 'nolength.json' $assetUrl5
+
+Assert (Start-App $feed5 @('--auto-update=check')) 'app up for the no-length scenario'
+Assert (Wait-Log 'showing update balloon for win-v9\.9\.9') 'the app offered the release (no-length scenario)'
+Assert (Invoke-ConsentedDownload) 'consented to the length-less download'
+Assert (Wait-Log 'update download failed' 30000) 'the length-less download reached a terminal state'
+# 4 MB of zeros is a complete body that is not a package: the download ran to
+# the end and the package check is what rejected it. A Truncated verdict here
+# would mean the check had started guessing at an unknown length.
+Assert ((Get-AppLog) -match 'update download failed: error\.NotAPackage') `
+    'it ran to completion and failed the PACKAGE check, not the length check'
+Assert ((Get-AppLog) -notmatch 'the transfer was cut short') `
+    'an unknown length was never treated as a short read'
 
 Stop-AssetServer
 
