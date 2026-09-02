@@ -45,11 +45,13 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 $script:failures = 0
+$script:passes = 0
 
 function Assert($name, $cond) {
     if ($NegativeControl) { $cond = -not $cond }
-    if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
+    if ($cond) { "  PASS $name"; $script:passes++ } else { "  FAIL $name"; $script:failures++ }
 }
 function AssertEq($name, $expected, $actual) {
     Assert "$name (expected '$expected', got '$actual')" ($expected -eq $actual)
@@ -254,6 +256,7 @@ try {
     AssertEq 'G6 the stamp makes a second push the same evening a no-op' 0 $g2.Exit
     AssertMatch 'G6 saying it already published today' 'already published today' $g2.Text
     Assert 'G7 and the publish script was never run' (-not (Test-Path -LiteralPath $ranMarker))
+    Complete-TestBody
 } finally {
     Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -266,5 +269,4 @@ if ($script:failures -eq 0 -and -not $NegativeControl) {
 }
 
 ""
-if ($script:failures -eq 0) { "ALL PASS" } else { "$($script:failures) FAILURE(S)" }
-exit ([int]($script:failures -gt 0))
+Write-TestVerdict -Label 'T1220 ACCEPTANCE' -Pass $script:passes -Fail $script:failures

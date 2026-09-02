@@ -19786,3 +19786,39 @@ and rewrites only the version anchors - so the edit would break section F of
 the public site. That is a gap worth naming rather than a word worth sneaking in.
 
 Floor: lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS.
+
+## 2026-09-01 - the audit that catches a test proving nothing is green again (T1257)
+
+`test\win32\asserted-nothing.ps1` is the check that stops a harness announcing
+ALL PASS having asserted nothing, and it had been red at HEAD - which is the
+state in which a check quietly stops being read. Two failures, both of them the
+rule failing on itself.
+
+`soak.ps1`'s `-SelfTest` branch printed a bare `ALL PASS` and `exit 0` halfway
+through the file: the `early-green` shape, a pass verdict that ends the run
+before the script's real verdict. Both of soak's verdicts now go through
+`Write-TestVerdict` (wrapped in a small `Write-SoakVerdict` so the line still
+lands in the run's report file), so there is no hand-rolled pass left in it and
+a selftest whose grading helpers all threw ends `ASSERTED NOTHING`, exit 2.
+
+The second was the T775 ratchet walking the wrong way again, and by more than
+the task said: measured against the sweep at `7fc22be42`, where T962 left the
+uncounted-final count at 37, five harnesses filed since then had each
+hand-rolled their own `"ALL PASS"` - `daily-publish`, `install-launch`,
+`install-ownership`, `one-installer`, `viewer-find` - against one
+(`morning-refresh`) that was retired with the swap. 37 + 5 - 1 = 41. All five
+are converted onto the shared scorer (four of them only counted failures and
+grew a pass counter to do it), so the ceiling comes DOWN to 36 rather than up to
+where the drift landed. Each conversion puts `Complete-TestBody` before the
+guard-due stamp, which is the ordering T1039 requires and `release-parity.ps1`
+established: the stamp is a child process that refuses to write while the body
+still reads `pending`.
+
+Every converted harness re-ran green and re-stamped its guard row, and their
+negative controls still score red - daily-publish `-NegativeControl` is
+`57 FAILURE(S)`, the three `-TeethCheck` harnesses still catch every mutation.
+The suite-wide meta-audits that read all 300-odd scripts (body-complete,
+isolation-meta, launch-preflight, verdict-exit, cleanslate, stderr-capture,
+desktop-launch, suite-run) stayed green over the edits.
+
+Floor: lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS.

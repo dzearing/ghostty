@@ -45,10 +45,12 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 $script:failures = 0
+$script:passes = 0
 
 function Assert($name, $cond) {
-    if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
+    if ($cond) { "  PASS $name"; $script:passes++ } else { "  FAIL $name"; $script:failures++ }
 }
 
 $paths = [ordered]@{
@@ -195,7 +197,7 @@ if (-not $TeethCheck) {
         if ($inject -eq '') { $poisoned[$key] = '' } else { $poisoned[$key] = $text[$key] + "`n" + $inject + "`n" }
         $stillPasses = & $checks[$name] $poisoned
         if ($stillPasses) { "  FAIL $name (mutation not caught)"; $script:failures++ }
-        else { "  PASS $name (caught)" }
+        else { "  PASS $name (caught)"; $script:passes++ }
     }
     # And the directory check, whose "mutation" is the directory coming back.
     $tmp = Join-Path ([System.IO.Path]::GetTempPath()) ("one-installer-" + [guid]::NewGuid().ToString('N'))
@@ -203,7 +205,7 @@ if (-not $TeethCheck) {
     try {
         $back = Join-Path $tmp 'msi'
         New-Item -ItemType Directory -Path $back | Out-Null
-        if (Test-Path -LiteralPath $back) { "  PASS B0 relay/deploy/msi/ is gone (caught)" }
+        if (Test-Path -LiteralPath $back) { "  PASS B0 relay/deploy/msi/ is gone (caught)"; $script:passes++ }
         else { "  FAIL B0 relay/deploy/msi/ is gone (mutation not caught)"; $script:failures++ }
     } finally {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -212,11 +214,11 @@ if (-not $TeethCheck) {
 
 # A clean green run stamps the files this harness covers (T783). The negative
 # control deliberately scores red on every check, so it never stamps.
+Complete-TestBody  # T1039: before the stamp, which is a child process reading this run's state
 if ($script:failures -eq 0 -and -not $TeethCheck) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
         update -Guard one-installer -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
 }
 
 ""
-if ($script:failures -eq 0) { "ALL PASS" } else { "$($script:failures) FAILURE(S)" }
-exit ([int]($script:failures -gt 0))
+Write-TestVerdict -Label 'T1175 ACCEPTANCE' -Pass $script:passes -Fail $script:failures

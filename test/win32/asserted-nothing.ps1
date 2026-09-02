@@ -233,7 +233,12 @@ Write-Host "  ($($uncountedFinal.Count) script(s) still print an UNCOUNTED final
 # harnesses filed since it was set each hand-rolled their own verdict, and this
 # assertion is the only thing that says so - the ceiling is a ratchet exactly to
 # the extent that a run that finds it exceeded is treated as work to do.
-$ceiling = 37
+# 2026-09-01 (T1257): 37 -> 36. It had drifted to 41 - five harnesses filed
+# since T962 (daily-publish, install-launch, install-ownership, one-installer,
+# viewer-find) each hand-rolled a bare "ALL PASS", against one (morning-refresh)
+# that was retired. All five are on the shared scorer now, so the ceiling comes
+# down past where T962 left it rather than up to where the drift landed.
+$ceiling = 36
 Assert "C3 the uncounted-final count did not grow past $ceiling" ($uncountedFinal.Count -le $ceiling)
 
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue

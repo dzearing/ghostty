@@ -68,6 +68,7 @@ $env:GHOZTTY_PIPE_SUFFIX = "-vfind$PID"
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
 Assert-GhozttyIsolatedBuild -Exe $exe | Out-Null
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -493,6 +494,7 @@ try {
     }
 
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'no crash anywhere in the run'
+    Complete-TestBody
 }
 finally {
     Stop-RepoInstances
@@ -524,6 +526,4 @@ if ($NegativeControl) {
     Write-Host "NEGATIVE CONTROL BROKEN: expected 2 failures, got $script:fail" -ForegroundColor Red
     exit 1
 }
-if ($script:fail -eq 0) { Write-Host 'ALL PASS'; exit 0 }
-Write-Host "$script:fail FAILURE(S)" -ForegroundColor Red
-exit 1
+Write-TestVerdict -Label 'T1184 ACCEPTANCE' -Pass $script:pass -Fail $script:fail -Skipped $script:skipped

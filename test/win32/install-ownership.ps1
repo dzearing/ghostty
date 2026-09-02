@@ -48,13 +48,15 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 $script:failures = 0
+$script:passes = 0
 
 function Assert($name, $cond) {
-    if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
+    if ($cond) { "  PASS $name"; $script:passes++ } else { "  FAIL $name"; $script:failures++ }
 }
 function AssertEq($name, $expected, $actual) {
-    if ($expected -eq $actual) { "  PASS $name" }
+    if ($expected -eq $actual) { "  PASS $name"; $script:passes++ }
     else { "  FAIL $name (expected '$expected', got '$actual')"; $script:failures++ }
 }
 
@@ -245,7 +247,7 @@ if (-not $TeethCheck) {
         if ($inject -eq '') { $poisoned[$key] = '' } else { $poisoned[$key] = $text[$key] + "`n" + $inject + "`n" }
         $stillPasses = & $checks[$name] $poisoned
         if ($stillPasses) { "  FAIL $name (mutation not caught)"; $script:failures++ }
-        else { "  PASS $name (caught)" }
+        else { "  PASS $name (caught)"; $script:passes++ }
     }
     # D1/D2's mutation is the retired file coming back, in a sandbox rather than
     # in the tree.
@@ -254,7 +256,7 @@ if (-not $TeethCheck) {
     try {
         $back = Join-Path $tmp 'morning-refresh.ps1'
         Set-Content -LiteralPath $back -Value '# it came back' -Encoding UTF8
-        if (Test-Path -LiteralPath $back) { "  PASS D1/D2 a restored morning-refresh.ps1 is visible (caught)" }
+        if (Test-Path -LiteralPath $back) { "  PASS D1/D2 a restored morning-refresh.ps1 is visible (caught)"; $script:passes++ }
         else { "  FAIL D1/D2 a restored morning-refresh.ps1 is visible (mutation not caught)"; $script:failures++ }
     } finally {
         Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -263,11 +265,11 @@ if (-not $TeethCheck) {
 
 # A clean green run stamps the files this harness covers (T783). The negative
 # control scores its checks inverted, so it never stamps.
+Complete-TestBody  # T1039: before the stamp, which is a child process reading this run's state
 if ($script:failures -eq 0 -and -not $TeethCheck) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
         update -Guard install-ownership -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
 }
 
 ""
-if ($script:failures -eq 0) { "ALL PASS" } else { "$($script:failures) FAILURE(S)" }
-exit ([int]($script:failures -gt 0))
+Write-TestVerdict -Label 'T1218 ACCEPTANCE' -Pass $script:passes -Fail $script:failures

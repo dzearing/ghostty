@@ -53,7 +53,21 @@ $logSlice = Join-Path $outDir 'log-slice.txt'
 # $appLog is derived AFTER the sandbox below moves LOCALAPPDATA - see there.
 $appLog = $null
 
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
+
 function Rep($m) { $m | Tee-Object -FilePath $report -Append | Write-Host }
+
+# The verdict goes through the shared scorer (T271), so a zero-assertion run -
+# a `-SelfTest` whose grading helpers all threw, or a soak that reached the end
+# having measured nothing - ends ASSERTED NOTHING and exit 2 rather than green.
+# `-NoExit` because the report file wants the line too; the exit code is the
+# scorer's either way.
+function Write-SoakVerdict([int]$Pass, [int]$Fail, [string]$Label) {
+    $v = Write-TestVerdict -Label $Label -Pass $Pass -Fail $Fail -NoExit
+    $v.Line | Out-File -FilePath $report -Append -Encoding utf8
+    exit $v.Code
+}
+
 $script:pass = 0
 $script:fail = 0
 function Assert([bool]$cond, [string]$label) {
@@ -175,9 +189,8 @@ if ($SelfTest) {
 
     Rep ""
     Rep "=== selftest: $($script:pass) passed, $($script:fail) failed"
-    if ($script:fail -gt 0) { Rep "$($script:fail) FAILURE(S)"; exit 1 }
-    Rep 'ALL PASS'
-    exit 0
+    Complete-TestBody
+    Write-SoakVerdict -Pass $script:pass -Fail $script:fail -Label 'T53 SOAK SELFTEST'
 }
 
 Add-Type @'
@@ -606,5 +619,6 @@ Rep "bystander: user agent held $($userSessionsBefore.Count) session(s) before, 
 Assert ($strays.Count -eq 0) "no session leaked into the user's agent (strays: $($strays -join ' '))"
 
 Rep ''
-if ($script:fail -eq 0) { Rep "ALL PASS ($script:pass assertions) - report: $report" }
-else { Rep "$script:fail FAILURE(S) / $script:pass passed - report: $report"; exit 1 }
+Rep "report: $report"
+Complete-TestBody
+Write-SoakVerdict -Pass $script:pass -Fail $script:fail -Label 'T53 SOAK'

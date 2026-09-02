@@ -53,11 +53,13 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+. (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 $script:failures = 0
 $script:skipped = 0
+$script:passes = 0
 
 function Assert($name, $cond) {
-    if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
+    if ($cond) { "  PASS $name"; $script:passes++ } else { "  FAIL $name"; $script:failures++ }
 }
 function Skip($name, $why) { "  SKIP $name ($why)"; $script:skipped++ }
 
@@ -307,18 +309,18 @@ if (-not $TeethCheck) {
         }
         $stillPasses = & $checks[$name] $poisoned
         if ($stillPasses) { "  FAIL $name (mutation not caught)"; $script:failures++ }
-        else { "  PASS $name (caught)" }
+        else { "  PASS $name (caught)"; $script:passes++ }
     }
 }
 
 # A clean green run stamps the files this harness covers (T783). A run with a
 # SKIP did not cover everything, so it does not stamp; the negative control
 # deliberately scores red on every check, so it never stamps either.
+Complete-TestBody  # T1039: before the stamp, which is a child process reading this run's state
 if ($script:failures -eq 0 -and $script:skipped -eq 0 -and -not $TeethCheck) {
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $Repo 'scripts\guard-due.ps1') `
         update -Guard install-launch -Repo $Repo 2>&1 | ForEach-Object { "  $_" }
 }
 
 ""
-if ($script:failures -eq 0) { "ALL PASS" } else { "$($script:failures) FAILURE(S)" }
-exit ([int]($script:failures -gt 0))
+Write-TestVerdict -Label 'T1176 ACCEPTANCE' -Pass $script:passes -Fail $script:failures -Skipped $script:skipped

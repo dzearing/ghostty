@@ -1,16 +1,16 @@
 {
     "guard":  "viewer-find",
     "script":  "test/win32/viewer-find.ps1",
-    "generated":  "2026-09-01T01:30:39-07:00",
-    "commit":  "cc0a1b123",
+    "generated":  "2026-09-01T23:24:13-07:00",
+    "commit":  "ee910c4bb",
     "uncommitted":  [
-                        "src/apprt/win32/ViewerFindBar.zig"
+                        "test/win32/viewer-find.ps1"
                     ],
     "files":  {
                   "src/apprt/win32/viewer_accel.zig":  "3c827cb3f9e626e8540629ce457aa6b75bb2edf32c28a7ea7ff6b38ead04f1b4",
                   "src/apprt/win32/viewer_find.zig":  "ca5c9ca6433db9e8598aa4e2b276cc34c84c414b71f893da187f14e48e33794b",
                   "src/apprt/win32/ViewerFindBar.zig":  "033b9b43436b62b93aa3038953dcdc3b7b782f007e33ae14b3a6228640d6b517",
                   "src/viewer/find.js":  "59dffe968a2a082a728d0e46549dea1a66f6fe059464d69833a4a9ed68eacbc3",
-                  "test/win32/viewer-find.ps1":  "fc96957e53741109ee6580420d854a7f28defd53c9bc7d02232bc86e19d0cd7f"
+                  "test/win32/viewer-find.ps1":  "74a7b442cf836c478727fe882fa7aedcabf58e962d9f7a77cd1083a0096dbf6d"
               }
 }
