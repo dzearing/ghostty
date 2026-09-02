@@ -71,6 +71,9 @@ if ($ExePath) { $exe = $ExePath }
 $env:GHOZTTY_PIPE_SUFFIX = "-captiontest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+# T363: the chrome color this script probes is DERIVED (a bar_wash over the
+# launch --background), so the expectation is computed rather than written down.
+. (Join-Path $PSScriptRoot 'lib\ColorMath.ps1')
 
 $script:pass = 0
 $script:fail = 0
@@ -248,9 +251,21 @@ try {
     } else {
         Check ($firstBlack -eq $expectCapH) "caption band is $expectCapH px tall (native 32 DIP, T496); measured $firstBlack"
     }
+    # T363: what makes the top row OURS is that it is the color our chrome
+    # theme derives - bar_wash over the launch --background - and not whatever
+    # DWM would paint. A range like `R in 9..59` restated that derived value as
+    # a private absolute: it passed for any dark grey, and it would go red for a
+    # different --background, a bar_wash tune or a light theme, none of which
+    # are defects. ColorMath.Get-Wash is the same arithmetic the Zig side runs.
     $capTop = Get-TestPixel -Shot $shot -X $probeX -Y ($win.Top + 2)
-    Check ($null -ne $capTop -and $capTop.R -gt 8 -and $capTop.R -lt 60) `
-        "the window's TOP row is client chrome, not a DWM caption (rgb $($capTop.R),$($capTop.G),$($capTop.B))"
+    $wantChrome = Get-Wash @(0, 0, 0) $BAR_WASH
+    $chromeDelta = if ($null -eq $capTop) { 999 } else {
+        [Math]::Max([math]::Abs([int]$capTop.R - $wantChrome[0]),
+         [Math]::Max([math]::Abs([int]$capTop.G - $wantChrome[1]),
+                     [math]::Abs([int]$capTop.B - $wantChrome[2])))
+    }
+    Check ($chromeDelta -le 2) `
+        "the window's TOP row is client chrome, not a DWM caption (rgb $($capTop.R),$($capTop.G),$($capTop.B) vs derived $($wantChrome -join ','))"
 
     # --- 2. the buttons paint where the layout module says -------------------
     # Layout from CaptionGeom (see the arithmetic there); what this section
@@ -277,7 +292,10 @@ try {
         for ($dy = -4; $dy -le 4; $dy++) {
             for ($dx = -8; $dx -le 8; $dx++) {
                 $c = Get-TestPixel -Shot $shot -X ($cx + $dx) -Y ($cy + $dy)
-                if ($null -ne $c -and $c.R -gt 100) { $lit++ }
+                # T363: brighter than THE CHROME, measured above - not brighter
+                # than a written-down 100, which is the same question only while
+                # the chrome happens to be a dark grey.
+                if ($null -ne $c -and $c.R -gt ($chrome.R + 80)) { $lit++ }
             }
         }
         Check ($lit -gt 0) "$($names[$i]) button paints a glyph in its center"
@@ -287,14 +305,17 @@ try {
     # slab painted with a resting fill (or at the wrong size) shows up here.
     $gapX = $win.Left + $borderX + $maxL - 1
     $gapC = Get-TestPixel -Shot $shot -X $gapX -Y $cy
-    Check ($null -ne $gapC -and $gapC.R -lt 60) "the resting slabs are bare chrome at the min/max seam"
+    # T363: "bare chrome" is a claim about WHICH SURFACE this pixel is, so it is
+    # scored against the chrome pixel measured above, not against a literal.
+    Check ($null -ne $gapC -and [math]::Abs([int]$gapC.R - $chrome.R) -le 8) `
+        "the resting slabs are bare chrome at the min/max seam (R=$(if($gapC){$gapC.R}) vs chrome $($chrome.R))"
     # ...and the GROUP gap that separates our button from the system trio. If
     # "..." were laid out like a fourth slab, its paint would reach into this
     # column.
     $groupX = $win.Left + $borderX + $minL - [int]($padMd / 2)
     $groupC = Get-TestPixel -Shot $shot -X $groupX -Y $cy
-    Check ($null -ne $groupC -and $groupC.R -lt 60) `
-        "the '...' is one GROUP step clear of the minimize slab, not jammed against it"
+    Check ($null -ne $groupC -and [math]::Abs([int]$groupC.R - $chrome.R) -le 8) `
+        "the '...' is one GROUP step clear of the minimize slab, not jammed against it (R=$(if($groupC){$groupC.R}) vs chrome $($chrome.R))"
     Close-TestWindowPixels $shot
 
     # --- 2b. the restatement AGREES with ChromeGeometry (T264) ---------------

@@ -110,9 +110,21 @@ try {
     $restShot = Get-TestWindowPixels -Window $h -Sync
     if ((Get-TestDistinctColors $restShot) -lt 3) { throw 'SETUP FAIL: captured a mid-paint frame' }
     $rest = Get-TestPixel -Shot $restShot -X ($win.Left + $borderX + $closeL + 3) -Y $cy
+    # T363: "bare chrome" is a claim about WHICH SURFACE this pixel is, so it is
+    # scored against the band itself - probed mid-width, right of the title text
+    # and well left of the buttons, the same column caption-bar.ps1 uses. The
+    # literal it replaces (R < 80) restated the chrome color the app DERIVES
+    # from the terminal background, so it would go red for a lighter theme that
+    # is painting exactly what it should, and it passed for any dark fill.
+    $bandRef = Get-TestPixel -Shot $restShot -X ($win.Left + $borderX + [int]($cli.Width / 2)) -Y $cy
     Close-TestWindowPixels $restShot
-    Check ($null -ne $rest -and $rest.R -lt 80 -and [math]::Abs($rest.R - $rest.B) -lt 24) `
-        "the resting close slab is bare chrome, not red (rgb $($rest.R),$($rest.G),$($rest.B))"
+    $restDelta = if ($null -eq $rest -or $null -eq $bandRef) { 999 } else {
+        [Math]::Max([math]::Abs([int]$rest.R - $bandRef.R),
+         [Math]::Max([math]::Abs([int]$rest.G - $bandRef.G),
+                     [math]::Abs([int]$rest.B - $bandRef.B)))
+    }
+    Check ($restDelta -le 8) `
+        "the resting close slab is bare chrome, not red (rgb $($rest.R),$($rest.G),$($rest.B) vs band $($bandRef.R),$($bandRef.G),$($bandRef.B))"
 
     Send-TestRawMessage -Window $h -Message $WM_NCLBUTTONDOWN `
         -WParam ([IntPtr]$HTCLOSE) -LParam (PackPoint 0 0) | Out-Null

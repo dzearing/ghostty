@@ -1,12 +1,12 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-09-02T01:56:04-07:00",
-    "commit":  "37624a1e0",
+    "generated":  "2026-09-02T02:48:38-07:00",
+    "commit":  "cffa68b7f",
     "uncommitted":  [
-                        "test/win32/lib/ApplierSandbox.ps1",
-                        "test/win32/update-apply.ps1",
-                        "test/win32/update-failure-visible.ps1"
+                        "test/win32/caption-bar.ps1",
+                        "test/win32/close-glyph-white.ps1",
+                        "test/win32/tab-strip.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -41,7 +41,7 @@
                   "test/win32/build-locked-artifact.ps1":  "5b9a47f783f56d1ecb35367bb360416a4798c04a165b63b2949a782a972e48a9",
                   "test/win32/build-mode-guard.ps1":  "cd0e27e13a471649f9ee233d62a1ca4d25aacd9df04d39f82a522baac3c26047",
                   "test/win32/caller-anchor.ps1":  "72086c4371d49dfea4a53bab3bbc7b7caa1ffff09ee79b07c4fe5467c618e557",
-                  "test/win32/caption-bar.ps1":  "baa4f95decae4c8f148b0bf3ffb3af28ebf56fa1e8085980d88b479bed56e235",
+                  "test/win32/caption-bar.ps1":  "795c8ea4afc40b830122de881dc9f6fc3c45b15354d7f2e4e249aa2f4866e162",
                   "test/win32/chooser-close-chord.ps1":  "70497b30e84e690acc614f7b500b1cf101b21f57c3452d60324201532c03fff8",
                   "test/win32/chooser-conn-pool.ps1":  "ab6693a92f6217745b2a4b0da20b679f1f2c9c227980c9dc4aaa9b92741c78a8",
                   "test/win32/chooser-controls.ps1":  "69a8d25a53eba9af41871bfebc202b015c83baebe4df8caa8a33ad7cb991a7d5",
@@ -71,7 +71,7 @@
                   "test/win32/cli-shim-redirect.ps1":  "d9270707fa5daba04008292352c21cfb3aa71a688528a10a3db2319484e5f3bb",
                   "test/win32/cli-unknown-flag.ps1":  "07ea51f386b5d1f59c1ad1a1ae7ff93c4b14ab35b7d4468a7ae9313e208427f2",
                   "test/win32/close-confirm-idle.ps1":  "09a5be3ee29edd36c7d7081a297ddbe61544d0617b56942a516efd77703afb96",
-                  "test/win32/close-glyph-white.ps1":  "52ea95cef45465a7c3a343a86db2dcd224e0e23c4471a15f19fdf11b2bf39387",
+                  "test/win32/close-glyph-white.ps1":  "cb2a97f2286e4fefff7a07ed5933ecbacbc49b32a28f594f5af44130e731e553",
                   "test/win32/color-contrast.ps1":  "464aa2aa9a4e6cf6470fbcd1ec523b705a9f3260a04f6af57f406ff36e00cb4e",
                   "test/win32/command-registry.ps1":  "4b451ab5f58c9456cee43a4127d2b26db4d0285accb0d1c8592fff49ac57fd01",
                   "test/win32/config-errors.ps1":  "1d64c1391b3f98388d3d4cdee2f6a23c4c30d952f005b977afb40b32625fe8c3",
@@ -259,7 +259,7 @@
                   "test/win32/stderr-capture-audit.ps1":  "04424b778285df67f2eeed9c8ee354d1446c62a920ab8de56bf8b4475569cf9b",
                   "test/win32/suite-run.ps1":  "3adb056c6a6ca3f7162a93526c9c74a29dc9ec2fc2584ae02785c24995c6debe",
                   "test/win32/tab-color.ps1":  "af75bcd47eeb68cf93ee056b7aa4e14e147314ab8b4adc3a9c0eb27dfb43f967",
-                  "test/win32/tab-strip.ps1":  "143b3b882fe5959f213828260770f0f6d97c323a6929b28ec6986f67fab8d2de",
+                  "test/win32/tab-strip.ps1":  "9217c29eab658913f60ac6af494ef630c882ef913c3bfbf3987d5951f00df027",
                   "test/win32/tab-strip-autohide.ps1":  "53655e95850098c972752b1deee1a16488c6c1abd4b46b6734c7500b896bae50",
                   "test/win32/tab-tooltip.ps1":  "2c16b672ae68453765b7c6b86419b4e93d783c063e67985a7789e41eead227a7",
                   "test/win32/target-staleness.ps1":  "25c28c99d39716155584ecda6f7a826dae310b3adaad3ae6dbb962c38f7f7d80",

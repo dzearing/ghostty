@@ -9,6 +9,34 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-02: T363 - **A chrome color check is scored against the chrome, not against a number.** `tab-strip.ps1` asserted that a patch of the strip was "bar background, not tab or accent" with `$px.R -ge 10 -and $px.R -le 40`. That number is nowhere in the app: the bar is a `bar_wash` (0.08) over the terminal background, computed at paint time. So the range only asked the right question while the script's `--background` happened to be black, and it also PASSED for any coincidentally-dark tab fill - the direction it claimed to rule out. T43 found the first half when the debug chrome marker made the bar amber and the assertion went red against a window painting exactly what it was told to; it shipped with the marker disabled for the suite, which left the literal.
+  The audit the task asked for found the same shape in four more places:
+  `tab-strip.ps1`'s three glyph scans (`sum < 150` = "brighter than a dark
+  grey"), `caption-bar.ps1`'s top-row, glyph-lit and two bare-chrome checks, and
+  `close-glyph-white.ps1`'s resting-slab check. All are now scored against a
+  pixel of the surface they name - the strip just left of the "+"'s painted
+  limit (the reference `Get-TestTabExtents` already uses), the caption band
+  probed mid-width, or `ColorMath.Get-Wash`, which is the arithmetic the Zig
+  side runs. The close-glyph one is the neat illustration: it reads
+  `50,50,50 vs band 50,50,50` on a window whose chrome is nowhere near the
+  `R < 80` the literal assumed. `remote-pill.ps1`'s hue relations and
+  `tab-color.ps1`'s `(255,69,58)` are absolutes the app itself spells, and were
+  left alone.
+  `tab-strip.ps1 -DebugMarker` is the repeatable proof: it re-enables the amber
+  tint the harness turns off, and the run has to be green. Four assertions there
+  could not be, and should not be - they measure how far a chrome WASH steps
+  away from the bar it is a fraction of, and a tinted bar is a lighter bar, so
+  the app paints less contrast. That is what `Window.zig`'s
+  `debugMarkerEnabled` says, and why T43 disabled the marker suite-wide, so
+  those four SKIP under the switch with the reason printed and the marker run
+  answers the question T363 actually asks: is every MEASUREMENT derived?
+  Evidence: tab-strip ALL PASS (70); tab-strip -DebugMarker ALL PASS (62);
+  close-glyph-white ALL PASS (5); caption-bar's four rewritten checks PASS
+  (`20,20,20 vs derived 20,20,20`). Floor: lib/none/win32/agent lanes and P1-P3
+  green; the six suite-wide audits that read every test script re-ran green and
+  re-stamped. caption-bar still ends on one UNIFORM-capture failure after the
+  maximize section - it reproduces byte for byte on the HEAD copy of the script,
+  so it predates this work and is filed as T1273.
 - 2026-09-02: T1264, T1265 - **A pane that comes back from a dead session says so again.** The faint `--- session restarted ---` line between the replayed scrollback and the fresh shell was missing on the keystroke-relaunch path everywhere, and on the automatic path at some window sizes and not others. Two defects, one symptom.
   The first is that **nobody drew it**. The agent bakes the divider into the ring
   at agent-restart time only (`preloadRingSnapshot`). A session whose shell dies

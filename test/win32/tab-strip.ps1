@@ -85,7 +85,13 @@
 # still the rule the cap assertions catch.)
 #
 # Only touches ghoztty processes running from this repo's zig-out.
-param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
+# -DebugMarker re-enables the win32 debug chrome marker (an amber tab bar)
+# after the harness disables it. T363: every claim this script makes about
+# a chrome color is scored against a pixel of the SAME surface, never
+# against a literal channel range, so an amber bar has to pass exactly the
+# way the dark one does. That is the run which proves it - a switch rather
+# than a hand edit, so the proof is repeatable.
+param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive, [switch]$DebugMarker)
 
 # T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
 # of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
@@ -100,11 +106,30 @@ $env:GHOZTTY_PIPE_SUFFIX = "-tabstriptest$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
+# After the dot-source, the way chrome-theme.ps1 does it: TestDesktop.ps1 sets
+# GHOZTTY_DEBUG_MARKER=0 at load, and this is the opt-out.
+if ($DebugMarker) { $env:GHOZTTY_DEBUG_MARKER = '1'; Write-Host 'INFO  debug chrome marker ENABLED (-DebugMarker)' }
+
 $script:pass = 0
 $script:fail = 0
 function Assert([bool]$cond, [string]$label) {
     if ($cond) { $script:pass++; Write-Host "PASS  $label" }
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
+}
+
+# A claim about chrome CONTRAST - how far a wash steps away from the bar it is
+# a fraction of. Those are claims about the SHIPPED chrome, and the debug marker
+# tints the bar, so every wash over it steps less far (Window.zig,
+# debugMarkerEnabled). T43 answered that by turning the marker off for the whole
+# suite; T363 keeps the switch for the opposite question - is every MEASUREMENT
+# derived? - and skips the four claims whose subject the marker legitimately
+# changes, so a -DebugMarker run is green exactly when the answer is yes.
+function Assert-Wash([bool]$cond, [string]$label) {
+    if ($DebugMarker) {
+        Write-Host "SKIP  $label - the marker tints the bar and every chrome wash is a fraction of it (T43)"
+        return
+    }
+    Assert $cond $label
 }
 
 function Kill-RepoInstances {
@@ -247,6 +272,20 @@ try {
         throw 'Get-Shot: the window never captured with real content (flat fill only)'
     }
 
+    # T363: a pixel is "lit" when it is a GLYPH rather than the surface behind
+    # it, so the floor is derived from the BAR's own pixel - sampled just left
+    # of the "+"'s painted limit, the strip that can belong to no tab and no
+    # button (the same reference Get-TestTabExtents uses). The literal it
+    # replaces (sum < 150) only asked the right question while the bar happened
+    # to be a dark grey: with the debug chrome marker live the bar itself reads
+    # as lit, and every mark extent measured off it spans the whole slot. The
+    # margin is the same 90 levels that literal carried over a (20,20,20) bar,
+    # so nothing about the shipped chrome moves.
+    function Lit-Floor($shot) {
+        $bar = $shot.Bitmap.GetPixel($offX + $m.RunRight - 2, $stripTop + $barH - 2)
+        return ([int]$bar.R + [int]$bar.G + [int]$bar.B) + 90
+    }
+
     # The LONGEST dark run on the scanline, not the first one. The chiclet's
     # rounded left edge antialiases to a dark pixel, a lighter pixel or two,
     # then the fill - so "first dark pixel until the first light one" measured a
@@ -348,9 +387,25 @@ try {
     # 2. No full-width accent rule under the strip
     # -----------------------------------------------------------------------
     Assert (-not (Any-Accent-Blue $shot)) 'selection: the full-width blue accent rule is gone (no accent pixels in the strip)'
+    # T363: score this against the bar itself, never against a literal channel
+    # range. The claim is "this pixel belongs to the BAR, not to a tab and not
+    # to an accent", so the oracle is a pixel that can belong to nothing else:
+    # the strip just left of the "+"'s painted limit, which is what
+    # Get-TestTabExtents already uses as its background reference. A range like
+    # `R in 10..40` restated a color the app DERIVES (bar_wash over
+    # --background) as a private absolute - it went red on an amber debug-marker
+    # bar that was painting exactly what it was told to, and it also PASSED for
+    # any coincidentally-dark tab fill, which is the direction it claimed to be
+    # strong in.
     $midStripX = [int](($tabRight + $clientW - $padR - 2 * $btnPaint - $gap) / 2)
-    $px = $shot.Bitmap.GetPixel($offX + $midStripX, $stripTop + $barH - 2)
-    Assert ($px.R -ge 10 -and $px.R -le 40) "strip: dead space right of the tab is bar background, not tab or accent (R=$($px.R))"
+    $barRefX = $m.RunRight - 2
+    $px    = $shot.Bitmap.GetPixel($offX + $midStripX, $stripTop + $barH - 2)
+    $barPx = $shot.Bitmap.GetPixel($offX + $barRefX, $stripTop + $barH - 2)
+    $barDelta = [math]::Max([math]::Abs([int]$px.R - $barPx.R),
+                 [math]::Max([math]::Abs([int]$px.G - $barPx.G),
+                             [math]::Abs([int]$px.B - $barPx.B)))
+    Assert ($barDelta -le 8) ("strip: dead space right of the tab is bar background, not tab or accent " +
+        "(($($px.R),$($px.G),$($px.B)) at x=$midStripX vs bar ($($barPx.R),$($barPx.G),$($barPx.B)) at x=$barRefX)")
 
     # -----------------------------------------------------------------------
     # 2c. T242: the selected chiclet's SEAM row carries no rim.
@@ -394,6 +449,7 @@ try {
     # -----------------------------------------------------------------------
     # Everything lit inside the "+"'s slot. The menu button is far to the
     # right, so a window this wide cannot catch it in the scan.
+    $litFloor = Lit-Floor $shot
     $scanL = $tabRight + 1
     $scanR = [math]::Min($tabRight + $gap + $btnPaint + $gap, $clientW - 1)
     $mLeft = -1; $mRight = -1; $mTop = -1; $mBot = -1
@@ -401,7 +457,7 @@ try {
     for ($x = $scanL; $x -le $scanR; $x++) {
         for ($y = 0; $y -lt $barH; $y++) {
             $p = $shot.Bitmap.GetPixel($offX + $x, $stripTop + $y)
-            if (($p.R + $p.G + $p.B) -lt 150) { continue }
+            if (($p.R + $p.G + $p.B) -lt $litFloor) { continue }
             if ($mLeft -lt 0 -or $x -lt $mLeft) { $mLeft = $x }
             if ($x -gt $mRight) { $mRight = $x }
             if ($mTop -lt 0 -or $y -lt $mTop) { $mTop = $y }
@@ -431,7 +487,7 @@ try {
         $hL = $clientW; $hR = -1
         for ($x = $scanL; $x -le $scanR; $x++) {
             $p = $shot.Bitmap.GetPixel($offX + $x, $stripTop + $barRow)
-            if (($p.R + $p.G + $p.B) -lt 150) { continue }
+            if (($p.R + $p.G + $p.B) -lt $litFloor) { continue }
             if ($x -lt $hL) { $hL = $x }
             if ($x -gt $hR) { $hR = $x }
         }
@@ -485,7 +541,7 @@ try {
     for ($x = $closeSqL; $x -lt $closeSqR; $x++) {
         for ($y = $btnTop; $y -lt $btnBot; $y++) {
             $p = $shot.Bitmap.GetPixel($offX + $x, $stripTop + $y)
-            if (($p.R + $p.G + $p.B) -lt 150) { continue }
+            if (($p.R + $p.G + $p.B) -lt $litFloor) { continue }
             if ($xL -lt 0 -or $x -lt $xL) { $xL = $x }
             if ($x -gt $xR) { $xR = $x }
             if ($xT -lt 0 -or $y -lt $xT) { $xT = $y }
@@ -612,7 +668,7 @@ try {
         # is indistinguishable from the strip, which is the pre-T206 world and
         # what T206_NEUTERED restores. Named as such so the control reports the
         # claim rather than a shrug.
-        Assert $false ("T206: an inactive tab is invisible against the strip - " +
+        Assert-Wash $false ("T206: an inactive tab is invisible against the strip - " +
                        "only $($tabs.Count) of 3 open tabs could be measured at all")
     }
     # NOT `else`. The inactive-surface claim above and the silhouette claims
@@ -699,7 +755,7 @@ try {
         $sideHi = Max-Lum $shot ($sel.Right - 2) ($sel.Right + $outPad) $selMidY
         $sideLo = Max-Lum $shot ($sel.Right - 2) ($sel.Right + $outPad) ($stripTop + $barH - 3)
         Write-Host "INFO  rim gradient: side@mid=$sideHi side@baseline=$sideLo"
-        Assert ($sideHi -ge ($sideLo + 12)) `
+        Assert-Wash ($sideHi -ge ($sideLo + 12)) `
             "T206: the rim FADES down the tab - a gradient, not a border (mid=$sideHi baseline=$sideLo)"
 
         # 8. THE FLARE. The selected tab's foot curves OUT into the baseline,
@@ -867,9 +923,9 @@ try {
             "T204: ...and only the hovered one - the + is dark while the x is hovered (edge=$(if($coldPlus){$coldPlus.Edge}))"
         Assert ($null -ne $hotClose -and $null -ne $restClose -and $hotClose.Edge -ge ($restClose.Edge + 8)) `
             "T204: hovering the close x lights a FILL, not just a red glyph (rest=$(if($restClose){$restClose.Edge}) hot=$(if($hotClose){$hotClose.Edge}))"
-        Assert ($null -ne $hotClose -and $hotClose.Corner -lt ($hotClose.Edge - 5)) `
+        Assert-Wash ($null -ne $hotClose -and $hotClose.Corner -lt ($hotClose.Edge - 5)) `
             "T204: that fill is ROUNDED - its corner is cut away (corner=$(if($hotClose){$hotClose.Corner}) edge=$(if($hotClose){$hotClose.Edge}))"
-        Assert ($null -ne $hotPlus -and $hotPlus.Corner -lt ($hotPlus.Edge - 5)) `
+        Assert-Wash ($null -ne $hotPlus -and $hotPlus.Corner -lt ($hotPlus.Edge - 5)) `
             "T204: the +'s fill is rounded the same way (corner=$(if($hotPlus){$hotPlus.Corner}) edge=$(if($hotPlus){$hotPlus.Edge}))"
         Close-TestHoverCapture $shotPlus
         Close-TestHoverCapture $shotClose
