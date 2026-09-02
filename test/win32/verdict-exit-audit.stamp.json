@@ -1,11 +1,11 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-09-02T09:27:00-07:00",
-    "commit":  "a566113be",
+    "generated":  "2026-09-02T10:00:25-07:00",
+    "commit":  "f67155b6f",
     "uncommitted":  [
-                        "test/win32/lib/TestDesktop.ps1",
-                        "test/win32/test-desktop-harness.ps1"
+                        "test/win32/split-dim.ps1",
+                        "test/win32/split-dim-viewer.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -252,8 +252,8 @@
                   "test/win32/single-instance-join.ps1":  "d276a7d97773c26b7cc622fe3ae14c735381f5e15c7ce137cfb44d84aa249039",
                   "test/win32/skip-visibility.ps1":  "c757621d0e3bb387d615cc74968e708190720f712eb6484d8438180c8ee870e2",
                   "test/win32/soak.ps1":  "cc3d8774680af5795741d2cb4ab6521e3161a102c8c45c64f36e8d76d047e639",
-                  "test/win32/split-dim.ps1":  "8dca0d4edece5d126077f409fcf4e32eb8e6f1440b3cfa7348b0013a8daeb1b3",
-                  "test/win32/split-dim-viewer.ps1":  "b557b55f71b6471c6b6691c2ab6474be8b86bad64e6a3df0a4ac9ef5c4516595",
+                  "test/win32/split-dim.ps1":  "a0d3d7e7816fc6a89ab6c2f285c2d19f2e2a550333765c2a3fabdb377c9e8b8b",
+                  "test/win32/split-dim-viewer.ps1":  "454a52890b54b98bd41361b823291d51d54b6986180613e921fd0d185324dea9",
                   "test/win32/split-divider.ps1":  "cf4eeef4cc31b15427bd2be83bb97e5edd88a0b055687312a3e17e4d66e16fcf",
                   "test/win32/split-zoom-nav.ps1":  "7ed3a76e0a6abc09573263efa8f7c7d3889ab31d6d8b258040ab7cf5e9882b12",
                   "test/win32/startup-failure.ps1":  "d2ed885900bd7d68765f605a5a94a622df2682d29c6d9fa27a4612b33cce6cb9",

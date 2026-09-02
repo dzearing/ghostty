@@ -129,12 +129,25 @@ function Wait-OverlayOver([int]$procId, $pane) {
 # nothing rather than returning a blank frame, so a capture taken between the
 # overlay becoming visible and its first paint is RETRIED here instead of
 # scored as "the overlay painted nothing".
+#
+# -AllowUniform, and why it is not a hole (T1283). This window is a single
+# FillRect: one colour over its whole interior is its CORRECT output, and
+# T303's bitmap-level refusal - written for WinUI windows that capture as a flat
+# fill because nothing GDI-painted - cannot tell the two apart, so it threw on
+# every capture here and the probe reported an empty colour. Both this script
+# and split-dim-viewer.ps1 were red on that, over the only oracle the dim
+# overlay has: the feature was fine and its watchdog was measuring nothing.
+# What replaces the refusal is the assertion itself. A capture that died reads
+# black (0,0,0) or the sentinel, and this probe pins an EXACT colour that
+# tracks the config - 16,16,20 under one run and 255,0,0 under another - so a
+# blank frame fails it rather than passing for free, which is the whole thing
+# T303 exists to prevent. -NegativeControl is the demonstration.
 function Get-OverlayFill($overlay) {
     $h = [IntPtr]$overlay.Hwnd
     for ($t = 0; $t -lt 10; $t++) {
         $shot = $null
         try {
-            $shot = Get-TestWindowPixels -Window $h -Sync
+            $shot = Get-TestWindowPixels -Window $h -Sync -AllowUniform
             $cx = [int](($overlay.Left + $overlay.Right) / 2)
             $cy = [int](($overlay.Top + $overlay.Bottom) / 2)
             $c = Get-TestPixel -Shot $shot -X $cx -Y $cy

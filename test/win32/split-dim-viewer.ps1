@@ -114,13 +114,17 @@ function Wait-NoOverlays([int]$procId) {
 # The overlay's OWN painted fill, as "r,g,b" (split-dim.ps1's migrated oracle,
 # synchronous since T943 - the overlay is layered, which is the shape T835's
 # torn capture was measured on; a capture taken before its first paint throws
-# and is retried rather than scored).
+# and is retried rather than scored). -AllowUniform for the same reason it
+# carries there (T1283): a solid-fill overlay is one colour by design, T303's
+# refusal reads that as an empty capture, and what keeps the probe honest
+# without it is that the assertion pins an exact colour a dead capture cannot
+# produce.
 function Get-OverlayFill($overlay) {
     $h = [IntPtr]$overlay.Hwnd
     for ($t = 0; $t -lt 10; $t++) {
         $shot = $null
         try {
-            $shot = Get-TestWindowPixels -Window $h -Sync
+            $shot = Get-TestWindowPixels -Window $h -Sync -AllowUniform
             $cx = [int](($overlay.Left + $overlay.Right) / 2)
             $cy = [int](($overlay.Top + $overlay.Bottom) / 2)
             $c = Get-TestPixel -Shot $shot -X $cx -Y $cy
