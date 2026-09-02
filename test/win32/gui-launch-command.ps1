@@ -53,6 +53,13 @@ param(
 # test never wants the caller pane's endpoint.
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 
+# T1240: the GUI launches ON THE TEST DESKTOP, not on the user's. A window
+# arrives on the desktop of whoever started the process, and this script starts
+# eight of them - so it used to throw eight across whatever the user was
+# reading. The CLI reads stay on `Run-Cli`: none of their verbs can create a
+# process.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $root = Join-Path $env:TEMP "ghoztty-gui-launch-command-$PID"
@@ -194,22 +201,21 @@ function Wait-AnyPaneText($tmp, $tag, $needle, $timeoutSec = 60) {
     return ''
 }
 
-# One hermetic GUI launch. $launchArgs is passed to Start-Process VERBATIM:
-# PowerShell does not quote -ArgumentList elements, so any element that must
-# survive as ONE argv entry (a `--command=` with spaces) has to carry its own
-# quotes - the same trap that made an early T104 repro look like a parser bug.
+# One hermetic GUI launch, on the test desktop (T1240). $launchArgs is an argv
+# LIST: an element that must survive as one entry (a `--command=` with spaces)
+# is quoted by the harness, so it no longer has to carry its own quotes - the
+# trap that made an early T104 repro look like a parser bug is now the harness's
+# job rather than each call site's.
 function Launch($tmp, $launchArgs) {
     New-Item -ItemType Directory -Force (Join-Path $tmp 'ghoztty\local-agent-debug') | Out-Null
     $env:LOCALAPPDATA = $tmp
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
-    if ($null -eq $launchArgs -or $launchArgs.Count -eq 0) {
-        # persistence: on (default), into a throwaway $env:LOCALAPPDATA - section D asserts a launch command and a RESTORE both happen.
-        Start-Process -FilePath $Exe -WindowStyle Minimized | Out-Null
-    } else {
-        # persistence: on (default), into a throwaway $env:LOCALAPPDATA - see the launch above.
-        Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList $launchArgs | Out-Null
-    }
+    # persistence: on (default), into a throwaway $env:LOCALAPPDATA - section D asserts a launch command and a RESTORE both happen.
+    if ($null -eq $launchArgs) { $launchArgs = @() }
+    [void](Start-OnTestDesktop -Exe $Exe -Arguments $launchArgs)
 }
+
+$td = New-TestDesktop
 
 Stop-TestProcs
 New-Item -ItemType Directory -Force $root | Out-Null
@@ -261,9 +267,9 @@ Stop-TestProcs
 # ============================================================================
 "== B: --command=... on the same launch path"
 # ============================================================================
-# ONE argv entry, so it carries its own quotes (see Launch's note).
+# ONE argv entry with spaces in it - the harness quotes it (see Launch's note).
 $tmpB = Join-Path $root 'b'
-Launch $tmpB @("`"--command=$script gamma delta`"")
+Launch $tmpB @("--command=$script gamma delta")
 $paneB = First-Pane $tmpB 'b' 60
 Assert "B1 the launch opened a window with a pane" ($paneB -ne '')
 
@@ -462,6 +468,7 @@ if ($null -eq $savedAgentBin) {
     $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin
 }
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+Remove-TestDesktop | Out-Null
 
 # A green run stamps the covered files (T783) so guard-due can answer "has
 # this harness been run as it now stands?". Red leaves the stamp alone.

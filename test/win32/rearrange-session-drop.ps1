@@ -33,6 +33,12 @@ param(
 # test never wants the caller pane's endpoint.
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 
+# T1240: the GUI launches ON THE TEST DESKTOP, not on the user's. A window
+# arrives on the desktop of whoever started the process, so the fixture here
+# used to put one across whatever the user was reading. The CLI calls stay on
+# `Run-Cli`: none of the verbs they use can create a process.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $root = Join-Path $env:TEMP "ghoztty-rearrange-drop-$PID"
@@ -150,7 +156,7 @@ function Start-TwoPane($label) {
     $env:LOCALAPPDATA = $tmp
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
     # persistence: on (default) - the dropped pane's SESSION is what this script asserts about.
-    Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @('--title=t128-rearrange') | Out-Null
+    [void](Start-OnTestDesktop -Exe $Exe -Arguments @('--title=t128-rearrange'))
     $pane = Wait-FirstPane $tmp 25
     $paneId = if ($null -ne $pane) { $pane.id } else { '' }
     $rows = Wait-AliveCount $tmp 'setup' 1 18
@@ -172,6 +178,8 @@ function Start-TwoPane($label) {
 function Send-Rearrange($tmp, $tag, $layout) {
     return (Run-Cli ("+rearrange --target=window-1 --layout=" + ($layout -replace '"', '\"')) "$tmp\rearrange-$tag.txt" 15)
 }
+
+$td = New-TestDesktop
 
 Stop-TestProcs
 New-Item -ItemType Directory -Force $root | Out-Null
@@ -235,6 +243,7 @@ $env:LOCALAPPDATA = $savedLocalAppData
 if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
 else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+Remove-TestDesktop | Out-Null
 
 if ($script:failures -eq 0) { "ALL PASS"; exit 0 }
 else { "$($script:failures) FAILURE(S)"; exit 1 }

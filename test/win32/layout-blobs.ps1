@@ -44,6 +44,12 @@ param(
 # test never wants the caller pane's endpoint.
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 
+# T1240: the GUI launches ON THE TEST DESKTOP, not on the user's. A window
+# arrives on the desktop of whoever started the process, so both launches here
+# used to put one across whatever the user was reading. The CLI calls stay on
+# `Run-Cli`: none of the verbs they use can create a process.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $root = Join-Path $env:TEMP "ghoztty-layout-blobs-$PID"
@@ -176,6 +182,8 @@ function Wait-AliveCount($tmp, $tag, $target, $timeoutSec = 20) {
     return $rows
 }
 
+$td = New-TestDesktop
+
 Stop-TestProcs
 New-Item -ItemType Directory -Force $root | Out-Null
 $savedLocalAppData = $env:LOCALAPPDATA
@@ -201,8 +209,8 @@ Assert-GhozttyPrivateEndpoint -Exe $Exe
 # GUI script left in window_placement-debug. Nothing here measures pixels, but a
 # window restored offscreen by a stale placement cannot be driven either.
 # persistence: on (default) - the agent under test only owns sessions when persistence is on.
-Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @(
-    '--title=t334-layout-blobs', '--window-width=100', '--window-height=30') | Out-Null
+[void](Start-OnTestDesktop -Exe $Exe -Arguments @(
+    '--title=t334-layout-blobs', '--window-width=100', '--window-height=30'))
 
 # ============================================================================
 "== A: one startup window mirrors as one record with its session id"
@@ -326,8 +334,8 @@ Assert "F1 the local manifest really is gone before the relaunch" (
     -not (Test-Path (Join-Path $tmp 'ghoztty\session-layout-debug.json')))
 
 # persistence: on (default) - the agent under test only owns sessions when persistence is on.
-Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList @(
-    '--title=t338-relaunch', '--window-width=100', '--window-height=30') | Out-Null
+[void](Start-OnTestDesktop -Exe $Exe -Arguments @(
+    '--title=t338-relaunch', '--window-width=100', '--window-height=30'))
 
 $recsF = Wait-Records $tmp 1 30
 Assert "F2 the store holds ONE record - the recovered window, no blank one beside it" (
@@ -364,6 +372,7 @@ $env:LOCALAPPDATA = $savedLocalAppData
 if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
 else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+Remove-TestDesktop | Out-Null
 
 if ($script:failures -eq 0) { "ALL PASS"; exit 0 }
 else { "$($script:failures) FAILURE(S)"; exit 1 }

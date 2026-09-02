@@ -41,15 +41,30 @@ function Stop-DebugGhoztty {
     Reset-GhozttyTestState -Exe $Exe -SettleMs 1000 | Out-Null
 }
 
-function Get-List {
-    cmd /c "`"$Exe`" +list > `"$tmp\list.txt`" 2>&1" | Out-Null
-    Get-Content "$tmp\list.txt" -Raw
+# T1240: the CLI runs ON THE TEST DESKTOP, not on the user's. `+new-window` is
+# the one verb that auto-launches the app, and the window it spawns lands on the
+# desktop of the process that spawned it - so this script used to throw a window
+# across whatever the user was reading. `Invoke-OnTestDesktop` is `& $Exe` with a
+# desktop named in the STARTUPINFO; nothing else about the assertions changed.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
+# Every CLI call in this file goes through here. It returns { ExitCode, Output,
+# Pid, TimedOut }; the child's stdout and stderr are captured to a file by the
+# harness, which is also what the old `cmd /c ... > file` dance was for - a
+# GUI-subsystem exe writes zero bytes to a PowerShell `>` redirect (T245).
+function Ghoz([string[]]$GhozArgs) {
+    return Invoke-OnTestDesktop -Exe $Exe -Arguments $GhozArgs
 }
 
-function Read-Pane($name, $outfile) {
-    cmd /c "`"$Exe`" +read --name=$name --lines=40 > `"$tmp\$outfile`" 2>&1" | Out-Null
-    Get-Content "$tmp\$outfile" -Raw
+function Get-List {
+    return (Ghoz @('+list')).Output
 }
+
+function Read-Pane($name) {
+    return (Ghoz @('+read', "--name=$name", '--lines=40')).Output
+}
+
+$td = New-TestDesktop
 
 Stop-DebugGhoztty
 Assert-GhozttyPrivateEndpoint -Exe $Exe
@@ -62,62 +77,63 @@ $agent = Start-Process -FilePath $AgentExe -ArgumentList "--listen", "127.0.0.1:
 Start-Sleep -Seconds 2
 Assert "agent is running" (-not $agent.HasExited)
 
-& $Exe +new-window --target=rembase 2>&1 | Out-Null
-Assert "base window exit 0" ($LASTEXITCODE -eq 0)
+$r = Ghoz @('+new-window', '--target=rembase')
+Assert "base window exit 0" ($r.ExitCode -eq 0)
 Start-Sleep -Seconds 2
 # Before the first +send-keys: prove the instance answering is ours.
 Assert-GhozttyIsolated -Exe $Exe
 
 "== 1: +new-remote-window dial + open"
-cmd /c "`"$Exe`" +new-remote-window --host=127.0.0.1 --port=$Port --name=rem > `"$tmp\open.txt`" 2>&1"
-Assert "exit 0" ($LASTEXITCODE -eq 0)
+$r = Ghoz @('+new-remote-window', '--host=127.0.0.1', "--port=$Port", '--name=rem')
+Assert "exit 0" ($r.ExitCode -eq 0)
 Start-Sleep -Seconds 2
 $list = Get-List
 Assert "remote window registered under --name" ($list -match '\[target: rem\]')
 
 "== 2: terminal round-trip through the agent"
-& $Exe +send-keys --target=rem "echo remote-roundtrip-ok" Enter 2>&1 | Out-Null
-Assert "send-keys exit 0" ($LASTEXITCODE -eq 0)
+$r = Ghoz @('+send-keys', '--target=rem', 'echo remote-roundtrip-ok', 'Enter')
+Assert "send-keys exit 0" ($r.ExitCode -eq 0)
 Start-Sleep -Seconds 3
-$dump = Read-Pane 'rem' 'read-rem.txt'
+$dump = Read-Pane 'rem'
 Assert "remote output visible via +read" ($dump -match 'remote-roundtrip-ok')
 
 "== 3: --command runs through the remote shell"
-cmd /c "`"$Exe`" +new-remote-window --host=127.0.0.1 --port=$Port --name=remcmd `"--command=echo remote-cmd-marker`" > `"$tmp\opencmd.txt`" 2>&1"
-Assert "exit 0" ($LASTEXITCODE -eq 0)
+$r = Ghoz @('+new-remote-window', '--host=127.0.0.1', "--port=$Port", '--name=remcmd', '--command=echo remote-cmd-marker')
+Assert "exit 0" ($r.ExitCode -eq 0)
 Start-Sleep -Seconds 3
-$dump = Read-Pane 'remcmd' 'read-remcmd.txt'
+$dump = Read-Pane 'remcmd'
 Assert "command output visible" ($dump -match 'remote-cmd-marker')
 
 "== 4: dial failure surfaces the Mac-parity error"
 $deadPort = $Port + 1
-cmd /c "`"$Exe`" +new-remote-window --host=127.0.0.1 --port=$deadPort --name=remdead > `"$tmp\dead.txt`" 2>&1"
-Assert "exit nonzero" ($LASTEXITCODE -ne 0)
-$err = Get-Content "$tmp\dead.txt" -Raw
+$r = Ghoz @('+new-remote-window', '--host=127.0.0.1', "--port=$deadPort", '--name=remdead')
+Assert "exit nonzero" ($r.ExitCode -ne 0)
+$err = $r.Output
 Assert "error names the endpoint" ($err -match "failed to reach 127.0.0.1:$deadPort")
 
 "== 5: tokenless relay args are refused with sign-in guidance (T21b)"
 $savedTok = $env:GHOSTTY_RELAY_TOKEN
 $env:GHOSTTY_RELAY_TOKEN = $null
-cmd /c "`"$Exe`" +new-remote-window --relay=https://relay.example --device=dev1 > `"$tmp\relay.txt`" 2>&1"
+$r = Ghoz @('+new-remote-window', '--relay=https://relay.example', '--device=dev1')
 $env:GHOSTTY_RELAY_TOKEN = $savedTok
-Assert "exit nonzero" ($LASTEXITCODE -ne 0)
-$err = Get-Content "$tmp\relay.txt" -Raw
+Assert "exit nonzero" ($r.ExitCode -ne 0)
+$err = $r.Output
 Assert "refusal says not signed in" ($err -match 'not signed in')
 
 "== 6: +close tears the remote window down cleanly"
-& $Exe +close --target=remcmd 2>&1 | Out-Null
-& $Exe +close --target=rem 2>&1 | Out-Null
-Assert "close exit 0" ($LASTEXITCODE -eq 0)
+[void](Ghoz @('+close', '--target=remcmd'))
+$r = Ghoz @('+close', '--target=rem')
+Assert "close exit 0" ($r.ExitCode -eq 0)
 Start-Sleep -Seconds 2
 $list = Get-List
 Assert "remote windows gone" (-not ($list -match '\[target: rem\]'))
 Assert "app still alive (base window listed)" ($list -match '\[target: rembase\]')
 
 "== cleanup"
-& $Exe +close --target=rembase 2>&1 | Out-Null
+[void](Ghoz @('+close', '--target=rembase'))
 Stop-DebugGhoztty
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+Remove-TestDesktop | Out-Null
 
 if ($script:failures -eq 0) { "ALL PASS"; exit 0 }
 else { "$($script:failures) FAILURE(S)"; exit 1 }

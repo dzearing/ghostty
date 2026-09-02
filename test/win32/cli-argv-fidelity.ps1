@@ -43,6 +43,16 @@ $ErrorActionPreference = 'Continue'
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
 . (Join-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) 'scripts\lib\NativeArgv.ps1')
 
+# T1240: the instance under test launches ON THE TEST DESKTOP, not on the
+# user's. A window arrives on the desktop of whoever started the process, so
+# this script used to put one across whatever the user was reading. Every CLI
+# call keeps its OWN transport, because the transports ARE the subject:
+# `Invoke-NativeExact` for the byte-exact one and the naive `& $Exe` for the
+# section-D control. Neither can open a window of its own once the instance
+# above is up - `+new-window` forwards to it, and the window it opens lands on
+# the app's desktop, which is now the test desktop.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
 $script:passes = 0
 $script:failures = 0
 $script:skipped = 0
@@ -146,6 +156,8 @@ $P_LEAD  = '"leading quoted phrase" then more'     # odd parity: PS declines to 
 $P_SLASH = 'trailing backslash D:\my dir\'         # closing quote eats the `\`
 $P_SAFE  = 'plain safe text'                       # positive control
 
+$td = New-TestDesktop
+
 & {
 
 "== 0: setup"
@@ -168,9 +180,8 @@ Assert "A9 the command line joins tokens with one space" (
 "== 0b: launch the instance under test"
 # persistence: off - this run asserts on a window it creates itself, and a
 # restored pane from an earlier run would answer the title/banner reads.
-$app = Start-Process -FilePath $Exe -WindowStyle Minimized -PassThru `
-    -ArgumentList @('--session-persistence=false', '--title=t279-argv-fidelity')
-$null = $app.Handle   # T197 habit: cache the handle before any wait
+$app = Start-OnTestDesktop -Exe $Exe `
+    -Arguments @('--session-persistence=false', '--title=t279-argv-fidelity')
 Start-Sleep -Seconds 2
 
 $r = Invoke-NativeExact -FilePath $Exe -Arguments @('+new-window', "--target=$target") -TimeoutMs 30000
@@ -252,6 +263,7 @@ if (-not $paneId) {
 "== teardown"
 Invoke-NativeExact -FilePath $Exe -Arguments @('+close', "--target=$target") -TimeoutMs 20000 | Out-Null
 Reset-GhozttyTestState -Exe $Exe -SettleMs 800 | Out-Null
+Remove-TestDesktop | Out-Null
 
 } 2>&1 | Tee-Object -FilePath $transcript
 

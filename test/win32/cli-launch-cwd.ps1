@@ -50,6 +50,15 @@ param(
 # test never wants the caller pane's endpoint.
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 
+# T1240: every launch here lands ON THE TEST DESKTOP, not on the user's. A
+# window arrives on the desktop of whoever started the process, and this script
+# starts four of them - so it used to throw four across whatever the user was
+# reading. What each arm measures is the launcher's CONSOLE, and none of that
+# changes: arm A still goes through cmd and the `.com` twin, arm B still gets a
+# console created for it, arm C is still two processes in one console, and arm D
+# is still DETACHED_PROCESS under a console-owning parent.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $script:skipped = 0
@@ -135,7 +144,11 @@ using System;
 using System.Runtime.InteropServices;
 using System.Text;
 public static class T506Spawn {
-    [StructLayout(LayoutKind.Sequential)] public struct STARTUPINFO {
+    // CharSet.Unicode is load-bearing since T1240: the default is Ansi, which
+    // marshals `lpDesktop` as an ANSI pointer into a struct CreateProcessW
+    // reads as wide - the desktop name arrives as mojibake, the spawn still
+    // SUCCEEDS, and the process simply never gets a desktop to draw on.
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] public struct STARTUPINFO {
         public int cb; public string lpReserved; public string lpDesktop; public string lpTitle;
         public int dwX, dwY, dwXSize, dwYSize, dwXCountChars, dwYCountChars, dwFillAttribute, dwFlags;
         public short wShowWindow, cbReserved2; public IntPtr lpReserved2, hStdInput, hStdOutput, hStdError;
@@ -159,8 +172,13 @@ public static class T506Spawn {
         return GetConsoleProcessList(buf, (uint)buf.Length);
     }
 
-    public static int StartDetached(string exe, string args, string cwd) {
+    // `desktop` is "WinSta0\<test desktop>" (T1240) so the GUI this spawns
+    // lands on the background test desktop instead of the user's. It changes
+    // nothing this arm measures: the child is still DETACHED_PROCESS with a
+    // console-owning parent, which is the whole premise of arm D.
+    public static int StartDetached(string exe, string args, string cwd, string desktop) {
         var si = new STARTUPINFO(); si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+        if (!string.IsNullOrEmpty(desktop)) si.lpDesktop = desktop;
         PROCESS_INFORMATION pi;
         var cmd = new StringBuilder("\"" + exe + "\" " + (args == null ? "" : args));
         if (!CreateProcessW(exe, cmd, IntPtr.Zero, IntPtr.Zero, false, DETACHED_PROCESS,
@@ -188,6 +206,8 @@ New-Item -ItemType Directory -Force $workDir | Out-Null
 # every arm below before the default ever ran.
 [void](Set-GhozttyTestIsolation -Tag 'clilaunch')
 $env:LOCALAPPDATA = $root
+$td = New-TestDesktop
+$deskName = "WinSta0\$($td.Name)"
 Stop-TestProcs
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
@@ -198,10 +218,9 @@ Assert-GhozttyPrivateEndpoint -Exe $Exe
 # cmd waits for it (console subsystem), and the twin returns as soon as it has
 # respawned the detached GUI - so this call completing is the launch, not a
 # timeout.
-$a = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
-    -ArgumentList "/c `"cd /d `"$workDir`" && `"$Com`" --session-persistence=false`""
-$null = $a.Handle
-[void]$a.WaitForExit(30000)
+[void]$td.RunProcess($env:ComSpec,
+    "/c `"cd /d `"$workDir`" && `"$Com`" --session-persistence=false`"",
+    $null, (Join-Path $root 'launch-a.txt'), 30000)
 $paneA = Wait-Terminal 'a'
 Assert "A1 the twin launched a GUI with a terminal pane" ($null -ne $paneA)
 Assert-GhozttyIsolated -Exe $Exe
@@ -241,9 +260,8 @@ Stop-TestProcs
 # A console created FOR the child (or none at all) holds one process. Every GUI
 # launch in this suite is this shape, and new-window-cwd.ps1 A5/A6 depend on it
 # staying non-CLI.
-$b = Start-Process -FilePath $Exe -WindowStyle Hidden -PassThru -WorkingDirectory $workDir `
-    -ArgumentList '--session-persistence=false'
-$null = $b.Handle
+$b = Start-OnTestDesktop -Exe $Exe -WorkingDirectory $workDir `
+    -Arguments @('--session-persistence=false')
 $paneB = Wait-Terminal 'b'
 Assert "B1 the app launched a terminal pane" ($null -ne $paneB)
 AssertEq "B2 the startup pane is in HOME, not the launcher's directory" `
@@ -255,15 +273,15 @@ Stop-TestProcs
 # ============================================================================
 # A Debug build is console-subsystem, so cmd hands it its own console and stays
 # attached while it runs. Two processes in one console is the signal.
-$c = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
-    -ArgumentList "/c `"cd /d `"$workDir`" && `"$Exe`" --session-persistence=false`""
-$null = $c.Handle
+$cPid = $td.StartProcess($env:ComSpec,
+    "/c `"cd /d `"$workDir`" && `"$Exe`" --session-persistence=false`"",
+    $null, (Join-Path $root 'launch-c.txt'))
 $paneC = Wait-Terminal 'c'
 Assert "C1 the app launched a terminal pane" ($null -ne $paneC)
 AssertEq "C2 the startup pane is in the shell's directory" `
     (Norm $workDir) (Norm $paneC.working_directory)
 Stop-TestProcs
-Stop-Process -Id $c.Id -Force -ErrorAction SilentlyContinue
+Stop-Process -Id $cPid -Force -ErrorAction SilentlyContinue
 
 # ============================================================================
 "== D: no console of its own, but a console-owning parent (the release leg)"
@@ -274,7 +292,7 @@ if ($consoleProcs -lt 1) {
     "SKIP  D: this host has no console, so the parent-console leg cannot be armed"
     $script:skipped++
 } else {
-    $pidD = [T506Spawn]::StartDetached($Exe, '--session-persistence=false', $workDir)
+    $pidD = [T506Spawn]::StartDetached($Exe, '--session-persistence=false', $workDir, $deskName)
     Assert "D1 the detached launch started" ($pidD -ne 0)
     $paneD = Wait-Terminal 'd'
     Assert "D2 the app launched a terminal pane" ($null -ne $paneD)
@@ -285,6 +303,7 @@ if ($consoleProcs -lt 1) {
 
 # ============================================================================
 Stop-TestProcs
+Remove-TestDesktop | Out-Null
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
 
 if ($script:failures -eq 0) {

@@ -256,6 +256,13 @@ if ($NoLaunch) {
     . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
     $null = Assert-GhozttyIsolatedBuild -Exe $exe
 
+    # T1240: the two probe launches land ON THE TEST DESKTOP. A window arrives
+    # on the desktop of whoever started the process, so section D used to throw
+    # two across whatever the user was reading. What is measured here is the
+    # REGISTRY, which the desktop has no bearing on.
+    . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+    $td = New-TestDesktop
+
     # The user's release-lineage registrations, as they stand right now.
     $before = Snapshot-Registrations
 
@@ -265,12 +272,12 @@ if ($NoLaunch) {
         $env:GHOZTTY_PATH_SELFHEAL = if ($seamValue -eq 'gate') { 'off' } else { $seamValue }
         $env:GHOZTTY_CLAUDE_SETUP = 'off'
         try {
-            $p = Start-Process -FilePath $exe `
-                -ArgumentList '--session-persistence=false', "--window-name=regsites-$tag" `
-                -PassThru
-            $handle = $p.Handle  # cache before exit (PS Start-Process ExitCode trap)
+            $started = Start-OnTestDesktop -Exe $exe `
+                -Arguments @('--session-persistence=false', "--window-name=regsites-$tag")
             Start-Sleep -Seconds 6
-            if (-not $p.HasExited) { $p.Kill(); $p.WaitForExit(5000) }
+            $p = $null
+            try { $p = [System.Diagnostics.Process]::GetProcessById($started.Pid) } catch { }
+            if ($null -ne $p -and -not $p.HasExited) { $p.Kill(); $p.WaitForExit(5000) }
             return $true
         } catch {
             return $false
@@ -314,6 +321,7 @@ if ($NoLaunch) {
         "(these moved: $($moved -join ', '))"
 
     Remove-Item 'HKCU:\Software\Classes\ghoztty-debug' -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-TestDesktop | Out-Null
 }
 
 # ---------------------------------------------------------------------------

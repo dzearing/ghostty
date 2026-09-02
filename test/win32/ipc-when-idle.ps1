@@ -43,9 +43,22 @@ function Assert($name, $cond) {
 function Stop-DebugGhoztty {
     Reset-GhozttyTestState -Exe $Exe -SettleMs 1000 | Out-Null
 }
+# T1240: the CLI runs ON THE TEST DESKTOP, not on the user's. `+new-window` is
+# the one verb that auto-launches the app, and the window it spawns lands on the
+# desktop of the process that spawned it - so this script used to throw a window
+# across whatever the user was reading. `Invoke-OnTestDesktop` is `& $Exe` with a
+# desktop named in the STARTUPINFO; nothing else about the timings changed.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
+# Every foreground CLI call in this file goes through here. It returns
+# { ExitCode, Output, Pid, TimedOut }; the child's stdout and stderr are
+# captured to a file by the harness, which is what the old `cmd /c ... > file`
+# dance was for - a GUI-subsystem exe writes zero bytes to a `>` redirect (T245).
+function Ghoz([string[]]$GhozArgs) {
+    return Invoke-OnTestDesktop -Exe $Exe -Arguments $GhozArgs
+}
 function Read-Pane([int]$lines = 10) {
-    cmd /c "`"$Exe`" +read --name=wia --lines=$lines > `"$tmp\read.txt`" 2>&1" | Out-Null
-    Get-Content "$tmp\read.txt" -Raw
+    return (Ghoz @('+read', '--name=wia', "--lines=$lines")).Output
 }
 # The typed command (`echo X`) sits after a shell prompt; the executed
 # output is X at the start of a line. Line-anchored match = it really ran.
@@ -53,28 +66,30 @@ function Pane-HasOutput([string]$marker) {
     (Read-Pane 50) -match "(?m)^$([regex]::Escape($marker))\s*$"
 }
 
+$td = New-TestDesktop
+
 Stop-DebugGhoztty
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== setup: window + named pane"
-& $Exe +new-window --target=wi 2>&1 | Out-Null
+[void](Ghoz @('+new-window', '--target=wi'))
 Start-Sleep -Seconds 3
 # Before the first +send-keys: prove the instance answering is ours.
 Assert-GhozttyIsolated -Exe $Exe
-& $Exe +split --target=wi --name=wia --direction=right 2>&1 | Out-Null
+[void](Ghoz @('+split', '--target=wi', '--name=wia', '--direction=right'))
 Start-Sleep -Seconds 2
 
 "== 1: idle pane -> --when-idle sends promptly"
 $t0 = Get-Date
-& $Exe +send-keys --target=wia --when-idle --idle-timeout=15 "echo WI-PROMPT" Enter 2>&1 | Out-Null
+$r = Ghoz @('+send-keys', '--target=wia', '--when-idle', '--idle-timeout=15', 'echo WI-PROMPT', 'Enter')
 $elapsed = ((Get-Date) - $t0).TotalSeconds
-Assert "exit 0" ($LASTEXITCODE -eq 0)
+Assert "exit 0" ($r.ExitCode -eq 0)
 Assert "sent promptly (<5s, took $([math]::Round($elapsed,1))s)" ($elapsed -lt 5)
 Start-Sleep -Seconds 2
 Assert "text executed" (Pane-HasOutput 'WI-PROMPT')
 
 "== 2: busy marker holds the send until it scrolls out of the window"
-& $Exe +send-keys --target=wia "echo WI-BUSY esc to interrupt" Enter 2>&1 | Out-Null
+[void](Ghoz @('+send-keys', '--target=wia', 'echo WI-BUSY esc to interrupt', 'Enter'))
 Start-Sleep -Seconds 2
 Assert "marker visible in last 10 lines" ((Read-Pane 10) -match 'esc to interrupt')
 $job = Start-Job -ScriptBlock {
@@ -87,7 +102,7 @@ Assert "still holding at +4s" ($job.State -eq 'Running')
 Assert "text not delivered while busy" (-not (Pane-HasOutput 'WI-DELAYED'))
 # Push the marker out of the 10-line poll window (2 lines per echo:
 # command + output; \n executes each line, shell-agnostic).
-& $Exe +send-keys --target=wia "echo WI-FILL-1\necho WI-FILL-2\necho WI-FILL-3\necho WI-FILL-4\necho WI-FILL-5\necho WI-FILL-6\necho WI-FILL-7\necho WI-FILL-8" Enter 2>&1 | Out-Null
+[void](Ghoz @('+send-keys', '--target=wia', 'echo WI-FILL-1\necho WI-FILL-2\necho WI-FILL-3\necho WI-FILL-4\necho WI-FILL-5\necho WI-FILL-6\necho WI-FILL-7\necho WI-FILL-8', 'Enter'))
 $done = Wait-Job $job -Timeout 30
 Assert "released after marker cleared" ($null -ne $done -and $done.State -eq 'Completed')
 $rc = Receive-Job $job | Select-Object -Last 1
@@ -100,25 +115,25 @@ Assert "text executed after release" (Pane-HasOutput 'WI-DELAYED')
 # Printer script avoids shell-specific quoting in the typed line: ~14
 # distinct lines over ~7s, then the pane goes static.
 Set-Content "$tmp\printer.ps1" '1..14 | ForEach-Object { "tick-$_"; Start-Sleep -Milliseconds 500 }'
-& $Exe +send-keys --target=wia "powershell -NoProfile -File $tmp\printer.ps1" Enter 2>&1 | Out-Null
+[void](Ghoz @('+send-keys', '--target=wia', "powershell -NoProfile -File $tmp\printer.ps1", 'Enter'))
 Start-Sleep -Seconds 2
 $t0 = Get-Date
-& $Exe +send-keys --target=wia --when-idle --idle-timeout=30 "echo WI-QUIET" Enter 2>&1 | Out-Null
+$r = Ghoz @('+send-keys', '--target=wia', '--when-idle', '--idle-timeout=30', 'echo WI-QUIET', 'Enter')
 $elapsed = ((Get-Date) - $t0).TotalSeconds
-Assert "exit 0" ($LASTEXITCODE -eq 0)
+Assert "exit 0" ($r.ExitCode -eq 0)
 Assert "held while streaming (>=3s, took $([math]::Round($elapsed,1))s)" ($elapsed -ge 3)
 Assert "released after quiescent (<20s)" ($elapsed -lt 20)
 Start-Sleep -Seconds 2
 Assert "text executed after quiescent" (Pane-HasOutput 'WI-QUIET')
 
 "== 4: marker never clears -> --idle-timeout releases the send"
-& $Exe +send-keys --target=wia "echo WI-BUSY2 esc to interrupt" Enter 2>&1 | Out-Null
+[void](Ghoz @('+send-keys', '--target=wia', 'echo WI-BUSY2 esc to interrupt', 'Enter'))
 Start-Sleep -Seconds 2
 Assert "marker visible again" ((Read-Pane 10) -match 'esc to interrupt')
 $t0 = Get-Date
-& $Exe +send-keys --target=wia --when-idle --idle-timeout=3 "--busy-marker=esc to interrupt" "echo WI-TIMEOUT" Enter 2>&1 | Out-Null
+$r = Ghoz @('+send-keys', '--target=wia', '--when-idle', '--idle-timeout=3', '--busy-marker=esc to interrupt', 'echo WI-TIMEOUT', 'Enter')
 $elapsed = ((Get-Date) - $t0).TotalSeconds
-Assert "exit 0" ($LASTEXITCODE -eq 0)
+Assert "exit 0" ($r.ExitCode -eq 0)
 Assert "held for ~timeout (>=2.5s, took $([math]::Round($elapsed,1))s)" ($elapsed -ge 2.5)
 Assert "did not hang (<15s)" ($elapsed -lt 15)
 Start-Sleep -Seconds 2
@@ -128,21 +143,22 @@ Assert "text executed after timeout" (Pane-HasOutput 'WI-TIMEOUT')
 # The marker text is still on screen from section 4, but nobody passes
 # --busy-marker here — a static pane must send promptly, proving the
 # product no longer pattern-matches any tool's UI on its own.
-& $Exe +send-keys --target=wia "echo WI-CHROME esc to interrupt" Enter 2>&1 | Out-Null
+[void](Ghoz @('+send-keys', '--target=wia', 'echo WI-CHROME esc to interrupt', 'Enter'))
 Start-Sleep -Seconds 2
 Assert "marker text on screen" ((Read-Pane 10) -match 'esc to interrupt')
 $t0 = Get-Date
-& $Exe +send-keys --target=wia --when-idle --idle-timeout=15 "echo WI-NODEFAULT" Enter 2>&1 | Out-Null
+$r = Ghoz @('+send-keys', '--target=wia', '--when-idle', '--idle-timeout=15', 'echo WI-NODEFAULT', 'Enter')
 $elapsed = ((Get-Date) - $t0).TotalSeconds
-Assert "exit 0" ($LASTEXITCODE -eq 0)
+Assert "exit 0" ($r.ExitCode -eq 0)
 Assert "sent promptly despite marker text (<5s, took $([math]::Round($elapsed,1))s)" ($elapsed -lt 5)
 Start-Sleep -Seconds 2
 Assert "text executed" (Pane-HasOutput 'WI-NODEFAULT')
 
 "== teardown"
-& $Exe +close --target=wi 2>&1 | Out-Null
+[void](Ghoz @('+close', '--target=wi'))
 Stop-DebugGhoztty
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+Remove-TestDesktop | Out-Null
 
 # --- stamp (T783) -----------------------------------------------------------
 # A green run records the content of every file this harness covers, so

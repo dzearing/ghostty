@@ -46,6 +46,12 @@ param(
 # test never wants the caller pane's endpoint.
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 
+# T1240: the GUI launches ON THE TEST DESKTOP, not on the user's. A window
+# arrives on the desktop of whoever started the process, so this script used to
+# put one across whatever the user was reading. The launch's WORKING DIRECTORY,
+# which is what the script measures, is passed through unchanged.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $root = Join-Path $env:TEMP "ghoztty-auto-launch-cwd-$PID"
@@ -199,8 +205,10 @@ function Launch-From($tmp, $fromDir) {
     $env:LOCALAPPDATA = $tmp
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
     # persistence: on (default), into a throwaway $env:LOCALAPPDATA - the agent under test is spawned from there, and there is no shared manifest to restore.
-    Start-Process -FilePath $Exe -WindowStyle Minimized -WorkingDirectory $fromDir | Out-Null
+    [void](Start-OnTestDesktop -Exe $Exe -WorkingDirectory $fromDir)
 }
+
+$td = New-TestDesktop
 
 Stop-TestProcs
 New-Item -ItemType Directory -Force $root | Out-Null
@@ -350,6 +358,7 @@ if ($null -eq $savedAgentBin) {
     $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin
 }
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+Remove-TestDesktop | Out-Null
 
 ""
 if ($script:failures -eq 0) { "ALL PASS"; exit 0 } else { "$($script:failures) FAILURE(S)"; exit 1 }

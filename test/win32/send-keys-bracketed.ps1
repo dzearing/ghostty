@@ -139,8 +139,21 @@ function Send-LegacyKeys([string]$Pane, [string]$JsonKeys) {
     } finally { $pipe.Dispose() }
 }
 
+# T1240: the app and every CLI call run ON THE TEST DESKTOP, not on the user's.
+# A bare launch puts its window on the desktop of the process that started it,
+# and `+new-window` (the one auto-launching verb) does the same - so this script
+# used to throw a window across whatever the user was reading. The bytes the
+# capture judges are unchanged; only the desktop the app lands on is.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
+# Every CLI call in this file goes through here. It returns { ExitCode, Output,
+# Pid, TimedOut }; the child's stdout and stderr are captured to a file by the
+# harness, so a GUI-subsystem exe's output arrives (T245).
+function Ghoz([string[]]$GhozArgs) {
+    return Invoke-OnTestDesktop -Exe $Exe -Arguments $GhozArgs
+}
 function Read-Pane([string]$name, [int]$lines = 20) {
-    return ((& $Exe +read "--name=$name" "--lines=$lines" 2>&1) | Out-String)
+    return (Ghoz @('+read', "--name=$name", "--lines=$lines")).Output
 }
 function Wait-Pane([string]$name, [string]$pat, [int]$sec = 30) {
     $d = (Get-Date).AddSeconds($sec)
@@ -188,31 +201,28 @@ function Invoke-Round(
     # LONG is captured rather than truncated to the expected length.
     $want = $Expect + 32
     $cmd = "powershell -NoProfile -File $capPath -Out $out -N $want -Secs 12 -Tag $tag -Mode $Mode"
-    & $Exe +split "--target=$win" "--name=$pane" "--command=$cmd" 2>&1 | Out-Null
+    [void](Ghoz @('+split', "--target=$win", "--name=$pane", "--command=$cmd"))
     if (-not (Wait-Pane $pane "READY-$tag" 30)) {
-        & $Exe +close "--target=$pane" 2>&1 | Out-Null
+        [void](Ghoz @('+close', "--target=$pane"))
         return '<never ready>'
     }
     Start-Sleep -Milliseconds 600
 
     if ($FirstArgs) {
-        $first = @("--target=$pane") + $FirstArgs
-        & $Exe +send-keys @first 2>&1 | Out-Null
+        [void](Ghoz (@('+send-keys', "--target=$pane") + $FirstArgs))
         Start-Sleep -Milliseconds $FirstGapMs
     }
     if ($LegacyKeys) {
         [void](Send-LegacyKeys $pane $LegacyKeys)
     } else {
-        $all = @("--target=$pane") + $SendArgs
-        & $Exe +send-keys @all 2>&1 | Out-Null
+        [void](Ghoz (@('+send-keys', "--target=$pane") + $SendArgs))
     }
     if ($ThenArgs) {
         # A real gap, not a race: the reuse path polls the pane for seconds
         # between its two calls, so the capture must see them as two separate
         # writes the way the pane does.
         Start-Sleep -Milliseconds 1500
-        $then = @("--target=$pane") + $ThenArgs
-        & $Exe +send-keys @then 2>&1 | Out-Null
+        [void](Ghoz (@('+send-keys', "--target=$pane") + $ThenArgs))
     }
     # The capture keeps reading until $want bytes or its own timeout, so it
     # never returns early on a short send. Poll until the file stops growing
@@ -228,8 +238,8 @@ function Invoke-Round(
         else { $stable = 0 }
         $got = $now
     }
-    & $Exe +send-keys "--target=$pane" C-c 2>&1 | Out-Null
-    & $Exe +close "--target=$pane" 2>&1 | Out-Null
+    [void](Ghoz @('+send-keys', "--target=$pane", 'C-c'))
+    [void](Ghoz @('+close', "--target=$pane"))
     return $got
 }
 
@@ -242,15 +252,17 @@ function Invoke-Round(
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
 [void](Set-GhozttyTestIsolation -Tag 'skbrk')
 
+$td = New-TestDesktop
+
 Reset-GhozttyTestState -Exe $Exe -SettleMs 1000 | Out-Null
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== setup: app + host window (no persistence, no activation)"
-Start-Process -FilePath $Exe -ArgumentList '--session-persistence=false' | Out-Null
+[void](Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false'))
 Start-Sleep -Seconds 4
-& $Exe +new-window "--target=$win" --no-activate 2>&1 | Out-Null
+[void](Ghoz @('+new-window', "--target=$win", '--no-activate'))
 Start-Sleep -Seconds 3
-Assert "window $win exists" (((& $Exe +list 2>&1) | Out-String) -match [regex]::Escape($win))
+Assert "window $win exists" ((Ghoz @('+list')).Output -match [regex]::Escape($win))
 # Before the first +send-keys: prove the instance answering is ours.
 Assert-GhozttyIsolated -Exe $Exe
 
@@ -463,9 +475,10 @@ Assert "exactly one submitting CR, not two" `
     (-not $r17.EndsWith($CR + $CR))
 
 "== teardown"
-& $Exe +close "--target=$win" 2>&1 | Out-Null
+[void](Ghoz @('+close', "--target=$win"))
 Reset-GhozttyTestState -Exe $Exe -SettleMs 500 | Out-Null
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+Remove-TestDesktop | Out-Null
 
 ""
 if ($script:failures -eq 0) {

@@ -24,18 +24,31 @@ function Assert($name, $cond) {
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
 [void](Set-GhozttyTestIsolation -Tag 't332')
 
+# T1240: the CLI runs ON THE TEST DESKTOP, not on the user's. `+new-window` is
+# the one verb that auto-launches the app, and the window it spawns lands on the
+# desktop of the process that spawned it - so this script used to throw a window
+# across whatever the user was reading. `Invoke-OnTestDesktop` is `& $Exe` with a
+# desktop named in the STARTUPINFO; nothing else about the assertions changed.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
 function Stop-DebugGhoztty {
     Reset-GhozttyTestState -Exe $Exe -SettleMs 1000 | Out-Null
 }
 
+# Every CLI call in this file goes through here. It returns { ExitCode, Output,
+# Pid, TimedOut }; the child's stdout and stderr are captured to a file by the
+# harness, which is also what the old `cmd /c ... > file` dance was for - a
+# GUI-subsystem exe writes zero bytes to a PowerShell `>` redirect (T245).
+function Ghoz([string[]]$GhozArgs) {
+    return Invoke-OnTestDesktop -Exe $Exe -Arguments $GhozArgs
+}
+
 function Get-ListJson {
-    cmd /c "`"$Exe`" +list --json > `"$tmp\list.json`" 2>&1" | Out-Null
-    try { Get-Content "$tmp\list.json" -Raw | ConvertFrom-Json } catch { $null }
+    try { (Ghoz @('+list', '--json')).Output | ConvertFrom-Json } catch { $null }
 }
 
 function Get-SessionsJson {
-    cmd /c "`"$Exe`" +sessions --json > `"$tmp\sessions.json`" 2>&1" | Out-Null
-    try { Get-Content "$tmp\sessions.json" -Raw | ConvertFrom-Json } catch { $null }
+    try { (Ghoz @('+sessions', '--json')).Output | ConvertFrom-Json } catch { $null }
 }
 
 # Flatten a splits node into its terminal-leaf objects.
@@ -60,14 +73,16 @@ function Get-WindowLeaves([string]$Target) {
 
 $transcript = Join-Path $env:TEMP 'ghoztty-ipc-t332-last.log'
 
+$td = New-TestDesktop
+
 & {
 
 Stop-DebugGhoztty
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== 1: a persistent pane's leaf reports its agent session id"
-& $Exe +new-window --target=t332w 2>&1 | Out-Null
-Assert "new-window exit 0" ($LASTEXITCODE -eq 0)
+$r = Ghoz @('+new-window', '--target=t332w')
+Assert "new-window exit 0" ($r.ExitCode -eq 0)
 
 # Poll: the id is published once the app<->agent OPEN handshake resolves, which
 # on a cold agent spawn (Defender scanning the fresh exe) can take a while.
@@ -96,8 +111,8 @@ Assert "row is alive" ($row -and $row.alive -eq $true)
 Assert "row is attached" ($row -and $row.attached -eq $true)
 
 "== 3: a viewer leaf omits the field"
-& $Exe +split --target=t332w --name=t332view --view=D:\git\ghoztty\README.md 2>&1 | Out-Null
-Assert "split --view exit 0" ($LASTEXITCODE -eq 0)
+$r = Ghoz @('+split', '--target=t332w', '--name=t332view', '--view=D:\git\ghoztty\README.md')
+Assert "split --view exit 0" ($r.ExitCode -eq 0)
 $viewer = $null
 $deadline = (Get-Date).AddSeconds(15)
 do {
@@ -111,9 +126,10 @@ Assert "viewer has no session_id property" (
     $viewer -and ($null -eq $viewer.PSObject.Properties['session_id']))
 
 "== teardown"
-& $Exe +close --target=t332w 2>&1 | Out-Null
+[void](Ghoz @('+close', '--target=t332w'))
 Stop-DebugGhoztty
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+Remove-TestDesktop | Out-Null
 
 } 2>&1 | Tee-Object -FilePath $transcript
 

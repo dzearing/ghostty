@@ -62,8 +62,23 @@ function Assert($name, $cond) {
 function Stop-DebugGhoztty {
     Reset-GhozttyTestState -Exe $Exe -SettleMs 1000 | Out-Null
 }
+# T1240: the app and every CLI call run ON THE TEST DESKTOP, not on the user's.
+# A bare launch puts its window on the desktop of the process that started it,
+# and `+new-window` (the one auto-launching verb) does the same - so this script
+# used to throw a window across whatever the user was reading. The transports
+# under test are unchanged: `--keys-file` still carries bytes verbatim, and the
+# positional-argument negative control is still a command line the child has to
+# re-split.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
+# Every CLI call in this file goes through here. It returns { ExitCode, Output,
+# Pid, TimedOut }; the child's stdout and stderr are captured to a file by the
+# harness, so a GUI-subsystem exe's output arrives (T245).
+function Ghoz([string[]]$GhozArgs) {
+    return Invoke-OnTestDesktop -Exe $Exe -Arguments $GhozArgs
+}
 function Read-Pane([int]$lines = 30) {
-    return ((& $Exe +read "--name=$pane" "--lines=$lines" 2>&1) | Out-String)
+    return (Ghoz @('+read', "--name=$pane", "--lines=$lines")).Output
 }
 function Wait-Pane([string]$pat, [int]$sec = 30) {
     $d = (Get-Date).AddSeconds($sec)
@@ -105,17 +120,15 @@ function Invoke-Capture([string]$payload, [string]$mode) {
     # argv split that duplicates or injects) is visible instead of being cut to
     # the expected length.
     $want = $payload.Length + 64
-    & $Exe +send-keys "--target=$pane" "powershell -NoProfile -File $capPath -Out $out -N $want -Secs 12 -Tag $tag" Enter 2>&1 | Out-Null
+    [void](Ghoz @('+send-keys', "--target=$pane", "powershell -NoProfile -File $capPath -Out $out -N $want -Secs 12 -Tag $tag", 'Enter'))
     if (-not (Wait-Pane "READY-$tag" 30)) { return @{ Text = '<never ready>'; Rc = -1 } }
     Start-Sleep -Milliseconds 400
     if ($mode -eq 'file') {
         $pf = New-LoopPromptFile -Text $payload -Tag 'skf'
-        & $Exe +send-keys "--target=$pane" "--keys-file=$pf" 2>&1 | Out-Null
-        $rc = $LASTEXITCODE
+        $rc = (Ghoz @('+send-keys', "--target=$pane", "--keys-file=$pf")).ExitCode
         Remove-Item -LiteralPath $pf -ErrorAction SilentlyContinue
     } else {
-        & $Exe +send-keys "--target=$pane" $payload 2>&1 | Out-Null
-        $rc = $LASTEXITCODE
+        $rc = (Ghoz @('+send-keys', "--target=$pane", $payload)).ExitCode
     }
     Wait-Pane "DONE-$tag" 20 | Out-Null
     Start-Sleep -Milliseconds 300
@@ -125,15 +138,17 @@ function Invoke-Capture([string]$payload, [string]$mode) {
     return @{ Text = $got; Rc = $rc }
 }
 
+$td = New-TestDesktop
+
 Stop-DebugGhoztty
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== setup: app + named pane (no persistence, no activation)"
-Start-Process -FilePath $Exe -ArgumentList '--session-persistence=false' | Out-Null
+[void](Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false'))
 Start-Sleep -Seconds 4
-& $Exe +new-window "--target=$pane" --no-activate 2>&1 | Out-Null
+[void](Ghoz @('+new-window', "--target=$pane", '--no-activate'))
 Start-Sleep -Seconds 3
-Assert "pane $pane exists" (((& $Exe +list 2>&1) | Out-String) -match [regex]::Escape($pane))
+Assert "pane $pane exists" ((Ghoz @('+list')).Output -match [regex]::Escape($pane))
 # Before the first +send-keys: prove the instance answering is ours.
 Assert-GhozttyIsolated -Exe $Exe
 
@@ -178,11 +193,11 @@ $plain = 'no-quotes-here'
 $pf = New-LoopPromptFile -Text $plain -Tag 'skf-order'
 $out = Join-Path $tmp 'cap-order.txt'
 Remove-Item $out -ErrorAction SilentlyContinue
-& $Exe +send-keys "--target=$pane" "powershell -NoProfile -File $capPath -Out $out -N $($plain.Length + 1) -Secs 12 -Tag ORD" Enter 2>&1 | Out-Null
+[void](Ghoz @('+send-keys', "--target=$pane", "powershell -NoProfile -File $capPath -Out $out -N $($plain.Length + 1) -Secs 12 -Tag ORD", 'Enter'))
 Assert "capture ready" (Wait-Pane 'READY-ORD' 30)
 Start-Sleep -Milliseconds 400
-& $Exe +send-keys "--target=$pane" "--keys-file=$pf" Enter 2>&1 | Out-Null
-Assert "exit 0" ($LASTEXITCODE -eq 0)
+$r = Ghoz @('+send-keys', "--target=$pane", "--keys-file=$pf", 'Enter')
+Assert "exit 0" ($r.ExitCode -eq 0)
 Wait-Pane 'DONE-ORD' 20 | Out-Null
 Start-Sleep -Milliseconds 300
 $ord = if (Test-Path $out) { [IO.File]::ReadAllText($out) } else { '' }
@@ -190,8 +205,9 @@ Remove-Item -LiteralPath $pf -ErrorAction SilentlyContinue
 Assert "file bytes then CR, in that order" ($ord -ceq ($plain + "`r"))
 
 "== 7: an unreadable --keys-file fails loudly instead of sending nothing"
-$err = (& $Exe +send-keys "--target=$pane" "--keys-file=$tmp\does-not-exist.txt" 2>&1) | Out-String
-Assert "exit nonzero" ($LASTEXITCODE -ne 0)
+$r = Ghoz @('+send-keys', "--target=$pane", "--keys-file=$tmp\does-not-exist.txt")
+$err = $r.Output
+Assert "exit nonzero" ($r.ExitCode -ne 0)
 Assert "names the path and the reason" ($err -match 'keys-file' -and $err -match 'FileNotFound')
 
 "== 8: the upgrade gate's own oracle sees an intact prompt in a pane tail"
@@ -200,18 +216,19 @@ Assert "names the path and the reason" ($err -match 'keys-file' -and $err -match
 # pane's rendered tail, wrapping and all.
 $gate = 'gate probe: /reset-context read go.md and go'
 $pf = New-LoopPromptFile -Text $gate -Tag 'skf-gate'
-& $Exe +send-keys "--target=$pane" "--keys-file=$pf" 2>&1 | Out-Null
+[void](Ghoz @('+send-keys', "--target=$pane", "--keys-file=$pf"))
 Start-Sleep -Seconds 2
 $tail = Read-Pane 30
 Remove-Item -LiteralPath $pf -ErrorAction SilentlyContinue
 Assert "Test-LoopPromptArrived sees the typed prompt" (Test-LoopPromptArrived -Tail $tail -Text $gate)
 Assert "and does NOT see a prompt that was never typed" (-not (Test-LoopPromptArrived -Tail $tail -Text 'gate probe: a different prompt entirely'))
-& $Exe +send-keys "--target=$pane" C-c 2>&1 | Out-Null
+[void](Ghoz @('+send-keys', "--target=$pane", 'C-c'))
 
 "== teardown"
-& $Exe +close "--target=$pane" 2>&1 | Out-Null
+[void](Ghoz @('+close', "--target=$pane"))
 Stop-DebugGhoztty
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+Remove-TestDesktop | Out-Null
 
 ""
 if ($script:failures -eq 0) {

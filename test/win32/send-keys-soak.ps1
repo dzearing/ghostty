@@ -73,9 +73,23 @@ while IFS= read -r -e -p 'rc> ' l; do
 done
 '@
 
+# T1240: the app and every CLI call run ON THE TEST DESKTOP, not on the user's.
+# A bare launch puts its window on the desktop of the process that started it,
+# and `+new-window` (the one auto-launching verb) does the same - so this soak
+# used to throw a window across whatever the user was reading, and then keep it
+# there for the whole run. Nothing about the byte-exactness judgement changed.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
+# Every CLI call in this file goes through here. It returns { ExitCode, Output,
+# Pid, TimedOut }; the child's stdout and stderr are captured to a file by the
+# harness, so a GUI-subsystem exe's output arrives (T245).
+function Ghoz([string[]]$GhozArgs) {
+    return Invoke-OnTestDesktop -Exe $Exe -Arguments $GhozArgs
+}
+
 function To-Unix([string]$p) { (& $bash -lc "cygpath -u '$($p -replace "'", "''")'").Trim() }
 function Read-Pane([string]$name, [int]$lines = 8) {
-    return ((& $Exe +read "--name=$name" "--lines=$lines" 2>&1) | Out-String)
+    return (Ghoz @('+read', "--name=$name", "--lines=$lines")).Output
 }
 function Wait-Pane([string]$name, [string]$pat, [int]$sec = 30) {
     $d = (Get-Date).AddSeconds($sec)
@@ -94,11 +108,12 @@ Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 # persistence: off - this soak wants a virgin pane per run, and a restore would
 # bring back the previous run's proxy panes to send into.
-Start-Process -FilePath $Exe -ArgumentList '--session-persistence=false' | Out-Null
+$td = New-TestDesktop
+[void](Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false'))
 Start-Sleep -Seconds 4
 $win = "sks$PID"
-& $Exe +new-window "--target=$win" --no-activate "--shell=$bash" `
-    "--command=bash $(To-Unix (Join-Path $tmp 'proxy.sh')) '$(To-Unix $receipt)'" 2>&1 | Out-Null
+[void](Ghoz @('+new-window', "--target=$win", '--no-activate', "--shell=$bash",
+    "--command=bash $(To-Unix (Join-Path $tmp 'proxy.sh')) '$(To-Unix $receipt)'"))
 Start-Sleep -Seconds 3
 Assert-GhozttyIsolated -Exe $Exe
 if (-not (Wait-Pane $win 'rc>' 30)) { 'SETUP FAIL: the proxy never prompted'; exit 1 }
@@ -109,9 +124,9 @@ $sent = New-Object System.Collections.ArrayList
 for ($i = 1; $i -le $Rounds; $i++) {
     $useLong = ($i % 2 -eq 0)
     [void]$sent.Add($(if ($useLong) { $long } else { $short }))
-    & $Exe +send-keys "--target=$win" Enter 2>&1 | Out-Null
+    [void](Ghoz @('+send-keys', "--target=$win", 'Enter'))
     Start-Sleep -Milliseconds $rand.Next($MinDelayMs, $MaxDelayMs)
-    & $Exe +send-keys "--target=$win" "--keys-file=$(if ($useLong) { $fLong } else { $fShort })" Enter 2>&1 | Out-Null
+    [void](Ghoz @('+send-keys', "--target=$win", "--keys-file=$(if ($useLong) { $fLong } else { $fShort })", 'Enter'))
     Start-Sleep -Milliseconds 250
 }
 Start-Sleep -Seconds 3
@@ -138,9 +153,10 @@ if ($payloads.Count -ne $sent.Count) {
 }
 
 "== teardown"
-& $Exe +close "--target=$win" 2>&1 | Out-Null
+[void](Ghoz @('+close', "--target=$win"))
 Reset-GhozttyTestState -Exe $Exe -SettleMs 500 | Out-Null
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+Remove-TestDesktop | Out-Null
 
 ""
 if ($bad -eq 0) {

@@ -54,10 +54,24 @@ Reset-GhozttyTestState -Exe $exe -SettleMs 500 | Out-Null
 . (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
 Register-RepoBuildTeardown -Exe $exe | Out-Null
 
-& $exe +new-window --target=ipcload --shell=cmd | Out-Null
+# T1240: the CLI runs ON THE TEST DESKTOP, not on the user's. `+new-window` is
+# the one verb that auto-launches the app, and the window it spawns lands on the
+# desktop of the process that spawned it - so this script used to throw a window
+# across whatever the user was reading. `Invoke-OnTestDesktop` is `& $exe` with a
+# desktop named in the STARTUPINFO; nothing else about the measurements changed.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+$td = New-TestDesktop
+
+# Every CLI call in this file goes through here. It returns { ExitCode, Output,
+# Pid, TimedOut }; the child's stdout and stderr are captured to a file by the
+# harness, so a GUI-subsystem exe's output arrives (T245).
+function Ghoz([string[]]$GhozArgs) {
+    return Invoke-OnTestDesktop -Exe $exe -Arguments $GhozArgs
+}
+
+[void](Ghoz @('+new-window', '--target=ipcload', '--shell=cmd'))
 Start-Sleep -Seconds 3
-& $exe +list | Out-Null
-if ($LASTEXITCODE -ne 0) { Write-Host 'SETUP FAIL: +list before load'; exit 1 }
+if ((Ghoz @('+list')).ExitCode -ne 0) { Write-Host 'SETUP FAIL: +list before load'; exit 1 }
 
 # Storm pane: an endless `type` loop over a 2MB file. A bounded echo loop
 # is useless here — cmd pushes 600k echo lines through ConPTY in <10s, so
@@ -70,8 +84,8 @@ if (-not (Test-Path $stormFile) -or (Get-Item $stormFile).Length -lt 2000000) {
     1..25000 | ForEach-Object { [void]$sb.AppendLine("storm-payload $_ " + ('z' * 60)) }
     [System.IO.File]::WriteAllText($stormFile, $sb.ToString())
 }
-& $exe +split --target=ipcload --name=ipcload-storm --direction=right --shell=cmd `
-    "--command=for /l %i in (1,1,2000000) do @type $stormFile" | Out-Null
+[void](Ghoz @('+split', '--target=ipcload', '--name=ipcload-storm', '--direction=right', '--shell=cmd',
+    "--command=for /l %i in (1,1,2000000) do @type $stormFile"))
 Start-Sleep -Seconds 1
 
 # Resolve the idle (original) pane's auto-registered name now: the leaf
@@ -83,7 +97,7 @@ function Walk($node) {
     if ($null -ne $node.terminal) { $script:leaves += $node.terminal }
     if ($null -ne $node.left) { Walk $node.left; Walk $node.right }
 }
-(& $exe +list --json | ConvertFrom-Json).data.windows |
+((Ghoz @('+list', '--json')).Output | ConvertFrom-Json).data.windows |
     Where-Object { $_.target -eq 'ipcload' } |
     ForEach-Object { Walk $_.tabs[0].splits }
 $probePane = ($leaves | Where-Object { $_.name -ne 'ipcload-storm' } | Select-Object -First 1).name
@@ -94,9 +108,9 @@ $ok = 0
 $bad = 0
 $firstErr = ''
 1..40 | ForEach-Object {
-    $out = & $exe +list 2>&1 | ForEach-Object { $_.ToString() } | Out-String
-    if ($LASTEXITCODE -eq 0) { $ok++ }
-    else { $bad++; if (-not $firstErr) { $firstErr = ($out.Trim() -split "`n")[0] } }
+    $r = Ghoz @('+list')
+    if ($r.ExitCode -eq 0) { $ok++ }
+    else { $bad++; if (-not $firstErr) { $firstErr = ("$($r.Output)".Trim() -split "`n")[0] } }
     Start-Sleep -Milliseconds 150
 }
 Assert ($bad -eq 0) "+list answers under storm: $ok/40 ok$(if ($firstErr) { " (first err: $firstErr)" })"
@@ -104,19 +118,18 @@ Assert ($bad -eq 0) "+list answers under storm: $ok/40 ok$(if ($firstErr) { " (f
 # The storm must still be running for the hammer to have meant anything,
 # and +read of a heavily-streaming pane must return content (an empty
 # read here is its own bug).
-$tail = & $exe +read --name=ipcload-storm --lines=5 | Out-String
+$tail = (Ghoz @('+read', '--name=ipcload-storm', '--lines=5')).Output
 Assert ($tail -match 'storm-payload') "storm still streaming and +read returns content mid-storm (len $($tail.Length))"
 
 # send-keys + read round-trip mid-storm, into the IDLE pane by name.
 $sendOk = 0
 1..5 | ForEach-Object {
-    & $exe +send-keys --target=$probePane "echo LOADPROBE_$_" Enter 2>&1 | Out-Null
-    if ($LASTEXITCODE -eq 0) { $sendOk++ }
+    if ((Ghoz @('+send-keys', "--target=$probePane", "echo LOADPROBE_$_", 'Enter')).ExitCode -eq 0) { $sendOk++ }
     Start-Sleep -Milliseconds 200
 }
 Assert ($sendOk -eq 5) "+send-keys answers under storm: $sendOk/5 ok"
 Start-Sleep -Milliseconds 800
-$probeTail = & $exe +read --name=$probePane --lines=10 | Out-String
+$probeTail = (Ghoz @('+read', "--name=$probePane", '--lines=10')).Output
 Assert ($probeTail -match 'LOADPROBE_5') 'probe echoes executed in the idle pane'
 
 # T62: +read against a TINY-WRITE storm. The type-loop storm above is
@@ -125,11 +138,11 @@ Assert ($probeTail -match 'LOADPROBE_5') 'probe echoes executed in the idle pane
 # (~60k/s). Before the read-thread batching fix each write took its own
 # renderer-mutex cycle and this +read starved 16-19s on the GUI thread
 # (whole app frozen). Bound: 2s.
-& $exe +split --target=ipcload --name=ipcload-echo --direction=down --shell=cmd `
-    "--command=for /l %i in (0,0,1) do @echo tiny-write-storm %i zzzzzzzzzzzzzzzzzzzzzzzzzzzz" | Out-Null
+[void](Ghoz @('+split', '--target=ipcload', '--name=ipcload-echo', '--direction=down', '--shell=cmd',
+    '--command=for /l %i in (0,0,1) do @echo tiny-write-storm %i zzzzzzzzzzzzzzzzzzzzzzzzzzzz'))
 Start-Sleep -Seconds 2
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-$echoTail = & $exe +read --name=ipcload-echo --lines=5 | Out-String
+$echoTail = (Ghoz @('+read', '--name=ipcload-echo', '--lines=5')).Output
 $sw.Stop()
 Assert ($echoTail -match 'tiny-write-storm') "echo-storm pane +read returns content (len $($echoTail.Length))"
 Assert ($sw.ElapsedMilliseconds -lt 2000) "echo-storm +read latency $($sw.ElapsedMilliseconds)ms < 2000ms (T62)"
@@ -150,8 +163,7 @@ try { $hog.Connect(5000) } catch { $hogOk = $false }
 Assert $hogOk "raw client can occupy one pipe instance (name: $pipeName)"
 if ($hogOk) {
     $swHog = [System.Diagnostics.Stopwatch]::StartNew()
-    & $exe +list | Out-Null
-    $hogCode = $LASTEXITCODE
+    $hogCode = (Ghoz @('+list')).ExitCode
     $swHog.Stop()
     $hog.Dispose()
     Assert ($hogCode -eq 0) "+list still answers while a client occupies an instance (exit $hogCode)"
@@ -166,7 +178,7 @@ if ($hogOk) {
 # parsing the kill-flush burst, not blocked in ReadFile). Observed: +close
 # stuck 9+ minutes with the app Not Responding.
 $swClose = [System.Diagnostics.Stopwatch]::StartNew()
-& $exe +close --target=ipcload | Out-Null
+[void](Ghoz @('+close', '--target=ipcload'))
 $swClose.Stop()
 Assert ($swClose.ElapsedMilliseconds -lt 10000) "+close of the storm window returns in $($swClose.ElapsedMilliseconds)ms < 10s"
 Start-Sleep -Seconds 1
@@ -174,6 +186,8 @@ Start-Sleep -Seconds 1
 Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
     Where-Object { $_.ExecutablePath -eq $exe -and $_.CommandLine -notmatch '\+' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+
+Remove-TestDesktop | Out-Null
 
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass assertions)" }

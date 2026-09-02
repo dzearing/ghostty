@@ -1,10 +1,13 @@
 {
     "guard":  "when-idle",
     "script":  "test/win32/ipc-when-idle.ps1",
-    "generated":  "2026-08-21T16:45:00-07:00",
-    "commit":  "aaf6a2c1b",
+    "generated":  "2026-09-01T19:27:22-07:00",
+    "commit":  "93167774c",
+    "uncommitted":  [
+                        "test/win32/ipc-when-idle.ps1"
+                    ],
     "files":  {
                   "src/cli/send_keys.zig":  "5c3fbe54befa85a383be23059cde3a0bb0a55e58882d5315f22b4220aa07be7f",
-                  "test/win32/ipc-when-idle.ps1":  "0ef920187d78e6b9a705f19038e42b3b01c159bc27c0dd44790d983ccf6ea099"
+                  "test/win32/ipc-when-idle.ps1":  "5c7e1f265e42274b3bef1e053550c655050487483180d232e02b4381d6e55859"
               }
 }

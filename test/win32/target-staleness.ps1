@@ -43,6 +43,21 @@ function Assert($name, $cond) {
     if ($cond) { "  PASS $name" } else { "  FAIL $name"; $script:failures++ }
 }
 
+# T1240: the CLI runs ON THE TEST DESKTOP, not on the user's. `+new-window` is
+# the one verb that auto-launches the app, and the window it spawns lands on the
+# desktop of the process that spawned it - so this script used to throw a window
+# across whatever the user was reading. `Invoke-OnTestDesktop` is `& $Exe` with a
+# desktop named in the STARTUPINFO; nothing else about the assertions changed.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
+# Every CLI call in this file goes through here. It returns { ExitCode, Output,
+# Pid, TimedOut }; the child's stdout and stderr are captured to a file by the
+# harness, which is what the old `cmd /c ... > file` dance was for - a
+# GUI-subsystem exe writes zero bytes to a PowerShell `>` redirect (T245).
+function Ghoz([string[]]$GhozArgs) {
+    return Invoke-OnTestDesktop -Exe $Exe -Arguments $GhozArgs
+}
+
 # Target and pane names are run-unique so a leftover from an interrupted run
 # can never be mistaken for this run's fixture - the third part of the T248
 # fix, applied to the script that documents it.
@@ -60,8 +75,8 @@ function Find-Leaf($node) {
 # +new-window names a SPLIT), so resolve it through +list, which auto-registers
 # every pane it discovers under its stable pane id.
 function Get-TargetPaneId {
-    cmd /c "`"$Exe`" +list --json > `"$tmp\list.json`" 2>&1" | Out-Null
-    $raw = if (Test-Path "$tmp\list.json") { Get-Content "$tmp\list.json" -Raw } else { '' }
+    $raw = (Ghoz @('+list', '--json')).Output
+    if (-not $raw) { $raw = '' }
     if ($raw -notmatch '"success":true') { return $null }
     $doc = $raw | ConvertFrom-Json
     foreach ($w in $doc.data.windows) {
@@ -77,18 +92,18 @@ function Get-TargetPaneId {
 function Read-Pane {
     $id = Get-TargetPaneId
     if (-not $id) { return '<no pane for target>' }
-    cmd /c "`"$Exe`" +read --name=$id --lines=40 > `"$tmp\read.txt`" 2>&1" | Out-Null
-    if (Test-Path "$tmp\read.txt") { Get-Content "$tmp\read.txt" -Raw } else { '' }
+    return (Ghoz @('+read', "--name=$id", '--lines=40')).Output
 }
 
 function New-Fixture($marker) {
     # `cmd /K echo <marker>` leaves the marker on screen and the shell alive,
     # so the pane is a persistable session for the agent to hold onto.
-    & $Exe +new-window --target=$target -e cmd /K echo $marker 2>&1 | Out-Null
-    $code = $LASTEXITCODE
+    $r = Ghoz @('+new-window', "--target=$target", '-e', 'cmd', '/K', 'echo', $marker)
     Start-Sleep -Seconds 5
-    return $code
+    return $r.ExitCode
 }
+
+$td = New-TestDesktop
 
 try {
     "== 0: clean slate, then run fixture A"
@@ -150,6 +165,7 @@ try {
 } finally {
     Reset-GhozttyTestState -Exe $Exe -SettleMs 500 | Out-Null
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-TestDesktop | Out-Null
 }
 
 ""

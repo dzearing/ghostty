@@ -35,6 +35,13 @@ param(
 # test never wants the caller pane's endpoint.
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
 
+# T1240: the GUI launches ON THE TEST DESKTOP, not on the user's. A window
+# arrives on the desktop of whoever started the process, so every Launch here
+# used to put one across whatever the user was reading. The CLI calls below stay
+# on `Run-Cli`: `+list`, `+read`, `+send-keys`, `+split` and `+set-banner` cannot
+# create a process, so none of them can put a window anywhere.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
 $root = Join-Path $env:TEMP "ghoztty-pane-id-$PID"
@@ -195,7 +202,7 @@ function Launch($tmp, $title, $restore) {
     $launchArgs = @('--session-relaunch=rerun')
     if (-not $restore) { $launchArgs += "--title=$title" }
     # persistence: on (default), into a throwaway $env:LOCALAPPDATA - the restore leg is what proves the pane id is stable. Launch-NoPersist is the =false twin.
-    Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList $launchArgs | Out-Null
+    [void](Start-OnTestDesktop -Exe $Exe -Arguments $launchArgs)
 }
 
 # A launch with session persistence OFF: plain exec (ConPTY) panes, no agent.
@@ -203,8 +210,7 @@ function Launch-NoPersist($tmp, $title) {
     New-Item -ItemType Directory -Force (Join-Path $tmp 'ghoztty') | Out-Null
     $env:LOCALAPPDATA = $tmp
     Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue
-    Start-Process -FilePath $Exe -WindowStyle Minimized `
-        -ArgumentList @('--session-persistence=false', "--title=$title") | Out-Null
+    [void](Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false', "--title=$title"))
 }
 
 # ---- manifest helpers (debug lineage writes the -debug filename) -----------
@@ -234,6 +240,8 @@ function Wait-ManifestPaneIds($tmp, $count, $timeoutSec = 15) {
     }
     return $ids
 }
+
+$td = New-TestDesktop
 
 Stop-TestProcs
 New-Item -ItemType Directory -Force $root | Out-Null
@@ -583,6 +591,7 @@ $env:LOCALAPPDATA = $savedLocalAppData
 if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
 else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+Remove-TestDesktop | Out-Null
 
 if ($script:failures -eq 0) { "ALL PASS$(if ($script:skipped) { " ($script:skipped SKIPPED)" })"; exit 0 }
 else { "$($script:failures) FAILURE(S)"; exit 1 }

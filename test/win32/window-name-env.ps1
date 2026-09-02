@@ -48,6 +48,12 @@ function Assert($name, $cond) {
 }
 . (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 
+# T1240: the GUI launches ON THE TEST DESKTOP, not on the user's. A window
+# arrives on the desktop of whoever started the process, so every Launch here
+# used to put one across whatever the user was reading. The CLI calls stay on
+# `Run-Cli`: none of the verbs they use can create a process.
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+
 # Kill ONLY zig-out ghoztty/agent processes (never the user's release build).
 function Stop-TestProcs {
     # T351: one shared, path-exact kill (lib\CleanSlate.ps1) instead of a private
@@ -156,8 +162,10 @@ function Launch($tmp, $title, $restore) {
     $env:GHOSTTY_LOCAL_AGENT_BIN = $AgentExe
     $launchArgs = @('--session-relaunch=rerun')
     if (-not $restore) { $launchArgs += "--title=$title" }
-    Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList $launchArgs | Out-Null
+    [void](Start-OnTestDesktop -Exe $Exe -Arguments $launchArgs)
 }
+
+$td = New-TestDesktop
 
 Stop-TestProcs
 New-Item -ItemType Directory -Force $root | Out-Null
@@ -307,6 +315,7 @@ $env:LOCALAPPDATA = $savedLocalAppData
 if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
 else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }
 Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+Remove-TestDesktop | Out-Null
 
 # --- stamp (T783) -----------------------------------------------------------
 # A green run records this harness's own content so scripts\guard-due.ps1 can

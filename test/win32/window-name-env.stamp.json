@@ -1,9 +1,12 @@
 {
     "guard":  "window-name-env",
     "script":  "test/win32/window-name-env.ps1",
-    "generated":  "2026-08-21T20:35:04-07:00",
-    "commit":  "8340e815a",
+    "generated":  "2026-09-01T19:33:21-07:00",
+    "commit":  "93167774c",
+    "uncommitted":  [
+                        "test/win32/window-name-env.ps1"
+                    ],
     "files":  {
-                  "test/win32/window-name-env.ps1":  "d0bc507c9842af891144f831f7a9b59bef4d7b6de132b0e6782ecf608864c3ca"
+                  "test/win32/window-name-env.ps1":  "d292041b208cf66beafc157adc10a1f484d46d61b9656965ba875423d0f283c7"
               }
 }

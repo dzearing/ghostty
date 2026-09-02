@@ -9,6 +9,34 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-01: T1240 (+T1267 filed) - **Eighteen more acceptance scripts stopped throwing terminal windows across the user's screen.** Batch 3 of T1193's four: `auto-launch-cwd`, `cli-argv-fidelity`, `cli-launch-cwd`, `conformance`, `gui-launch-command`, `ipc-list-session-id`, `ipc-remote`, `ipc-send-keys-fidelity`, `ipc-under-load`, `ipc-when-idle`, `layout-blobs`, `pane-id`, `rearrange-session-drop`, `registration-sites`, `send-keys-bracketed`, `send-keys-soak`, `target-staleness`, `window-name-env`. GUI launches went to `Start-OnTestDesktop`, CLI calls to `Invoke-OnTestDesktop` behind a local `Ghoz` helper, and every `cmd /c "... > file"` dance went with them - the harness captures both streams, which is what that dance was for. Each ran green individually; the declaration list is down from 28 pending to 10, so the sweep is what proves it rather than this paragraph.
+  The turn's value was not the mechanical part. `cli-launch-cwd.ps1` went 7-red
+  after its migration and stayed red until two spawn facts were measured rather
+  than assumed. First: **`CreateProcessW` does not search PATH.** With
+  `lpApplicationName` set, `cmd.exe` resolves against the current directory and
+  nothing else, so the arm-A launch failed outright and `RunProcess` returned an
+  empty string - the harness's own "spawn failed" answer, which a caller that
+  only reads the pane sees as "the app never came up". `$env:ComSpec` is the fix
+  and the rule for every future `cmd` launch through the harness. Second, and
+  worth remembering longer: the script's own `T506Spawn` P/Invoke declared
+  `[StructLayout(LayoutKind.Sequential)]` with **no `CharSet`**, which is Ansi.
+  Passing a desktop name into `lpDesktop` therefore handed `CreateProcessW` an
+  ANSI pointer inside a struct it reads as wide - **the spawn SUCCEEDED, returned
+  a real pid, and the process simply had no desktop to draw on.** A failure that
+  reports success is the shape this suite keeps paying for; the fix is one
+  attribute, and the comment beside it now says why it is load-bearing.
+  Which is also why T1267 is filed. The sweep saw ONE of that script's four
+  launch sites: an invocation assembled as a string for `cmd`, and an exe passed
+  as an ARGUMENT to a `[Type]::Method(...)`, are both invisible to an AST rule
+  over command names. So a script can be declared migrated, pass the sweep, and
+  still open three windows on the user's screen. The proposal with teeth is to
+  stop parsing the source and ask the box - `AnyVisibleWindowOnInteractiveDesktop`
+  already exists in the harness and answers exactly the question the list is read
+  as answering.
+  Floor: all four lanes PASS, ipc-p1/p2/p3 ALL PASS, and the seven harnesses the
+  edits made due (isolation-meta, launch-preflight, verdict-exit, cleanslate,
+  stderr-capture, test-desktop, desktop-launch) all green - guard-due back to
+  exit 0 with only the two standing advisory rows.
 - 2026-09-01: T1227 - **The staleness gate now checks its own watch list, after a bug report about that list turned out to be a bug in the report.** T1227 was filed saying two `Covers` entries in `scripts\guard-due.ps1` held control characters where a backslash belongs (`src<BEL>pprt\win32\install_prepare.zig`, `dist\windows-installer<BS>uild-msi.sh`), which would make those guards unable to ever go due. Checked first, and it is false: the HEAD blob and the worktree copy both contain zero characters below 0x20, and all 118 rows' patterns resolve to at least one file today. The bytes came from a tool that halves backslashes on the way to a terminal - the report was mangled, not the file.
   What was real is why that took a byte scan to answer. `Get-CoveredFiles` asks
   `Get-ChildItem` with `-ErrorAction SilentlyContinue`, so a pattern matching
