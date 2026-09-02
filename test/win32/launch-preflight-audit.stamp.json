@@ -1,11 +1,10 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-09-02T01:02:28-07:00",
-    "commit":  "3f3f7b560",
+    "generated":  "2026-09-02T01:41:51-07:00",
+    "commit":  "c6c80f66d",
     "uncommitted":  [
-                        "test/win32/lib/TestDesktop.ps1",
-                        "test/win32/session-relaunch.ps1"
+                        "test/win32/update-apply.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -270,7 +269,7 @@
                   "test/win32/test-reach-audit.ps1":  "9987988dde78037ac8545dd70de97e50d2d9312bca3e9c0ee89d0be955eb638e",
                   "test/win32/title-font.ps1":  "946fd12880bb0433a535283fb6146fb7d2a8fd1b2d1f0f74e00fa7ce1720dcb8",
                   "test/win32/title-jitter.ps1":  "305bd304faf09988c8852f7fa69f2c780212b639fb837085b5869ab5457acab7",
-                  "test/win32/update-apply.ps1":  "474e74998cb0e2a31b8ab555ee5a7b4b36958293e4afe1fd856c341e1ea16acc",
+                  "test/win32/update-apply.ps1":  "1702e7177db3732e4792601dc9837a7a0b2509c32c14058f912959ef4a94a536",
                   "test/win32/update-check.ps1":  "6485b5d065d48160309375ad57672071b1c38c99acdf63a26f3c1bc4588ed80c",
                   "test/win32/update-failure-visible.ps1":  "2aa609f410ee44f950354c01637ed81552791e88331178423f5b9686d5748c34",
                   "test/win32/update-graceful.ps1":  "8dd249a5f108c2f129a2673c857e68808115c8fd963d67ffaef7ab43a3c70944",

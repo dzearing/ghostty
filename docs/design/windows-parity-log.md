@@ -19868,3 +19868,46 @@ isolation-meta, launch-preflight, verdict-exit, cleanslate, stderr-capture,
 desktop-launch, suite-run) stayed green over the edits.
 
 Floor: lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS.
+
+## 2026-09-02 - the update test can no longer walk off with the build it was handed (T1268)
+
+`test\win32\update-apply.ps1` drives the real applier - the detached process
+that waits for the app to exit, lets msiexec replace the install, and relaunches
+the terminal. Section 8 armed it with `zig-out\bin\ghoztty.exe` as the install
+target, which made the repo build the thing the applier was allowed to move.
+That is by design on the applier's side: an image msiexec cannot overwrite gets
+renamed aside so a fresh one can be written. The package here is a fake one
+msiexec always rejects, so nothing ever writes `ghoztty.exe` back. On
+2026-09-01 a straggler from an earlier script held the exe open at exactly that
+moment, and the run finished having left `ghoztty.exe.old-1788324281` and no
+`ghoztty.exe` - section 9 died with `CreateProcessW failed: 2` and the turn had
+no binary at all.
+
+The applier was doing its job; the harness was pointing a destructive operation
+at the one file the rest of the turn depends on. Sections 8 and 9 now use a
+throwaway install directory under `$work` holding a COPY of the build, the way
+`update-real-msi.ps1` already sandboxes the product identity for the same
+reason. Every assertion in those sections reads the applier's own log, so they
+hold unchanged against the copy - and section 9, whose whole subject is an
+applier that WOULD rename the image it is running from, now runs out of that
+sandbox, so a regression in the refusal costs a copy rather than the build. The
+copy lives outside the repo, where `Stop-RepoGhoztty` refuses to reach by
+design, so its relaunched terminals are stopped by a path-exact
+`Kill-SandboxInstances`.
+
+The other half is that nothing noticed. Two new sections close that: section 11
+asserts the repo build is where it was and that no `ghoztty.exe.old-*` is left -
+the check that would have scored red on 2026-09-01 - and a `Restore-RepoBuild`
+that runs after the finding (and from a `trap`, so a throw does not skip it)
+puts a sidelined build back, so a FUTURE harness reaching the same state leaves
+the box usable instead of stranded. Section 12 exercises that repair against
+scratch files, because a safety net whose only exercise is the emergency it
+exists for is a net nobody has measured. `-NegativeControl` plants the
+2026-09-01 stray after the applier arms and is the proof the alarm can fail: a
+stray planted any earlier is swept by the app's own launch-time sweep in
+section 6, which is why the switch arms it where the damage actually happened.
+
+Evidence: three full runs with `zig-out\bin\ghoztty.exe` held open by a
+`FileShare.Read` handle for their whole duration. Green is ALL PASS (52
+assertions) with the build untouched; `-NegativeControl` is 1 FAILED / 51
+passed, exit 1, no guard stamp, and the build still in place afterwards.
