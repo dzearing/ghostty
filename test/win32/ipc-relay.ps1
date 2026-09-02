@@ -10,7 +10,9 @@
 # relay+agent (send-keys -> read), --command forwarded into the agent OPEN,
 # tokenless refusal ("not signed in"), bad-token dial failure (Mac-parity
 # error), agent killed under a live window => GUI keeps answering IPC (no
-# hang/crash), +close teardown.
+# hang/crash), agent RESTARTED under that dead window => the ladder settles on a
+# definite verdict (T368), +close teardown, and no connection threads left
+# behind afterwards.
 #
 # SETUP IS GATED (T1105). Sections 0a-0c build the world every claim below
 # stands on - the relay, the agent, and a live app to open relay windows in -
@@ -86,6 +88,45 @@ function Show-LastCli {
     else { "    -> output:"; ($out.TrimEnd() -split "`r?`n" | ForEach-Object { "       $_" }) }
 }
 
+# The GUI process under test, path-exact on $Exe. Every `ghoztty.exe` a Run-Cli
+# call spawns lives under the same path, so "the app" is the OLDEST of them -
+# Stop-TestProcs cleared the field before 0c, which makes the base window's
+# instance the first one started. Used for the two things only the process can
+# answer: is it still alive (no crash), and how many threads is it holding
+# (no orphaned connection threads).
+function Get-AppProc {
+    Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe'" |
+        Where-Object { $_.ExecutablePath -eq $Exe } |
+        Sort-Object CreationDate | Select-Object -First 1
+}
+
+function Get-AppThreadCount {
+    $p = Get-AppProc
+    if ($null -eq $p) { return -1 }
+    return [int]$p.ThreadCount
+}
+
+# The T609 connection object for one window, or $null. Every read goes through a
+# real `+list --json` CLI call, so a poll that stops answering is itself the
+# hang this script exists to catch: the caller gets $null AND $script:lastCli
+# names the timeout.
+function Get-Connection($target, $outfile, $timeoutSec = 15) {
+    $code = Run-Cli '+list --json' $outfile $timeoutSec
+    if ($code -ne 0) { return $null }
+    $j = $null
+    try { $j = (Get-Out $outfile) | ConvertFrom-Json } catch { return $null }
+    if (-not ($j -and $j.data -and $j.data.windows)) { return $null }
+    $w = $j.data.windows | Where-Object { $_.target -eq $target } | Select-Object -First 1
+    if ($null -eq $w) { return $null }
+    if ($w.PSObject.Properties.Name -notcontains 'connection') { return $null }
+    return $w.connection
+}
+
+function Format-Connection($c) {
+    if ($null -eq $c) { return '(none)' }
+    return ($c | ConvertTo-Json -Compress)
+}
+
 function Stop-TestProcs {
     # T351: one shared, path-exact kill (lib\CleanSlate.ps1) for the app and its
     # sibling agent - the private copies each filtered differently. The extra
@@ -156,18 +197,28 @@ if ($null -eq $dev) { Stop-TestProcs; "$($script:failures) FAILURE(S)"; exit 1 }
 # agent-sharing-uplink, ipc-remote, remote-inherit) already forks its lineage;
 # this one was the last that did not. Its stdout/stderr go to files so an agent
 # that dies has something to say for itself.
-$savedAgentInstance = $env:GHOZTTY_AGENT_INSTANCE
-$env:GHOZTTY_AGENT_INSTANCE = "ipcrelay$PID"
-$env:GHOSTTY_DEVICE_TOKEN = $dev.token
-$env:GHOSTTY_AGENT_HEARTBEAT = "$tmp\agent.heartbeat"
-$agent = Start-Process -FilePath $AgentExe -PassThru -WindowStyle Hidden `
-    -RedirectStandardOutput "$tmp\agent.out" -RedirectStandardError "$tmp\agent.err" `
-    -ArgumentList "--relay=$RelayBase", "--headless"
-$null = $agent.Handle   # before any HasExited/ExitCode read (lib\ExitCodeAudit.ps1)
-if ($null -eq $savedAgentInstance) { Remove-Item env:GHOZTTY_AGENT_INSTANCE -ErrorAction SilentlyContinue }
-else { $env:GHOZTTY_AGENT_INSTANCE = $savedAgentInstance }
-Remove-Item env:GHOSTTY_DEVICE_TOKEN -ErrorAction SilentlyContinue
-Remove-Item env:GHOSTTY_AGENT_HEARTBEAT -ErrorAction SilentlyContinue
+# T368 factored the launch into a function: section 6b starts a SECOND agent on
+# the same lineage (same GHOZTTY_AGENT_INSTANCE, same device token, same
+# heartbeat file) after killing the first. A restarted agent that differs in any
+# of those is not the same machine coming back, it is a different one, and the
+# reconnect claim would be measuring the wrong thing.
+function Start-HarnessAgent($tag) {
+    $savedAgentInstance = $env:GHOZTTY_AGENT_INSTANCE
+    $env:GHOZTTY_AGENT_INSTANCE = "ipcrelay$PID"
+    $env:GHOSTTY_DEVICE_TOKEN = $dev.token
+    $env:GHOSTTY_AGENT_HEARTBEAT = "$tmp\agent.heartbeat"
+    $p = Start-Process -FilePath $AgentExe -PassThru -WindowStyle Hidden `
+        -RedirectStandardOutput "$tmp\$tag.out" -RedirectStandardError "$tmp\$tag.err" `
+        -ArgumentList "--relay=$RelayBase", "--headless"
+    $null = $p.Handle   # before any HasExited/ExitCode read (lib\ExitCodeAudit.ps1)
+    if ($null -eq $savedAgentInstance) { Remove-Item env:GHOZTTY_AGENT_INSTANCE -ErrorAction SilentlyContinue }
+    else { $env:GHOZTTY_AGENT_INSTANCE = $savedAgentInstance }
+    Remove-Item env:GHOSTTY_DEVICE_TOKEN -ErrorAction SilentlyContinue
+    Remove-Item env:GHOSTTY_AGENT_HEARTBEAT -ErrorAction SilentlyContinue
+    return $p
+}
+
+$agent = Start-HarnessAgent 'agent'
 Start-Sleep -Seconds 3
 Assert "agent is running" (-not $agent.HasExited)
 if ($agent.HasExited) {
@@ -288,6 +339,19 @@ Assert "error names device via relay" ((Get-Out 'badtok.txt') -match [regex]::Es
 if (-not ((Get-Out 'badtok.txt') -match [regex]::Escape("failed to reach $($dev.id) via relay"))) { Show-LastCli }
 
 "== 6: agent killed under a live relay window => GUI keeps answering (no hang)"
+# T368: the pre-drop thread baseline, sampled while the link is still healthy.
+# Section 7 reads it back after +close - a connection that is dropped, re-dialed
+# and then torn down must not leave its transport threads behind. Max of three
+# samples, because a GUI process's pool workers come and go and the claim is
+# about a LEAK, not about hitting one number.
+$threadsBefore = 0
+foreach ($i in 1..3) {
+    $n = Get-AppThreadCount
+    if ($n -gt $threadsBefore) { $threadsBefore = $n }
+    Start-Sleep -Milliseconds 300
+}
+"  app thread baseline before the drop: $threadsBefore"
+
 Stop-Process -Id $agent.Id -Force -ErrorAction SilentlyContinue
 Start-Sleep -Seconds 3
 $code = Run-Cli '+list' 'list2.txt' 15
@@ -326,6 +390,95 @@ if ($null -ne $dropped -and $null -ne $dropped.connection) {
     "    connection: $($dropped.connection | ConvertTo-Json -Compress)"
 }
 
+"== 6b: agent RESTARTED under the dead relay window => the ladder settles (T368)"
+# T368's own clause, verbatim: "kill + restart the agent under a LIVE remote
+# window, then assert the pane comes back (re-ATTACH) or reports a clear
+# disconnected state - no hang, no crash, no orphan connection threads."
+#
+# The disjunction is deliberate and it is the whole contract. What must NOT
+# happen is the third thing: a window that sits in `reconnecting` forever, or
+# vanishes, or takes the GUI down with it. So the assertion is that the ladder
+# reaches a DEFINITE verdict inside a budget that covers it, and that whichever
+# verdict it reaches is internally consistent and backed by the window actually
+# working (the connected arm is proved with a round-trip, not with a field).
+#
+# Budget: the fast ladder is 5 attempts at 1/2/4/8/15s (~30s from the drop), and
+# an exhausted ladder arms a background re-dial every 45s. 150s covers the fast
+# pass plus two slow re-dials, so a slow recovery reads as a recovery and not as
+# a failure.
+#
+# Which arm this box takes TODAY is the disconnected one, and T1278 is why: a
+# hard-killed `--listen` agent loses its session records, so the restarted agent
+# reaps the still-live PTY holder as an orphan and the ladder is told
+# `session_gone`. That is a real defect with its own task; it is NOT this
+# script's subject, and hard-coding either arm here would make the harness go
+# red the day T1278 is fixed and the window starts coming back instead.
+$agent2 = Start-HarnessAgent 'agent2'
+Start-Sleep -Seconds 3
+Assert "restarted agent is running" (-not $agent2.HasExited)
+if ($agent2.HasExited) {
+    "    agent2 exited $($agent2.ExitCode) (183 = another instance holds the guard)"
+    foreach ($f in 'agent2.out', 'agent2.err') {
+        $t = (Get-Out $f)
+        if (-not [string]::IsNullOrWhiteSpace($t)) {
+            "    $($f):"; ($t.TrimEnd() -split "`r?`n" | Select-Object -Last 8 | ForEach-Object { "       $_" })
+        }
+    }
+}
+
+$settled = $null
+$seen = @()
+$stalled = $false
+$sw6b = [System.Diagnostics.Stopwatch]::StartNew()
+while ($sw6b.Elapsed.TotalSeconds -lt 150) {
+    $c = Get-Connection 'relwin' 'list6b.txt' 15
+    if ($null -eq $c) {
+        # Either the CLI stopped answering or the window left +list --json.
+        # Both are failures of this section and neither is worth waiting out.
+        $stalled = $true
+        break
+    }
+    $desc = Format-Connection $c
+    if ($seen -notcontains $desc) { $seen += $desc; "  t+$([math]::Round($sw6b.Elapsed.TotalSeconds))s $desc" }
+    if ($c.state -ne 'reconnecting') { $settled = $c; break }
+    Start-Sleep -Seconds 3
+}
+$sw6b.Stop()
+
+Assert "the relay window kept answering +list --json throughout the restart" (-not $stalled)
+if ($stalled) { Show-LastCli }
+Assert "the app survived the kill + restart (no crash)" ($null -ne (Get-AppProc))
+Assert "the ladder settled on a definite verdict within 150s (not stuck reconnecting)" (
+    $null -ne $settled)
+if ($null -eq $settled) { "    last states seen: $($seen -join ' -> ')" }
+
+if ($null -ne $settled -and $settled.state -eq 'connected') {
+    # The re-ATTACH arm. A field is not a working window, so prove it the way
+    # section 2 proved the original link: drive the remote shell and read it back.
+    "  arm: RE-ATTACHED after $([math]::Round($sw6b.Elapsed.TotalSeconds))s"
+    Assert "a re-connected window reports no attempt count" (
+        $settled.PSObject.Properties.Name -notcontains 'attempt')
+    $code = Run-Cli '+send-keys --target=relwin "echo relay-reattach-ok" Enter' 'sk2.txt'
+    Assert "send-keys through the restored link exits 0" ($code -eq 0)
+    if ($code -ne 0) { Show-LastCli }
+    Start-Sleep -Seconds 3
+    $code = Run-Cli '+read --name=relwin --lines=40' 'read3.txt'
+    Assert "the re-attached pane echoes through the new transport" (
+        (Get-Out 'read3.txt') -match 'relay-reattach-ok')
+} elseif ($null -ne $settled) {
+    # The clear-disconnected arm. "Clear" is the assertion: a disconnected
+    # window has to say whether anything will ever bring it back, because that
+    # is the difference between the status pill telling the user to wait and
+    # telling them to act.
+    "  arm: DISCONNECTED after $([math]::Round($sw6b.Elapsed.TotalSeconds))s (T1278: the restarted agent reaps the holder)"
+    Assert "the verdict is 'disconnected', not some third state" ($settled.state -eq 'disconnected')
+    Assert "and it says whether the window is self-healable" (
+        $settled.PSObject.Properties.Name -contains 'self_healable' -and
+        $settled.self_healable -is [bool])
+    Assert "a disconnected window reports no attempt count" (
+        $settled.PSObject.Properties.Name -notcontains 'attempt')
+}
+
 "== 7: +close tears the dead relay window down cleanly (no hang)"
 $code = Run-Cli '+close --target=relwin' 'close1.txt' 20
 Assert "close exit 0 within timeout" ($code -eq 0)
@@ -335,11 +488,44 @@ $code = Run-Cli '+list' 'list3.txt' 15
 Assert "relay window gone" (-not ((Get-Out 'list3.txt') -match '\[target: relwin\]'))
 Assert "app survived the teardown" ((Get-Out 'list3.txt') -match '\[target: relbase\]')
 
+# T368: no orphan connection threads. The window under test dropped its
+# transport, ran a ladder that dialed more of them, and has now been closed - so
+# every transport it ever held is retired and freed, and the process must be
+# back where it started. This is the check that a retired transport being "shut
+# down off-thread" actually finishes: a leak here is invisible to every other
+# assertion in this file, and it accumulates one window at a time in a terminal
+# people leave open for days.
+#
+# Retirement is asynchronous by design, so this waits rather than sampling once.
+$threadsAfter = -1
+$swT = [System.Diagnostics.Stopwatch]::StartNew()
+while ($swT.Elapsed.TotalSeconds -lt 45) {
+    $threadsAfter = Get-AppThreadCount
+    if ($threadsAfter -ge 0 -and $threadsAfter -le $threadsBefore) { break }
+    Start-Sleep -Seconds 2
+}
+$swT.Stop()
+"  app threads: $threadsBefore before the drop -> $threadsAfter after +close"
+Assert "no connection threads left behind after +close (<= the pre-drop baseline)" (
+    $threadsAfter -ge 0 -and $threadsAfter -le $threadsBefore)
+
 "== cleanup"
 Run-Cli '+close --target=relbase' 'closebase.txt' | Out-Null
 Stop-TestProcs
+if ($agent2) { Stop-Process -Id $agent2.Id -Force -ErrorAction SilentlyContinue }
 Stop-Process -Id $relay.Id -Force -ErrorAction SilentlyContinue
 Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
+
+# A green run stamps the covered files (T783) so guard-due can answer "has this
+# harness been run against the code as it now stands?". Red leaves the stamp
+# alone - red stays due. T368 added the row: before it, nothing tied an edit to
+# RemoteReconnect.zig or the relay dial to running the harness that owns the
+# ladder end to end.
+if ($script:failures -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass `
+        -File (Join-Path $PSScriptRoot '..\..\scripts\guard-due.ps1') `
+        update -Guard ipc-relay 2>&1 | ForEach-Object { "  $_" }
+}
 
 if ($script:failures -eq 0) { "ALL PASS"; exit 0 }
 else { "$($script:failures) FAILURE(S)"; exit 1 }

@@ -1,15 +1,10 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-09-02T12:41:21-07:00",
-    "commit":  "301967041",
+    "generated":  "2026-09-02T13:32:14-07:00",
+    "commit":  "2e717485b",
     "uncommitted":  [
-                        "test/win32/ipc-floor-setup.ps1",
-                        "test/win32/ipc-p1.ps1",
-                        "test/win32/ipc-p2.ps1",
-                        "test/win32/ipc-p3.ps1",
-                        "test/win32/lib/FloorFixture.ps1",
-                        "test/win32/lib/TestDesktop.ps1"
+                        "test/win32/ipc-relay.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -136,7 +131,7 @@
                   "test/win32/ipc-p2.ps1":  "1f20cfe50e0517943b8629cf65236c69b68d1c893925cea4920179278e6359b3",
                   "test/win32/ipc-p3.ps1":  "6b34a13686be3969ceb27466b352c69d90a4a13c5c4e3c3fc22ffde52bf60eeb",
                   "test/win32/ipc-read-race.ps1":  "ff6f89cab2e92dae0fa13e1ea2f9a89f2579175ddcc2b8b55c53b8b7f330bee6",
-                  "test/win32/ipc-relay.ps1":  "5e55a8d6d5f9f19117fe416ad0324129cca2296f30267f6df4c578f3506a7de0",
+                  "test/win32/ipc-relay.ps1":  "7d6837579539a1624fabf31916cfc3923ca91f6db356d1aaae8db7560dcbe02f",
                   "test/win32/ipc-remote.ps1":  "861e93ef7522e4559ccd66cccea2cddc89f363df666bfe4b135da2bd143d0ea9",
                   "test/win32/ipc-send-keys-fidelity.ps1":  "ecd1a63052e0a9c52fdb10003f817026c4b95acd8fe76b4e2cff8a57a1ff2fd8",
                   "test/win32/ipc-startup-latency.ps1":  "f9696e3e450043659688926efca6912b1ddeb19113e1be8c2581e20a591196a6",

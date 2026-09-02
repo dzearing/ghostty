@@ -1266,6 +1266,25 @@ $GuardTable = @(
             'test\win32\remote-reconnect-relay.ps1'
         )
     },
+    # The relay window end to end against a REAL relay and a REAL agent (T368),
+    # where remote-reconnect-relay above drives a fake one. It is the only thing
+    # that kills and RESTARTS the agent under a live remote window, so it owns
+    # two claims nothing else can make: the ladder settles on a definite verdict
+    # rather than spinning, and the transports it dialed on the way are freed at
+    # +close instead of accumulating threads. Until T368 the script had no row
+    # at all, so an edit to the ladder or the dial was tied to nothing.
+    [pscustomobject]@{
+        Name   = 'ipc-relay'
+        Script = 'test\win32\ipc-relay.ps1'
+        Stamp  = 'test\win32\ipc-relay.stamp.json'
+        Covers = @(
+            'src\apprt\win32\RemoteReconnect.zig',
+            'src\apprt\win32\remote_reconnect.zig',
+            'src\remote\relay_dial.zig',
+            'src\apprt\ipc\list.zig',
+            'test\win32\ipc-relay.ps1'
+        )
+    },
     # Standalone-install adoption (T549) only fires on a box that still has
     # the old agent MSI, so the whole flow - idle-stop, the deny-terminate
     # shield around the uninstall, the Run-key repair - is invisible to the

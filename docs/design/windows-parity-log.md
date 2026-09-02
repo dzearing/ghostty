@@ -20257,3 +20257,48 @@ three floor scripts. Floor: four zig lanes, P1-P3 singly and 18-in-order, and th
 seven audits the edit made due.
 
 Filed: T1290 (the clean slate leaves the agent's session store behind).
+
+## 2026-09-02 - T368: a restarted machine has to leave the window somewhere definite
+
+`test\win32\ipc-relay.ps1` killed the agent under a live relay window and
+stopped there. It proved the GUI kept answering and that the connection field
+left `connected`, and then closed the window - so the half of the story a user
+actually lives through, the machine coming *back*, was never driven by anything
+on this box. T368 has carried that clause since 2026-08-02 and was parked twice:
+once behind the driver (T366), once behind a strong oracle (T609), because the
+only thing to assert against was log text.
+
+Section 6b restarts the agent on the SAME lineage the first one had - same
+`GHOZTTY_AGENT_INSTANCE`, same device token, same heartbeat file, since an agent
+that differs in any of those is a different machine and not a recovery - then
+polls the T609 `+list --json` `connection` field until the ladder reaches a
+verdict. The assertion is the disjunction T368 asks for and not one arm of it:
+either the window comes back, or it says plainly that it is disconnected. What
+it may not do is the third thing - spin in `reconnecting` forever, leave
+`+list --json`, or take the app down. The budget is 150s, which covers the fast
+ladder (5 attempts at 1/2/4/8/15s) plus two of the 45s background re-dials, so a
+slow recovery reads as a recovery.
+
+Both arms are written, and that is deliberate. Today this box takes the
+disconnected one, at t+3s, for the reason T1278 already records: a hard-killed
+`--listen` agent loses its session records, so the restarted agent reaps the
+still-live PTY holder and the ladder is told `session_gone`. Hard-coding that
+arm would make the harness go red on the day T1278 is fixed and the window
+starts re-attaching instead. The connected arm is proved by typing into the pane
+and reading it back, because a field is not a working window.
+
+Section 7 gained the check the task's clause names last and nothing had: no
+orphan connection threads. The window under test dropped a transport, ran a
+ladder that dialed more, and was then closed, so the process must be back at its
+pre-drop thread baseline. Measured 33 before the drop, 25 after `+close`. This
+is invisible to every other assertion in the file and it accumulates one window
+at a time in a terminal people leave open for days.
+
+Validation: `test\win32\ipc-relay.ps1` ALL PASS on the box, section 6b settling
+at t+3s on the disconnected arm with the state walk printed
+(`reconnecting attempt=3` -> `disconnected self_healable=false`). The script had
+no `guard-due.ps1` row at all, so an edit to `RemoteReconnect.zig`,
+`remote_reconnect.zig`, `relay_dial.zig` or `list.zig` was tied to nothing that
+runs it end to end against a real relay and a real agent; there is an
+`ipc-relay` row now and a green run stamps it. Floor: four `floor-lane.ps1`
+lanes and P1-P3.
