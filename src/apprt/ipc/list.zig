@@ -4,7 +4,10 @@ const Allocator = std.mem.Allocator;
 /// The `+list` response payload: the data model and its JSON serialization,
 /// shape-matched to the Mac server's Swift encoder (IPCMessage.swift) — the
 /// CLI's human formatter and the ghoztty skill both parse this. The golden
-/// tests below pin the shape; keep them in sync with any Mac change.
+/// tests below pin the shape, and the drift detector at the bottom of this
+/// file checks it against the Swift encoder's own source on every test run
+/// (T370), so a field added on either seat and not the other is a red lane
+/// rather than a field a client silently never sees.
 pub const List = struct {
     windows: []const Window,
 
@@ -823,5 +826,409 @@ test "List: connection reports the ladder's three states (T609)" {
             try testing.expect(std.mem.indexOf(u8, json, "attempt") == null);
         if (c.conn.self_healable == null)
             try testing.expect(std.mem.indexOf(u8, json, "self_healable") == null);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T370 — the drift detector between this encoder and the Mac server's.
+//
+// `+list --json` has TWO encoders that must produce byte-identical JSON: the
+// one above, and `macos/Sources/Features/IPC/IPCMessage.swift`. One client
+// reads both. Until this check existed the only thing keeping them together
+// was a comment asking whoever touched one to remember the other, and it had
+// already been missed — Mac encoded `type` and `url` for months while the Zig
+// side emitted neither, and four golden tests asserted the drifted shape as
+// correct. Drift is silent in both directions: the win32 lane never compiles
+// Swift, and the Mac build never runs this file's tests as a shape check.
+//
+// So the check reads the Swift ENCODER'S OWN SOURCE, which is checked in and
+// therefore reachable from either seat, and compares the field names and
+// order it would emit against the field names and order this encoder actually
+// emits — read off a real `serializeResponse` call rather than a second
+// description of it. Win32-only fields are named explicitly, and naming one
+// asserts the Mac does NOT emit it, so the exemption cannot quietly hide the
+// day Mac grows the same field.
+
+/// One JSON key the Swift encoder emits, in encode order.
+const SwiftKey = struct {
+    name: []const u8,
+    /// `encodeIfPresent`: the key vanishes when the value is nil. Anything
+    /// else is written even when nil, as an explicit `null`.
+    conditional: bool,
+};
+
+/// A `CodingKeys` entry: the Swift property name and the JSON key it maps to
+/// (`case pane_type = "type"`).
+const SwiftAlias = struct { name: []const u8, raw: []const u8 };
+
+/// Swift source with `//` comments removed, so a doc comment cannot
+/// contribute a brace, a quote, or one of the words scanned for below.
+/// Caller frees.
+fn swiftStripComments(alloc: Allocator, src: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    var i: usize = 0;
+    var in_string = false;
+    while (i < src.len) {
+        const c = src[i];
+        if (in_string) {
+            if (c == '\\' and i + 1 < src.len) {
+                try out.appendSlice(alloc, src[i .. i + 2]);
+                i += 2;
+                continue;
+            }
+            if (c == '"') in_string = false;
+            try out.append(alloc, c);
+            i += 1;
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+            try out.append(alloc, c);
+            i += 1;
+            continue;
+        }
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
+            while (i < src.len and src[i] != '\n') i += 1;
+            continue;
+        }
+        try out.append(alloc, c);
+        i += 1;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// The brace-balanced body that follows `decl` — `struct TerminalData`,
+/// `enum CodingKeys`, `func encode(to encoder: Encoder)`. Null when the
+/// declaration is not there, which is how a rename shows up as a failure
+/// instead of a vacuous pass.
+fn swiftBlock(src: []const u8, decl: []const u8) ?[]const u8 {
+    const at = std.mem.indexOf(u8, src, decl) orelse return null;
+    var i = at + decl.len;
+    while (i < src.len and src[i] != '{') : (i += 1) {}
+    if (i >= src.len) return null;
+
+    const start = i + 1;
+    var depth: usize = 1;
+    var in_string = false;
+    i = start;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if (in_string) {
+            if (c == '\\') {
+                i += 1;
+            } else if (c == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        switch (c) {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if (depth == 0) return src[start..i];
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// The `CodingKeys` map inside a type body, empty when it has none.
+fn swiftCodingKeys(alloc: Allocator, body: []const u8) ![]SwiftAlias {
+    var out: std.ArrayList(SwiftAlias) = .empty;
+    errdefer out.deinit(alloc);
+
+    const block = swiftBlock(body, "enum CodingKeys") orelse
+        return out.toOwnedSlice(alloc);
+
+    var lines = std.mem.splitScalar(u8, block, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, trimmed, "case ")) continue;
+        var items = std.mem.splitScalar(u8, trimmed["case ".len..], ',');
+        while (items.next()) |item| {
+            const entry = std.mem.trim(u8, item, " \t\r");
+            if (entry.len == 0) continue;
+            if (std.mem.indexOfScalar(u8, entry, '=')) |eq| {
+                try out.append(alloc, .{
+                    .name = std.mem.trim(u8, entry[0..eq], " \t"),
+                    .raw = std.mem.trim(u8, entry[eq + 1 ..], " \t\""),
+                });
+            } else {
+                try out.append(alloc, .{ .name = entry, .raw = entry });
+            }
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+fn swiftResolve(aliases: []const SwiftAlias, name: []const u8) []const u8 {
+    for (aliases) |a| if (std.mem.eql(u8, a.name, name)) return a.raw;
+    return name;
+}
+
+/// The JSON keys `decl` encodes, in encode order. Handles both shapes this
+/// file uses: an explicit `encode(to:)` body, and a plain `Encodable` struct
+/// whose synthesized encoding follows declaration order. Caller frees.
+fn swiftEncodedKeys(alloc: Allocator, src: []const u8, decl: []const u8) ![]SwiftKey {
+    const body = swiftBlock(src, decl) orelse {
+        std.debug.print("T370: '{s}' is not in the Mac encoder any more\n", .{decl});
+        return error.SwiftDeclNotFound;
+    };
+    const aliases = try swiftCodingKeys(alloc, body);
+    defer alloc.free(aliases);
+
+    var out: std.ArrayList(SwiftKey) = .empty;
+    errdefer out.deinit(alloc);
+
+    if (swiftBlock(body, "func encode(to encoder: Encoder)")) |enc| {
+        const marker = "container.encode";
+        const for_key = "forKey: .";
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, enc, i, marker)) |at| {
+            const conditional = std.mem.startsWith(u8, enc[at..], "container.encodeIfPresent");
+            const key_at = std.mem.indexOfPos(u8, enc, at, for_key) orelse {
+                std.debug.print("T370: no 'forKey:' after an encode call in {s}\n", .{decl});
+                return error.SwiftKeyNotFound;
+            };
+            var end = key_at + for_key.len;
+            while (end < enc.len and (std.ascii.isAlphanumeric(enc[end]) or enc[end] == '_')) end += 1;
+            try out.append(alloc, .{
+                .name = swiftResolve(aliases, enc[key_at + for_key.len .. end]),
+                .conditional = conditional,
+            });
+            i = end;
+        }
+    } else {
+        // Synthesized `Encodable`: declaration order, every field written
+        // even when nil.
+        var depth: usize = 0;
+        var lines = std.mem.splitScalar(u8, body, '\n');
+        while (lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \t\r");
+            const at_top = depth == 0;
+            for (trimmed) |c| switch (c) {
+                '{' => depth += 1,
+                '}' => depth -|= 1,
+                else => {},
+            };
+            if (!at_top) continue;
+            if (!std.mem.startsWith(u8, trimmed, "let ") and
+                !std.mem.startsWith(u8, trimmed, "var ")) continue;
+            const rest = trimmed[4..];
+            const colon = std.mem.indexOfScalar(u8, rest, ':') orelse continue;
+            try out.append(alloc, .{
+                .name = swiftResolve(aliases, std.mem.trim(u8, rest[0..colon], " \t")),
+                .conditional = false,
+            });
+        }
+    }
+    return out.toOwnedSlice(alloc);
+}
+
+/// Assert this encoder's key order for `decl` matches the Mac encoder's, once
+/// the deliberately win32-only keys are set aside.
+fn expectMacShape(
+    alloc: Allocator,
+    swift: []const u8,
+    decl: []const u8,
+    zig_keys: []const []const u8,
+    win32_only: []const []const u8,
+) !void {
+    const mac = try swiftEncodedKeys(alloc, swift, decl);
+    defer alloc.free(mac);
+
+    // Calling a key win32-only ASSERTS the Mac does not emit it. The day Mac
+    // grows the same field, the exemption is what has to go.
+    for (win32_only) |extra| {
+        for (mac) |k| {
+            if (!std.mem.eql(u8, k.name, extra)) continue;
+            std.debug.print(
+                "T370 {s}: '{s}' is no longer win32-only — the Mac encoder emits it; " ++
+                    "drop it from the exemption list and match Mac's position\n",
+                .{ decl, extra },
+            );
+            return error.MacShapeDrift;
+        }
+    }
+
+    var i: usize = 0;
+    for (zig_keys) |zk| {
+        var exempt = false;
+        for (win32_only) |extra| {
+            if (std.mem.eql(u8, zk, extra)) exempt = true;
+        }
+        if (exempt) continue;
+        if (i >= mac.len) {
+            std.debug.print(
+                "T370 {s}: this encoder emits '{s}', the Mac encoder does not\n",
+                .{ decl, zk },
+            );
+            return error.MacShapeDrift;
+        }
+        if (!std.mem.eql(u8, zk, mac[i].name)) {
+            std.debug.print(
+                "T370 {s}: field {d} is '{s}' here and '{s}' on Mac\n",
+                .{ decl, i, zk, mac[i].name },
+            );
+            return error.MacShapeDrift;
+        }
+        i += 1;
+    }
+    if (i != mac.len) {
+        std.debug.print(
+            "T370 {s}: the Mac encoder emits '{s}', this encoder does not\n",
+            .{ decl, mac[i].name },
+        );
+        return error.MacShapeDrift;
+    }
+}
+
+test "List: the JSON shape still matches the Mac Swift encoder (T370)" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const swift = try swiftStripComments(alloc, @embedFile("macos_ipc_message_swift"));
+    defer alloc.free(swift);
+
+    // Every optional populated, so this encoder emits every key it knows how
+    // to emit and the order can be read straight off the wire.
+    const leaf_left: List.Node = .{ .leaf = .{
+        .id = "11",
+        .title = "viewer",
+        .working_directory = "/home",
+        .pid = 7,
+        .tty = "conpty",
+        .name = "left",
+        .focused = true,
+        .exit_code = 0,
+        .pane_type = "viewer",
+        .url = "file:///x.md",
+        .background_tint = "#112233",
+        .banner = "**PR #1**",
+        .session_id = "s1",
+    } };
+    const leaf_right: List.Node = .{ .leaf = List.empty_terminal };
+    const split: List.Node = .{ .split = .{
+        .direction = "horizontal",
+        .ratio = 0.5,
+        .left = &leaf_left,
+        .right = &leaf_right,
+    } };
+    const tabs = [_]List.Tab{.{
+        .id = "0",
+        .title = "pwsh",
+        .index = 0,
+        .selected = true,
+        .splits = &split,
+    }};
+    const windows = [_]List.Window{.{
+        .id = "1",
+        .title = "pwsh",
+        .target = "box",
+        .focused = true,
+        .tabs = &tabs,
+        .chrome = .{ .dpi = 96 },
+        .connection = .{ .state = "connected" },
+    }};
+    const json = try (List{
+        .windows = &windows,
+        .build = .{
+            .version = "v",
+            .commit = "c",
+            .mode = "Debug",
+            .runtime = "win32",
+            .exe = "e",
+            .exe_modified = "m",
+            .pid = 1,
+        },
+    }).serializeResponse(alloc);
+    defer alloc.free(json);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+    defer parsed.deinit();
+
+    const data = parsed.value.object.get("data").?.object;
+    const window = data.get("windows").?.array.items[0].object;
+    const tab = window.get("tabs").?.array.items[0].object;
+    const node = tab.get("splits").?.object;
+    const leaf = node.get("left").?.object;
+    const term = leaf.get("terminal").?.object;
+
+    // `build` (T52), `chrome` (T231), `connection` (T609), `background_tint`
+    // (T67) and `session_id` (T332) are win32-only on purpose; the Mac half of
+    // each is filed separately. Everything else must match name for name and
+    // position for position.
+    try expectMacShape(alloc, swift, "struct ListStateData", data.keys(), &.{"build"});
+    try expectMacShape(alloc, swift, "struct WindowData", window.keys(), &.{ "chrome", "connection" });
+    try expectMacShape(alloc, swift, "struct TabData", tab.keys(), &.{});
+    try expectMacShape(alloc, swift, "struct TerminalData", term.keys(), &.{ "background_tint", "session_id" });
+
+    // The Swift enum encodes its leaf case then its split case, so the two
+    // shapes this encoder writes concatenate into the same sequence.
+    var node_keys: std.ArrayList([]const u8) = .empty;
+    defer node_keys.deinit(alloc);
+    try node_keys.appendSlice(alloc, leaf.keys());
+    try node_keys.appendSlice(alloc, node.keys());
+    try expectMacShape(alloc, swift, "enum SplitNodeData", node_keys.items, &.{});
+
+    // Order is half the contract; the other half is WHICH keys survive a null
+    // value. A key the Mac writes unconditionally must still be there as an
+    // explicit null, and one it `encodeIfPresent`s must vanish.
+    const bare_leaf: List.Node = .{ .leaf = List.empty_terminal };
+    const bare_tabs = [_]List.Tab{.{
+        .id = "0",
+        .title = "pwsh",
+        .index = 0,
+        .selected = true,
+        .splits = &bare_leaf,
+    }};
+    const bare_windows = [_]List.Window{.{
+        .id = "1",
+        .title = "pwsh",
+        .target = null,
+        .focused = true,
+        .tabs = &bare_tabs,
+    }};
+    const bare_json = try (List{ .windows = &bare_windows }).serializeResponse(alloc);
+    defer alloc.free(bare_json);
+
+    var bare_parsed = try std.json.parseFromSlice(std.json.Value, alloc, bare_json, .{});
+    defer bare_parsed.deinit();
+
+    const bare_term = bare_parsed.value.object.get("data").?.object
+        .get("windows").?.array.items[0].object
+        .get("tabs").?.array.items[0].object
+        .get("splits").?.object
+        .get("terminal").?.object;
+
+    const mac_term = try swiftEncodedKeys(alloc, swift, "struct TerminalData");
+    defer alloc.free(mac_term);
+    for (mac_term) |k| {
+        const present = bare_term.get(k.name) != null;
+        if (k.conditional) {
+            if (present) {
+                std.debug.print(
+                    "T370 TerminalData: '{s}' is emitted for a null value here, " ++
+                        "the Mac encoder omits it\n",
+                    .{k.name},
+                );
+                return error.MacShapeDrift;
+            }
+        } else if (!present) {
+            std.debug.print(
+                "T370 TerminalData: '{s}' is omitted for a null value here, " ++
+                    "the Mac encoder writes it as null\n",
+                .{k.name},
+            );
+            return error.MacShapeDrift;
+        }
+    }
+    // The win32-only keys are all additive, so a bare pane carries none.
+    for ([_][]const u8{ "background_tint", "session_id" }) |extra| {
+        try testing.expect(bare_term.get(extra) == null);
     }
 }

@@ -20302,3 +20302,62 @@ no `guard-due.ps1` row at all, so an edit to `RemoteReconnect.zig`,
 runs it end to end against a real relay and a real agent; there is an
 `ipc-relay` row now and a green run stamps it. Floor: four `floor-lane.ps1`
 lanes and P1-P3.
+
+## 2026-09-02 - T370: the two +list encoders now check each other
+
+`+list --json` is written by two encoders that must produce byte-identical
+output - `src/apprt/ipc/list.zig` here and
+`macos/Sources/Features/IPC/IPCMessage.swift` on the Mac - because one client
+reads both. What kept them together was a sentence in a comment asking whoever
+touched one to remember the other, and it had already failed: Mac encoded
+`type` and `url` for months while the Zig side emitted neither, and four golden
+tests asserted the drifted shape as correct. T90b closed that instance by luck,
+because it happened to touch the very fields that had drifted.
+
+The check reads the Swift encoder's own source. That is what makes it work from
+either seat: the Windows lane has no Swift toolchain and the Mac build never
+runs this file's tests as a shape check, but the source is checked in and both
+seats have it. `SharedDeps.add` embeds
+`macos/Sources/Features/IPC/IPCMessage.swift` as data on every binary it wires
+(`@embedFile` cannot escape its module root, so a relative path is not an
+option); the embed is referenced only from a test, so nothing shipped carries
+it. It went there rather than onto the one test binary because three binaries
+reach `list.zig` - the first attempt put it on `test_exe` alone and
+`test-agent` went red - and the next one to appear must not have to remember.
+
+What it compares is the Mac encoder's field names, order and null-behavior
+against the key order a REAL `serializeResponse` call emits, parsed back out of
+the JSON. Not a second description of the Zig encoder: the wire bytes. Both
+Swift encoding shapes are handled - an explicit `encode(to:)` body mapped
+through `CodingKeys` (so `case pane_type = "type"` resolves), and a plain
+`Encodable` struct whose synthesized encoding follows declaration order.
+`ListStateData`, `WindowData`, `TabData`, `SplitNodeData` and `TerminalData`
+are all covered, and a declaration that is renamed away fails rather than
+passing vacuously.
+
+The deliberate divergences are named rather than papered over. `build` (T52),
+`chrome` (T231), `connection` (T609), `background_tint` (T67) and `session_id`
+(T332) are win32-only, and naming one ASSERTS the Mac does not emit it - so the
+exemption cannot quietly absorb the day Mac grows the same field. Order is only
+half the contract; the other half is which keys survive a null value, so a
+second serialization with every optional empty checks that a key Mac writes
+unconditionally is still there as an explicit null and one it
+`encodeIfPresent`s has vanished.
+
+A drift detector that has never detected a drift is an assertion about nothing,
+so it was made red four ways and reverted each time: a field added to the Zig
+encoder only (`field 8 is 'drift_probe' here and 'type' on Mac`), a field added
+to the Swift encoder only, the Mac growing `background_tint` - which reports
+that the exemption is what has to go, not the assertion - and `encode` changed
+to `encodeIfPresent` on `url`. Each message names the field and the seat.
+
+The "keep them in sync" comment is gone. A rule with an enforcer does not need
+to ask.
+
+Filed: T1292, for the two gaps this leaves standing - value TYPES are unchecked
+(a `pid` that becomes a string still slips through), and `+list` is the only
+payload covered.
+
+Validation: `scripts\floor-lane.ps1 -Lane all` all four green, P1-P3 all pass
+(25/20/16 assertions), `test\win32\ipc-relay.ps1` ALL PASS - it is the
+`guard-due` row that covers `list.zig`, and it stamped.

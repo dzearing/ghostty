@@ -153,6 +153,17 @@ pub fn add(
         step.root_module.addImport("locale-c", c.createModule());
     }
 
+    // The Mac server's `+list` encoder, embedded as data (T370). Both
+    // encoders must emit byte-identical JSON, and neither seat's build
+    // compiles the other's source, so the drift detector in
+    // `src/apprt/ipc/list.zig` reads the checked-in Swift text instead. It
+    // lands here rather than on the one test binary because three of them
+    // reach that file and the next one to appear must not have to remember;
+    // the embed is referenced only from a test, so nothing shipped carries it.
+    step.root_module.addAnonymousImport("macos_ipc_message_swift", .{
+        .root_source_file = b.path("macos/Sources/Features/IPC/IPCMessage.swift"),
+    });
+
     // C imports needed to manage/create PTYs
     switch (target.result.os.tag) {
         .freebsd,
