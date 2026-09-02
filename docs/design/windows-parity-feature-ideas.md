@@ -188,3 +188,14 @@ as the digest that showed them.
 - The installer asks the running Ghoztty to step aside (Restart Manager)
 - A scripted clean-machine rehearsal (install, re-install over a running copy, read the version back everywhere)
 - Let CI MSI build clear the packaging guard
+
+## 2026-09-02
+
+- Pipe anything into a viewer pane (`| ghoztty +view` renders a command's output as a document)
+- Filter a pane while it is still streaming (live pattern filter over arriving output)
+- Lock a pane so stray keys cannot reach it (read-only toggle for a production shell)
+- A tray of every link and path a pane printed (clickable, newest first)
+- Hovering a pane focuses it (opt-in focus-follows-mouse across splits)
+- Hide the tab strip when there is only one tab
+- Which pane is eating my CPU (per-pane child-process CPU/memory readout)
+- Quieter on battery (power-aware render cadence when unplugged and unfocused)
