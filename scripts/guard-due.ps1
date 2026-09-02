@@ -1050,7 +1050,8 @@ $GuardTable = @(
             'src\apprt\win32\update_install.zig',
             'src\apprt\win32\update_check.zig',
             'src\apprt\win32\install_location.zig',
-            'test\win32\update-apply.ps1'
+            'test\win32\update-apply.ps1',
+            'test\win32\lib\ApplierSandbox.ps1'
         )
     },
     # Whether a failed update SAYS anything (T1206). The update-apply row above
@@ -1066,7 +1067,8 @@ $GuardTable = @(
         Covers = @(
             'src\apprt\win32\update_apply.zig',
             'src\apprt\win32\update_install.zig',
-            'test\win32\update-failure-visible.ps1'
+            'test\win32\update-failure-visible.ps1',
+            'test\win32\lib\ApplierSandbox.ps1'
         )
     },
     # The release-channel check itself (T24, T1171): does the app find a newly

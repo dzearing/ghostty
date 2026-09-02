@@ -1,10 +1,12 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-09-02T01:41:51-07:00",
-    "commit":  "c6c80f66d",
+    "generated":  "2026-09-02T01:55:54-07:00",
+    "commit":  "37624a1e0",
     "uncommitted":  [
-                        "test/win32/update-apply.ps1"
+                        "test/win32/lib/ApplierSandbox.ps1",
+                        "test/win32/update-apply.ps1",
+                        "test/win32/update-failure-visible.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -147,6 +149,7 @@
                   "test/win32/launch-preflight-audit.ps1":  "474a31cc4abb0fc92c75e577bb81e1b5a6e9ff9e6548f2438d6b0fd5eead2178",
                   "test/win32/layout-blob-cross-lineage.ps1":  "87f15d32d375a5262334a59d3e8a0f7f37f8d8647c2000686f532c7df1417324",
                   "test/win32/layout-blobs.ps1":  "d91f5b4afad56f13d8fba4d6f00abf44539b9a5e93afadd26acaec53c5413b75",
+                  "test/win32/lib/ApplierSandbox.ps1":  "82870ff2c01dd3d3e36b1b1f8ff7ed7359059245db8e5d88ac9e30838e177bd8",
                   "test/win32/lib/AssertedNothingAudit.ps1":  "1d6653930bb345709b81aa0c6bc480d8a7c09a28e7efb32f85eace39eda26dc3",
                   "test/win32/lib/BodyCompleteAudit.ps1":  "5adfbff59b4fe5cd317adfdafd798630016f623a4cc94bf5c481544b6c3cd042",
                   "test/win32/lib/BrowserLeak.ps1":  "ae41845c0869dc0a37c9104ff6189f07d1e4ede98445bdecbeb3e222f5224826",
@@ -269,9 +272,9 @@
                   "test/win32/test-reach-audit.ps1":  "9987988dde78037ac8545dd70de97e50d2d9312bca3e9c0ee89d0be955eb638e",
                   "test/win32/title-font.ps1":  "946fd12880bb0433a535283fb6146fb7d2a8fd1b2d1f0f74e00fa7ce1720dcb8",
                   "test/win32/title-jitter.ps1":  "305bd304faf09988c8852f7fa69f2c780212b639fb837085b5869ab5457acab7",
-                  "test/win32/update-apply.ps1":  "1702e7177db3732e4792601dc9837a7a0b2509c32c14058f912959ef4a94a536",
+                  "test/win32/update-apply.ps1":  "c26d2dfa2d8fdfa3a667c1cffd2e7e0943cb5feb138a04f900efb5bb0ab5d023",
                   "test/win32/update-check.ps1":  "6485b5d065d48160309375ad57672071b1c38c99acdf63a26f3c1bc4588ed80c",
-                  "test/win32/update-failure-visible.ps1":  "2aa609f410ee44f950354c01637ed81552791e88331178423f5b9686d5748c34",
+                  "test/win32/update-failure-visible.ps1":  "1461a89d59acbfe5b8c66685cf50d786aa51c97e7d5bb64ae683ff6593773647",
                   "test/win32/update-graceful.ps1":  "8dd249a5f108c2f129a2673c857e68808115c8fd963d67ffaef7ab43a3c70944",
                   "test/win32/update-progress.ps1":  "3107586eba654bf2021e46c47be937e37e59a66aee947129ddc5729a9405783d",
                   "test/win32/update-real-msi.ps1":  "a3518108e44ccc5efd0108d261343d5f10ddf3e6412ca80027a822bd2ee61014",

@@ -66,47 +66,17 @@ function Kill-RepoInstances {
     [void](Stop-RepoGhoztty -Exe $exe -AppOnly -SettleMs 500)
 }
 
-# T1268: the applier sections run against a COPY of the build in a scratch
-# install directory, so the process that is allowed to rename ghoztty.exe aside
-# can never be pointed at the one binary the rest of the turn depends on. That
-# copy is not under the repo, so `Stop-RepoGhoztty` refuses it (by design) -
-# this is the path-exact equivalent for it.
-function Kill-SandboxInstances([string]$Path, [int]$SettleMs = 500) {
-    $leaf = Split-Path -Leaf $Path
-    Get-CimInstance Win32_Process -Filter "Name='$leaf'" |
-        Where-Object { $_.ExecutablePath -eq $Path } |
-        ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-    if ($SettleMs -gt 0) { Start-Sleep -Milliseconds $SettleMs }
-}
+# T1268/T1271: the applier sections run against a COPY of the build in a
+# scratch install directory, so the process that is allowed to rename
+# ghoztty.exe aside can never be pointed at the one binary the rest of the turn
+# depends on. The sandbox, the alarm that says the repo build survived, and the
+# repair that puts a sidelined build back all live in lib\ApplierSandbox.ps1 -
+# `update-failure-visible.ps1` drives the same applier and needs the same three.
+. (Join-Path $PSScriptRoot 'lib\ApplierSandbox.ps1')
 
-# T1268, belt and braces: put the repo build back if ANYTHING in this run
-# sidelined it. On 2026-09-01 section 8's applier found zig-out\bin\ghoztty.exe
-# locked by a straggler, renamed it aside so msiexec could write a fresh one,
-# and msiexec then rejected the fake package - leaving the turn with no build at
-# all. The sandbox above is why that cannot happen again; this is what a FUTURE
-# harness reaching the same state would hit instead of stranding the build.
-function Restore-RepoBuild([string]$ExePath) {
-    if (-not $ExePath) { $ExePath = $exe }
-    $binDir = Split-Path $ExePath -Parent
-    $sidelined = @(Get-ChildItem -LiteralPath $binDir -Filter 'ghoztty.exe.old-*' -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -match '^ghoztty\.exe\.old-\d+$' } |
-        Sort-Object LastWriteTime -Descending)
-    if ($sidelined.Count -eq 0) { return }
-    $restored = $false
-    foreach ($s in $sidelined) {
-        if (-not $restored -and -not (Test-Path -LiteralPath $ExePath)) {
-            Move-Item -LiteralPath $s.FullName -Destination $ExePath -Force
-            Write-Host "  T1268: restored $ExePath from $($s.Name)"
-            $restored = $true
-        } else {
-            Remove-Item -LiteralPath $s.FullName -Force -ErrorAction SilentlyContinue
-            Write-Host "  T1268: removed stray $($s.Name)"
-        }
-    }
-}
 # However this script ends - an assertion failure walks off the bottom, a throw
 # does not - the repo build is put back on the way out.
-trap { Restore-RepoBuild; break }
+trap { Restore-RepoBuild -ExePath $exe; break }
 
 # T1206: a non-zero msiexec now raises Ghoztty's own modal and HOLDS it until it
 # is read, so the applier no longer exits on its own after a rejection. That
@@ -332,10 +302,8 @@ Assert ($log7 -notmatch 'msiexec') 'applier(bad): never reached msiexec'
 # exe open is all it takes to leave the turn with no binary. Every assertion
 # below reads the applier's own log, so it holds just as well against the copy.
 Kill-RepoInstances
-$installDir = Join-Path $work 'installdir'
-New-Item -ItemType Directory -Force $installDir | Out-Null
-$installExe = Join-Path $installDir 'ghoztty.exe'
-Copy-Item $exe $installExe -Force
+$sandbox = New-ApplierSandbox -Exe $exe -Root $work
+$installExe = $sandbox.Exe
 $dead = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', 'exit' -PassThru -WindowStyle Hidden
 $null = $dead.Handle
 [void]$dead.WaitForExit(10000)
@@ -368,7 +336,7 @@ Assert (Test-Path $applyMsi) 'applier(run): a package msiexec rejected is kept, 
 Assert (Test-Path $installExe) 'applier(run): the install directory still has its terminal'
 # The relaunch is a real app; it belongs to this harness now. It is the sandbox
 # copy, which lives outside the repo, so it needs its own path-exact stop.
-Kill-SandboxInstances $installExe
+[void](Stop-ApplierSandbox -Sandbox $sandbox)
 Kill-RepoInstances
 
 # -- 9. an applier running out of the install directory refuses ----------
@@ -398,7 +366,7 @@ Assert ($log9 -match 'refusing to install into') 'applier(inside): refused rathe
 Assert ($log9 -notmatch 'is in use; renamed it aside') 'applier(inside): nothing was renamed'
 Assert (Test-Path $installExe) 'applier(inside): the terminal is still where it was'
 Assert ($log9 -match 'relaunched .*ghoztty\.exe as pid \d+') 'applier(inside): still gave the user their terminal back'
-Kill-SandboxInstances $installExe
+[void](Stop-ApplierSandbox -Sandbox $sandbox)
 Kill-RepoInstances
 
 # -- 11. the harness left the repo build alone (T1268) --------------------
@@ -412,13 +380,12 @@ if ($NegativeControl) {
     Copy-Item $exe (Join-Path (Split-Path $exe -Parent) 'ghoztty.exe.old-1788324281') -Force
     Write-Host '  NEGATIVE CONTROL: planted a sidelined repo build'
 }
-$strays = @(Get-ChildItem -LiteralPath (Split-Path $exe -Parent) -Filter 'ghoztty.exe.old-*' -File -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -match '^ghoztty\.exe\.old-\d+$' })
+$strays = @(Get-SidelinedBuild -ExePath $exe)
 Assert (Test-Path $exe) 'harness: the repo build is exactly where it was'
 Assert ($strays.Count -eq 0) "harness: nothing sidelined the repo build ($($strays.Count) stray .old-* left)"
 # Reported first, then repaired: the assertion above is the finding, and a run
 # that quietly fixed the damage before looking would never have one.
-Restore-RepoBuild
+Restore-RepoBuild -ExePath $exe
 
 # -- 12. the repair itself, demonstrated (T1268) --------------------------
 # Section 11 is the alarm; this is the proof that the thing it triggers can
@@ -429,20 +396,20 @@ $restoreDir = Join-Path $work 'restore'
 New-Item -ItemType Directory -Force $restoreDir | Out-Null
 $restoreExe = Join-Path $restoreDir 'ghoztty.exe'
 [IO.File]::WriteAllText((Join-Path $restoreDir 'ghoztty.exe.old-1788324281'), 'the build')
-Restore-RepoBuild $restoreExe
+Restore-RepoBuild -ExePath $restoreExe
 Assert (Test-Path $restoreExe) 'restore: a sidelined build with no ghoztty.exe beside it is moved back'
 Assert ((Test-Path $restoreExe) -and ([IO.File]::ReadAllText($restoreExe) -eq 'the build')) 'restore: it is the sidelined bytes, not an empty file'
 Assert (@(Get-ChildItem -LiteralPath $restoreDir -Filter 'ghoztty.exe.old-*').Count -eq 0) 'restore: nothing sidelined is left behind'
 
 [IO.File]::WriteAllText((Join-Path $restoreDir 'ghoztty.exe.old-1788324282'), 'stale')
-Restore-RepoBuild $restoreExe
+Restore-RepoBuild -ExePath $restoreExe
 Assert ([IO.File]::ReadAllText($restoreExe) -eq 'the build') 'restore: a live ghoztty.exe is never overwritten by a stray'
 Assert (@(Get-ChildItem -LiteralPath $restoreDir -Filter 'ghoztty.exe.old-*').Count -eq 0) 'restore: the stray is swept anyway'
 
 $keepDir = Join-Path $work 'restore-keep'
 New-Item -ItemType Directory -Force $keepDir | Out-Null
 [IO.File]::WriteAllText((Join-Path $keepDir 'ghoztty.exe.old-keep'), 'not a sidelined image')
-Restore-RepoBuild (Join-Path $keepDir 'ghoztty.exe')
+Restore-RepoBuild -ExePath (Join-Path $keepDir 'ghoztty.exe')
 Assert (Test-Path (Join-Path $keepDir 'ghoztty.exe.old-keep')) 'restore: a file that is not a sidelined image is left alone'
 Assert (-not (Test-Path (Join-Path $keepDir 'ghoztty.exe'))) 'restore: and nothing is invented from it'
 

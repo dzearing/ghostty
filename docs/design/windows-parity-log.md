@@ -19911,3 +19911,40 @@ Evidence: three full runs with `zig-out\bin\ghoztty.exe` held open by a
 `FileShare.Read` handle for their whole duration. Green is ALL PASS (52
 assertions) with the build untouched; `-NegativeControl` is 1 FAILED / 51
 passed, exit 1, no guard stamp, and the build still in place afterwards.
+
+## 2026-09-02 - the second update harness stops aiming the applier at the build (T1271)
+
+`test\win32\update-failure-visible.ps1` had the shape T1268 had just removed
+from `update-apply.ps1`: all three of its applier arms passed
+`zig-out\bin\ghoztty.exe` as the install directory. The applier renames an
+image it cannot overwrite aside so msiexec can write a fresh one, and every
+package this script uses is one that never installs - a fake one msiexec
+rejects in arm A, a forced code through the Debug seam in arms B and C, which
+still clear the install directory on the way past. So all three arms could
+sideline the repo build and leave nothing to put it back, three times per run
+instead of once.
+
+All three now install into a throwaway directory holding a copy of the build,
+and a new arm E asserts the repo build is exactly where it was with no
+`ghoztty.exe.old-*` beside it - the check that would have scored red on
+2026-09-01, when the sibling harness finished having left
+`ghoztty.exe.old-1788324281` and no `ghoztty.exe`.
+
+The sandbox, the alarm and the repair are now ONE implementation:
+`test\win32\lib\ApplierSandbox.ps1` (`New-ApplierSandbox`,
+`Stop-ApplierSandbox`, `Get-SidelinedBuild`, `Restore-RepoBuild`), which
+`update-apply.ps1` was converted to as part of this. Copying sixty lines of
+subtle safety code into the second harness is how the third one gets a subtly
+wrong copy; the sandbox also arms `Register-RepoBuildTeardown` on itself, so
+the app the applier relaunches out of it is reaped when the PowerShell exits
+rather than by a hand-written kill at the bottom of each script. Both
+`guard-due.ps1` rows now cover the library, so an edit to it re-arms both
+harnesses instead of neither.
+
+Evidence: full runs of both harnesses with `zig-out\bin\ghoztty.exe` held open
+by a `FileShare.Read` handle throughout - `update-failure-visible` ALL PASS (30
+assertions), `update-apply` ALL PASS (52) - with the build untouched and no
+strays either time. `-NegativeControl` on the new arm is 1 FAILURE / 29 passed,
+exit 1, no stamp, and the planted stray swept afterwards. Floor: lib/none/win32/
+agent ALL LANES PASS; P1/P2/P3 ALL PASS. The seven suite-wide audits that read
+every test script re-ran green over the new library and re-stamped.

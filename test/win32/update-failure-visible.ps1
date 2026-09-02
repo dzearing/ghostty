@@ -18,6 +18,15 @@
 #   C  negative control: an update that succeeds raises NO dialog
 #   D  wiring the compiler does not check: the other silent path, and the
 #      Debug-only seam arm B needs
+#   E  the repo build survived the run (T1271; -NegativeControl proves the
+#      alarm can score red)
+#
+# Every arm hands the applier a THROWAWAY install directory holding a copy of
+# the build (lib\ApplierSandbox.ps1), never zig-out\bin. The applier's job when
+# it meets a locked image is to rename it aside so msiexec can write a fresh
+# one, and the packages here are ones msiexec never accepts - so pointed at the
+# repo build, a single straggler holding ghoztty.exe open leaves the turn with
+# no binary at all (T1268, observed for real on 2026-09-01).
 #
 # Runs on a BACKGROUND Win32 desktop (test/win32/lib/TestDesktop.ps1) with a
 # private IPC endpoint and a per-run LOCALAPPDATA, and never installs anything:
@@ -28,7 +37,8 @@
 
 param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
-    [switch]$Interactive
+    [switch]$Interactive,
+    [switch]$NegativeControl
 )
 
 $ErrorActionPreference = 'Continue'
@@ -39,6 +49,7 @@ $env:GHOZTTY_NO_STARTUP_ESCAPE = '1'
 . (Join-Path $PSScriptRoot 'lib\Isolation.ps1')
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\HarnessLeak.ps1')
+. (Join-Path $PSScriptRoot 'lib\ApplierSandbox.ps1')
 . (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 
 $script:passes = 0
@@ -83,6 +94,14 @@ $td = New-TestDesktop -Interactive:$Interactive
 # tested is what ships.
 $applier = Join-Path $root 'ghoztty-updater.exe'
 Copy-Item $Exe $applier -Force
+
+# ...and the directory it is told to install INTO is a throwaway holding a copy
+# of the build (T1271). See the header: the applier renames a locked image
+# aside, every package here is one msiexec refuses, and nothing ever writes the
+# exe back - so the one binary the rest of the turn depends on is not what that
+# is aimed at. Every assertion below reads the applier's own log or its dialog,
+# so all of them hold just as well against the copy.
+$sandbox = New-ApplierSandbox -Exe $Exe -Root $root
 
 # A file with the compound-document signature and enough bytes to pass the
 # app's own "is this really a package" check, so the rejection under test comes
@@ -166,7 +185,7 @@ try {
 
     $msiA = Join-Path $root 'apply-me.msi'
     New-FakePackage $msiA
-    $appA = Start-Applier 'a' "$(New-DeadPid)|$msiA|$Exe"
+    $appA = Start-Applier 'a' "$(New-DeadPid)|$msiA|$($sandbox.Exe)"
 
     $dlgA = Wait-Dialog $appA.Pid $FEEDBACK_BUDGET_MS
     Assert "A1 the failed update raised Ghoztty's own dialog" ($dlgA -ne [IntPtr]::Zero)
@@ -202,6 +221,7 @@ try {
     Start-Sleep -Milliseconds 1500
     Assert "A11 dismissing it lets the applier finish" (-not (Test-Alive $appA.Pid))
     Assert "A12 a package msiexec rejected is kept, not deleted" (Test-Path $msiA)
+    [void](Stop-ApplierSandbox -Sandbox $sandbox)
     [void](Stop-RepoGhoztty -Exe $Exe -AppOnly -SettleMs 600)
 
     # ========================================================================
@@ -222,7 +242,7 @@ try {
     New-FakePackage $msiB
     $env:GHOZTTY_UPDATE_MSI_CODE = '1618'
     try {
-        $appB = Start-Applier 'b' "$(New-DeadPid)|$msiB|$Exe"
+        $appB = Start-Applier 'b' "$(New-DeadPid)|$msiB|$($sandbox.Exe)"
     } finally {
         Remove-Item env:GHOZTTY_UPDATE_MSI_CODE -ErrorAction SilentlyContinue
     }
@@ -246,6 +266,7 @@ try {
     }
     Start-Sleep -Milliseconds 1500
     Assert "B7 dismissing it lets the applier finish" (-not (Test-Alive $appB.Pid))
+    [void](Stop-ApplierSandbox -Sandbox $sandbox)
     [void](Stop-RepoGhoztty -Exe $Exe -AppOnly -SettleMs 600)
 
     # ========================================================================
@@ -262,7 +283,7 @@ try {
     New-FakePackage $msiC
     $env:GHOZTTY_UPDATE_MSI_CODE = '0'
     try {
-        $appC = Start-Applier 'c' "$(New-DeadPid)|$msiC|$Exe"
+        $appC = Start-Applier 'c' "$(New-DeadPid)|$msiC|$($sandbox.Exe)"
     } finally {
         Remove-Item env:GHOZTTY_UPDATE_MSI_CODE -ErrorAction SilentlyContinue
     }
@@ -279,6 +300,7 @@ try {
     $logC = Get-ApplierLog $appC.Err
     Assert "C4 and the log records a success, not a failure" `
         (($logC -match 'msiexec succeeded') -and ($logC -notmatch 'could not finish updating'))
+    [void](Stop-ApplierSandbox -Sandbox $sandbox)
     [void](Stop-RepoGhoztty -Exe $Exe -AppOnly -SettleMs 600)
 
     # ========================================================================
@@ -302,6 +324,30 @@ try {
     Assert "D5 the dialog title is the one constant both sides read" `
         ($applySrc -match 'pub const failure_title = "Ghoztty could not finish updating";')
 
+    # ========================================================================
+    "== E: the harness left the repo build alone"
+    # ========================================================================
+    # Arms A-C each drive a process whose JOB is to move ghoztty.exe out of the
+    # way when it cannot be overwritten. Whatever they did, they did it to the
+    # sandbox copy: this is the check that would have gone red on 2026-09-01,
+    # when update-apply.ps1 - the same shape, the same applier - finished having
+    # left zig-out\bin\ghoztty.exe.old-1788324281 and no ghoztty.exe.
+    if ($NegativeControl) {
+        # Reconstruct exactly what that run left behind, at the point in the
+        # script where it left it. Planting it any earlier would only prove that
+        # the app's own launch-time sweep works: every arm above starts a real
+        # Ghoztty, and that sweep is what clears a sidelined image.
+        Copy-Item $Exe (Join-Path (Split-Path $Exe -Parent) 'ghoztty.exe.old-1788324281') -Force
+        "  NEGATIVE CONTROL: planted a sidelined repo build"
+    }
+    $strays = @(Get-SidelinedBuild -ExePath $Exe)
+    Assert "E1 the repo build is exactly where it was" (Test-Path $Exe)
+    Assert "E2 nothing sidelined the repo build ($($strays.Count) stray .old-* left)" `
+        ($strays.Count -eq 0)
+    # Reported first, then repaired: the assertion above is the finding, and a
+    # run that quietly fixed the damage before looking would never have one.
+    Restore-RepoBuild -ExePath $Exe
+
     # LAST statement of the top-level try (T1039): an unwind from anywhere
     # above must not reach the verdict as if the run had finished.
     Complete-TestBody
@@ -312,7 +358,12 @@ try {
     if ($savedApply) { $env:GHOZTTY_UPDATE_APPLY = $savedApply }
     $env:LOCALAPPDATA = $savedLocalAppData
     Remove-TestDesktop
+    if ($sandbox) { [void](Stop-ApplierSandbox -Sandbox $sandbox) }
     [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 600)
+    # However this run ended - an assertion walked off the bottom, or something
+    # threw before arm E could even look - the repo build is put back on the way
+    # out. The sandbox is why this should never have anything to do.
+    Restore-RepoBuild -ExePath $Exe
     if ($script:failures -eq 0) { Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue }
     else { Write-Host "logs kept in $root" }
 }
@@ -325,4 +376,4 @@ if ($script:failures -eq 0) {
 }
 
 Write-Host ''
-Write-TestVerdict -Pass $script:passes -Fail $script:failures -Label 'update-failure-visible' -MinPass 24
+Write-TestVerdict -Pass $script:passes -Fail $script:failures -Label 'update-failure-visible' -MinPass 26
