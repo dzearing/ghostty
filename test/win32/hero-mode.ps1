@@ -73,9 +73,35 @@
 # chain (toggle on -> nav -> tile click -> ctrl+shift nav -> toggle off) ran,
 # and it is also T61's no-tree-mutation oracle.
 #
+# WHERE THE SCREENSHOTS GO, AND WHAT THE COMMITTED ONE IS FOR (T1128). This script used to
+# end by writing `artifacts\hero-mode-t59b.png` unconditionally - a TRACKED
+# path - so every ordinary run left the working tree dirty. The go-loop reads a
+# dirty tree at claim time as stranded work from a dead turn, so a routine
+# acceptance run manufactured a false report for the next one, and 13 commits
+# of that file are accidents rather than decisions.
+#
+# That artifact is DOCUMENTATION, not a reference: T59b.md and
+# windows-parity-details.md cite it as the screenshot of the layout this script
+# proves. It is not compared against, and it cannot be: since the migration to
+# the background test desktop the hero pane's terminal glass comes back as a
+# flat fill (the CAPTURE LIMIT above), so a pixel diff against a committed
+# picture would be permanently red for the desktop rather than for the app.
+# Deleting it instead would break two live citations.
+#
+# So: every run writes its shots to -ShotDir ($TEMP by default), and only
+# -UpdateBaseline refreshes the committed copy. What replaces the missing
+# comparison is a floor - Get-TestCaptureContent scores each shot, and a
+# capture that has collapsed to near-uniform FAILS the run instead of being
+# saved silently, which is the check the 133921 -> 41165 byte drop went past.
+#
 # -ExePath: test a different build. Release builds emit no debug log, so
 # log-based assertions auto-skip (geometry is the verdict).
-param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
+#
+# -ShotDir: where the window shots this run takes are written (default $TEMP).
+# -UpdateBaseline: ALSO refresh the committed screenshot in artifacts\. Nothing
+# in git is written without it - see WHERE THE SCREENSHOTS GO above.
+param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive,
+      [string]$ShotDir, [switch]$UpdateBaseline)
 
 # T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
 # of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
@@ -92,6 +118,8 @@ if ($ExePath) { $exe = $ExePath }
 $env:GHOZTTY_PIPE_SUFFIX = "-herotest$PID"
 $errlog = Join-Path $env:TEMP 'ghoztty-hero-mode-stderr.log'
 Remove-Item $errlog -ErrorAction SilentlyContinue
+if (-not $ShotDir) { $ShotDir = $env:TEMP }
+New-Item -ItemType Directory -Force $ShotDir | Out-Null
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\PaneCapture.ps1')
@@ -304,10 +332,35 @@ function Get-ColorRun([string[]]$strip, [int]$tr, [int]$tg, [int]$tb) {
     return @{ Length = $best; Start = $bestAt }
 }
 
+# Saves the shot and RETURNS what is in it, so the caller can assert a floor.
+# A near-uniform capture is still written - a picture of the failure is the
+# most useful thing to have when this goes red - but it is written where the
+# run's own output goes, never over the committed screenshot.
 function Save-WindowShot([IntPtr]$top, [string]$path) {
     $shot = Get-TestWindowPixels -Window $top -Sync
-    try { $shot.Bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png) }
-    finally { Close-TestWindowPixels $shot }
+    try {
+        $shot.Bitmap.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+        return (Get-TestCaptureContent -Shot $shot)
+    } finally { Close-TestWindowPixels $shot }
+}
+
+# THE FLOOR, in one place so the assertion and the baseline gate cannot drift
+# apart. Calibrated on this box 2026-09-02: this window scores 23 distinct /
+# 0.60 top share with the terminal glass flat-filled, and 87 / 0.57 when the
+# glass captures too. A dead capture is 1 / 1.0. The floor is set to separate
+# those, not to police the known surface limit.
+$script:shotFloorDistinct = 8
+$script:shotFloorTopShare = 0.90
+function Test-ShotHasContent($content) {
+    return ($content.Distinct -ge $script:shotFloorDistinct -and
+            $content.TopShare -le $script:shotFloorTopShare)
+}
+
+function Assert-ShotHasContent($content, [string]$label) {
+    Assert (Test-ShotHasContent $content) `
+        ("$label is a picture of a window ($($content.Distinct) distinct colors " +
+         "of $($content.Sampled) sampled, top color $([math]::Round($content.TopShare * 100))%; " +
+         "floor $script:shotFloorDistinct / $([math]::Round($script:shotFloorTopShare * 100))%)")
 }
 
 # ---------------------------------------------------------------------------
@@ -421,7 +474,8 @@ for ($t = 0; $t -lt 5 -and -not $sigChanged; $t++) {
     if ($sig1.Sig -ne $sig2.Sig) { $sigChanged = $true }
 }
 Assert $sigChanged 'carousel thumbnails visibly update while a busy TUI runs in a hidden pane'
-Save-WindowShot $top (Join-Path $env:TEMP 'ghoztty-hero-snap.png')
+Assert-ShotHasContent (Save-WindowShot $top (Join-Path $ShotDir 'ghoztty-hero-snap.png')) `
+    'the phase-1 carousel shot'
 
 # The two `Get-PaneColorCount` probes T214 dropped, RESTORED (T275) - now
 # against the pane's own pixels rather than a PrintWindow flat fill. The claim
@@ -775,9 +829,22 @@ if ($null -ne $big4) {
         }
     }
 
-    $artifacts = Join-Path $PSScriptRoot 'artifacts'
-    New-Item -ItemType Directory -Force $artifacts | Out-Null
-    Save-WindowShot $top (Join-Path $artifacts 'hero-mode-t59b.png')
+    # The run's own copy, always. The committed one in artifacts\ only under
+    # -UpdateBaseline (T1128) - see WHERE THE SCREENSHOTS GO in the header.
+    $shotPath = Join-Path $ShotDir 'hero-mode-t59b.png'
+    $t59bShot = Save-WindowShot $top $shotPath
+    Write-Host "T59b window shot: $shotPath"
+    Assert-ShotHasContent $t59bShot 'the T59b window shot'
+    if ($UpdateBaseline) {
+        if (Test-ShotHasContent $t59bShot) {
+            $artifacts = Join-Path $PSScriptRoot 'artifacts'
+            New-Item -ItemType Directory -Force $artifacts | Out-Null
+            Copy-Item $shotPath (Join-Path $artifacts 'hero-mode-t59b.png') -Force
+            Write-Host 'baseline updated: test\win32\artifacts\hero-mode-t59b.png'
+        } else {
+            Write-Host 'baseline NOT updated: this capture is near-uniform' -ForegroundColor Red
+        }
+    }
 }
 
 } finally {

@@ -229,6 +229,107 @@ if ($null -eq $capText2) { $capText2 = '' }
 Assert (($pc2.ExitCode -eq 0) -and ($capText2 -match 'REACHED THE END') -and ($capText2 -notmatch 'SKIP ALL')) `
     'a capability that IS available lets the run continue, silently'
 Remove-Item -LiteralPath $capProbe, $capOut -Force -ErrorAction SilentlyContinue
+
+# ---------------------------------------------------------------------
+# C. the capture CONTENT FLOOR (T1128).
+#
+# Get-TestCaptureContent is what lets a script assert "this is a picture of
+# something" instead of discovering months later that its saved screenshot had
+# quietly lost two thirds of its bytes. A floor that has only ever been seen
+# saying "fine" is indistinguishable from one that cannot say anything else, so
+# both sides are constructed here from synthetic bitmaps: no desktop, no app,
+# no timing - just the arithmetic, which is the part a caller trusts.
+#
+# The real committed screenshot is the third case, and the one that matters:
+# hero-mode.ps1's floor must clear a window whose terminal glass PrintWindow
+# could not read, because that is a documented limit and not a regression.
+# ---------------------------------------------------------------------
+Write-Host ''
+Write-Host '-- C. capture content floor'
+Add-Type -AssemblyName System.Drawing
+function New-FakeShot($bmp) {
+    [pscustomobject]@{ Bitmap = $bmp; Width = $bmp.Width; Height = $bmp.Height; Left = 0; Top = 0 }
+}
+
+# The floor is READ OUT OF hero-mode.ps1 rather than restated here. A
+# demonstration that carries its own copy of the number stops demonstrating the
+# gate the moment somebody tunes the gate.
+$heroSrc = [System.IO.File]::ReadAllText((Join-Path $PSScriptRoot 'hero-mode.ps1'))
+$mD = [regex]::Match($heroSrc, '\$script:shotFloorDistinct\s*=\s*(\d+)')
+$mT = [regex]::Match($heroSrc, '\$script:shotFloorTopShare\s*=\s*([\d.]+)')
+Assert ($mD.Success -and $mT.Success) 'hero-mode.ps1 still declares the content floor in one place'
+$floorD = if ($mD.Success) { [int]$mD.Groups[1].Value } else { 8 }
+$floorT = if ($mT.Success) { [double]$mT.Groups[1].Value } else { 0.90 }
+Write-Host "  floor read from hero-mode.ps1: $floorD distinct / $floorT top share"
+function Test-Floor($c) { return ($c.Distinct -ge $floorD -and $c.TopShare -le $floorT) }
+
+$flat = New-Object System.Drawing.Bitmap 400, 300
+$g = [System.Drawing.Graphics]::FromImage($flat)
+$g.Clear([System.Drawing.Color]::FromArgb(32, 34, 40)); $g.Dispose()
+$flatC = Get-TestCaptureContent -Shot (New-FakeShot $flat)
+Write-Host "  flat fill: distinct=$($flatC.Distinct) topShare=$([math]::Round($flatC.TopShare,3))"
+Assert ($flatC.Distinct -eq 1 -and $flatC.TopShare -eq 1.0) `
+    "a flat fill scores 1 distinct / 1.0 top share (got $($flatC.Distinct) / $($flatC.TopShare))"
+Assert (-not (Test-Floor $flatC)) `
+    "and is BELOW hero-mode.ps1's floor of $floorD distinct / $([math]::Round($floorT * 100))% top share (the gate fires)"
+
+# NEAR-uniform rather than uniform, and this is the case the whole floor is
+# for: three small blocks of color on an otherwise flat field. That is enough
+# for Test-TestCaptureUniform to answer "not uniform" - it asks only whether
+# every sample MATCHES - so the binary check passes it through, and only a
+# measure of HOW MUCH is there catches it.
+$near = New-Object System.Drawing.Bitmap 400, 300
+$g = [System.Drawing.Graphics]::FromImage($near)
+$g.Clear([System.Drawing.Color]::FromArgb(32, 34, 40))
+$i = 0
+foreach ($c in @([System.Drawing.Color]::Red, [System.Drawing.Color]::Lime, [System.Drawing.Color]::Blue)) {
+    $br = New-Object System.Drawing.SolidBrush $c
+    $g.FillRectangle($br, (20 + $i * 90), 40, 34, 34)
+    $br.Dispose()
+    $i++
+}
+$g.Dispose()
+$nearShot = New-FakeShot $near
+$nearC = Get-TestCaptureContent -Shot $nearShot
+Write-Host "  near-uniform: distinct=$($nearC.Distinct) topShare=$([math]::Round($nearC.TopShare,3))"
+Assert (-not (Test-TestCaptureUniform -Shot $nearShot)) `
+    'the binary uniform check passes a near-uniform capture through (which is why the floor exists)'
+Assert (-not (Test-Floor $nearC)) `
+    "and the content floor still fires on it ($($nearC.Distinct) distinct, top $([math]::Round($nearC.TopShare * 100))%)"
+
+# The positive half: a busy bitmap clears the floor, so the gate is not simply
+# refusing everything.
+$busy = New-Object System.Drawing.Bitmap 400, 300
+$g = [System.Drawing.Graphics]::FromImage($busy)
+for ($y = 0; $y -lt 300; $y += 4) {
+    for ($x = 0; $x -lt 400; $x += 4) {
+        $br = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::FromArgb(
+            ($x % 200) + 20, ($y % 180) + 30, (($x + $y) % 150) + 40))
+        $g.FillRectangle($br, $x, $y, 4, 4)
+        $br.Dispose()
+    }
+}
+$g.Dispose()
+$busyC = Get-TestCaptureContent -Shot (New-FakeShot $busy)
+Write-Host "  busy: distinct=$($busyC.Distinct) topShare=$([math]::Round($busyC.TopShare,3))"
+Assert (Test-Floor $busyC) `
+    "a bitmap with real content clears the floor ($($busyC.Distinct) distinct, top $([math]::Round($busyC.TopShare * 100))%)"
+
+# And the committed screenshot itself, which is the calibration this floor was
+# set from: the hero window with its terminal glass flat-filled must PASS.
+$refPng = Join-Path $PSScriptRoot 'artifacts\hero-mode-t59b.png'
+if (Test-Path -LiteralPath $refPng) {
+    $refBmp = [System.Drawing.Bitmap]::FromFile($refPng)
+    $refC = Get-TestCaptureContent -Shot (New-FakeShot $refBmp)
+    Write-Host "  committed hero screenshot: distinct=$($refC.Distinct) topShare=$([math]::Round($refC.TopShare,3))"
+    Assert (Test-Floor $refC) `
+        "the committed hero screenshot clears the floor ($($refC.Distinct) distinct, top $([math]::Round($refC.TopShare * 100))%)"
+    $refBmp.Dispose()
+} else {
+    Assert $false "the committed hero screenshot is missing ($refPng)"
+}
+$flat.Dispose(); $near.Dispose(); $busy.Dispose()
+
 Kill-RepoInstances
 Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive

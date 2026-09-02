@@ -3493,6 +3493,63 @@ function Test-TestCaptureUniform {
     return $true
 }
 
+<#
+How much is in this capture? Test-TestCaptureUniform above answers the binary
+question - is EVERY sampled pixel the same color - and a capture only has to
+keep one stray pixel to slip past it. This answers the same question as a pair
+of NUMBERS, so "the capture collapsed" is something a script can assert a floor
+against instead of eyeballing a file size afterwards.
+
+T1128: `hero-mode.ps1` saved a window shot on every run and asserted nothing
+about it, and the saved file quietly went from 133921 to 41165 bytes - the
+signature of an image that has lost most of its content - while the run scored
+ALL PASS. A byte count is not available to the script that took the picture;
+these two numbers are.
+
+  Distinct  - how many distinct colors the grid sampled.
+  TopShare  - the fraction of samples that are the single most common color.
+
+A blank capture is `Distinct = 1, TopShare = 1.0`. Real window chrome over a
+surface PrintWindow could not read scores around 23 / 0.60 (measured on this
+box, 2026-09-02); a fully painted window of the same size scores 87 / 0.57. So
+a floor of `Distinct >= 8` with `TopShare <= 0.90` separates "the capture died"
+from "a known region of this window does not capture", which is a documented
+limit and must not read as a regression.
+
+Sampled on a grid rather than every pixel: GetPixel is a per-call marshal, and
+2400 of them is milliseconds where 1.26M is a visible pause in every run.
+#>
+function Get-TestCaptureContent {
+    param(
+        [Parameter(Mandatory = $true)]$Shot,
+        [int]$Inset = 8,
+        [int]$Samples = 48
+    )
+    $x1 = $Shot.Width - $Inset
+    $y1 = $Shot.Height - $Inset
+    if ($x1 -le $Inset -or $y1 -le $Inset) {
+        return [pscustomobject]@{ Distinct = 0; TopShare = 1.0; Sampled = 0 }
+    }
+    $stepX = [math]::Max(1, [int](($x1 - $Inset) / $Samples))
+    $stepY = [math]::Max(1, [int](($y1 - $Inset) / $Samples))
+    $hist = @{}
+    $n = 0
+    for ($y = $Inset; $y -lt $y1; $y += $stepY) {
+        for ($x = $Inset; $x -lt $x1; $x += $stepX) {
+            $c = $Shot.Bitmap.GetPixel($x, $y).ToArgb()
+            $n++
+            if ($hist.ContainsKey($c)) { $hist[$c]++ } else { $hist[$c] = 1 }
+        }
+    }
+    if ($n -eq 0) { return [pscustomobject]@{ Distinct = 0; TopShare = 1.0; Sampled = 0 } }
+    $top = ($hist.Values | Measure-Object -Maximum).Maximum
+    return [pscustomobject]@{
+        Distinct = $hist.Count
+        TopShare = [double]$top / $n
+        Sampled  = $n
+    }
+}
+
 function Get-TestWindowPixels {
     param(
         [Parameter(Mandatory = $true)][IntPtr]$Window,
