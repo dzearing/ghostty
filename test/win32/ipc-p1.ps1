@@ -56,6 +56,11 @@ function Stop-DebugGhoztty {
 function Ghoz([string[]]$GhozArgs) {
     return Invoke-OnTestDesktop -Exe $Exe -Arguments $GhozArgs
 }
+# T1285: a call the run cannot continue without - see lib\FloorFixture.ps1.
+. (Join-Path $PSScriptRoot 'lib\FloorFixture.ps1')
+function Need([string]$What, [string[]]$GhozArgs) {
+    return Need-Ghoz -What $What -GhozArgs $GhozArgs -Exe $Exe
+}
 
 function Get-List {
     return (Ghoz @('+list')).Output
@@ -87,13 +92,19 @@ $td = New-TestDesktop
 
 & {
 
+Invoke-FloorBody {
+
 Stop-DebugGhoztty
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== 1: +new-window auto-launch from cold, all basic flags"
-$r = Ghoz @('+new-window', '--target=p1win', '--title=P1Title', '--command=echo p1-marker')
+# T1285: this is both an assertion AND the fixture every later section needs, so
+# it is scored and then, if it did not come up, the run stops here rather than
+# blaming +close and +list for a window that was never built.
+$r = Need 'the p1win fixture window' @('+new-window', '--target=p1win', '--title=P1Title', '--command=echo p1-marker')
 Assert "exit 0" ($r.ExitCode -eq 0)
 $list = Wait-ListMatch '\[target: p1win\]'
+Need-Listed 'the p1win fixture window' '\[target: p1win\]' $list
 Assert-GhozttyIsolated -Exe $Exe
 Assert "window registered under target" ($list -match '\[target: p1win\]')
 Assert "title override shows" ($list -match 'P1Title')
@@ -106,7 +117,7 @@ $list = Get-List
 Assert "still exactly one p1win" (([regex]::Matches($list, '\[target: p1win\]')).Count -eq 1)
 
 "== 3: inline split + named pane + explicit cwd"
-$r = Ghoz @('+new-window', '--target=p1ide', '--split=down', '--split-command=echo split-pane', '--name=p1term', '--working-directory=C:\Windows')
+$r = Need 'the p1ide fixture window' @('+new-window', '--target=p1ide', '--split=down', '--split-command=echo split-pane', '--name=p1term', '--working-directory=C:\Windows')
 Assert "exit 0" ($r.ExitCode -eq 0)
 # Wait on the cwd (the last field to settle: it is served from the pane's
 # cached pwd, T111b); when it shows, the window and pane rows are there too.
@@ -123,7 +134,8 @@ Assert "exec window registered" ($list -match '\[target: p1exec\]')
 
 "== 5: json shape"
 $json = $null
-try { $json = (Ghoz @('+list', '--json')).Output | ConvertFrom-Json } catch {}
+# T1285: STDOUT alone - the CLI's own diagnostics share the merged stream.
+try { $json = (Ghoz @('+list', '--json')).StdOut | ConvertFrom-Json } catch {}
 Assert "json parses" ($null -ne $json)
 Assert "success true" ($json.success -eq $true)
 Assert "windows array present" ($null -ne $json.data.windows)
@@ -168,6 +180,8 @@ if (-not $second.TimedOut) { Assert "exit code 0" ($second.ExitCode -eq 0) }
 Start-Sleep -Seconds 2
 $after = ([regex]::Matches((Get-List), '(?m)^Window:')).Count
 Assert "window count grew" ($after -eq ($before + 1))
+
+}  # Invoke-FloorBody - teardown below runs whether or not the body stopped early
 
 "== teardown"
 Stop-DebugGhoztty

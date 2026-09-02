@@ -44,11 +44,19 @@ function Stop-DebugGhoztty {
 function Ghoz([string[]]$GhozArgs) {
     return Invoke-OnTestDesktop -Exe $Exe -Arguments $GhozArgs
 }
+# T1285: a call the run cannot continue without - see lib\FloorFixture.ps1.
+. (Join-Path $PSScriptRoot 'lib\FloorFixture.ps1')
+function Need([string]$What, [string[]]$GhozArgs) {
+    return Need-Ghoz -What $What -GhozArgs $GhozArgs -Exe $Exe
+}
 function Get-List {
     return (Ghoz @('+list')).Output
 }
 function Get-IdeJson {
-    $j = (Ghoz @('+list', '--json')).Output | ConvertFrom-Json
+    # T1285: the JSON comes off STDOUT alone. Sharing one stream with the CLI's
+    # diagnostics is how a 5s "Waiting for Ghoztty to answer" notice turned a
+    # slow answer into "Invalid JSON primitive: Waiting."
+    $j = (Ghoz @('+list', '--json')).StdOut | ConvertFrom-Json
     $j.data.windows | Where-Object { $_.target -eq 'p2ide' }
 }
 
@@ -73,14 +81,16 @@ $td = New-TestDesktop
 
 & {
 
+Invoke-FloorBody {
+
 Stop-DebugGhoztty
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== 1: three-pane layout by name (docs/claude/cli.md example shape)"
-[void](Ghoz @('+new-window', '--target=p2ide'))
+[void](Need 'the p2ide fixture window' @('+new-window', '--target=p2ide'))
 # Cold-launch guard first (T379); the settle sleep after it stays, because the
 # later +send-keys sections need the pane's shell up, not just the window row.
-[void](Wait-ListMatch '\[target: p2ide\]')
+Need-Listed 'the p2ide fixture window' '\[target: p2ide\]' (Wait-ListMatch '\[target: p2ide\]')
 Start-Sleep -Seconds 3
 # Before the first +send-keys: prove the instance answering is ours.
 Assert-GhozttyIsolated -Exe $Exe
@@ -144,6 +154,8 @@ Assert "tab title tracks shell" ($list -match 'P2-SHELL-FIGHTS')
 "== 8: +rename missing target errors"
 $r = Ghoz @('+rename', '--target=p2ghost', '--title=x')
 Assert "nonzero exit" ($r.ExitCode -ne 0)
+
+}  # Invoke-FloorBody - teardown below runs whether or not the body stopped early
 
 "== teardown"
 [void](Ghoz @('+close', '--target=p2ide'))

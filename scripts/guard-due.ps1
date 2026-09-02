@@ -2241,6 +2241,28 @@ $GuardTable = @(
             'test\win32\test-desktop-harness.ps1'
         )
     },
+    # The P1-P3 floor's fixture gate (T1285). The floor is what CLAUDE.md names
+    # as the bar for every change, and on 2026-09-02 it scored sixteen product
+    # failures for an app that had simply stopped answering - its fixture verbs
+    # were called with `[void](...)`, so the one thing that would have said so
+    # was thrown away. lib\FloorFixture.ps1 is the refusal that replaced them,
+    # and a refusal is only a refusal while it can still fire: section B of the
+    # harness constructs an unreachable app and demands ONE setup failure rather
+    # than a cascade. The three floor scripts ride along because they are the
+    # only callers, so an edit that quietly reverts one back to `[void]` has to
+    # answer to the same harness. About a minute.
+    [pscustomobject]@{
+        Name   = 'ipc-floor-setup'
+        Script = 'test\win32\ipc-floor-setup.ps1'
+        Stamp  = 'test\win32\ipc-floor-setup.stamp.json'
+        Covers = @(
+            'test\win32\lib\FloorFixture.ps1',
+            'test\win32\ipc-floor-setup.ps1',
+            'test\win32\ipc-p1.ps1',
+            'test\win32\ipc-p2.ps1',
+            'test\win32\ipc-p3.ps1'
+        )
+    },
     # The build-mode gate itself (T350, tightened by T1158). BuildMode.ps1 was
     # only ever covered by the build-fresh row above, whose script grades the
     # FRESHNESS half - so the gate's own harness, build-mode-guard.ps1, had no

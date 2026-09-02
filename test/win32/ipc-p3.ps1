@@ -45,12 +45,19 @@ function Stop-DebugGhoztty {
 function Ghoz([string[]]$GhozArgs) {
     return Invoke-OnTestDesktop -Exe $Exe -Arguments $GhozArgs
 }
+# T1285: a call the run cannot continue without - see lib\FloorFixture.ps1.
+. (Join-Path $PSScriptRoot 'lib\FloorFixture.ps1')
+function Need([string]$What, [string[]]$GhozArgs) {
+    return Need-Ghoz -What $What -GhozArgs $GhozArgs -Exe $Exe
+}
 function Get-P3Title {
     $m = [regex]::Match((Ghoz @('+list')).Output, '(?m)^Window: "([^"]*)" \[target: p3\]')
     $m.Groups[1].Value
 }
 function Get-P3Json {
-    $j = (Ghoz @('+list', '--json')).Output | ConvertFrom-Json
+    # T1285: STDOUT alone - a CLI diagnostic sharing the stream is how a slow
+    # answer read as a malformed one.
+    $j = (Ghoz @('+list', '--json')).StdOut | ConvertFrom-Json
     $j.data.windows | Where-Object { $_.target -eq 'p3' }
 }
 
@@ -75,20 +82,22 @@ $td = New-TestDesktop
 
 & {
 
+Invoke-FloorBody {
+
 Stop-DebugGhoztty
 Assert-GhozttyPrivateEndpoint -Exe $Exe
 
 "== setup: window + named panes"
-[void](Ghoz @('+new-window', '--target=p3'))
+[void](Need 'the p3 fixture window' @('+new-window', '--target=p3'))
 # Cold-launch guard first (T379); the settle sleep after it stays, because the
 # +send-keys sections need the pane's shell up, not just the window row.
-[void](Wait-ListMatch '\[target: p3\]')
+Need-Listed 'the p3 fixture window' '\[target: p3\]' (Wait-ListMatch '\[target: p3\]')
 Start-Sleep -Seconds 3
 # Before the first +send-keys: prove the instance answering is ours.
 Assert-GhozttyIsolated -Exe $Exe
-[void](Ghoz @('+split', '--target=p3', '--name=p3a', '--direction=right'))
+[void](Need 'the p3a fixture pane' @('+split', '--target=p3', '--name=p3a', '--direction=right'))
 Start-Sleep -Seconds 1
-[void](Ghoz @('+split', '--target=p3', '--name=p3b', '--direction=down'))
+[void](Need 'the p3b fixture pane' @('+split', '--target=p3', '--name=p3b', '--direction=down'))
 Start-Sleep -Seconds 2
 
 "== 1: +read echoes back known strings byte-accurate"
@@ -149,6 +158,8 @@ Assert "duplicate errors" ($r.ExitCode -ne 0)
 $missing = '{"pane":"nope"}'
 $r = Ghoz @('+rearrange', '--target=p3', ('--layout=' + ($missing -replace '"','\"')))
 Assert "unknown pane errors" ($r.ExitCode -ne 0)
+
+}  # Invoke-FloorBody - teardown below runs whether or not the body stopped early
 
 "== teardown"
 [void](Ghoz @('+close', '--target=p3'))

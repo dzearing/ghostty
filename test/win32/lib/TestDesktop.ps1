@@ -522,9 +522,20 @@ public class GhozttyTestDesktop {
     // (LastError says why). A timeout terminates the child rather than leaking
     // it onto a desktop nobody will look at again.
     public string RunProcess(string exe, string args, string cwd, string outPath, int timeoutMs) {
+        return RunProcess(exe, args, cwd, outPath, null, timeoutMs);
+    }
+
+    // T1285: the same, with the child's STDERR going to its own file. A verb
+    // whose stdout is machine-readable (`+list --json`) shares one stream with
+    // every diagnostic the CLI prints, and the CLI does print: at 5s
+    // `ipc_timeout.writeNotice` says it is still waiting. That notice landed in
+    // front of the JSON and `ConvertFrom-Json` failed with "Invalid JSON
+    // primitive: Waiting." - so a slow answer read as a malformed one, in a
+    // floor whose whole job is to tell those apart.
+    public string RunProcess(string exe, string args, string cwd, string outPath, string errPath, int timeoutMs) {
         return (string)Run(delegate() {
             IntPtr hProc;
-            int procId = SpawnCore(exe, args, cwd, outPath, out hProc);
+            int procId = SpawnCore(exe, args, cwd, outPath, errPath, out hProc);
             if (procId == 0) return "";
             uint waited = WaitForSingleObject(hProc, (uint)timeoutMs);
             uint code = 259;
@@ -541,13 +552,17 @@ public class GhozttyTestDesktop {
     }
 
     int SpawnCore(string exe, string args, string cwd, string stderrPath, out IntPtr hProcess) {
+        return SpawnCore(exe, args, cwd, stderrPath, null, out hProcess);
+    }
+
+    int SpawnCore(string exe, string args, string cwd, string stderrPath, string errPath, out IntPtr hProcess) {
         hProcess = IntPtr.Zero;
         {
             var si = new STARTUPINFO();
             si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
             if (!Interactive) si.lpDesktop = "WinSta0\\" + Name;
 
-            IntPtr hErr = IntPtr.Zero, hNul = IntPtr.Zero;
+            IntPtr hErr = IntPtr.Zero, hNul = IntPtr.Zero, hErr2 = IntPtr.Zero;
             bool inherit = false;
             uint flags = 0x08000000; // CREATE_NO_WINDOW: without it the child's
                                      // log floods the harness's own stdout.
@@ -558,9 +573,16 @@ public class GhozttyTestDesktop {
                 // GENERIC_WRITE, share read+write, CREATE_ALWAYS, normal.
                 hErr = CreateFileW(stderrPath, 0x40000000, 3, ref sa, 2, 0x80, IntPtr.Zero);
                 hNul = CreateFileW("NUL", 0x80000000, 3, ref sa, 3, 0x80, IntPtr.Zero);
+                // T1285: a second file only when the caller asked for the two
+                // streams apart; with errPath null the child keeps the merged
+                // handle every existing caller was written against.
+                if (!string.IsNullOrEmpty(errPath)) {
+                    hErr2 = CreateFileW(errPath, 0x40000000, 3, ref sa, 2, 0x80, IntPtr.Zero);
+                    if (hErr2 == new IntPtr(-1)) hErr2 = IntPtr.Zero;
+                }
                 if (hErr != IntPtr.Zero && hErr != new IntPtr(-1)) {
                     si.dwFlags |= 0x00000100; // STARTF_USESTDHANDLES
-                    si.hStdError = hErr;
+                    si.hStdError = (hErr2 != IntPtr.Zero) ? hErr2 : hErr;
                     si.hStdOutput = hErr;
                     si.hStdInput = hNul;
                     inherit = true;
@@ -573,6 +595,7 @@ public class GhozttyTestDesktop {
                 IntPtr.Zero, string.IsNullOrEmpty(cwd) ? null : cwd, ref si, out pi);
             int err = Marshal.GetLastWin32Error();
             if (hErr != IntPtr.Zero && hErr != new IntPtr(-1)) CloseHandle(hErr);
+            if (hErr2 != IntPtr.Zero) CloseHandle(hErr2);
             if (hNul != IntPtr.Zero && hNul != new IntPtr(-1)) CloseHandle(hNul);
             if (!ok) { LastError = "CreateProcessW failed: " + err; return 0; }
             CloseHandle(pi.hThread);
@@ -2235,16 +2258,26 @@ function Invoke-OnTestDesktop {
         Clear-TestWindowPlacement | Out-Null
     }
     $argLine = ($Arguments | ForEach-Object { if ($_ -match '\s') { '"' + $_ + '"' } else { $_ } }) -join ' '
-    $out = Join-Path $env:TEMP ("ghoztty-testdesk-cli-$PID-" + [guid]::NewGuid().ToString('N').Substring(0, 8) + '.txt')
+    $stem = Join-Path $env:TEMP ("ghoztty-testdesk-cli-$PID-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    $out = "$stem.txt"
+    $err = "$stem.err.txt"
     try {
-        $res = $td.RunProcess($Exe, $argLine, $WorkingDirectory, $out, [int]($TimeoutSec * 1000))
+        $res = $td.RunProcess($Exe, $argLine, $WorkingDirectory, $out, $err, [int]($TimeoutSec * 1000))
         if ([string]::IsNullOrEmpty($res)) { throw "Invoke-OnTestDesktop failed: $($td.LastError)" }
         $parts = $res -split ':'
-        $text = ''
-        if (Test-Path -LiteralPath $out) {
-            $text = (Get-Content -LiteralPath $out -Raw -ErrorAction SilentlyContinue)
-            if ($null -eq $text) { $text = '' }
+        $readAll = {
+            param($path)
+            if (-not (Test-Path -LiteralPath $path)) { return '' }
+            $t = (Get-Content -LiteralPath $path -Raw -ErrorAction SilentlyContinue)
+            if ($null -eq $t) { '' } else { $t }
         }
+        $stdout = & $readAll $out
+        $stderr = & $readAll $err
+        # T1285: `Output` stays the two streams together, because ~50 scripts
+        # read an error SENTENCE out of it. What is new is that a caller with a
+        # machine-readable answer to parse can now ask for the half that carries
+        # it, instead of hoping the CLI stayed quiet.
+        $text = $stdout + $stderr
         $procId = [int]$parts[1]
         # A CLI that auto-launched the app leaves the GUI behind on purpose, and
         # it is the GUI - not this CLI - that the desktop's leak check should
@@ -2255,11 +2288,14 @@ function Invoke-OnTestDesktop {
         return [pscustomobject]@{
             ExitCode = [int]$parts[0]
             Output   = $text
+            StdOut   = $stdout
+            StdErr   = $stderr
             Pid      = $procId
             TimedOut = ($parts[2] -eq 'timeout')
         }
     } finally {
         Remove-Item -LiteralPath $out -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $err -Force -ErrorAction SilentlyContinue
     }
 }
 

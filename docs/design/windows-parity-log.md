@@ -20205,3 +20205,55 @@ split-dim-viewer measure an empty colour off a GDI-painted overlay), T1284 (the
 chooser close-chord fails its own positive control). Those three are the reds
 whose cause is not settled, and guessing at them here would have been the thing
 this task exists to stop.
+
+## 2026-09-02 - T1285: the floor stops blaming the product for an app it cannot reach
+
+The title of the task was a hypothesis and it was wrong, which is half the
+finding. `ipc-p1; ipc-p2; ipc-p3` was run back to back six times - eighteen runs -
+and every one was ALL PASS, with wall times identical run to run (10s / 22s /
+32s). The order the three are run in is not the variable, so there is nothing
+one leaves behind for the next to trip over.
+
+What there IS: an intermittent red that the floor reports as sixteen lies. It
+was reproduced once, P2 scoring `16 FAILURE(S)` between two green runs, and its
+transcript names two harness defects rather than a product one.
+
+The first is a shared stream. `Invoke-OnTestDesktop` handed the child ONE file
+for stdout and stderr, so when the app was slow the CLI's own five-second
+"Waiting for Ghoztty to answer '+list'" notice (`src/os/ipc_timeout.zig`) landed
+in front of the JSON and `ConvertFrom-Json` failed with "Invalid JSON primitive:
+Waiting." A slow answer scored as a malformed one, in the floor whose job is
+telling those apart. The child's streams now come back separately; `.Output`
+still carries both, because some fifty scripts read an error SENTENCE out of it,
+and the three floor scripts parse `+list --json` off `.StdOut` alone.
+
+The second is a fixture nobody checked. P2 and P3 built theirs with
+`[void](Ghoz @('+new-window', '--target=p2ide'))` and `[void](Wait-ListMatch
+...)` - both the exit code and the answer to "did it appear?" discarded - so a
+window that never came up produced sixteen lines blaming `+split`, `+send-keys`
+and `+rename`, none of which had been reached. `lib\FloorFixture.ps1` is the
+replacement: `Need-Ghoz` reads the answer, treats the CLI's own "still waiting"
+notice as a failure even behind a zero exit, and ends the run with ONE
+`FAIL SETUP:` block naming the verb, the elapsed time and what the CLI said on
+each stream. Not a retry - a retry would hand back a green run over the same
+unreachable app; this turns sixteen wrong answers into one right one.
+
+Two leads were measured and dropped rather than written up as causes. The
+agent's `sessions.json` is genuinely stale cross-run state that
+`lib\CleanSlate.ps1` never clears - after a floor run it held five PINNED
+sessions from earlier runs, one still carrying P1's `echo p1-marker` - but a
+seeded 24-session store and the real one both left `+new-window` at 300-450ms
+and `+split` under 150ms and resurrected no holders, so it is T1290 and not this.
+A freshly written, Defender-cold pair of binaries was green too.
+
+Validation: `test\win32\ipc-floor-setup.ps1` ALL PASS (10 assertions). Section A
+proves the streams come back apart and that `Output` still carries both; section
+B is the demonstration a new refusal owes (go.md) - it constructs an unreachable
+app with `GHOZTTY_IPC_TIMEOUT_MS=1` and demands exactly one setup failure with no
+cascade behind it, and it scored 4 FAILURE(S) against the first cut of the fix,
+which is how an evidence block swallowed by `[void](Need ...)` was caught.
+`guard-due.ps1` carries an `ipc-floor-setup` row over the new library and the
+three floor scripts. Floor: four zig lanes, P1-P3 singly and 18-in-order, and the
+seven audits the edit made due.
+
+Filed: T1290 (the clean slate leaves the agent's session store behind).
