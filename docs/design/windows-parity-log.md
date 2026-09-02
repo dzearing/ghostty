@@ -9,6 +9,52 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-02: T1264, T1265 - **A pane that comes back from a dead session says so again.** The faint `--- session restarted ---` line between the replayed scrollback and the fresh shell was missing on the keystroke-relaunch path everywhere, and on the automatic path at some window sizes and not others. Two defects, one symptom.
+  The first is that **nobody drew it**. The agent bakes the divider into the ring
+  at agent-restart time only (`preloadRingSnapshot`). A session whose shell dies
+  under a still-RUNNING agent never goes near that path - but its ring is
+  non-empty all the same, so `RELAUNCHED.replayed` came back true, the viewer
+  suppressed its own divider exactly as the contract tells it to, and the line
+  existed nowhere. `appendRestartDivider` is now idempotent (it returns if the
+  ring already ends with one) and runs on EVERY relaunch, so the reboot path
+  keeps the one it preloaded and the tombstone path gets the one it never had.
+  Exactly one line, ever, is now a property of one function instead of an
+  agreement between two processes.
+  The second is that **the respawned shell painted over it**. Whatever is on the
+  active screen when the fresh child's first bytes arrive is overwritten -
+  conhost hands over its whole screen buffer as absolutely-positioned VT - and
+  the divider is the last line of the replay. So it survived or vanished
+  according to how the replay happened to sit in the window, which is why the
+  same assertion passed on the user's desktop and failed on the test desktop.
+  The viewer now parks the replayed screen into SCROLLBACK at the replay's end
+  offset before the repaint can reach it: the same T666 move the attach path
+  already makes, reached through a new additive `RELAUNCHED.replay_bytes` so the
+  viewer knows where that boundary is. Geometry stops being load-bearing.
+  **The negative control is the part worth keeping.** With the five source files
+  stashed and the two binaries rebuilt, the script reproduced A10, A11 and B7 red
+  on the test desktop - the exact three failures the task described; restored and
+  rebuilt, ALL PASS. That is the difference between "the tests are green" and
+  "this change is why".
+  T1265 rode along, because the divider was the only thing blocking it and the
+  migration is what proves the fix is geometry-independent rather than lucky:
+  `session-relaunch.ps1` now starts the app with `Start-OnTestDesktop` and the CLI
+  with `Invoke-OnTestDesktop`, its `@user-desktop-launch` declaration is deleted,
+  and `-UserDesktop` stays as a debugging aid for a human who wants to watch a
+  relaunch happen. `lib\TestDesktop.ps1`'s pending list is now empty: the only
+  entries left are the permanent exceptions.
+  Floor: all four lanes PASS (lib/none/win32/agent), ipc-p1/p2/p3 ALL PASS,
+  `session-relaunch.ps1` ALL PASS both ways, and every harness these edits made
+  due re-run green - holder-volume, session-vanished, pane-ingest-lag,
+  session-relaunch-notify, agent-relay-session-e2e, isolation-meta,
+  launch-preflight, verdict-exit, cleanslate, stderr-capture, desktop-launch,
+  test-desktop. Three new unit tests pin the one-divider rule.
+  Also parked this turn: **T1261** (watch the first automatic end-of-day publish)
+  went to `blocked(docker-down)`. Its whole content is watching a real publish
+  fire, and `daily-publish.ps1 -Check` reports the SKIP path because Docker
+  Desktop is off - starting it is the user's call. Everything else the publish
+  needs was verified present so the first real firing has one variable and not
+  three, and the `unblock:` condition says so.
+
 - 2026-09-01: T1241 - **The last of the install, update and diagnostics acceptance scripts stopped opening windows on the user's desktop.** Batch 4 of T1193's four, and the one that closes the list: `clipboard-retry`, `crash-diagnostics`, `install-prepare`, `path-selfheal`, `reset-context`, `soak`, `update-apply`, `update-check`, `wheel-scroll`. GUI launches went to `Start-OnTestDesktop`, waited CLI steps to `Invoke-OnTestDesktop`, and the declaration list in `lib\TestDesktop.ps1` is down from 10 pending to 1 - `session-relaunch.ps1`, which T1265 holds behind T1264. Every script ran green individually on the box.
   Two of the nine were not mechanical, and both failed the same way: **a private
   P/Invoke that enumerates the CALLER's desktop.** `wheel-scroll.ps1` carried its

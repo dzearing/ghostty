@@ -1,16 +1,11 @@
 {
     "guard":  "cleanslate",
     "script":  "test/win32/cleanslate-audit.ps1",
-    "generated":  "2026-09-01T23:21:07-07:00",
-    "commit":  "ee910c4bb",
+    "generated":  "2026-09-02T01:02:42-07:00",
+    "commit":  "3f3f7b560",
     "uncommitted":  [
-                        "test/win32/asserted-nothing.ps1",
-                        "test/win32/daily-publish.ps1",
-                        "test/win32/install-launch.ps1",
-                        "test/win32/install-ownership.ps1",
-                        "test/win32/one-installer.ps1",
-                        "test/win32/soak.ps1",
-                        "test/win32/viewer-find.ps1"
+                        "test/win32/lib/TestDesktop.ps1",
+                        "test/win32/session-relaunch.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -182,7 +177,7 @@
                   "test/win32/lib/SkipAudit.ps1":  "1f144bf0f762eebc385656df1fa39d7629363d44164393de241248c4a231eade",
                   "test/win32/lib/StderrCaptureAudit.ps1":  "69d0a25615d35acc06bf6c1471016186163ae1881ae70a12461425546ac4b7d8",
                   "test/win32/lib/TestClient.ps1":  "98b5449096d7103ec31d8eb19b2d0d84985c48fddc88a5871eeb641ec43091f8",
-                  "test/win32/lib/TestDesktop.ps1":  "6c500324784ec7aedf027c8fd1b27a7d7aad612a310d1f2579b6c40bc1284608",
+                  "test/win32/lib/TestDesktop.ps1":  "57e9793314ac6538f3c0489dc4db3399290473d7c6b83e855b88dd2c912386dc",
                   "test/win32/lib/TestReachAudit.ps1":  "3b2fb64aee74f3451127f4f9776141f5781dd210a6fdf0019410485664f0a840",
                   "test/win32/lib/TestScore.ps1":  "1bc571121b1b60ce5d9b63a0e1c8ebf23f6da575f8e9f7dab1a410cbc2888acc",
                   "test/win32/lib/ThrowawayProduct.ps1":  "ae41da0116447e2a9d7beea82575bd9843cd819e6e007a17d89383abf68200b5",
@@ -242,7 +237,7 @@
                   "test/win32/session-persistence.ps1":  "f3c1e45d764a320f9f5a97979350697c1556fcc26a1b9ea71c1824abbd080a9c",
                   "test/win32/session-reattach.ps1":  "cb73635c3f3503ffc470a75e9a65ef39a5adb30496149ed22c92bfd360a4a1ea",
                   "test/win32/session-reattach-zombie.ps1":  "182b955a0eef9125ff18b57e946d890d9d91797a590d4b943e603465baef61e6",
-                  "test/win32/session-relaunch.ps1":  "530b223db8c36bd35f9d5e8e63c4ed1ecdf44bd32039c3144a19586cefe5d764",
+                  "test/win32/session-relaunch.ps1":  "2463fcfa34a6875b1ce2d1f3eda42abf642b05588835efed4e3258af45f08a28",
                   "test/win32/session-relaunch-notify.ps1":  "2164bd5e229f69b9751a01a2e1232c3a5747b7fc52c258d1e9a99bd4737051d4",
                   "test/win32/session-restore-maximized.ps1":  "5af0d5334fc5974b4bf643c69addfb503c6f35b8f161691c729ad704ffafddf7",
                   "test/win32/session-resume-offset.ps1":  "afda54cfd0df1b0163c489618689744e41ac6ad2b24a2e1a506607ad0d5ccb87",

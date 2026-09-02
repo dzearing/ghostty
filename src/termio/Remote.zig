@@ -50,6 +50,7 @@ const session_notice = @import("session_notice.zig");
 const open_failed_notice = @import("open_failed_notice.zig");
 const attach_failed_notice = @import("attach_failed_notice.zig");
 const restore_park = @import("restore_park.zig");
+const history_guard = @import("history_guard.zig");
 const restore_history = @import("restore_history.zig");
 
 const log = std.log.scoped(.io_remote);
@@ -773,6 +774,10 @@ pub fn threadEnter(
     // don't smear (§5.4). Only meaningful with `relaunch_replayed`.
     var replay_cols: u16 = 0;
     var replay_rows: u16 = 0;
+    // The absolute offset at which the RESPAWNED child's own output starts, i.e.
+    // everything the agent queued ahead of it (T1264). 0 = nothing replayed, or an
+    // agent too old to say. The boundary the replayed screen is parked at.
+    var relaunch_replay_bytes: u64 = 0;
     // Set on a live ATTACH from the agent-reported pre-attach geometry + ring
     // head (T106): the raw ring replay is geometry-bound VT, so we replay at
     // the geometry it was drawn at and reflow to the live grid once the drain
@@ -1028,6 +1033,7 @@ pub fn threadEnter(
                 relaunch_replayed = r.replayed;
                 replay_cols = r.replay_cols;
                 replay_rows = r.replay_rows;
+                relaunch_replay_bytes = r.replay_bytes;
                 break :pane p;
             }
             log.warn(
@@ -1427,6 +1433,22 @@ pub fn threadEnter(
         }
     }
 
+    // T1264: the relaunch equivalent of the T666 park above. The respawned shell
+    // REPAINTS — conhost hands over its whole screen buffer as absolutely-
+    // positioned VT — so anything still on the active screen when its first bytes
+    // land is overwritten. The replay ends with the restart divider, which put the
+    // divider squarely in the line of fire: it survived or vanished according to
+    // how the replay happened to sit in the window, which is why the same
+    // assertion passed at one geometry and failed at another. Park the replayed
+    // screen into SCROLLBACK at the replay's end offset and the repaint lands on
+    // blank rows instead. Only where the child actually repaints (conhost), and
+    // only when something was replayed — a blank relaunch has nothing to protect.
+    if (did_relaunch and relaunch_replay_bytes > 0 and
+        history_guard.enabledFor(self.child_pty_flavor))
+    {
+        rd.park_target = relaunch_replay_bytes;
+    }
+
     // T532, the WRITER half. A relaunch, a restore-policy fresh shell, and a
     // prompt-deferred relaunch all begin a NEW byte stream at 0 — `Connection`
     // arms their panes with `discard_below = 0` for exactly that reason. Our
@@ -1682,7 +1704,32 @@ fn performAwaitedRelaunch(self: *Remote, td: *termio.Termio.ThreadData) void {
     // The respawned child has a fresh pid + pty; re-publish for `getProcessInfo`
     // (`sendRelaunchOnPane` updated the pane's pid/tty on ok).
     self.publishProcessInfo(rd.pane);
-    @call(.always_inline, termio.Termio.processOutput, .{ rd.io, restart_divider });
+    // Same contract as `threadEnter`'s `did_relaunch and !relaunch_replayed`
+    // (T1264): whenever the agent replayed the dead session's scrollback it has
+    // spliced the divider into that stream itself, in the one place it belongs —
+    // between the old output and the respawned child's first byte. Ours is
+    // synchronous and the replay drains async below, so an unconditional inject
+    // here lands ABOVE the scrollback it is supposed to close off, and doubles the
+    // marker once the agent bakes one in. Keep it for the blank relaunch, where
+    // there is nothing to replay and the restart would otherwise look like a
+    // spontaneous new prompt.
+    if (!res.replayed) {
+        @call(.always_inline, termio.Termio.processOutput, .{ rd.io, restart_divider });
+    }
+
+    // T1264: the same park `threadEnter` arms on the rerun path, for the same
+    // reason — the respawned shell repaints over whatever is on the active screen,
+    // and the divider is the last thing on it. With a replay in flight the park
+    // has to wait for its end offset; with nothing to replay the child's repaint
+    // is the very next thing that can arrive, so park now, synchronously, while
+    // the tombstone prompt and the divider we just wrote are still the screen.
+    if (history_guard.enabledFor(self.child_pty_flavor)) {
+        if (res.replay_bytes > 0) {
+            rd.park_target = res.replay_bytes;
+        } else {
+            parkRestoredScreen(rd.io);
+        }
+    }
 
     // The respawned session's DATA arrives on the ring (armed since threadEnter);
     // drain once immediately in case it landed while we were parked on the RPC (the

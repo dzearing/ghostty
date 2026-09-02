@@ -29,15 +29,29 @@
 # user's real release instance, which uses a different agent lineage + state dir).
 #
 #   powershell -NoProfile -File test\win32\session-relaunch.ps1
+#
+# Both the app and the CLI run on the BACKGROUND test desktop (T211/T1238,
+# migration T1265), so a run never throws windows across what the user is
+# reading. Every assertion here goes through the CLI and reads +read text -
+# no SendInput, no screen capture - so nothing in it needs the input desktop.
+# `-UserDesktop` puts the launches back on the caller's desktop for a human
+# who wants to WATCH the relaunch happen; it is a debugging aid, not a
+# supported mode, and the audit's declaration list no longer carries this
+# script. That the two agree is not free: until T1264 the divider assertions
+# passed at the user-desktop geometry and failed at this one, which is what
+# blocked the migration.
 param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
-    [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe'
+    [string]$AgentExe = 'D:\git\ghoztty\zig-out\bin\ghoztty-agent.exe',
+    [switch]$UserDesktop
 )
 
 # T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
 # of any isolation setup, because it drops an inherited $GHOZTTY_IPC_SOCKET - a
 # test never wants the caller pane's endpoint.
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
+. (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
+if (-not $UserDesktop) { $script:td = New-TestDesktop }
 
 $ErrorActionPreference = 'Continue'
 $script:failures = 0
@@ -57,6 +71,19 @@ function Stop-TestProcs {
 
 # Run a zig-out ghoztty +command with a hard timeout; stdout+stderr -> $out.
 function Run-Cli($argsLine, $out, $timeoutSec = 15) {
+    # T1265: the CLI runs on the test desktop too. None of these verbs is the
+    # one that auto-launches (`+new-window`), so today they could not strand a
+    # window on the user's desktop - but the desktop a CLI process sits on is
+    # inherited by anything it ever spawns, and that is not a property to leave
+    # depending on which verbs the script happens to use.
+    if (-not $UserDesktop) {
+        $r = Invoke-OnTestDesktop -Exe $Exe -Arguments ($argsLine -split ' ') `
+            -TimeoutSec $timeoutSec -Desktop $script:td
+        $text = if ($null -eq $r.Output) { '' } else { [string]$r.Output }
+        Set-Content -LiteralPath $out -Value $text -Encoding UTF8
+        if ($r.TimedOut) { return $null }
+        return $r.ExitCode
+    }
     $p = Start-Process -FilePath cmd.exe -WindowStyle Hidden -PassThru `
         -ArgumentList "/c `"`"$Exe`" $argsLine > `"$out`" 2>&1`""
     $null = $p.Handle   # before any wait, or ExitCode reads empty (lib\ExitCodeAudit.ps1)
@@ -213,7 +240,11 @@ function Launch($tmp, $title, $relaunch, $restore) {
     $launchArgs = @("--session-relaunch=$relaunch")
     if (-not $restore) { $launchArgs += "--title=$title" }
     # persistence: on (default) - session persistence IS this script's subject.
-    Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList $launchArgs | Out-Null
+    if ($UserDesktop) {
+        Start-Process -FilePath $Exe -WindowStyle Minimized -ArgumentList $launchArgs | Out-Null
+    } else {
+        Start-OnTestDesktop -Exe $Exe -Arguments $launchArgs -Desktop $script:td | Out-Null
+    }
 }
 
 # Marker match after whitespace strip (survives narrow-window per-glyph wrapping,
@@ -539,12 +570,18 @@ if ($script:failures -gt 0) {
     if (Test-Path "$tmpA\read-post.txt") { Get-Content "$tmpA\read-post.txt" -Raw }
     "== DIAG: prompt read =="
     if (Test-Path "$tmpB\read-prompt.txt") { Get-Content "$tmpB\read-prompt.txt" -Raw }
+    # T1264: B7 is about what the pane holds AFTER the keystroke relaunch, and
+    # that read was the one the diag never printed - so a red B7 said "no
+    # divider" and nothing about what was there instead.
+    "== DIAG: prompt read-relaunched =="
+    if (Test-Path "$tmpB\read-relaunched.txt") { Get-Content "$tmpB\read-relaunched.txt" -Raw }
     "== DIAG: relpSid=$relpSid prpSid=$prpSid"
 }
 
 # ============================================================================
 "== cleanup"
 Stop-TestProcs
+if (-not $UserDesktop) { Remove-TestDesktop }
 $env:LOCALAPPDATA = $savedLocalAppData
 if ($null -ne $savedAgentBin) { $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin }
 else { Remove-Item env:GHOSTTY_LOCAL_AGENT_BIN -ErrorAction SilentlyContinue }

@@ -447,6 +447,25 @@ pub const OutputRing = struct {
         return self.len;
     }
 
+    /// Whether the newest retained bytes are exactly `suffix` (T1264). The one
+    /// question the RELAUNCH path needs answered before it appends the restart
+    /// divider: has somebody already put it there? Reads backwards through the
+    /// wrap rather than materializing the ring, so asking is free.
+    pub fn endsWith(self: OutputRing, suffix: []const u8) bool {
+        if (suffix.len == 0) return true;
+        if (suffix.len > self.len) return false;
+        const cap = self.buf.len;
+        // Index one past the newest byte, then walk back over `suffix`.
+        var ridx = (self.start + self.len) % cap;
+        var i = suffix.len;
+        while (i > 0) {
+            i -= 1;
+            ridx = if (ridx == 0) cap - 1 else ridx - 1;
+            if (self.buf[ridx] != suffix[i]) return false;
+        }
+        return true;
+    }
+
     /// Reset the ring to hold exactly `bytes` starting at absolute offset
     /// `base_offset` (T13 reboot preload of a disk snapshot). Discards any prior
     /// contents. If `bytes` exceeds capacity only its tail is kept (the same
@@ -2076,8 +2095,14 @@ pub const SessionStore = struct {
     /// decision until adoption has answered "did anything actually restart?"
     /// (T906). Caller holds the store lock. No-op on an empty ring — a divider
     /// with nothing above it marks a boundary the user never crossed.
-    fn appendRestartDivider(sess: *Session) void {
+    ///
+    /// EXACTLY ONCE is enforced here rather than by each caller (T1264): the
+    /// RELAUNCH handler appends the divider for a tombstone the running agent
+    /// never reloaded from disk, and that same session may already carry one
+    /// from the reboot preload. A second line would read as two restarts.
+    pub fn appendRestartDivider(sess: *Session) void {
         if (sess.ring.len == 0) return;
+        if (sess.ring.endsWith(reboot_divider)) return;
         sess.ring.append(sess.out_offset.value, reboot_divider);
         sess.out_offset.value +%= reboot_divider.len;
         sess.last_snapshot_offset = sess.out_offset.value;
@@ -2957,6 +2982,68 @@ test "OutputRing: preload resets to bytes at a base offset (tail kept if oversiz
     ring.preload(0, "0123456789"); // 10 bytes into an 8-byte ring
     try testing.expectEqual(@as(u64, 2), ring.base_offset);
     try testing.expectEqualSlices(u8, "23456789", out[0..ring.copyRetained(&out)]);
+}
+
+test "OutputRing.endsWith: matches across the wrap, and never past the retained bytes (T1264)" {
+    const alloc = testing.allocator;
+    var ring = try OutputRing.init(alloc, 8);
+    defer ring.deinit();
+    // Empty ring: only the empty suffix matches.
+    try testing.expect(ring.endsWith(""));
+    try testing.expect(!ring.endsWith("a"));
+
+    ring.append(0, "abcdef");
+    try testing.expect(ring.endsWith("def"));
+    try testing.expect(ring.endsWith("abcdef"));
+    try testing.expect(!ring.endsWith("dee"));
+    // Longer than what is retained is a miss, not a read off the front.
+    try testing.expect(!ring.endsWith("zabcdef"));
+
+    // Force a wrap: the 8-byte ring now holds "cdefghij", written across the seam.
+    ring.append(6, "ghij");
+    var out: [8]u8 = undefined;
+    try testing.expectEqualSlices(u8, "cdefghij", out[0..ring.copyRetained(&out)]);
+    try testing.expect(ring.endsWith("hij"));
+    try testing.expect(ring.endsWith("cdefghij"));
+    try testing.expect(!ring.endsWith("bcdefghij")); // evicted byte is not "retained"
+    try testing.expect(!ring.endsWith("hik"));
+}
+
+test "appendRestartDivider: exactly one divider, whatever put it there (T1264)" {
+    const alloc = testing.allocator;
+    var sess: Session = undefined;
+    sess.ring = try OutputRing.init(alloc, 1 << 12);
+    defer sess.ring.deinit();
+    sess.out_offset = .{ .value = 0 };
+    sess.last_snapshot_offset = 0;
+
+    // An empty ring never gets one: a boundary with nothing above it is a lie.
+    SessionStore.appendRestartDivider(&sess);
+    try testing.expectEqual(@as(usize, 0), sess.ring.len);
+
+    // A tombstone the running agent never reloaded from disk: output, no divider.
+    // This is the case the RELAUNCH handler covers (the reboot preload's is the
+    // other one), and the divider closes it off.
+    sess.ring.append(0, "tick-0\r\ntick-1\r\n");
+    sess.out_offset.value = sess.ring.tailOffset();
+    SessionStore.appendRestartDivider(&sess);
+    try testing.expect(sess.ring.endsWith(reboot_divider));
+    try testing.expectEqual(sess.ring.tailOffset(), sess.out_offset.value);
+    const after_first = sess.ring.len;
+
+    // Asking twice — the reboot path preloaded one, then RELAUNCH asks — must not
+    // draw a second line: the user restarted once.
+    SessionStore.appendRestartDivider(&sess);
+    try testing.expectEqual(after_first, sess.ring.len);
+
+    // Once fresh output lands on top, a LATER restart is a real second boundary.
+    sess.ring.append(sess.out_offset.value, "fresh$ ");
+    sess.out_offset.value = sess.ring.tailOffset();
+    SessionStore.appendRestartDivider(&sess);
+    try testing.expect(sess.ring.endsWith(reboot_divider));
+    var buf: [1 << 12]u8 = undefined;
+    const n = sess.ring.copyRetained(&buf);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, buf[0..n], reboot_divider));
 }
 
 test "SessionTable: create mints unique ids/channels, enforces cap, frees cleanly" {

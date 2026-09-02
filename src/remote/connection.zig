@@ -714,6 +714,11 @@ pub const RelaunchOutcome = struct {
     /// prompt redraws in the raw stream don't smear (§5.4).
     replay_cols: u16 = 0,
     replay_rows: u16 = 0,
+    /// The absolute stream offset at which the respawned child's OWN output
+    /// starts, i.e. the size of everything the agent queued ahead of it (T1264).
+    /// 0 = nothing replayed, or an agent too old to say. See
+    /// `protocol.Relaunched.replay_bytes`.
+    replay_bytes: u64 = 0,
 };
 
 /// A caller-owned, deep copy of a `PROC_SNAPSHOT` reply (§9.3 process view). The
@@ -2472,9 +2477,9 @@ pub const Connection = struct {
             // and tear the pre-registered channel back down (a value return does not
             // fire the `errdefer` above).
             self.teardownPane(pane);
-            return .{ .pane = null, .ok = false, .found = res.found, .pid = res.pid, .replayed = res.replayed, .replay_cols = res.replay_cols, .replay_rows = res.replay_rows };
+            return .{ .pane = null, .ok = false, .found = res.found, .pid = res.pid, .replayed = res.replayed, .replay_cols = res.replay_cols, .replay_rows = res.replay_rows, .replay_bytes = res.replay_bytes };
         }
-        return .{ .pane = pane, .ok = true, .found = true, .pid = res.pid, .replayed = res.replayed, .replay_cols = res.replay_cols, .replay_rows = res.replay_rows };
+        return .{ .pane = pane, .ok = true, .found = true, .pid = res.pid, .replayed = res.replayed, .replay_cols = res.replay_cols, .replay_rows = res.replay_rows, .replay_bytes = res.replay_bytes };
     }
 
     /// Register the inbound ring + a `Pane` for a session about to be relaunched,
@@ -2521,7 +2526,7 @@ pub const Connection = struct {
     /// agent still had the session, and the (respawned) child pid. Unlike
     /// `RelaunchOutcome` this carries no pane — `sendRelaunchOnPane` operates on a pane
     /// the caller already prepared and still owns.
-    pub const RelaunchResult = struct { ok: bool, found: bool, pid: i64, replayed: bool = false, replay_cols: u16 = 0, replay_rows: u16 = 0 };
+    pub const RelaunchResult = struct { ok: bool, found: bool, pid: i64, replayed: bool = false, replay_cols: u16 = 0, replay_rows: u16 = 0, replay_bytes: u64 = 0 };
 
     /// Send `RELAUNCH` for an already-prepared pane (see `prepareRelaunchPane`) and
     /// await `RELAUNCHED`. On `ok`, the recorded process is respawned and streaming on
@@ -2569,7 +2574,7 @@ pub const Connection = struct {
             if (pane.tty) |t| self.alloc.free(t);
             pane.tty = new_tty;
         }
-        return .{ .ok = r.ok, .found = r.found, .pid = r.pid, .replayed = r.replayed, .replay_cols = r.replay_cols, .replay_rows = r.replay_rows };
+        return .{ .ok = r.ok, .found = r.found, .pid = r.pid, .replayed = r.replayed, .replay_cols = r.replay_cols, .replay_rows = r.replay_rows, .replay_bytes = r.replay_bytes };
     }
 
     /// True iff the negotiated peer advertised the `close_session` capability —

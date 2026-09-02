@@ -1524,6 +1524,23 @@ pub const Relaunched = struct {
     replay_cols: u16 = 0,
     replay_rows: u16 = 0,
 
+    /// How many bytes of replay the agent queued ahead of the respawned child's
+    /// first output, and therefore the absolute stream offset at which that
+    /// child's own bytes begin (the relaunch pane's stream is renumbered from 0).
+    /// 0 = nothing replayed.
+    ///
+    /// The client needs this because the respawned shell REPAINTS (T1264): conhost
+    /// hands over its whole screen buffer as absolutely-positioned VT, and
+    /// whatever is still on the active screen at that moment is overwritten —
+    /// which is how the restart divider, the last line of the replay, went missing
+    /// on a pane whose geometry happened to leave it below the fold. Knowing where
+    /// the replay ends lets the client park the replayed screen into SCROLLBACK
+    /// first (`park_target`, the same T666 move the attach path makes), so the
+    /// repaint lands on blank rows and the divider survives at any window size.
+    /// Additive/defaulted → an older agent sends 0 and the client keeps its
+    /// previous (geometry-dependent) behavior.
+    replay_bytes: u64 = 0,
+
     /// The respawned child's PTY slave path (set with `ok == true`; a relaunch
     /// opens a FRESH pty, so any previously-reported tty is stale). See
     /// `Opened.tty`. Additive/optional (older agents omit it).

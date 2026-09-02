@@ -1977,6 +1977,15 @@ pub const Server = struct {
         // sampled BEFORE this append, so a notice on an otherwise-empty ring
         // doesn't make the viewer suppress its own divider.
         const had_snapshot = rs.ring.len > 0;
+        // T1264: place the divider BEFORE the notice and before the replay copy.
+        // The reboot path (agent restarted, ring preloaded from disk) already has
+        // one and `appendRestartDivider` leaves it alone; a tombstone relaunched
+        // under a still-running agent never had one, and the viewer suppresses its
+        // own whenever anything was replayed (`replayed` below) — so on that path
+        // the boundary between the dead session's output and the respawned child's
+        // was simply missing. Only the producer can put it in the right place:
+        // the viewer's inject is synchronous and would land ahead of the replay.
+        session.SessionStore.appendRestartDivider(rs);
         if (req.notice) |notice| {
             if (notice.len > 0) {
                 // Same append+advance the reboot divider does in
@@ -2030,6 +2039,11 @@ pub const Server = struct {
             // can replay at that width then reflow — see Relaunched.replay_cols.
             .replay_cols = if (had_snapshot and replay_n > 0) replay_cols else 0,
             .replay_rows = if (had_snapshot and replay_n > 0) replay_rows else 0,
+            // Where the respawned child's own output starts (T1264). Unlike
+            // `replayed` this counts EVERYTHING queued ahead of it — divider and
+            // notice included — because it is a stream position, not a claim
+            // about scrollback.
+            .replay_bytes = replay_lo + replay_n,
             .tty = tty_copy,
         }) catch {};
 
@@ -5084,6 +5098,83 @@ test "T824 RELAUNCH: a notice on an EMPTY ring does not read as replayed scrollb
     try testing.expect(!rp.value.replayed);
     try testing.expectEqual(@as(u16, 0), rp.value.replay_cols);
     try testing.expectEqual(@as(u16, 0), rp.value.replay_rows);
+}
+
+test "T1264 RELAUNCH: a tombstone the running agent never reloaded still gets ONE divider" {
+    // The reboot path preloads [scrollback][divider] from disk. A session whose
+    // shell died under a STILL-RUNNING agent has scrollback in its live ring and
+    // never went near that path — but `replayed` is true for it all the same, so
+    // the viewer suppresses its own divider and the restart used to be invisible.
+    // The agent places it, because only the producer can place it between the old
+    // output and the respawned child's first byte.
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc0: FakeChild = .{ .alloc = alloc };
+    defer fc0.deinit();
+    var fc1: FakeChild = .{ .alloc = alloc };
+    defer fc1.deinit();
+    var kids = [_]*FakeChild{ &fc0, &fc1 };
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(0x1264);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    try h.client.sendControlJson(.open, protocol.control_channel, protocol.Open{
+        .command = "sleep 600",
+        .rows = 24,
+        .cols = 80,
+    });
+    const of = try h.client.waitControl(.opened);
+    var op = try protocol.parseJson(protocol.Opened, alloc, of.payload);
+    defer op.deinit();
+
+    // Live output lands in the ring, and reaches the attached viewer as it happens.
+    const before = "tick-0\r\ntick-1\r\n";
+    h.server.onChildOutput(of.channel, before);
+    const d_live = (try h.client.nextData()).?;
+    const dp_live = try protocol.DataPayload.decode(d_live.payload);
+    try testing.expectEqualSlices(u8, before, dp_live.bytes);
+
+    // The shell dies: a tombstone with a NON-empty ring and no disk snapshot.
+    h.server.store.mutex.lock();
+    const s = h.server.store.table.getByIdStr(op.value.session_id).?;
+    s.alive = false;
+    s.relaunchable = true;
+    const sid = s.id_str;
+    h.server.store.mutex.unlock();
+
+    try h.client.sendControlJson(.relaunch, protocol.control_channel, protocol.Relaunch{
+        .session_id = &sid,
+        .rows = 24,
+        .cols = 80,
+    });
+    const rf = try h.client.waitControl(.relaunched);
+    var rp = try protocol.parseJson(protocol.Relaunched, alloc, rf.payload);
+    defer rp.deinit();
+    try testing.expect(rp.value.ok and rp.value.found);
+    // Scrollback was replayed, so the viewer prints nothing of its own...
+    try testing.expect(rp.value.replayed);
+
+    // ...and what it replays ENDS with the divider, exactly once, with the
+    // pre-kill output above it rather than below.
+    const d0 = (try h.client.nextData()).?;
+    const dp0 = try protocol.DataPayload.decode(d0.payload);
+    try testing.expectEqual(@as(u64, 0), dp0.byte_offset);
+    const want = before ++ session.reboot_divider;
+    try testing.expectEqualSlices(u8, want, dp0.bytes);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, dp0.bytes, session.reboot_divider));
+
+    // The respawned child's first output continues after it — no offset hole, and
+    // nothing of the fresh shell lands above the marker.
+    h.server.onChildOutput(of.channel, "fresh-prompt$ ");
+    const d1 = (try h.client.nextData()).?;
+    const dp1 = try protocol.DataPayload.decode(d1.payload);
+    try testing.expectEqual(@as(u64, want.len), dp1.byte_offset);
+    try testing.expectEqualSlices(u8, "fresh-prompt$ ", dp1.bytes);
 }
 
 test "OPEN records cwd → sessions.json carries it (T132 reboot floor)" {
