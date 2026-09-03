@@ -1,10 +1,10 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-09-03T16:27:11-07:00",
-    "commit":  "9905b9f36",
+    "generated":  "2026-09-03T16:57:26-07:00",
+    "commit":  "ece143ded",
     "uncommitted":  [
-                        "test/win32/parity-tasks-seat.ps1"
+                        "test/win32/focus-defer.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -92,7 +92,7 @@
                   "test/win32/floor-lane-cache-heal.ps1":  "d40d1a377c30e9861010bacb09a810fb848ade4cbc54ed38ecc9980d4f13d740",
                   "test/win32/floor-lane-leak-sweep.ps1":  "c339c10d3445889e7107e6158a32c593bad1ce2454b107551561b39e9f1fd24d",
                   "test/win32/floor-lane-solo-confirm.ps1":  "2e7b8705867fd366ef614013d2cdd8e9e213136a4f8e9347ac049215944c0a50",
-                  "test/win32/focus-defer.ps1":  "6d4e301b38488b345e9c5397844420e69a8f49c6abea26a632af531974c7358f",
+                  "test/win32/focus-defer.ps1":  "0781efdaa91cf1730f88acaec0143573697a9d4d305e4becdd08eab8774efafd",
                   "test/win32/focus-follows-mouse.ps1":  "09c5f9884b9c51bdb0d91321a12c0e8b8c554552434fd78f7b6267826caaa4e1",
                   "test/win32/font-inherit.ps1":  "f303affd8f1c72da77f48f09a10b18d0c7c72af845a4602455bf013662d8c257",
                   "test/win32/foreground-audit.ps1":  "d343505dc8ede3b8a22d230eb7621f529f2a106a740301fead22d422b59310e3",

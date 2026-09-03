@@ -40,12 +40,15 @@
 # regression holding.
 #
 # -NegativeControl inverts the deferred-focus assertion and MUST fail.
+# -NegativeControlBudget drops the T408 `+list` latency budget to 1 ms and MUST
+# fail - the break-test that the budget assertion can score red at all.
 #
 # Only ever touches ghoztty processes from the repo zig-out.
 #   powershell -NoProfile -File test\win32\focus-defer.ps1
 param(
     [string]$Exe,
     [switch]$NegativeControl,
+    [switch]$NegativeControlBudget,
     [switch]$Interactive
 )
 $ErrorActionPreference = 'Continue'
@@ -192,11 +195,58 @@ Assert $resp 'GUI thread still pumps WM_NULL after click storm'
 
 # The IPC listener runs ON the GUI thread; a reply within timeout proves the
 # thread is pumping messages (a hang would leave +list stuck / pipe-busy).
+# This one is the WEDGE backstop, and it runs first precisely because it is
+# the safe probe: it is out-of-process, so a genuinely hung GUI thread costs
+# 8 seconds instead of hanging this script.
 $ipcOk = $false
 $job = Start-Job { param($e) & $e +list } -ArgumentList $Exe
 if (Wait-Job $job -Timeout 8) { Receive-Job $job | Out-Null; if ($job.State -eq 'Completed') { $ipcOk = $true } }
 Remove-Job $job -Force -ErrorAction SilentlyContinue
 Assert $ipcOk '+list answers within 8s (GUI-thread IPC listener alive)'
+
+# T408: 8s is a wedge detector wearing a latency assertion's clothes. The bug
+# class this section exists for - IPC starvation while a pane floods - shows
+# up as LATENCY long before it shows up as a wedge, and an agent driving a
+# busy pane feels a 4-second `+list` as broken even though it "answers". So
+# measure the round trip directly, under the same flood, and hold it to a
+# budget with visible headroom rather than 110x of it.
+#
+# Measured in-process (no Start-Job): the job wrapper spends most of its time
+# launching a second PowerShell, which swamps the number being measured.
+# What remains inside each sample is a ghoztty.exe CreateProcess plus the
+# named-pipe round trip - both of which a starved GUI thread lengthens.
+#
+# BASELINE (2026-09-03, this box, Debug zig-out, ~2,500 lines/s flood): median
+# 12-15 ms across runs, worst single sample 18 ms. T408 recorded 73 ms for this
+# same round trip, but that number was taken through the Start-Job wrapper and
+# is mostly the second PowerShell's startup - which is the reason to measure
+# in-process rather than to inherit its baseline.
+#
+# The budget is 200 ms, ~13x the measured median, so a 13x starvation
+# regression fails here where 8s needed 650x. It is asserted on the MEDIAN of
+# 5, so one descheduled sample cannot fail an otherwise healthy run. The
+# headroom is deliberately in absolute terms as well as in ratio: this is a
+# Debug build, and a ReleaseFast app consumes the flood faster, so the GUI
+# thread there does more work per second than it does here. 200 ms absorbs
+# that difference many times over rather than assuming it is zero.
+$ipcBudgetMs = 200
+if ($NegativeControlBudget) { $ipcBudgetMs = 1 }   # break-test: MUST fail
+$samples = @()
+$sampleFails = 0
+for ($i = 0; $i -lt 5; $i++) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    & $Exe +list 2>&1 | Out-Null
+    $sw.Stop()
+    if ($LASTEXITCODE -ne 0) { $sampleFails++ }
+    $samples += [int]$sw.Elapsed.TotalMilliseconds
+}
+$sorted = @($samples | Sort-Object)
+$ipcMedian = $sorted[[int]($sorted.Count / 2)]
+Write-Host "      +list latency under flood: median ${ipcMedian} ms (samples: $($samples -join ', ') ms; budget ${ipcBudgetMs} ms, baseline 15 ms)"
+# A `+list` that fails FAST would sail under any budget, so the timing is only
+# a measurement of the round trip once every sample is known to have made one.
+Assert ($sampleFails -eq 0) "all 5 latency samples were successful +list calls ($sampleFails failed)"
+Assert ($ipcMedian -le $ipcBudgetMs) "+list median latency under flood is within ${ipcBudgetMs} ms (measured ${ipcMedian} ms)"
 
 # Focus still controllable after the storm (thread not wedged mid-dispatch).
 Assert (Test-ClickFocuses $surfaces[0] 2000) 'focus still moves after storm'
