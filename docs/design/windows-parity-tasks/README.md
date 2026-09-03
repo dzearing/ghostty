@@ -139,8 +139,27 @@ scripts\parity-tasks.ps1 list -Phase K
 scripts\parity-tasks.ps1 show T144
 scripts\parity-tasks.ps1 set-status T144 -Status done -Commit abc1234
 scripts\parity-tasks.ps1 new -Title "Short title" -Phase K -Deps T73,T94
+scripts\parity-tasks.ps1 stale-scan -Top 40   # which todos may already be fixed
 scripts\parity-tasks.ps1 validate             # ids, titles, statuses, dangling deps
 ```
+
+**A todo is a claim about the code, made on the day it was filed, and nothing
+re-checks it** (T404). T98 was handed out fourteen days after T41 had already
+fixed its defect at the source, and the loop spent a whole turn discovering
+that; the expensive version is a card a later fix only PARTLY repaired, where
+the next agent implements over work it never read.
+
+So the question is asked at PICK time. `next` prints the filing date and any
+commits that have touched the files the task itself names since — with `CHECK
+FIRST` when there are any — and `stale-scan` asks it of the whole queue, ranked
+by a later commit having NAMED the task (a follow-up that fixed it in passing, a
+split that absorbed it, a duplicate that closed it), then oldest first.
+
+Both are prompts, never verdicts: of the first four cards checked this way, one
+was already fixed by a main intake, one was partly fixed, and two were entirely
+real. Only exact FILE paths count — a card naming `test\win32\` names an area,
+and ranked by raw hit count every such card sat on top with 300+ "touches",
+which measures how busy the repo is and says nothing about the task.
 
 `validate` is the gate: run it before committing a task change. It prints
 `ALL PASS (<n> tasks)` or the specific problems, and exits non-zero on

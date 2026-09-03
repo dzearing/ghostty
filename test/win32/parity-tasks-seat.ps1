@@ -61,6 +61,15 @@
 #      file untouched when it refuses. `-NoNote` keeps the bulk pass and says
 #      it took it. Every other transition - claim, close, re-park - is
 #      unchanged.
+#   Q. "Is this task still true?" (T404). A todo is a claim about the code made
+#      on the day it was filed and nothing re-checks it, so `next` names the
+#      filing date and any commits that have touched the files the task itself
+#      names since, and `stale-scan` ranks the whole queue by the same
+#      question - a later commit NAMING the task first, then oldest. Runs in a
+#      throwaway git repo, because the signal is a question about history. A
+#      task naming only a directory must not count (ranked by raw hit count the
+#      first cut put every task naming `test\win32` on top), and outside a repo
+#      the whole signal degrades to silence rather than guessing.
 #
 # Hermetic: sections A-H run against a fixture task dir under $env:TEMP via
 # `-TaskDir`; docs\design\windows-parity-tasks\ is only ever READ (section I).
@@ -727,6 +736,97 @@ Assert 'and still journals the transition' (
 
 $r = Task-Run @('validate')
 Assert 'the gated fixture still validates' ($r.Code -eq 0)
+
+# --- Q. "is this task still true?" (T404) ------------------------------------
+# Runs in a THROWAWAY GIT REPO, because the whole signal is a question about
+# history: a fixture task dir with no repo around it can only prove the silent
+# path (which is section Q5).
+'Q. staleness signal: age, moved files, and later commits that NAME the task'
+$qrepo = Join-Path $env:TEMP "ghoztty-parity-stale-$PID"
+$qtasks = Join-Path $qrepo 'docs\design\windows-parity-tasks'
+if (Test-Path $qrepo) { Remove-Item -Recurse -Force $qrepo }
+New-Item -ItemType Directory -Force $qtasks | Out-Null
+New-Item -ItemType Directory -Force (Join-Path $qrepo 'src\sub') | Out-Null
+
+function Q-Git { param([string[]]$GitArgs) & git -C $qrepo @GitArgs 2>&1 | Out-Null }
+function Q-Write {
+    param([string]$Rel, [string]$Text)
+    $p = Join-Path $qrepo $Rel
+    [System.IO.File]::WriteAllText($p, $Text, (New-Object System.Text.UTF8Encoding $false))
+}
+function Q-Task {
+    param([string]$Id, [string]$Body)
+    $lines = @('---', "id: $Id", ("title: " + (ConvertTo-Json "fixture $Id" -Compress)),
+        'deps: []', 'status: "todo"', 'commits: []', 'seat: "win"', 'priority: "P2"',
+        '---', '', "# $Id - fixture", '', $Body, '')
+    Q-Write ("docs/design/windows-parity-tasks/$Id.md") ($lines -join "`n")
+}
+
+Q-Git @('init', '--quiet')
+Q-Git @('config', 'user.email', 'seat@example.com')
+Q-Git @('config', 'user.name', 'Seat Harness')
+Q-Git @('config', 'commit.gpgsign', 'false')
+Q-Write 'src/foo.zig' "// foo`n"
+Q-Write 'src/bar.zig' "// bar`n"
+Q-Write 'src/sub/deep.zig' "// deep`n"
+Q-Git @('add', '-A'); Q-Git @('commit', '-m', 'seed', '--quiet')
+
+# The three shapes, filed together so they share a filing date:
+#   T1 names a file that later MOVES; T2 names a file nobody touches;
+#   T3 names nothing at all but is NAMED by a later commit message;
+#   T4 names only a DIRECTORY, which must not count (the hub-file trap).
+Q-Task 'T1' 'The defect is in `src/foo.zig`, near the top.'
+Q-Task 'T2' 'The defect is in `src/bar.zig`, which nobody has touched.'
+Q-Task 'T3' 'A prose-only card. No code path is named here at all.'
+Q-Task 'T4' 'Everything under `src/sub` is suspect.'
+Q-Git @('add', '-A'); Q-Git @('commit', '-m', 'file four fixture tasks', '--quiet')
+
+# Backdate is not needed: the signal only requires the touching commit to be
+# strictly newer than the filing one, and git timestamps to the second - so
+# sleep past the boundary rather than rewriting history.
+Start-Sleep -Seconds 2
+Q-Write 'src/foo.zig' "// foo, fixed`n"
+Q-Git @('add', '-A')
+Q-Git @('commit', '-m', 'repair the foo path while here (T3)', '--quiet')
+
+$r = Task-Run -CmdArgs @('next') -Dir $qtasks
+# Two matches rather than one long one: Out-String wraps at the host width, so
+# a regex spanning 80 columns fails on a narrow console and nowhere else.
+Assert 'Q1 next names the date the task was filed' ($r.Out -match 'filed \d{4}-\d\d-\d\d \(\d+d ago\)')
+Assert 'Q1a ...and counts the commits that moved the files it names' ($r.Out -match '1 commit\(s\) since touched')
+if ($r.Out -notmatch '1 commit\(s\) since touched') { "      (Q1a saw: " + ($r.Out -replace "`r?`n", ' / ') + ')' }
+# The count is the point of Q1a, and getting it wrong is silent: git timestamps
+# to the second and `--since` is inclusive, so before the strict re-check in
+# Get-TouchingCommits the SEED commit (same second as the filing one, because
+# this fixture builds its history in a burst) was reported as news about T1.
+Assert 'Q1b ...and says to check the defect still reproduces before building' (
+    $r.Out -match 'CHECK FIRST')
+
+$r = Task-Run -CmdArgs @('stale-scan', '-Top', '10') -Dir $qtasks
+Assert 'Q2 stale-scan reports the task whose file moved' ($r.Out -match 'T1\s+P2\s+age=\s*\d+d\s+named=\s*0\s+touched=\s*1')
+Assert 'Q3 ...and ranks the task a later commit NAMED above it' (
+    $r.Out -match 'T3\s+P2\s+age=\s*\d+d\s+named=\s*1' -and
+    $r.Out.IndexOf('T3 ') -lt $r.Out.IndexOf('T1 '))
+Assert 'Q3b ...naming the commit that mentioned it' ($r.Out -match 'named by \w+ \d{4}-\d\d-\d\d repair the foo path')
+Assert 'Q4 a task whose files nobody touched is not listed' ($r.Out -notmatch '(?m)^T2\s')
+# The trap that made the first cut of this report useless: ranked by raw hit
+# count, seventeen tasks naming `test\win32` sat at the top with 300+ touches
+# each, which measures how busy the repo is and says nothing about any task.
+Assert 'Q4b a task naming only a DIRECTORY is not listed (the hub-file trap)' ($r.Out -notmatch '(?m)^T4\s')
+Assert 'Q4c the header says the report is a prompt, not a verdict' ($r.Out -match 'PROMPT TO VERIFY')
+
+# Outside a repo there is no history to ask, and the answer is that sentence -
+# not this repo's history reported against somebody's fixture.
+$r = Task-Run -CmdArgs @('stale-scan') -Dir $fixture
+Assert 'Q5 stale-scan outside a git repo says so and exits nonzero' (
+    $r.Code -ne 0 -and $r.Out -match 'not inside a git repository')
+Reset-Fixture
+New-FixtureTask -Id 'T1'
+$r = Task-Run -CmdArgs @('next') -Dir $fixture
+Assert 'Q5b ...and next still hands out the task, silent about staleness rather than guessing' (
+    $r.Out -match 'NEXT: T1' -and $r.Out -notmatch 'CHECK FIRST' -and $r.Out -notmatch 'filed \d{4}')
+
+if (Test-Path $qrepo) { Remove-Item -Recurse -Force $qrepo -ErrorAction SilentlyContinue }
 
 # --- teardown ---------------------------------------------------------------
 if (Test-Path $fixture) { Remove-Item -Recurse -Force $fixture }

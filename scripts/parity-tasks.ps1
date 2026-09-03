@@ -33,8 +33,17 @@
   checked, and prints the task's `unblock:` text so the caller sees the
   condition they are claiming. Every other transition is untouched.
 
+  IS THIS TASK STILL TRUE? (T404). A todo is a claim about the code made on the
+  day it was filed, and nothing re-checked it: T98 was handed out fourteen days
+  after T41 had already fixed its defect at the source. `next` now prints the
+  filing date and any commits that have touched the files the task itself names
+  since, and `stale-scan` asks the same question of the whole queue - ranked by
+  a later commit having NAMED the task by id, then oldest first. Both are
+  prompts to verify, never verdicts.
+
 .EXAMPLE
   scripts\parity-tasks.ps1 list -Status todo
+  scripts\parity-tasks.ps1 stale-scan -Top 40
   scripts\parity-tasks.ps1 next
   scripts\parity-tasks.ps1 next -Seat mac
   scripts\parity-tasks.ps1 show T144
@@ -46,7 +55,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('list', 'next', 'show', 'new', 'set-status', 'set-priority', 'set-order', 'note', 'ack-stranded', 'validate')]
+    [ValidateSet('list', 'next', 'show', 'new', 'set-status', 'set-priority', 'set-order', 'note', 'ack-stranded', 'stale-scan', 'validate')]
     [string]$Command,
 
     [Parameter(Position = 1)]
@@ -144,7 +153,12 @@ param(
     # shape as the two above, and it exists because a run can be red for a
     # reason that is not this turn's (a flaky runner, a red commit somebody
     # else pushed, no network); it PRINTS that it was used.
-    [switch]$NoCiCheck
+    [switch]$NoCiCheck,
+
+    # `stale-scan` prints the N most-suspect todos (T404). The whole queue is
+    # 400+ files, and a sweep that dumps all of them is a re-derivation rather
+    # than a report.
+    [int]$Top = 25
 )
 
 $ErrorActionPreference = 'Stop'
@@ -485,6 +499,129 @@ function Get-DepCycles {
     return @($script:dcCycles)
 }
 
+# ------------------------------------------------------------- staleness ---
+#
+# "Is this task still true?" (T404). A todo is a claim about the code made on
+# the day it was filed, and nothing re-checks it: T98 was handed out 14 days
+# after T41 had already fixed its defect at the source, and the loop spent a
+# whole context discovering that. The expensive version of the same shape is a
+# task a later fix only PARTLY repaired, where the next agent implements over
+# work it never read.
+#
+# The signal is cheap and it belongs at PICK time, not after the build: how old
+# the claim is, and whether anything has touched the files the task itself
+# names since it was made. It is a prompt to verify, never a verdict - a task
+# whose files moved may still be entirely open, and an untouched one may have
+# been fixed somewhere else. `next` prints it for the one task it hands out;
+# `stale-scan` prints it for the whole queue so a sweep is a report rather than
+# a re-derivation.
+
+# The path prefixes a task body can name that mean "code this task is about".
+# Anchored on real top-level directories so ordinary prose ("the src of the
+# problem") cannot match, and deliberately NOT including the tracker's own
+# docs\design\windows-parity-tasks\ - every task names sibling task files, and
+# counting the tracker's own churn would make every task look busy.
+$StalePathPattern = '(?<![\w./\\-])((?:src|scripts|test|macos|dist|include|images)[\\/][\w.\\/-]*[\w])'
+
+function Get-RepoRootFor {
+    param([string]$Path)
+    # Resolved from the TASK DIR, not from $PSScriptRoot, so a fixture task dir
+    # living outside any repo answers $null and the whole signal degrades to
+    # silence instead of reporting this repo's history against fake tasks.
+    try {
+        $top = & git -C $Path rev-parse --show-toplevel 2>$null
+        if ($LASTEXITCODE -ne 0 -or -not $top) { return $null }
+        return ($top | Select-Object -First 1).Trim()
+    } catch { return $null }
+}
+
+# Code paths a task file names, normalised to repo-relative forward slashes and
+# filtered to the ones that actually exist. A path that no longer exists is
+# dropped rather than reported: `git log -- <gone>` answers about its deletion,
+# which is not the question.
+function Get-TaskCodePaths {
+    param([string]$Path, [string]$Root)
+    if (-not $Root) { return @() }
+    $text = [System.IO.File]::ReadAllText($Path)
+    $seen = [ordered]@{}
+    foreach ($m in [regex]::Matches($text, $StalePathPattern)) {
+        $p = $m.Groups[1].Value -replace '\\', '/'
+        $p = $p.TrimEnd('.', ',', ')', ':', ';')
+        if (-not $p) { continue }
+        if ($seen.Contains($p)) { continue }
+        # FILES only, never directories. A task that names `test\win32\` names
+        # an AREA, and every commit in the repo touches some area: the first
+        # cut of this ranked by raw hit count and put seventeen tasks naming
+        # `test\win32` at the top with 300+ "touches" each, which is a
+        # restatement of how busy the repo is, not a signal about the task.
+        if (-not (Test-Path -LiteralPath (Join-Path $Root $p) -PathType Leaf)) { continue }
+        $seen[$p] = $true
+    }
+    return @($seen.Keys)
+}
+
+# The day the task was filed: the author date of the commit that ADDED its
+# file. Falls back to the file's own mtime when git cannot answer (a task
+# created this turn and not yet committed), which is the right answer for a
+# fresh file and harmless for an old one.
+function Get-TaskFiledDate {
+    param([string]$Path, [string]$Root)
+    if ($Root) {
+        try {
+            $lines = @(& git -C $Root log --diff-filter=A --format=%aI -- $Path 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $lines.Count -gt 0) {
+                $last = $lines[-1]
+                if ($last) { return [datetime]::Parse($last.Trim()) }
+            }
+        } catch { }
+    }
+    try { return (Get-Item $Path).LastWriteTime } catch { return $null }
+}
+
+# Commits since $Since that touched any of $Paths, newest first, as
+# "<sha> <date> <subject>" strings.
+function Get-TouchingCommits {
+    param([string]$Root, [string[]]$Paths, [datetime]$Since, [int]$Limit = 3)
+    if (-not $Root -or -not $Paths -or $Paths.Count -eq 0) { return @() }
+    $sinceArg = '--since=' + $Since.ToString('yyyy-MM-ddTHH:mm:ss')
+    try {
+        $out = @(& git -C $Root log $sinceArg '--no-merges' '--format=%aI %h %as %s' '--' @Paths 2>$null)
+        if ($LASTEXITCODE -ne 0) { return @() }
+    } catch { return @() }
+    # `--since` is inclusive to the second, so a commit made in the same second
+    # as the filing one comes back with it. Git timestamps have no sub-second
+    # resolution, so the boundary has to be re-applied here: strictly AFTER,
+    # and a commit that IS the filing commit is not news about the task.
+    $kept = @()
+    foreach ($line in $out) {
+        if (-not $line) { continue }
+        $bits = $line.Split(' ', 2)
+        $when = try { [datetime]::Parse($bits[0]) } catch { $null }
+        if ($when -and $when -le $Since) { continue }
+        $kept += $bits[1]
+    }
+    return @($kept)
+}
+
+# One line for `next`, or $null when there is nothing worth saying. Silence is
+# the default on purpose: a task filed yesterday whose files nobody touched
+# adds a line of noise to every pick for no information.
+function Get-StaleSignal {
+    param([string]$Path, [string]$Root)
+    $filed = Get-TaskFiledDate -Path $Path -Root $Root
+    if (-not $filed) { return $null }
+    $ageDays = [int][math]::Floor(((Get-Date) - $filed).TotalDays)
+    $paths = Get-TaskCodePaths -Path $Path -Root $Root
+    $commits = @(Get-TouchingCommits -Root $Root -Paths $paths -Since $filed)
+    if ($ageDays -lt 7 -and $commits.Count -eq 0) { return $null }
+    return [pscustomobject]@{
+        AgeDays = $ageDays
+        Filed   = $filed
+        Paths   = $paths
+        Commits = $commits
+    }
+}
+
 # --------------------------------------------------------------- commands ---
 
 switch ($Command) {
@@ -634,6 +771,17 @@ switch ($Command) {
                 Write-Host ("      order={0} priority={1} deps={2} seat={3}" -f $ord, $pri, ($t.Deps -join ','), $t.Seat)
                 if ($t.TriageReason) { Write-Host ("      why: {0}" -f $t.TriageReason) }
                 Write-Host ("      file: docs/design/windows-parity-tasks/{0}.md" -f $t.Id)
+                # "Is this still true?" asked BEFORE the build, not after it
+                # (T404).
+                $stale = Get-StaleSignal -Path $t.Path -Root (Get-RepoRootFor $TaskDir)
+                if ($stale) {
+                    Write-Host ("      filed {0} ({1}d ago); {2} commit(s) since touched its files" -f `
+                            $stale.Filed.ToString('yyyy-MM-dd'), $stale.AgeDays, $stale.Commits.Count)
+                    foreach ($c in ($stale.Commits | Select-Object -First 3)) { Write-Host ("        {0}" -f $c) }
+                    if ($stale.Commits.Count -gt 0) {
+                        Write-Host "      CHECK FIRST: confirm the defect still reproduces - it may already be fixed."
+                    }
+                }
                 if ($Claim) {
                     $claimText = [System.IO.File]::ReadAllText($t.Path, [System.Text.Encoding]::UTF8)
                     $claimed = [regex]::Replace($claimText, '(?m)^status:\s*.*$', 'status: "in-progress"', 1)
@@ -942,6 +1090,165 @@ switch ($Command) {
         Add-ProgressNote -Path (Get-TaskPath $tid) -SessionId $Session -NoteText (
             "took over stranded working-tree paths (dirty since before this turn's claim): " + (@($snap.paths) -join ', '))
         Write-Host ("{0} now owns {1} stranded path(s); validate passes while it stays open" -f $tid, @($snap.paths).Count)
+    }
+
+    'stale-scan' {
+        # The sweep, as a report (T404). Ranks this seat's open todos by how
+        # much the code they name has moved since they were filed, so "which of
+        # these 400 claims about the code might already be false?" is one
+        # command instead of four hundred greps.
+        #
+        # ONE git pass for the whole queue. Per-task `git log` calls were the
+        # obvious shape and cost ~400 process spawns; this walks the history
+        # once with --name-only and intersects in memory.
+        $root = Get-RepoRootFor $TaskDir
+        if (-not $root) {
+            Write-Host "stale-scan: $TaskDir is not inside a git repository, so there is no history to ask."
+            exit 1
+        }
+        $wantSeat = if ($Seat) { $Seat } else { $DefaultSeat }
+        $todos = @(Get-AllTasks | Where-Object {
+                $_.Status -match '^todo' -and (Test-SeatMatch $_.Seat $wantSeat)
+            })
+        if ($todos.Count -eq 0) { Write-Host "stale-scan: no open todos for seat=$wantSeat."; exit 0 }
+
+        # Every task's filed date in ONE pass. Per-task `git log` was the
+        # obvious shape and made the scan unusable: 400 process spawns took
+        # longer than reading the tasks by hand, which is the thing this
+        # command exists to replace.
+        $marker = '::C::'
+        $taskRel = 'docs/design/windows-parity-tasks'
+        $filedByFile = @{}
+        $addLog = @(& git -C $root log --diff-filter=A '--name-only' ("--format=$marker%aI") '--' $taskRel 2>$null)
+        $when = $null
+        foreach ($line in $addLog) {
+            if ($null -eq $line) { continue }
+            if ($line.StartsWith($marker)) {
+                $when = try { [datetime]::Parse($line.Substring($marker.Length)) } catch { $null }
+                continue
+            }
+            $f = $line.Trim()
+            if (-not $f -or -not $when) { continue }
+            # Newest first, so the LAST write for a path is the commit that
+            # first added it - the same rule Get-TaskFiledDate applies.
+            $filedByFile[[System.IO.Path]::GetFileName($f)] = $when
+        }
+
+        $rows = @()
+        $earliest = $null
+        foreach ($t in $todos) {
+            $filed = $filedByFile[[System.IO.Path]::GetFileName($t.Path)]
+            if (-not $filed) { $filed = (Get-Item $t.Path).LastWriteTime }
+            $paths = Get-TaskCodePaths -Path $t.Path -Root $root
+            if ($filed -and (-not $earliest -or $filed -lt $earliest)) { $earliest = $filed }
+            $exact = @{}
+            foreach ($p in $paths) { $exact[$p] = $true }
+            $rows += [pscustomobject]@{
+                Task = $t; Filed = $filed; Paths = $paths; Exact = $exact
+                Hits = @(); Mentions = @()
+            }
+        }
+        if (-not $earliest) { $earliest = (Get-Date).AddYears(-5) }
+
+        # Inverted index: changed-file -> the rows that named it. The obvious
+        # loop (every changed file against every row) is ~20k lines x 400 rows
+        # and takes minutes in PS 5.1; this is one hash lookup per line.
+        $byPath = @{}
+        foreach ($r in $rows) {
+            foreach ($p in $r.Exact.Keys) {
+                if (-not $byPath.ContainsKey($p)) { $byPath[$p] = New-Object System.Collections.ArrayList }
+                [void]$byPath[$p].Add($r)
+            }
+        }
+
+        $log = @(& git -C $root log ('--since=' + $earliest.ToString('yyyy-MM-ddTHH:mm:ss')) `
+                '--no-merges' '--name-only' ("--format=$marker%h %aI %as %s") 2>$null)
+        $curSha = $null; $curWhen = $null; $curLine = $null
+        foreach ($line in $log) {
+            if ($null -eq $line) { continue }
+            if ($line.StartsWith($marker)) {
+                $rest = $line.Substring($marker.Length)
+                $bits = $rest.Split(' ', 4)
+                $curSha = $bits[0]
+                $curWhen = try { [datetime]::Parse($bits[1]) } catch { $null }
+                $curLine = "{0} {1} {2}" -f $bits[0], $bits[2], $bits[3]
+                continue
+            }
+            if (-not $line.Trim()) { continue }
+            if (-not $curWhen) { continue }
+            $f = $line.Trim() -replace '\\', '/'
+            if (-not $byPath.ContainsKey($f)) { continue }
+            foreach ($r in $byPath[$f]) {
+                if (-not $r.Filed -or $curWhen -le $r.Filed) { continue }
+                if ($r.Hits -notcontains $curLine) { $r.Hits += $curLine }
+            }
+        }
+
+        # The HIGH-PRECISION signal, and the reason the report is worth reading
+        # at all (T404). A commit that NAMES an open task's id, made after that
+        # task was filed, is somebody having already dealt with it - a
+        # follow-up that fixed it in passing, a split that absorbed it, a
+        # revert. `touched=` alone cannot carry the report: ranked by it, the
+        # top of the list is whichever hub file the repo is busiest in
+        # (seventeen guard-due tasks, because everyone edits guard-due.ps1),
+        # which says nothing about any one task.
+        #
+        # A second pass rather than a wider format on the first: --name-only
+        # and %b both emit bare lines after the header, and there is no way to
+        # tell a body line from a path once they are mixed.
+        $rowById = @{}
+        foreach ($r in $rows) { $rowById[$r.Task.Id] = $r }
+        $msgLog = @(& git -C $root log ('--since=' + $earliest.ToString('yyyy-MM-ddTHH:mm:ss')) `
+                '--no-merges' ("--format=$marker%h %aI %as %s%n%b") 2>$null)
+        $curWhen = $null; $curLine = $null; $curIds = $null
+        $flush = {
+            if ($curLine -and $curIds) {
+                foreach ($id in $curIds.Keys) {
+                    $r = $rowById[$id]
+                    if (-not $r -or -not $r.Filed -or $curWhen -le $r.Filed) { continue }
+                    if ($r.Mentions -notcontains $curLine) { $r.Mentions += $curLine }
+                }
+            }
+        }
+        foreach ($line in $msgLog) {
+            if ($null -eq $line) { continue }
+            if ($line.StartsWith($marker)) {
+                & $flush
+                $rest = $line.Substring($marker.Length)
+                $bits = $rest.Split(' ', 4)
+                $curWhen = try { [datetime]::Parse($bits[1]) } catch { $null }
+                $curLine = "{0} {1} {2}" -f $bits[0], $bits[2], $bits[3]
+                $curIds = @{}
+            }
+            if (-not $curIds) { continue }
+            foreach ($m in [regex]::Matches($line, '\bT\d+\b')) { $curIds[$m.Value] = $true }
+        }
+        & $flush
+
+        $now = Get-Date
+        # Mentions first, then oldest first. Age is the tiebreaker rather than
+        # the hit count on purpose: among tasks nobody has named, the one whose
+        # claim about the code is oldest is the one most likely to have gone
+        # false, and hit count only measures how busy its files are.
+        $ranked = @($rows | Where-Object { $_.Hits.Count -gt 0 -or $_.Mentions.Count -gt 0 } | Sort-Object `
+            @{ Expression = { $_.Mentions.Count }; Descending = $true }, `
+            @{ Expression = { $_.Filed } })
+        $named = @($ranked | Where-Object { $_.Mentions.Count -gt 0 }).Count
+        Write-Host ("stale-scan: {0} open todo(s) for seat={1}. {2} were NAMED by a later commit; {3} name code that has moved since they were filed." -f `
+                $todos.Count, $wantSeat, $named, $ranked.Count)
+        Write-Host "Each line is a PROMPT TO VERIFY, not a verdict - the defect may still be entirely open."
+        Write-Host ""
+        foreach ($r in ($ranked | Select-Object -First $Top)) {
+            $age = if ($r.Filed) { [int][math]::Floor(($now - $r.Filed).TotalDays) } else { 0 }
+            $pri = if ($r.Task.Priority) { $r.Task.Priority } else { '--' }
+            Write-Host ("{0,-7} {1}  age={2,4}d  named={3,2}  touched={4,3}  {5}" -f `
+                    $r.Task.Id, $pri, $age, $r.Mentions.Count, $r.Hits.Count, $r.Task.Title)
+            foreach ($h in ($r.Mentions | Select-Object -First 3)) { Write-Host ("     named by {0}" -f $h) }
+        }
+        if ($ranked.Count -gt $Top) {
+            Write-Host ""
+            Write-Host ("... {0} more; -Top {1} to see them all." -f ($ranked.Count - $Top), $ranked.Count)
+        }
     }
 
     'validate' {

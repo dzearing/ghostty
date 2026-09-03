@@ -150,6 +150,12 @@ Concretely, in order, with no stops in between:
      the triage summary with a one-line reason each. A proposal the user has
      not vetoed by the NEXT day's triage is closed as `skipped(stale: …)`.
      Never close a P0/P1 by staleness alone.
+   - **Already-fixed sweep** (T404): run
+     `scripts\parity-tasks.ps1 stale-scan -Top 20` and check the `named=` rows —
+     open todos a LATER commit named by id, which is the shape of a card
+     something else already fixed in passing. Verify before closing; the report
+     is a prompt, not a verdict. Anything closed this way names the commit that
+     actually fixed it and lands the validation the card was owed.
    - **Main intake** (user, 2026-08-07: "reduce the lag of the windows
      client to virtually hours rather than days"; daily for now): `git fetch
      origin main`, then evaluate every commit new since the last intake and
@@ -282,6 +288,26 @@ Concretely, in order, with no stops in between:
    `validate` fails an in-progress task that has none. Pass `-Session` with
    your session id when you know it, so a stale task names the conversation
    that was working it.
+
+   **Check the task is still TRUE before you build it** (T404). A todo is a
+   claim about the code made on the day it was filed, and until now nothing
+   re-checked it: T98 was handed out fourteen days after T41 had already fixed
+   its defect at the source, and that turn produced no code. So `next` now
+   prints the filing date and any commits that have touched the files the task
+   itself names since, and says `CHECK FIRST` when there are any. It is a
+   prompt, not a verdict — verify against the code, then take one of three
+   paths: **already fixed** → close it with the commit that ACTUALLY fixed it
+   (not a new one) and land the validation it was owed, since on that shape the
+   *test* is the deliverable; **partly fixed** → rewrite its Summary to what is
+   LEFT before you build, so you are not implementing over a fix you never
+   read; **still real** → journal the re-verification and carry on.
+
+   `stale-scan` asks the same question of the whole queue, ranked by a later
+   commit having NAMED the task, then oldest first:
+
+   ```
+   powershell -NoProfile -File scripts\parity-tasks.ps1 stale-scan -Top 40
+   ```
 
    **Tag it when you file it.** `new -Tags fix,polish` (closed set: `feature`
    / `fix` / `polish` / `perf` / `test` / `infra` / `docs` / `security`) —
