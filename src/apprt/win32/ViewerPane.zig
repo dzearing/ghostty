@@ -3535,44 +3535,51 @@ fn renderFileContent(self: *ViewerPane) void {
         return;
     }
 
-    const bytes = std.fs.cwd().readFileAlloc(alloc, path, content.max_file_bytes) catch |err| {
-        self.injectError(alloc, switch (err) {
-            error.FileTooBig => content.error_too_large,
-            else => content.error_unreadable,
-        }, path);
-        return;
+    // The file's bytes and the script built from them are deliberately NOT
+    // alive at the same time as the call that consumes the script (T389): the
+    // bytes are freed on the way out of this block, so the peak is the file
+    // plus its widened literal rather than the file plus a UTF-8 literal plus
+    // the UTF-16 widening of that literal.
+    const js: [:0]u16 = js: {
+        const bytes = std.fs.cwd().readFileAlloc(alloc, path, content.max_file_bytes) catch |err| {
+            self.injectError(alloc, switch (err) {
+                error.FileTooBig => content.error_too_large,
+                else => content.error_unreadable,
+            }, path);
+            return;
+        };
+        defer alloc.free(bytes);
+
+        // A UTF-8 BOM is invisible to the reader and NOT invisible to the
+        // renderer: left in place it becomes a stray glyph ahead of the first
+        // heading, and Windows editors write one routinely. Dropped here rather
+        // than in the page, so both platforms' renderers stay one file.
+        var text = bytes;
+        if (std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) text = text[3..];
+
+        // Mac's `String(data:encoding:.utf8)` returning nil is exactly this check;
+        // a binary file opened by mistake gets a card, not mojibake.
+        if (!std.unicode.utf8ValidateSlice(text)) {
+            self.injectError(alloc, content.error_not_text, path);
+            return;
+        }
+
+        break :js switch (self.mode) {
+            .markdown => content.setMarkdownCallUtf16(alloc, text),
+            .code => content.setCodeCallUtf16(
+                alloc,
+                text,
+                content.highlightLanguage(content.extension(path)),
+            ),
+            // Neither has content to inject: a website is its own page, and so is a
+            // rendered `.html` file (T601) — the web view loaded it directly. A
+            // diff and an image both answered above, before there was any text to
+            // read.
+            .web, .html, .diff, .image => return,
+        } catch return;
     };
-    defer alloc.free(bytes);
-
-    // A UTF-8 BOM is invisible to the reader and NOT invisible to the
-    // renderer: left in place it becomes a stray glyph ahead of the first
-    // heading, and Windows editors write one routinely. Dropped here rather
-    // than in the page, so both platforms' renderers stay one file.
-    var text = bytes;
-    if (std.mem.startsWith(u8, text, "\xEF\xBB\xBF")) text = text[3..];
-
-    // Mac's `String(data:encoding:.utf8)` returning nil is exactly this check;
-    // a binary file opened by mistake gets a card, not mojibake.
-    if (!std.unicode.utf8ValidateSlice(text)) {
-        self.injectError(alloc, content.error_not_text, path);
-        return;
-    }
-
-    const js = switch (self.mode) {
-        .markdown => content.setMarkdownCall(alloc, text),
-        .code => content.setCodeCall(
-            alloc,
-            text,
-            content.highlightLanguage(content.extension(path)),
-        ),
-        // Neither has content to inject: a website is its own page, and so is a
-        // rendered `.html` file (T601) — the web view loaded it directly. A
-        // diff and an image both answered above, before there was any text to
-        // read.
-        .web, .html, .diff, .image => return,
-    } catch return;
     defer alloc.free(js);
-    self.executeScript(alloc, js);
+    self.executeScriptWide(alloc, js);
 }
 
 // -------------------------------------------------------------------------
@@ -3712,16 +3719,26 @@ fn injectError(self: *ViewerPane, alloc: Allocator, title: []const u8, detail: [
 }
 
 fn executeScript(self: *ViewerPane, alloc: Allocator, js: []const u8) void {
-    const c = self.controller orelse return;
-    const p = self.pending orelse return;
-    const web = c.coreWebView() orelse return;
-    defer web.release();
-
+    // Every small call goes through here — a gutter number, an error card, a
+    // scroll request — where one extra copy of a few dozen bytes costs
+    // nothing. A whole DOCUMENT does not come this way: `renderFileContent`
+    // escapes straight into UTF-16 and calls `executeScriptWide` (T389).
     const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, js) catch {
         log.warn("could not widen the viewer content script", .{});
         return;
     };
     defer alloc.free(wide);
+    self.executeScriptWide(alloc, wide);
+}
+
+/// Hand WebView2 a script that is already UTF-16. The widening is a full copy
+/// of whatever is being injected, so the one caller that injects a whole file
+/// builds its buffer this way from the start (T389).
+fn executeScriptWide(self: *ViewerPane, alloc: Allocator, wide: [:0]const u16) void {
+    const c = self.controller orelse return;
+    const p = self.pending orelse return;
+    const web = c.coreWebView() orelse return;
+    defer web.release();
 
     const handler = ExecuteScriptCompletedHandler.create(alloc, p) catch return;
     p.refs += 1;

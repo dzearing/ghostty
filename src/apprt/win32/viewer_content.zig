@@ -639,18 +639,6 @@ pub fn highlightLanguage(ext: []const u8) ?[]const u8 {
 // The `window.__viewer` calls
 // -------------------------------------------------------------------------
 
-/// `window.__viewer.setMarkdown("…")`. Caller owns the result.
-pub fn setMarkdownCall(alloc: Allocator, source: []const u8) Allocator.Error![]u8 {
-    return try call(alloc, "setMarkdown", &.{source});
-}
-
-/// `window.__viewer.setCode("…", "lang")`. An unknown language is the empty
-/// string, which is what the page treats as "plain text" — the same value
-/// Mac's `lang ?? ""` passes.
-pub fn setCodeCall(alloc: Allocator, source: []const u8, lang: ?[]const u8) Allocator.Error![]u8 {
-    return try call(alloc, "setCode", &.{ source, lang orelse "" });
-}
-
 /// The path an image pane's picture is served from (T1183), under the same
 /// synthetic origin every other file-mode resource uses.
 ///
@@ -729,15 +717,77 @@ pub fn setErrorCall(alloc: Allocator, title: []const u8, detail: []const u8) All
 fn call(alloc: Allocator, name: []const u8, args: []const []const u8) Allocator.Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, "window.__viewer.");
-    try out.appendSlice(alloc, name);
-    try out.append(alloc, '(');
-    for (args, 0..) |a, i| {
-        if (i > 0) try out.appendSlice(alloc, ", ");
-        try appendJsString(alloc, &out, a);
-    }
-    try out.append(alloc, ')');
+    appendCall(u8, alloc, &out, name, args) catch |err| switch (err) {
+        // A u8 sink copies bytes through; only the UTF-16 sink decodes, so
+        // only it can find a malformed sequence.
+        error.InvalidUtf8 => unreachable,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
     return try out.toOwnedSlice(alloc);
+}
+
+/// What building a page call can fail with. `InvalidUtf8` is reachable only on
+/// the UTF-16 path, which decodes on the way out.
+pub const ScriptError = Allocator.Error || error{InvalidUtf8};
+
+/// `window.__viewer.setMarkdown("…")`, already widened for `ExecuteScript`
+/// (T389).
+///
+/// The whole point of this shape is the copy it does NOT make. Building the
+/// literal as UTF-8 and widening it afterwards — which is what this call used
+/// to do — leaves a document alive three times at once: its bytes, its escaped
+/// UTF-8 literal, and the UTF-16 widening of that literal. At the
+/// `max_file_bytes` ceiling that is ~128 MB of transient allocation for one
+/// pane, and a source full of quotes escapes larger still. Escaping straight
+/// into the UTF-16 sink drops the middle copy: the same escape table runs
+/// once, and what it writes IS the buffer WebView2 is handed. Caller owns the
+/// result.
+pub fn setMarkdownCallUtf16(alloc: Allocator, source: []const u8) ScriptError![:0]u16 {
+    return try callUtf16(alloc, "setMarkdown", &.{source});
+}
+
+/// `window.__viewer.setCode("…", "lang")`, widened — the code-mode twin of
+/// `setMarkdownCallUtf16`. An unknown language is the empty string, which is
+/// what the page treats as "plain text" — the same value Mac's `lang ?? ""`
+/// passes.
+pub fn setCodeCallUtf16(
+    alloc: Allocator,
+    source: []const u8,
+    lang: ?[]const u8,
+) ScriptError![:0]u16 {
+    return try callUtf16(alloc, "setCode", &.{ source, lang orelse "" });
+}
+
+fn callUtf16(alloc: Allocator, name: []const u8, args: []const []const u8) ScriptError![:0]u16 {
+    var out: std.ArrayList(u16) = .empty;
+    errdefer out.deinit(alloc);
+    // Ask for the whole thing up front. A geometric regrow is itself a second
+    // live copy of everything written so far, which is exactly the shape this
+    // path exists to avoid; escapes and the sentinel can still push past this,
+    // and then the list grows as it always would.
+    var want: usize = name.len + 32;
+    for (args) |a| want += a.len + 4;
+    try out.ensureTotalCapacity(alloc, want);
+    try appendCall(u16, alloc, &out, name, args);
+    return try out.toOwnedSliceSentinel(alloc, 0);
+}
+
+/// `window.__viewer.<name>(<escaped args>)` into either sink.
+fn appendCall(
+    comptime T: type,
+    alloc: Allocator,
+    out: *std.ArrayList(T),
+    name: []const u8,
+    args: []const []const u8,
+) ScriptError!void {
+    try appendChunk(T, alloc, out, "window.__viewer.");
+    try appendChunk(T, alloc, out, name);
+    try appendChunk(T, alloc, out, "(");
+    for (args, 0..) |a, i| {
+        if (i > 0) try appendChunk(T, alloc, out, ", ");
+        try appendJsStringTo(T, alloc, out, a);
+    }
+    try appendChunk(T, alloc, out, ")");
 }
 
 /// Write `s` as a JS string literal.
@@ -753,65 +803,90 @@ pub fn appendJsString(
     out: *std.ArrayList(u8),
     s: []const u8,
 ) Allocator.Error!void {
-    try out.append(alloc, '"');
+    appendJsStringTo(u8, alloc, out, s) catch |err| switch (err) {
+        error.InvalidUtf8 => unreachable, // see `call`
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+}
+
+/// The same literal, written straight into a UTF-16 sink (T389). One escape
+/// table, two sinks: a second copy of these rules is a second thing to get
+/// wrong, and the two outputs are asserted equal in the none lane.
+pub fn appendJsStringUtf16(
+    alloc: Allocator,
+    out: *std.ArrayList(u16),
+    s: []const u8,
+) ScriptError!void {
+    return try appendJsStringTo(u16, alloc, out, s);
+}
+
+fn appendJsStringTo(
+    comptime T: type,
+    alloc: Allocator,
+    out: *std.ArrayList(T),
+    s: []const u8,
+) ScriptError!void {
+    comptime std.debug.assert(T == u8 or T == u16);
+    try appendChunk(T, alloc, out, "\"");
+    // Everything between `run` and `i` needs no escaping, so it crosses in one
+    // chunk rather than a code unit at a time. That is not only faster: on the
+    // UTF-16 side a byte-at-a-time copy would cut multi-byte sequences in half.
+    // Every escape below begins on a sequence boundary and consumes whole
+    // sequences, so a run never splits one.
+    var run: usize = 0;
     var i: usize = 0;
     while (i < s.len) {
         const c = s[i];
+        var hex: [6]u8 = undefined;
+        var esc: []const u8 = "";
+        var adv: usize = 1;
         switch (c) {
-            '"' => {
-                try out.appendSlice(alloc, "\\\"");
-                i += 1;
-            },
-            '\\' => {
-                try out.appendSlice(alloc, "\\\\");
-                i += 1;
-            },
-            0x08 => {
-                try out.appendSlice(alloc, "\\b");
-                i += 1;
-            },
-            0x0c => {
-                try out.appendSlice(alloc, "\\f");
-                i += 1;
-            },
-            '\n' => {
-                try out.appendSlice(alloc, "\\n");
-                i += 1;
-            },
-            '\r' => {
-                try out.appendSlice(alloc, "\\r");
-                i += 1;
-            },
-            '\t' => {
-                try out.appendSlice(alloc, "\\t");
-                i += 1;
-            },
+            '"' => esc = "\\\"",
+            '\\' => esc = "\\\\",
+            0x08 => esc = "\\b",
+            0x0c => esc = "\\f",
+            '\n' => esc = "\\n",
+            '\r' => esc = "\\r",
+            '\t' => esc = "\\t",
             // U+2028 / U+2029, in UTF-8: E2 80 A8 / E2 80 A9.
             0xE2 => {
                 if (i + 2 < s.len and s[i + 1] == 0x80 and (s[i + 2] == 0xA8 or s[i + 2] == 0xA9)) {
-                    try out.appendSlice(
-                        alloc,
-                        if (s[i + 2] == 0xA8) "\\u2028" else "\\u2029",
-                    );
-                    i += 3;
-                } else {
-                    try out.append(alloc, c);
-                    i += 1;
+                    esc = if (s[i + 2] == 0xA8) "\\u2028" else "\\u2029";
+                    adv = 3;
                 }
             },
             else => {
-                if (c < 0x20) {
-                    var hex: [6]u8 = undefined;
-                    _ = std.fmt.bufPrint(&hex, "\\u{x:0>4}", .{c}) catch unreachable;
-                    try out.appendSlice(alloc, &hex);
-                } else {
-                    try out.append(alloc, c);
-                }
-                i += 1;
+                if (c < 0x20) esc = std.fmt.bufPrint(&hex, "\\u{x:0>4}", .{c}) catch unreachable;
             },
         }
+        if (esc.len == 0) {
+            i += 1;
+            continue;
+        }
+        try appendChunk(T, alloc, out, s[run..i]);
+        try appendChunk(T, alloc, out, esc);
+        i += adv;
+        run = i;
     }
-    try out.append(alloc, '"');
+    try appendChunk(T, alloc, out, s[run..]);
+    try appendChunk(T, alloc, out, "\"");
+}
+
+/// Append one UTF-8 chunk to a sink of `T`: bytes for a UTF-8 sink, decoded
+/// code units for a UTF-16 one. A UTF-16 unit is never produced per byte of
+/// input — 1-, 2- and 3-byte sequences each make one unit and a 4-byte one
+/// makes two — so `s.len` units is always enough room.
+fn appendChunk(
+    comptime T: type,
+    alloc: Allocator,
+    out: *std.ArrayList(T),
+    s: []const u8,
+) ScriptError!void {
+    if (s.len == 0) return;
+    if (T == u8) return try out.appendSlice(alloc, s);
+    try out.ensureUnusedCapacity(alloc, s.len);
+    const written = try std.unicode.utf8ToUtf16Le(out.unusedCapacitySlice(), s);
+    out.items.len += written;
 }
 
 // -------------------------------------------------------------------------
@@ -1692,21 +1767,21 @@ test "mimeType and highlightLanguage carry the Mac tables" {
 test "the __viewer calls are the shape the page exposes" {
     const alloc = testing.allocator;
     {
-        const js = try setMarkdownCall(alloc, "# Hi");
+        const js = try setMarkdownCallUtf16(alloc, "# Hi");
         defer alloc.free(js);
-        try testing.expectEqualStrings("window.__viewer.setMarkdown(\"# Hi\")", js);
+        try expectUtf16(alloc, "window.__viewer.setMarkdown(\"# Hi\")", js);
     }
     {
-        const js = try setCodeCall(alloc, "let x", "javascript");
+        const js = try setCodeCallUtf16(alloc, "let x", "javascript");
         defer alloc.free(js);
-        try testing.expectEqualStrings("window.__viewer.setCode(\"let x\", \"javascript\")", js);
+        try expectUtf16(alloc, "window.__viewer.setCode(\"let x\", \"javascript\")", js);
     }
     {
         // An unknown extension renders as plain text, which the page spells as
         // an empty language id.
-        const js = try setCodeCall(alloc, "x", null);
+        const js = try setCodeCallUtf16(alloc, "x", null);
         defer alloc.free(js);
-        try testing.expectEqualStrings("window.__viewer.setCode(\"x\", \"\")", js);
+        try expectUtf16(alloc, "window.__viewer.setCode(\"x\", \"\")", js);
     }
     {
         const js = try setErrorCall(alloc, error_not_text, "C:\\a.bin");
@@ -1796,6 +1871,111 @@ test "appendJsString escapes the JS line terminators JSON does not" {
     out.clearRetainingCapacity();
     try appendJsString(alloc, &out, "\u{2014}");
     try testing.expectEqualStrings("\"\u{2014}\"", out.items);
+}
+
+test "appendJsStringUtf16 writes exactly what widening the UTF-8 literal would (T389)" {
+    const alloc = testing.allocator;
+
+    // The two sinks share one escape table; this is the assertion that keeps
+    // them sharing it. Anything with a run boundary in an interesting place:
+    // escapes back to back, escapes at both ends, multi-byte sequences either
+    // side of one, and the two line terminators the escaper has to look ahead
+    // for.
+    const cases = [_][]const u8{
+        "",
+        "plain",
+        "\"",
+        "\\",
+        "\"\\\"",
+        "a\"b\\c\nd\te\r\x00f",
+        "a\u{2028}b\u{2029}c",
+        "\u{2014}\"\u{2014}",
+        "\u{1F600} emoji either side \u{1F600}",
+        "\u{00E9}\u{4E2D}\u{1F600}\n\u{00E9}",
+        "tail run with no escape at all",
+        "\x1f\x1e\x1d",
+    };
+
+    for (cases) |c| {
+        var narrow: std.ArrayList(u8) = .empty;
+        defer narrow.deinit(alloc);
+        try appendJsString(alloc, &narrow, c);
+
+        var wide: std.ArrayList(u16) = .empty;
+        defer wide.deinit(alloc);
+        try appendJsStringUtf16(alloc, &wide, c);
+
+        const expected = try std.unicode.utf8ToUtf16LeAlloc(alloc, narrow.items);
+        defer alloc.free(expected);
+        try testing.expectEqualSlices(u16, expected, wide.items);
+    }
+}
+
+test "setMarkdownCallUtf16 survives a source that is nothing but escapes" {
+    const alloc = testing.allocator;
+
+    // The pathological document T389 names: every byte needs escaping, so the
+    // literal comes out twice the size of the file. Built one escape at a
+    // time, so the expectation is not the implementation restated.
+    var source: [512]u8 = undefined;
+    for (&source, 0..) |*b, i| b.* = if (i % 2 == 0) '"' else '\\';
+
+    var expected: std.ArrayList(u8) = .empty;
+    defer expected.deinit(alloc);
+    try expected.appendSlice(alloc, "window.__viewer.setMarkdown(\"");
+    for (source) |b| try expected.appendSlice(alloc, if (b == '"') "\\\"" else "\\\\");
+    try expected.appendSlice(alloc, "\")");
+
+    const wide = try setMarkdownCallUtf16(alloc, &source);
+    defer alloc.free(wide);
+    // The sentinel is what `ExecuteScript` reads to know where the script ends.
+    try testing.expectEqual(@as(u16, 0), wide[wide.len]);
+    try expectUtf16(alloc, expected.items, wide);
+}
+
+test "setCodeCallUtf16 carries the language argument" {
+    const alloc = testing.allocator;
+    const wide = try setCodeCallUtf16(alloc, "x = 1\n", "python");
+    defer alloc.free(wide);
+    try expectUtf16(alloc, "window.__viewer.setCode(\"x = 1\\n\", \"python\")", wide);
+
+    // An unknown language is the empty string, which is what the page reads as
+    // plain text.
+    const none = try setCodeCallUtf16(alloc, "x", null);
+    defer alloc.free(none);
+    try expectUtf16(alloc, "window.__viewer.setCode(\"x\", \"\")", none);
+}
+
+/// Assert a widened script is exactly `expected` — written as UTF-8 here
+/// because a UTF-16 literal in a test is unreadable, and compared as UTF-16
+/// because that is what crosses to WebView2.
+fn expectUtf16(alloc: Allocator, expected: []const u8, actual: []const u16) !void {
+    const want = try std.unicode.utf8ToUtf16LeAlloc(alloc, expected);
+    defer alloc.free(want);
+    testing.expectEqualSlices(u16, want, actual) catch |err| {
+        // A u16 diff is unreadable on its own; print both sides as text too.
+        const got = std.unicode.utf16LeToUtf8Alloc(alloc, actual) catch return err;
+        defer alloc.free(got);
+        std.debug.print("expected: {s}\n     got: {s}\n", .{ expected, got });
+        return err;
+    };
+}
+
+test "setMarkdownCallUtf16 leaks nothing when an allocation fails" {
+    // Every regrow of the UTF-16 sink is a failure point, and this path hands
+    // back a sentinel slice the caller frees; `checkAllAllocationFailures`
+    // walks each one.
+    const Case = struct {
+        fn run(alloc: Allocator, source: []const u8) !void {
+            const js = try setMarkdownCallUtf16(alloc, source);
+            alloc.free(js);
+        }
+    };
+    try testing.checkAllAllocationFailures(
+        testing.allocator,
+        Case.run,
+        .{"a \"quoted\" \u{2028} line, long enough to force a regrow " ** 8},
+    );
 }
 
 test "classifyLink: the Mac policy, with the virtual host carved out first" {
