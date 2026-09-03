@@ -286,6 +286,22 @@ $GuardTable = @(
             'test\win32\lib\BrowserLeak.ps1'
         )
     },
+    # The viewer's ERROR CARD (T381): the only thing that photographs the card a
+    # viewer paints when there is no WebView2 runtime. The unit lane proves the
+    # layout module's arithmetic and cannot see a pixel; this box HAS the
+    # runtime, so nothing else here ever takes that branch at all. Covers the
+    # painter, the geometry module, the failure strings it renders, and the
+    # shared measurement lib the probe reads pixels through.
+    [pscustomobject]@{
+        Name   = 'viewer-error-card'
+        Script = 'test\win32\viewer-error-card.ps1'
+        Stamp  = 'test\win32\viewer-error-card.stamp.json'
+        Covers = @(
+            'test\win32\viewer-error-card.ps1',
+            'test\win32\lib\ColorMath.ps1',
+            'src\apprt\win32\viewer_error_card.zig'
+        )
+    },
     # Narrow viewer panes (T1130): the only thing that measures viewer chrome
     # against the pane it lives in. The unit lanes assert the pure layout
     # modules and cannot see a WINDOW placed outside its parent, and the P1-P3

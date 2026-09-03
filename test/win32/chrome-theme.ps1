@@ -181,43 +181,9 @@ function Kill-RepoInstances {
 # Capture helpers
 # ---------------------------------------------------------------------------
 
-# Every pixel of a screen-coordinate box, summarised: the MODE (the color the
-# most pixels are, i.e. the band fill by construction - the title and the
-# button glyphs are a small minority of a caption band) and the two luminance
-# extremes with their colors.
-#
-# `-Step` samples every Nth pixel in both axes. A caption band is small enough
-# to walk whole; a PANEL is ~900x700, and 630k `GetPixel` calls through
-# PowerShell is minutes per capture. Sampling cannot change which color is the
-# MODE (the fill is most of the box by construction) and still lands on plenty
-# of glyph pixels for the extremes, because text strokes are not one pixel wide
-# at these sizes.
-function Measure-Box($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1, [int]$Step = 1) {
-    $hist = @{}
-    $minL = 2.0; $maxL = -1.0
-    $minC = $null; $maxC = $null
-    for ($y = $Y0; $y -lt $Y1; $y += $Step) {
-        for ($x = $X0; $x -lt $X1; $x += $Step) {
-            $c = Get-TestPixel -Shot $Shot -X $x -Y $y
-            if ($null -eq $c) { continue }
-            $key = '{0},{1},{2}' -f $c.R, $c.G, $c.B
-            if ($hist.ContainsKey($key)) { $hist[$key]++ } else { $hist[$key] = 1 }
-            $l = Get-Lum601 $c.R $c.G $c.B
-            if ($l -lt $minL) { $minL = $l; $minC = @([int]$c.R, [int]$c.G, [int]$c.B) }
-            if ($l -gt $maxL) { $maxL = $l; $maxC = @([int]$c.R, [int]$c.G, [int]$c.B) }
-        }
-    }
-    if ($hist.Count -eq 0) { return $null }
-    $top = $hist.GetEnumerator() | Sort-Object -Property Value -Descending | Select-Object -First 1
-    $parts = $top.Key -split ','
-    return [pscustomobject]@{
-        Mode     = @([int]$parts[0], [int]$parts[1], [int]$parts[2])
-        ModeN    = [int]$top.Value
-        Darkest  = $minC
-        Lightest = $maxC
-        Distinct = $hist.Count
-    }
-}
+# `Measure-Box` moved to lib\ColorMath.ps1 (T381): viewer-error-card.ps1 needs the
+# same box summary to read a card's fill and its text extremes, and a second copy
+# of it would be a second chance to disagree about what MODE means.
 
 # Is there a pixel of EXACTLY $Rgb anywhere in the capture? Exact on purpose:
 # GDI strokes a solid pen with no antialiasing, so an accent border lands as its

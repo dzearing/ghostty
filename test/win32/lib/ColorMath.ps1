@@ -164,6 +164,51 @@ function Get-Contrast([int[]]$A, [int[]]$B) {
 
 function Format-Rgb([int[]]$Rgb) { return ('#{0:x2}{1:x2}{2:x2}' -f $Rgb[0], $Rgb[1], $Rgb[2]) }
 
+# --- capture measurement ------------------------------------------------------
+#
+# Shared with the color derivations above because the two are always used
+# together: a probe measures a box, then compares what it found with what the
+# app would have derived. It reads pixels through `Get-TestPixel`, so a caller
+# dot-sources lib\TestDesktop.ps1 as well (both of today's do).
+
+# Every pixel of a screen-coordinate box, summarised: the MODE (the color the
+# most pixels are, i.e. the band fill by construction - the title and the
+# button glyphs are a small minority of a caption band) and the two luminance
+# extremes with their colors.
+#
+# `-Step` samples every Nth pixel in both axes. A caption band is small enough
+# to walk whole; a PANEL is ~900x700, and 630k `GetPixel` calls through
+# PowerShell is minutes per capture. Sampling cannot change which color is the
+# MODE (the fill is most of the box by construction) and still lands on plenty
+# of glyph pixels for the extremes, because text strokes are not one pixel wide
+# at these sizes.
+function Measure-Box($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1, [int]$Step = 1) {
+    $hist = @{}
+    $minL = 2.0; $maxL = -1.0
+    $minC = $null; $maxC = $null
+    for ($y = $Y0; $y -lt $Y1; $y += $Step) {
+        for ($x = $X0; $x -lt $X1; $x += $Step) {
+            $c = Get-TestPixel -Shot $Shot -X $x -Y $y
+            if ($null -eq $c) { continue }
+            $key = '{0},{1},{2}' -f $c.R, $c.G, $c.B
+            if ($hist.ContainsKey($key)) { $hist[$key]++ } else { $hist[$key] = 1 }
+            $l = Get-Lum601 $c.R $c.G $c.B
+            if ($l -lt $minL) { $minL = $l; $minC = @([int]$c.R, [int]$c.G, [int]$c.B) }
+            if ($l -gt $maxL) { $maxL = $l; $maxC = @([int]$c.R, [int]$c.G, [int]$c.B) }
+        }
+    }
+    if ($hist.Count -eq 0) { return $null }
+    $top = $hist.GetEnumerator() | Sort-Object -Property Value -Descending | Select-Object -First 1
+    $parts = $top.Key -split ','
+    return [pscustomobject]@{
+        Mode     = @([int]$parts[0], [int]$parts[1], [int]$parts[2])
+        ModeN    = [int]$top.Value
+        Darkest  = $minC
+        Lightest = $maxC
+        Distinct = $hist.Count
+    }
+}
+
 # --- the derived colors a probe asks for ------------------------------------
 #
 # Only the ones whose contrast clamp is a NO-OP on the surfaces these scripts

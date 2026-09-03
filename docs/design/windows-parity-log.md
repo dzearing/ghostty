@@ -20624,3 +20624,63 @@ PASS, P1-P3 ALL PASS.
 Filed: T1303 (section E's 30-second wait for the post-update sweep goes red
 under box load and green solo, minutes apart, over the same code - a real leak
 and a slow box are currently indistinguishable).
+
+## 2026-09-03 - the "no WebView2 here" card has finally been photographed (T381)
+
+A viewer pane on a box with no WebView2 runtime paints a small native card
+instead of a page: one line saying what is missing, one saying what to do about
+it. T373 shipped it and asserted every NUMBER in it at 1.0, 1.25, 1.5 and 2.0.
+Nothing ever asserted a PIXEL of it, because this box has the runtime - every
+live viewer here takes the happy path, so the card's only evidence was a layout
+function agreeing with itself.
+
+`test\win32\viewer-error-card.ps1` closes that. `GHOZTTY_WEBVIEW2_BROWSER_DIR`
+overrides the runtime probe outright, including the "does it exist" check, so
+pointing it at a directory that is not there makes a box WITH the runtime take
+the runtime-absent branch faithfully; it is inherited through CreateProcessW, so
+setting it on the harness before the launch reaches the app and nothing else.
+`GhozttyViewer` answers WM_PRINTCLIENT, so `PrintWindow` with no flags
+photographs the pane's own GDI painting synchronously - which is what lets this
+run on the background test desktop where the composite and the cursor are dead.
+
+What it measures, on a dark `#1e1e1e` background and a light `#f3f3f3` one:
+the clearance band is exactly the configured background (the proof these are the
+viewer's pixels and not a blank bitmap), the card's painted extent is the layout
+module's own numbers at this box's 1.25 scale, and the message, the hint and the
+rim clear 4.5:1, 4.5:1 and 3:1 against the MEASURED fill - measured rather than
+predicted, because the fill comes out of a wash plus a CIELAB contrast clamp and
+a second copy of that clamp here would be a second copy of the thing under test.
+
+It is its own script rather than a section of `viewer-panes.ps1` because the
+override is process-wide and permanent for the instance that inherits it, and
+all eleven of that script's sections need a WORKING WebView2.
+
+Two controls, and the first run needed both. Section C launches the same pane
+with the runtime found normally and asserts the card's two vertical edges are
+gone - written first as "the middle row is all background", which FAILED,
+because with a live web view `PrintWindow` does not bring the host's own fill
+back for the region the Chromium child owns and every pixel there differs from
+the background. A transition pair is the shape of a card; a page has none. The
+same run also asserts the clearance band is NOT the background there, so the two
+states are provably different rather than merely scoring differently.
+`-NegativeControl` raises both floors past what any colour pair can reach and
+fails with exactly six.
+
+The first run also scored ALL PASS over a section that had thrown: a PowerShell
+comma binds tighter than a minus, so `@($lay.Left - 1, $lay.Left)` is
+`$lay.Left - @(1, $lay.Left)`, and the throw unwound the whole thing under a
+green line. That is the T1039 shape exactly, and the fix is the two lines it
+prescribes - `lib\TestScore.ps1` armed at the dot-source, `Complete-TestBody`
+as the last statement of the body - plus a `-MinPass` floor of 30, so a run that
+lands six of forty-one says so instead of stamping its guard.
+
+`Measure-Box` moved out of `chrome-theme.ps1` into `lib\ColorMath.ps1`: the
+probe needs the same box summary to read a fill and its text extremes, and a
+second copy would be a second chance to disagree about what MODE means.
+
+Evidence: viewer-error-card ALL PASS (41 assertions), `-NegativeControl` 6
+failures exactly; chrome-theme re-run ALL PASS (64) after the move; floor lanes
+lib/none/win32/agent all PASS; P1-P3 ALL PASS; and the eleven meta-audits that
+police a new harness - body-complete, asserted-nothing, verdict-exit,
+isolation-meta, launch-preflight, cleanslate, stderr-capture, desktop-launch,
+test-reach, printclient-audit, control-char-scan - all green over it.
