@@ -70,6 +70,12 @@ test {
     // user's live sessions — both are constants and pure logic a lane can
     // check, and neither can be asked of a running install.
     _ = @import("win32/install_prepare.zig");
+    // The installer maintenance prompt (T1291). Same argument as the prepare
+    // step above, plus one of its own: the two exit codes it hands msiexec ARE
+    // the feature — 0 repairs, 1602 cancels quietly, and any other value is
+    // error 1721 in the user's face — and no lane can learn that from a real
+    // install, because a real install would replace the user's Ghoztty.
+    _ = @import("win32/install_maintenance.zig");
     // Escaping the app's job object, and measuring who is in it (T524, T426).
     // Both are what stands between a daemon/supervisor and dying with the
     // process it exists to outlive, so the lane compiles and checks them in

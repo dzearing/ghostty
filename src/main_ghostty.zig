@@ -108,6 +108,23 @@ pub fn main() !MainReturn {
         }
     }
 
+    // T1291: this process may be the installer's MAINTENANCE prompt — msiexec
+    // running `[INSTALLDIR]ghoztty.exe --install-maintenance` because the same
+    // version is already installed, which without this ends with the installer
+    // silently exiting and telling the user nothing. It puts up a Repair /
+    // Cancel dialog and answers msiexec with its exit code.
+    //
+    // Asked beside the prepare step above and for the same reasons: it must
+    // never look like a second instance of the terminal the user is running,
+    // and it is gated on there being no `+action` so a pane that somehow
+    // carries the flag stays whatever verb it asked for.
+    if (@hasDecl(apprt.App, "runInstallMaintenance") and state.action == null) {
+        if (apprt.App.runInstallMaintenance(alloc)) |code| {
+            posix.exit(code);
+            return;
+        }
+    }
+
     // T695: this process may be a `ghoztty://` URL activation — the shell
     // launching our registered protocol handler with a clicked link as argv.
     // Asked before the single-instance bind, because an activation must never

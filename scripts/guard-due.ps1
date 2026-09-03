@@ -990,6 +990,20 @@ $GuardTable = @(
             'test\win32\install-prepare.ps1'
         )
     },
+    # Re-running the installer for the version already installed must say so
+    # rather than vanish (T1291). The MSI half and the app half are one feature
+    # - the package runs the exe and reads its exit code - so an edit to either
+    # side asks the same harness whether the pair still agrees.
+    [pscustomobject]@{
+        Name   = 'install-maintenance'
+        Script = 'test\win32\install-maintenance.ps1'
+        Stamp  = 'test\win32\install-maintenance.stamp.json'
+        Covers = @(
+            'src\apprt\win32\install_maintenance.zig',
+            'dist\windows-installer\build-msi.sh',
+            'test\win32\install-maintenance.ps1'
+        )
+    },
     # "Which Ghoztty am I running?" has ONE answer per surface (T1205). Windows
     # cannot replace a running image, so the file on disk and the process in
     # front of the user are routinely different builds - and the About box used

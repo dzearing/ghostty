@@ -20503,3 +20503,69 @@ and re-stamped.
 Filed: T1297 (the watchdog answers a 529 by re-submitting into it, with no
 backoff and no notion of waiting on something transient) and T1298 (the dashboard
 still shows liveness only - a human watching the board cannot see this shape).
+
+## 2026-09-03 - T1291: the installer stops vanishing when you already have that version
+
+You run the installer for the build you are already running, and the window
+disappears. Nothing is said, nothing is logged, and you cannot tell whether it
+worked, did nothing on purpose, or broke. The user, on 2026-09-03: *"there
+should be some message to ask what to do (reinstall, cancel) that's a standard
+dialog to let you know you're already good, not just silently fail."*
+
+Everything about that was working as designed, which is why nothing complained.
+An MSI whose ProductCode is already installed puts Windows Installer into
+MAINTENANCE mode, and maintenance mode hands the whole question - repair?
+change? remove? - to the package's authored UI. This package has none, on
+purpose: a double-clicked install is a progress bar and then a terminal, with no
+wizard anywhere. So there was nothing to show, no feature state changed, and
+msiexec exited 0.
+
+The fix is not a wizard. Bolting a WixUI dialog set on for the rarest path would
+give the product a second, differently-styled installer UI, and it would be the
+only one most people ever see. Instead the package asks THE APP, through the
+same type-51/type-50 custom-action pair it already uses for `--install-prepare`
+(T1207) and for launch-on-finish (T1176): msiexec runs
+`[INSTALLDIR]ghoztty.exe --install-maintenance`, and the app puts up the dark
+`ConfirmDialog` every other Ghoztty prompt uses, relabelled Repair / Cancel.
+
+The answer travels back as the exit code, which is the one channel an EXE custom
+action has, and the two numbers are the whole feature. Repair exits 0, and the
+package has already armed `REINSTALL=ALL` / `REINSTALLMODE=amus` before
+`CostFinalize` - which is where feature states are decided, and therefore too
+early to have asked yet - so a success simply lets the repair it already planned
+proceed. Cancel exits 1602, `ERROR_INSTALL_USEREXIT`: the ONE non-zero code
+Windows Installer reads as "the person said no", ending the transaction quietly
+with nothing written and no error. Any other value surfaces as error 1721, "a
+program run as part of the setup did not finish as expected", which is a worse
+outcome than the silence being replaced. All four actions are gated on
+`UILevel > 3`, so the in-app updater's `/qb-!` install (UILevel 3) never sees a
+dialog - a modal prompt inside an unattended update is a hang, not a courtesy.
+
+The same pass split the version bands. The `Upgrade` table had two rows, and the
+upper one began at the current version INCLUSIVE - so a package carrying the
+same `ProductVersion` as the install was announced as "a newer version of
+Ghoztty is already installed", which is a lie the user cannot act on. There are
+now three: older, equal (`SAMEVERSIONFOUND`, detect-only), and strictly newer,
+each with its own `LaunchCondition` message that says the true thing.
+
+Validation: `test\win32\install-maintenance.ps1` ALL PASS (40 assertions), and
+its `-TeethCheck` ALL PASS over all 21 source checks. The live section is the
+part worth naming: it launches the real debug exe as the package's prompt on a
+background desktop, finds the `GhozttyConfirmDialog`, reads its two BUTTON
+captions back as `Repair` and `Cancel`, presses each, and measures the process
+exit codes as 0 and 1602 - the contract with msiexec, measured rather than
+asserted. `build-msi.sh` gained its own read-back block for the compiled
+package, and E2 through E12 feed it each broken table it exists to reject,
+starting with the silent package itself. `scripts\floor-lane.ps1 -Lane all`
+green, P1-P3 ALL PASS.
+
+What is deliberately still unmeasured: a real msiexec maintenance run. Building
+the package needs wixl, which on this box means Docker, and installing the real
+product would replace the user's Ghoztty. The MSI half is asserted at its source
+and at its build-time read-back; the half that decides what the user sees and
+what msiexec is told is measured live.
+
+Filed: T1299 (nobody has ever installed the MSI and clicked through it on this
+box - three installer defects in a row reached the user before any harness
+could) and T1300 (Apps & Features still offers no Repair, now that there is one
+to offer).

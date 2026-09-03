@@ -55,6 +55,7 @@ const update_install = @import("update_install.zig");
 const update_progress = @import("update_progress.zig");
 const UpdateProgress = @import("UpdateProgress.zig");
 const install_prepare = @import("install_prepare.zig");
+const install_maintenance = @import("install_maintenance.zig");
 const utf16_text = @import("utf16_text.zig");
 const tray_notify = @import("tray_notify.zig");
 const orphan_notify = @import("orphan_notify.zig");
@@ -8307,6 +8308,18 @@ pub fn runUpdateApplier(alloc: Allocator) ?u8 {
 /// A DECL on the apprt for the same reason `runRelaunchGuard` is one.
 pub fn runInstallPrepare(alloc: Allocator) ?u8 {
     return install_prepare.runFromArgs(alloc);
+}
+
+/// Was this process started as the installer's maintenance prompt (T1291)? If
+/// so, ask and hand `main` the exit code — a prompt never becomes a terminal.
+/// msiexec runs it out of INSTALLDIR when the SAME version is already
+/// installed, which is the case that used to end with the installer vanishing
+/// without a word. The Cancel answer never comes back here: it leaves the
+/// process with 1602, which is wider than the `u8` `main` exits with.
+///
+/// A DECL on the apprt for the same reason `runRelaunchGuard` is one.
+pub fn runInstallMaintenance(alloc: Allocator) ?u8 {
+    return install_maintenance.runFromArgs(alloc);
 }
 
 /// T675: is this process inside a kill-on-close job it does not own — the

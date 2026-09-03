@@ -367,12 +367,25 @@ template = """<?xml version="1.0" encoding="utf-8"?>
       <UpgradeVersion Minimum="0.0.0" IncludeMinimum="yes"
                       Maximum="@PRODUCT_VERSION@" IncludeMaximum="no"
                       Property="OLDERVERSIONFOUND" MigrateFeatures="yes"/>
+      <!-- T1291: the same version and a NEWER version are two different
+           answers, and telling somebody who has this exact build that a
+           "newer version" is installed is a lie they cannot act on. The
+           equal-version band is detected on its own so each case can say the
+           true thing. (Neither row ever matches the package's OWN install:
+           FindRelatedProducts skips the ProductCode being installed, which is
+           what leaves the maintenance path below to handle "you already have
+           this package".) -->
       <UpgradeVersion Minimum="@PRODUCT_VERSION@" IncludeMinimum="yes"
+                      Maximum="@PRODUCT_VERSION@" IncludeMaximum="yes"
+                      OnlyDetect="yes"
+                      Property="SAMEVERSIONFOUND"/>
+      <UpgradeVersion Minimum="@PRODUCT_VERSION@" IncludeMinimum="no"
                       OnlyDetect="yes"
                       Property="NEWERVERSIONFOUND"/>
     </Upgrade>
 
-    <Condition Message="A newer version of Ghoztty is already installed.">NOT NEWERVERSIONFOUND</Condition>
+    <Condition Message="A newer version of Ghoztty is already installed, so this installer has nothing to add. Close it and keep using the version you have, or remove that one from Apps and Features first if you really want to go back.">NOT NEWERVERSIONFOUND</Condition>
+    <Condition Message="This version of Ghoztty is already installed, so there is nothing to update. Close this installer and carry on - your Ghoztty is up to date.">NOT SAMEVERSIONFOUND</Condition>
 
     <Directory Id="TARGETDIR" Name="SourceDir">
       <Directory Id="LocalAppDataFolder">
@@ -514,6 +527,58 @@ template = """<?xml version="1.0" encoding="utf-8"?>
                   Execute="immediate"
                   Return="ignore"/>
 
+    <!-- T1291: re-running the installer for the version you already have must
+         SAY SO, not vanish.
+
+         (No double hyphen anywhere in this comment: XML forbids one inside a
+         comment and wixl rejects the whole document over it. Flags are written
+         without their leading dashes.)
+
+         What it looked like: msiexec sees its own ProductCode already
+         installed, enters MAINTENANCE mode, hands the whole question to the
+         package's authored UI, finds there is none (this product deliberately
+         has no wizard), changes no feature state and exits 0 without a word.
+         The user, 2026-09-03: "it just silently quit ... there should be some
+         message to ask what to do (reinstall, cancel)".
+
+         The answer is the app, through the same type 51 / type 50 pair the two
+         actions above use, rather than a WixUI dialog set: a second,
+         differently styled installer UI for the rarest path is a worse
+         experience than the one dark Ghoztty dialog every other prompt in this
+         product uses. `ghoztty.exe install-maintenance` shows Repair / Cancel
+         and answers with its exit code (src/apprt/win32/install_maintenance.zig).
+
+         Three pieces, in the order they have to happen:
+
+         1. SetRepairMode / SetRepairModeFlags pre-arm REINSTALL=ALL before
+            CostFinalize, because CostFinalize is where feature states are
+            decided and therefore too early to have asked the question yet.
+            Nothing is written at that point, so pre-arming a repair the user
+            then cancels costs nothing.
+         2. MaintenancePrompt runs AFTER CostFinalize, which is the first
+            moment INSTALLDIR resolves and therefore the first moment there is
+            an exe path to run.
+         3. Return="check": exit 0 lets the pre-armed repair proceed, and 1602
+            (ERROR_INSTALL_USEREXIT) ends the transaction cleanly with no
+            error dialog. That is the ONE non-zero code Windows Installer reads
+            as "the user said no"; every other value surfaces as error 1721.
+
+         Gated on UILevel > 3 for the reason LaunchApp is: the in app updater
+         installs with /qb-! (UILevel 3), and a modal dialog inside an
+         unattended update is a hang, not a courtesy. REMOVE, PATCH and
+         UPGRADINGPRODUCTCODE exclude uninstall, patching and being removed by
+         a newer package, so the only case left is the one the user hit. -->
+    <CustomAction Id="SetRepairMode" Property="REINSTALL" Value="ALL"/>
+    <CustomAction Id="SetRepairModeFlags" Property="REINSTALLMODE" Value="amus"/>
+    <CustomAction Id="SetMaintenancePromptCmd"
+                  Property="MAINTENANCEPROMPTCMD"
+                  Value="[INSTALLDIR]ghoztty.exe"/>
+    <CustomAction Id="MaintenancePrompt"
+                  Property="MAINTENANCEPROMPTCMD"
+                  ExeCommand="--install-maintenance --installed-version=[ARPDISPLAYVERSION]"
+                  Execute="immediate"
+                  Return="check"/>
+
     <Property Id="LAUNCHAPP" Value="1"/>
     <CustomAction Id="SetLaunchAppCmd"
                   Property="LAUNCHAPPCMD"
@@ -528,6 +593,10 @@ template = """<?xml version="1.0" encoding="utf-8"?>
       <RemoveExistingProducts After="InstallValidate"/>
       <Custom Action="SetPrepareInstallDirCmd" Before="PrepareInstallDir"/>
       <Custom Action="PrepareInstallDir" Before="InstallValidate">Installed OR OLDERVERSIONFOUND</Custom>
+      <Custom Action="SetRepairMode" Before="CostFinalize">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
+      <Custom Action="SetRepairModeFlags" After="SetRepairMode">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
+      <Custom Action="SetMaintenancePromptCmd" After="CostFinalize">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
+      <Custom Action="MaintenancePrompt" After="SetMaintenancePromptCmd">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
       <Custom Action="SetLaunchAppCmd" Before="LaunchApp"/>
       <Custom Action="LaunchApp" After="InstallFinalize">NOT Installed AND NOT OLDERVERSIONFOUND AND UILevel &gt; 3 AND LAUNCHAPP = "1"</Custom>
     </InstallExecuteSequence>
@@ -746,6 +815,130 @@ if errs:
     sys.exit(1)
 print("launch-on-finish ok: SetLaunchAppCmd -> LaunchApp (asyncNoWait) after InstallFinalize")
 print("session-safe upgrade ok: PrepareInstallDir (immediate, ignore) before InstallValidate")
+PYEOF
+
+# Read the already-installed maintenance wiring back out of the compiled
+# package (T1291). Its own verifier rather than more of the block above,
+# because each of these blocks is EXTRACTED and fed synthetic tables by an
+# acceptance script (test/win32/install-maintenance.ps1 here), and a verifier
+# that answers one question is one a demonstration can aim at.
+#
+# What it is guarding: re-running the installer for the version already
+# installed used to enter maintenance mode, find no authored UI, and exit 0
+# without a word. A MaintenancePrompt row that is missing, asynchronous, or
+# ignoring its exit code is indistinguishable from that silence.
+echo "==> verify already-installed maintenance prompt (CustomAction + sequence + Upgrade)"
+msiinfo export "$OUT" Upgrade > "$WORK/Upgrade.idt" || {
+  echo "error: the MSI has no Upgrade table - it could not tell an existing install apart at all" >&2; exit 1; }
+python3 - "$WORK/CustomAction.idt" "$WORK/InstallExecuteSequence.idt" "$WORK/Upgrade.idt" <<'PYEOF'
+import sys
+
+def rows(path):
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        lines = f.read().replace("\r\n", "\n").split("\n")
+    # .idt header: column names, column types, table name.
+    return [l.split("\t") for l in lines[3:] if l.strip()]
+
+ca = {r[0]: r for r in rows(sys.argv[1])}
+seq = {r[0]: r for r in rows(sys.argv[2])}
+# Upgrade columns: UpgradeCode, VersionMin, VersionMax, Language, Attributes,
+# Remove, ActionProperty.
+up = {r[6]: r for r in rows(sys.argv[3]) if len(r) > 6}
+errs = []
+
+# The prompt itself. A wrong Return flag here is not a missing feature but a
+# worse one: an action that ignores its exit code makes Cancel repair anyway,
+# and an asynchronous one makes both buttons meaningless.
+if "MaintenancePrompt" not in ca:
+    errs.append("CustomAction table has no MaintenancePrompt row - re-running the installer for the installed version would silently exit again")
+else:
+    t = int(ca["MaintenancePrompt"][1])
+    if t & 0x3F != 50:
+        errs.append(f"MaintenancePrompt base type is {t & 0x3F}, expected 50 (exe from property)")
+    if t & 64:
+        errs.append(f"MaintenancePrompt type {t} ignores its exit code - Cancel would repair anyway")
+    if t & 128:
+        errs.append(f"MaintenancePrompt type {t} is asynchronous - msiexec would not wait for the answer")
+    if t & 0x400:
+        errs.append(f"MaintenancePrompt type {t} is deferred - it must run in the immediate sequence to be able to stop the install")
+    if ca["MaintenancePrompt"][2] != "MAINTENANCEPROMPTCMD":
+        errs.append(f"MaintenancePrompt source is {ca['MaintenancePrompt'][2]!r}, expected MAINTENANCEPROMPTCMD")
+    if "--install-maintenance" not in ca["MaintenancePrompt"][3]:
+        errs.append(f"MaintenancePrompt arguments are {ca['MaintenancePrompt'][3]!r}, expected to carry --install-maintenance")
+
+if "SetMaintenancePromptCmd" not in ca:
+    errs.append("CustomAction table has no SetMaintenancePromptCmd row - MAINTENANCEPROMPTCMD would be empty and nothing would ask")
+else:
+    if int(ca["SetMaintenancePromptCmd"][1]) != 51:
+        errs.append(f"SetMaintenancePromptCmd type is {ca['SetMaintenancePromptCmd'][1]}, expected 51 (property set)")
+    if ca["SetMaintenancePromptCmd"][3] != "[INSTALLDIR]ghoztty.exe":
+        errs.append(f"SetMaintenancePromptCmd target is {ca['SetMaintenancePromptCmd'][3]!r}, expected [INSTALLDIR]ghoztty.exe")
+
+# Answering Repair has to actually repair something. REINSTALL is read at
+# CostFinalize, so it is armed before the question is asked and unwound by a
+# Cancel that ends the transaction before anything is written.
+for action, prop, value in (
+    ("SetRepairMode", "REINSTALL", "ALL"),
+    ("SetRepairModeFlags", "REINSTALLMODE", "amus"),
+):
+    if action not in ca:
+        errs.append(f"CustomAction table has no {action} row - Repair would be answered and then do nothing")
+    else:
+        if int(ca[action][1]) != 51:
+            errs.append(f"{action} type is {ca[action][1]}, expected 51 (property set)")
+        if ca[action][2] != prop:
+            errs.append(f"{action} sets {ca[action][2]!r}, expected {prop}")
+        if ca[action][3] != value:
+            errs.append(f"{action} value is {ca[action][3]!r}, expected {value!r}")
+
+for action in ("MaintenancePrompt", "SetMaintenancePromptCmd", "SetRepairMode",
+               "SetRepairModeFlags", "CostFinalize"):
+    if action not in seq:
+        errs.append(f"InstallExecuteSequence has no {action} row")
+if not errs:
+    n_cost = int(seq["CostFinalize"][2])
+    n_arm = int(seq["SetRepairMode"][2])
+    n_arm_flags = int(seq["SetRepairModeFlags"][2])
+    n_ask = int(seq["MaintenancePrompt"][2])
+    n_ask_set = int(seq["SetMaintenancePromptCmd"][2])
+    if n_arm >= n_cost or n_arm_flags >= n_cost:
+        errs.append(f"REINSTALL is armed at {n_arm}/{n_arm_flags}, not before CostFinalize at {n_cost} - feature states are decided there, so Repair would do nothing")
+    if n_ask <= n_cost:
+        errs.append(f"MaintenancePrompt is sequenced at {n_ask}, before CostFinalize at {n_cost} - INSTALLDIR does not resolve until then, so there would be no exe to run")
+    if n_ask_set >= n_ask:
+        errs.append(f"SetMaintenancePromptCmd is sequenced at {n_ask_set}, not before MaintenancePrompt at {n_ask}")
+    # The gate. UILevel is the one that keeps the in-app updater's /qb-! install
+    # from stopping on a modal dialog nobody is there to answer.
+    for action in ("MaintenancePrompt", "SetMaintenancePromptCmd", "SetRepairMode", "SetRepairModeFlags"):
+        cond = seq[action][1]
+        for want in ("Installed", "REMOVE", "UPGRADINGPRODUCTCODE", "UILevel"):
+            if want not in cond:
+                errs.append(f"{action} condition {cond!r} does not gate on {want}")
+
+# The equal-version band is detected on its own, so a same-version package is
+# never announced as a "newer version".
+for prop in ("OLDERVERSIONFOUND", "SAMEVERSIONFOUND", "NEWERVERSIONFOUND"):
+    if prop not in up:
+        errs.append(f"Upgrade table has no {prop} row - the installer cannot tell that case apart")
+if "SAMEVERSIONFOUND" in up and "NEWERVERSIONFOUND" in up:
+    same, newer = up["SAMEVERSIONFOUND"], up["NEWERVERSIONFOUND"]
+    # Attributes: msidbUpgradeAttributesOnlyDetect(2),
+    # VersionMinInclusive(256), VersionMaxInclusive(512).
+    if same[1] != same[2]:
+        errs.append(f"SAMEVERSIONFOUND spans {same[1]}..{same[2]}, expected a single version")
+    if int(same[4]) & 256 == 0 or int(same[4]) & 512 == 0:
+        errs.append(f"SAMEVERSIONFOUND attributes {same[4]} do not include both bounds, so the equal version falls through it")
+    if int(same[4]) & 2 == 0:
+        errs.append(f"SAMEVERSIONFOUND attributes {same[4]} are not detect-only - it would try to remove the install it found")
+    if int(newer[4]) & 256:
+        errs.append(f"NEWERVERSIONFOUND attributes {newer[4]} include the minimum, so the SAME version is reported as a newer one")
+
+if errs:
+    for e in errs:
+        print(f"error: {e}", file=sys.stderr)
+    sys.exit(1)
+print("already-installed ok: REINSTALL armed before CostFinalize, MaintenancePrompt (immediate, check) after it")
+print("version bands ok: older / same / newer are three different answers")
 PYEOF
 
 # Read the no-reboot / Restart-Manager wiring back out of the compiled package

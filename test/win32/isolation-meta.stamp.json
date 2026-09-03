@@ -1,10 +1,10 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-09-03T10:07:02-07:00",
-    "commit":  "6161bc18e",
+    "generated":  "2026-09-03T10:59:41-07:00",
+    "commit":  "d056d6ad9",
     "uncommitted":  [
-                        "test/win32/go-loop-guard.ps1"
+                        "test/win32/install-maintenance.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -117,6 +117,7 @@
                   "test/win32/host-settings.ps1":  "4bc5045b4017d45d664d2f715b14e538022cb9ff87e40cedbdeecd4a1216ccb5",
                   "test/win32/hover-capture.ps1":  "0a8055d036ef8aa5ef83d91851c418f52dfdc09ea29d63f5eae9af87a9ee92a1",
                   "test/win32/install-launch.ps1":  "df8a8917d448d735d327ae87bcfde00f09a665dcbe0737ae56c4c0487d8225ca",
+                  "test/win32/install-maintenance.ps1":  "db2c31ab1fd5febe1fa61d2aada2f953a8b027c96b6fca56613b90c1b3b2488b",
                   "test/win32/install-ownership.ps1":  "0c574d3d71e1b8b86c3ff21fbd54eb8dd8a5341a117ad83ea969480ec9e188ad",
                   "test/win32/install-prepare.ps1":  "ac1f575172c802935bd99d0635db38007eea2a7df81d3e150ec42eaeaa998e1a",
                   "test/win32/install-restart.ps1":  "c41b5d41f9a6f3aadcbdde6f99989c35e77ddfe412b4968deb0baf956e5af1b2",
