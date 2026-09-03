@@ -1,10 +1,11 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-09-03T11:45:12-07:00",
-    "commit":  "5bbf2072a",
+    "generated":  "2026-09-03T12:29:19-07:00",
+    "commit":  "56c99bc78",
     "uncommitted":  [
-                        "test/win32/install-walkthrough.ps1"
+                        "test/win32/install-walkthrough.ps1",
+                        "test/win32/lib/ThrowawayProduct.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -121,7 +122,7 @@
                   "test/win32/install-ownership.ps1":  "0c574d3d71e1b8b86c3ff21fbd54eb8dd8a5341a117ad83ea969480ec9e188ad",
                   "test/win32/install-prepare.ps1":  "ac1f575172c802935bd99d0635db38007eea2a7df81d3e150ec42eaeaa998e1a",
                   "test/win32/install-restart.ps1":  "c41b5d41f9a6f3aadcbdde6f99989c35e77ddfe412b4968deb0baf956e5af1b2",
-                  "test/win32/install-walkthrough.ps1":  "89588ae15bcb3038d143711564e21b28eee58cb84c5de6ef8b401dcd48e70314",
+                  "test/win32/install-walkthrough.ps1":  "52f1194df11a1ee5d77271e8a2feaa26cffc5475d999a60079a8194efb653354",
                   "test/win32/ipc-child-exited.ps1":  "d976a5172b4773f582972eedc3fa1b00bb1c03f5c33eeb5efc06e5d52542112b",
                   "test/win32/ipc-command-keepalive.ps1":  "3e16597ad1d157d43c6581b946f35aada744b80f52ca38d52f678095975c2b14",
                   "test/win32/ipc-fake-server.ps1":  "d8a18c722615e1ca8582e804d794886cb7734a9eb084f87add9d411b285a689b",
@@ -186,7 +187,7 @@
                   "test/win32/lib/TestDesktop.ps1":  "42d47db53b5fb12f34cc8f41403251207858af330a2cf6507f8237c1ed8e972b",
                   "test/win32/lib/TestReachAudit.ps1":  "3b2fb64aee74f3451127f4f9776141f5781dd210a6fdf0019410485664f0a840",
                   "test/win32/lib/TestScore.ps1":  "1bc571121b1b60ce5d9b63a0e1c8ebf23f6da575f8e9f7dab1a410cbc2888acc",
-                  "test/win32/lib/ThrowawayProduct.ps1":  "ae41da0116447e2a9d7beea82575bd9843cd819e6e007a17d89383abf68200b5",
+                  "test/win32/lib/ThrowawayProduct.ps1":  "d0754fbb3791ee3d5fec2369a523df0c23ccb6d4738bad21dd37c25cf86c82fd",
                   "test/win32/lib/VerdictExitAudit.ps1":  "8a22b157dc4e93add59e9b3da93a0620c667644cefb1b3641dc2f6cd370f226e",
                   "test/win32/local-split-no-command-rerun.ps1":  "ee277b6308cdb172e153fe92d0624732f8b64743418134ce466da5534138fae2",
                   "test/win32/log-append.ps1":  "dbfc7cfcb11dddb0896c83d0d1c70ead785ec15a683da511df6fe630d6279fdf",
