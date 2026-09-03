@@ -1004,6 +1004,32 @@ $GuardTable = @(
             'test\win32\install-maintenance.ps1'
         )
     },
+    # Somebody actually installs the installer and clicks through it (T1299).
+    # Fresh install, upgrade, same-version maintenance, older-over-newer and
+    # uninstall, driven with a real msiexec against a real package rewritten to
+    # a throwaway identity - the only row in this table whose subject is the
+    # product a user meets rather than the recipe that builds it.
+    #
+    # ADVISORY, and for the reason `release-artifacts-packaging` above is: the
+    # subject is a PACKAGE, this box cannot build one (wixl, therefore Docker),
+    # and the newest published release is by definition the state of the world
+    # BEFORE the edit that makes this row due. So on the turn that edits
+    # `build-msi.sh` the question is unanswerable here, which is exactly the
+    # shape a hatch pressed every time cannot carry. It reports at every claim,
+    # the daily publish gives it a package carrying the change within a day, and
+    # its teeth in the meantime are fork-ci's `windows-cross` compile of the same
+    # file. A clean walk with no skipped case stamps it the normal way.
+    [pscustomobject]@{
+        Name     = 'install-walkthrough'
+        Script   = 'test\win32\install-walkthrough.ps1'
+        Stamp    = 'test\win32\install-walkthrough.stamp.json'
+        Advisory = $true
+        Covers   = @(
+            'dist\windows-installer\build-msi.sh',
+            'scripts\msi-test-identity.ps1',
+            'test\win32\install-walkthrough.ps1'
+        )
+    },
     # "Which Ghoztty am I running?" has ONE answer per surface (T1205). Windows
     # cannot replace a running image, so the file on disk and the process in
     # front of the user are routinely different builds - and the About box used

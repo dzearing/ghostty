@@ -296,3 +296,20 @@ restores it and asserts the notice goes away (its own negative control).
 Sections A20–A22 of `test\win32\release-artifacts.ps1` hold the ARP wiring
 statically; the live proof is the package read-back inside `build-msi.sh`,
 which needs Docker.
+
+**And the installer itself is walked, on this box, with a real `msiexec`**
+(T1299). `test\win32\install-walkthrough.ps1` downloads the newest PUBLISHED
+`win-v*` package, runs it through `scripts\msi-test-identity.ps1` - which gives
+it its own ProductCode, UpgradeCode, install directory, component GUIDs and
+Start Menu name, so nothing it does can reach the user's Ghoztty - and then
+installs it, upgrades it, re-runs it at the same version, tries an older package
+over it and uninstalls it, asserting the OUTCOME each time (files, PATH entry,
+shortcut, Apps & Features version, a terminal window that opens) rather than
+msiexec's exit code. No Docker and no rebuild: the subject is the bytes that
+were published. `-Msi <path>` walks a local package instead, `-TeethCheck`
+proves the refusal that keeps it off the user's product goes red, and a case the
+package predates - a release older than the feature under test - is named and
+skipped rather than asserted either way. Its `guard-due.ps1` row is advisory for
+the reason `release-artifacts-packaging` is: this box cannot build a package, so
+the newest release is by definition the world before the edit that made the row
+due.
