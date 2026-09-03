@@ -18,7 +18,9 @@
 #
 # It also answers "did today's digest get written?" (`digest=` on the line,
 # T1223) - go.md step 0.5 had no enforcement at all, so a skipped morning was
-# invisible until somebody asked for it.
+# invisible until somebody asked for it - and "did anything actually SHIP?"
+# (`publish=`, T1292), which had the same shape and cost three days of finished
+# work sitting on the branch while the user ran a build from before it.
 #
 # Exit codes are the verdict, so a caller can branch without parsing:
 #   0 healthy      - a live owner, recent activity, a marked window
@@ -44,6 +46,11 @@ param(
     # the harness passes an explicit one so "before 05:00" and "after 05:00"
     # are both reachable without waiting for a particular hour of the day.
     [datetime]$DigestAsOf = [datetime]::MinValue,
+    # The daily publish's watermark, and the instant it is judged against
+    # (T1292). Both are seams for the harness; the defaults are what the loop
+    # actually reads.
+    [string]$PublishWatermark = '',
+    [datetime]$PublishAsOf = [datetime]::MinValue,
     [switch]$Json,
     # Gather the evidence a death leaves behind, for dissecting WHY.
     [switch]$Postmortem
@@ -52,6 +59,8 @@ param(
 $ErrorActionPreference = 'Continue'
 if (-not $Repo) { $Repo = Split-Path -Parent $PSScriptRoot }
 if ($DigestAsOf -eq [datetime]::MinValue) { $DigestAsOf = Get-Date }
+if ($PublishAsOf -eq [datetime]::MinValue) { $PublishAsOf = Get-Date }
+if (-not $PublishWatermark) { $PublishWatermark = Join-Path $env:LOCALAPPDATA 'ghoztty\daily-publish' }
 # Get-LoopStop. loop-session.ps1 is documented as free of load-time side effects.
 . (Join-Path $PSScriptRoot 'loop-session.ps1')
 $IsoFmt = 'yyyy-MM-ddTHH:mm:ssK'
@@ -174,6 +183,44 @@ if (Test-Path -LiteralPath (Join-Path $Repo $digestRel)) {
     }
 }
 
+# --- the daily publish (T1292) ---------------------------------------------
+#
+# The digest field above exists because a step whose omission produces no signal
+# eventually stops happening. Delivery had exactly that shape and it was worse,
+# because the omission was *reported* - one polite SKIP line per evening in a
+# temp log nobody reads - while the user went three days downloading a build
+# from before the fix they had asked for. "Nothing shipped" has to be visible in
+# the same place as "no digest", so it is.
+#
+# Read from the publish watermark alone: no gh, no network, no clock beyond the
+# local date. daily-publish.ps1 is what reconciles a pushed tag against the
+# release CI actually created, so by the time a state gets here it is honest.
+#
+#   ok         - published (or tagged and building) today or yesterday
+#   stale-<n>d - the last publish was n days ago, n >= 2
+#   failed     - the last attempt did not produce a release
+#   never      - nothing has ever been published from this box
+$publishState = 'never'
+$publishTag = ''
+$publishDate = ''
+try {
+    if (Test-Path -LiteralPath $PublishWatermark) {
+        $wmText = [IO.File]::ReadAllText($PublishWatermark).Trim()
+        $wm = $null
+        if ($wmText.StartsWith('{')) { $wm = $wmText | ConvertFrom-Json }
+        elseif ($wmText -match '^(\d{4}-\d{2}-\d{2})') { $wm = [pscustomobject]@{ date = $Matches[1]; tag = ''; result = '' } }
+        if ($wm -and $wm.date) {
+            $publishDate = [string]$wm.date
+            $publishTag = [string]$wm.tag
+            $days = [int]([math]::Floor(($PublishAsOf.Date - ([datetime]::ParseExact($publishDate, 'yyyy-MM-dd', $null)).Date).TotalDays))
+            if ([string]$wm.result -eq 'failed') { $publishState = 'failed' }
+            elseif ($days -ge 2) { $publishState = "stale-${days}d" }
+            elseif ($days -lt 0) { $publishState = 'ok' }
+            else { $publishState = 'ok' }
+        }
+    }
+} catch { $publishState = 'never' }
+
 # --- verdict ----------------------------------------------------------------
 
 $alive = ($state -eq 'held')
@@ -187,6 +234,13 @@ if (-not $dashboard) { $notes += "dashboard is not listening on $Port" }
 if ($inProgress.Count -gt 1) { $notes += "$($inProgress.Count) tasks claimed in-progress" }
 if ($digestState -eq 'missing') {
     $notes += "today's digest is missing - go.md step 0.5, write $digestRel (never backfill an older day)"
+}
+if ($publishState -eq 'never') {
+    $notes += 'nothing has ever been published from this box - go.md step 6.5, scripts\daily-publish.ps1 -Check says whether one is due'
+} elseif ($publishState -eq 'failed') {
+    $notes += "the last publish did not land: $(if ($publishTag) { $publishTag } else { $publishDate }) was tagged and no release exists - check the Release (Windows) run for that tag"
+} elseif ($publishState -like 'stale-*') {
+    $notes += "nothing has shipped since $publishDate ($publishState) - the work that has landed since is not on the user's machine"
 }
 
 $verdict = 'healthy'
@@ -226,13 +280,16 @@ if ($Json) {
         open_decisions = $openDecisions
         digest         = $digestState
         digest_path    = $digestRel
+        publish        = $publishState
+        publish_tag    = $publishTag
+        publish_date   = $publishDate
         stopped        = [bool]$stopReq
         notes          = $notes
     } | ConvertTo-Json -Depth 4
 } else {
     $task = if ($inProgress.Count) { $inProgress -join ',' } else { 'none' }
     "$(Now-Iso) $($verdict.ToUpper()) uptime=$uptime turn=$turn state=$state pane=$pane pid=$loopPid " +
-    "task=$task decisions_open=$openDecisions digest=$digestState windows=$marked watchdog=$watchdog dashboard=$dashboard"
+    "task=$task decisions_open=$openDecisions digest=$digestState publish=$publishState windows=$marked watchdog=$watchdog dashboard=$dashboard"
     foreach ($n in $notes) { "  - $n" }
 }
 

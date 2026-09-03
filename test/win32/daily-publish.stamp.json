@@ -1,14 +1,17 @@
 {
     "guard":  "daily-publish",
     "script":  "test/win32/daily-publish.ps1",
-    "generated":  "2026-09-01T23:19:56-07:00",
-    "commit":  "ee910c4bb",
+    "generated":  "2026-09-03T08:47:55-07:00",
+    "commit":  "18f45d5ea",
     "uncommitted":  [
+                        "scripts/daily-publish.ps1",
+                        "scripts/publish-windows-tag.ps1",
                         "test/win32/daily-publish.ps1"
                     ],
     "files":  {
-                  "scripts/daily-publish.ps1":  "f7ef4b653a56238ac36bf0a2a1c07c1f7527e1f97d8c7e0e647c3ec8d2774360",
+                  "scripts/daily-publish.ps1":  "0d6a4a1b64aaaf5a2c3f5f688be06e73e44e9f75ad690fc87cb642bd42001581",
                   "scripts/publish-windows-release.ps1":  "4b2b82d21d6c04e291499716220bfa102fdb194433bb2f707ec54f878b45b146",
-                  "test/win32/daily-publish.ps1":  "1622d021c6fe10739ff686383d9550b68972e22dd834cc4c54a8729d7440049f"
+                  "scripts/publish-windows-tag.ps1":  "fbf416f550baf907a037646938e8c0eccb52ac6d47644cc31307aa08a44d5383",
+                  "test/win32/daily-publish.ps1":  "89b3bb6b8b5417ec26da3722180fe0db9786f37f791aa9faadb4c26fdce3217d"
               }
 }

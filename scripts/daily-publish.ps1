@@ -18,23 +18,51 @@
 # point is that a fix which landed today ships today - a morning publish would
 # always be shipping yesterday.
 #
-# WHAT IT DOES, once a day: run scripts\publish-windows-release.ps1, which
-# builds the ReleaseFast staging prefix, packages the MSI + portable ZIP under
-# the msitools Docker image and creates the win-v<Version> GitHub release. The
-# installed terminal's update check scans for the newest win-v tag, so that
-# publish IS the delivery.
+# AND A CATCH-UP RULE, because the evening hour assumes a workday this loop does
+# not have (T1292). On 2026-09-02 the loop's last push was at 14:28 and it then
+# stalled: 17:00 never arrived while anything was running, so the day published
+# nothing and said nothing. A wall-clock gate inside a process with no schedule
+# is a coin flip. So a publish is ALSO due at the first task-boundary push once
+# -StaleHours (24 by default) have passed since the last one, whatever the hour.
+# The evening rule still shapes a normal day; the catch-up rule is what makes
+# "work ships within a day" true rather than aspirational, and it is what fires
+# on the morning after a day that died early.
+#
+# WHAT IT DOES, once a day: run scripts\publish-windows-tag.ps1, which puts the
+# win-v<Version> tag on HEAD and pushes it to origin. The Release (Windows)
+# workflow then builds the MSI + portable ZIP on ubuntu-latest and creates the
+# release. The installed terminal's update check scans for the newest win-v tag,
+# so that release IS the delivery.
+#
+# WHY A TAG PUSH AND NOT A LOCAL BUILD (T1292). Until 2026-09-03 this ran
+# scripts\publish-windows-release.ps1, which packages the MSI with wixl inside
+# the msitools Docker image. wixl does not run on Windows, so that path requires
+# Docker Desktop - and Docker Desktop is deliberately kept down on this box (its
+# WSL2 backend once took 28 GB and buried the machine), which is exactly why
+# every script here says starting it is the user's call. The result was a
+# publish that asked every evening for a precondition it was structurally
+# forbidden to satisfy: it wrote a polite SKIP into a temp log and shipped
+# nothing, for three days, while nineteen tasks closed. A step whose failure mode
+# is "nothing happens" is the worst kind, so the dependency is gone rather than
+# excused. -Local reinstates the old path for a box that genuinely wants to
+# package locally.
 #
 # WHAT IT NEVER DOES: touch the installed app. See scripts\install-ownership.ps1
 # and decision D85. Publishing is the only delivery path this repo has.
 #
-# SKIPS ARE NOT FAILURES. Two preconditions are outside this loop's gift:
-# Docker Desktop must be up (wixl does not run on Windows) and `gh` must be
-# authenticated. Neither is something a turn may go and fix - starting Docker in
-# particular is the user's call, since its WSL2 backend has buried this box
-# before. A missing precondition is a SKIP with the reason named in the log, the
-# watermark is NOT consumed (so a later push the same day can still publish),
-# and the loop carries on. The one thing that must never happen is a publish
-# attempt stalling the turn.
+# SKIPS ARE NOT FAILURES. What a publish needs that this loop cannot arrange is
+# now down to one thing: HEAD must already be on the remote (it always is, since
+# the commit guard pushes). Under -Local the old pair comes back - Docker
+# Desktop up, `gh` authenticated. A missing precondition is a SKIP with the
+# reason named in the log, the watermark is NOT consumed (so a later push the
+# same day can still publish), and the loop carries on. The one thing that must
+# never happen is a publish attempt stalling the turn.
+#
+# A SKIP IS ALSO NOT INVISIBLE ANY MORE. `publish=` on
+# scripts\go-loop-health.ps1 reads the watermark and reports ok / due /
+# stale-<n>d / failed / never, and degrades the run when nothing has shipped for
+# a day. That is the same shape as `digest=` (T1223) and it exists for the same
+# reason: the three-day outage had to be noticed by the user.
 #
 # HOW THE CALLER USES IT (go.md step 6.5):
 #
@@ -64,11 +92,21 @@
 # refuses an existing tag as a second line of defence.
 #
 # WATERMARK. %LOCALAPPDATA%\ghoztty\daily-publish, one JSON object recording the
-# local date, the tag, the commit and the outcome of the last publish. The date
-# is what the due decision reads; the rest is what the morning digest reads to
-# answer "is what I am running the work I read about yesterday?". A plain
-# yyyy-MM-dd line is still accepted, so an older watermark is not a reason to
-# publish twice.
+# local date, the instant, the tag, the commit and the outcome of the last
+# publish. The date is what the due decision reads; the instant is what the
+# catch-up rule measures; the rest is what the morning digest and the health
+# line read to answer "is what I am running the work I read about yesterday?". A
+# plain yyyy-MM-dd line is still accepted, so an older watermark is not a reason
+# to publish twice, and a watermark with no `at` falls back to its date at the
+# cutoff hour.
+#
+# THE TAG IS NOT THE RELEASE, so the watermark records `tagged` and the NEXT run
+# confirms it. CI builds for ten minutes after the push, and a run that goes red
+# leaves a tag with no release behind it - which used to be indistinguishable
+# from a successful publish. Every invocation re-checks a `tagged` watermark
+# against `gh release view` and rewrites it to `published` or `failed`, so the
+# health line tells the truth about what actually shipped rather than about what
+# was attempted.
 #
 # Acceptance: test\win32\daily-publish.ps1
 [CmdletBinding(PositionalBinding = $false)]
@@ -78,6 +116,11 @@ param(
     # Local hour on/after which a task-boundary push counts as "end of the day's
     # work". 17, so the day's fixes are published while the day is still today.
     [int]$HourLocal = 17,
+    # The catch-up rule: however early in the day it is, a publish is due once
+    # this many hours have passed since the last one. 24, so a day whose loop
+    # stalled before the evening ships its work the next morning instead of
+    # never. 0 disables it and restores the pure evening gate.
+    [int]$StaleHours = 24,
     # Test seam. Empty = now.
     [string]$Now = '',
     # Decide and print, change nothing, publish nothing.
@@ -86,10 +129,15 @@ param(
     [switch]$Force,
     # Test seam: go as far as the publish and report what WOULD have run.
     [switch]$NoPublish,
-    # Passed through to publish-windows-release.ps1 (build + package, no
-    # release). Still stamps, so a dry run consumes the day deliberately.
+    # Passed through to the publish script (everything but the release itself).
+    # Still stamps, so a dry run consumes the day deliberately.
     [switch]$DryRun,
-    # Empty = the sibling publish-windows-release.ps1.
+    # Publish by building and packaging on this box (the pre-T1292 path):
+    # scripts\publish-windows-release.ps1, which needs Docker Desktop up and gh
+    # authenticated. The default is the tag push, which needs neither.
+    [switch]$Local,
+    # Empty = publish-windows-tag.ps1, or publish-windows-release.ps1 under
+    # -Local.
     [string]$PublishScript = ''
 )
 
@@ -105,7 +153,12 @@ function Test-DailyPublishDue {
         [Parameter(Mandatory)][datetime]$Now,
         # The watermark's date, or '' / $null when there is no watermark.
         [string]$LastDate = '',
+        # The watermark's instant, for the catch-up rule. Empty falls back to
+        # LastDate at the cutoff hour, which is when an old-format watermark's
+        # publish would have happened.
+        [string]$LastAt = '',
         [int]$HourLocal = 17,
+        [int]$StaleHours = 24,
         [switch]$Force
     )
     $today = $Now.ToString('yyyy-MM-dd')
@@ -113,11 +166,35 @@ function Test-DailyPublishDue {
     if ($Force) {
         return [pscustomobject]@{ Due = $true; Today = $today; Why = "forced (last=$(if ($last) { $last } else { 'never' }))" }
     }
-    if ($Now.Hour -lt $HourLocal) {
-        return [pscustomobject]@{ Due = $false; Today = $today; Why = "before ${HourLocal}:00 local (it is $($Now.ToString('HH:mm'))) - the day's work is not done yet" }
-    }
+    # Ordered before the hour check on purpose: one publish per local day is the
+    # invariant BOTH rules below sit under, so neither can double-publish.
     if ($last -eq $today) {
         return [pscustomobject]@{ Due = $false; Today = $today; Why = "already published today ($today)" }
+    }
+    if ($Now.Hour -lt $HourLocal) {
+        # The evening rule has not fired. The catch-up rule (T1292) is what keeps
+        # a day that stalled before 17:00 from shipping nothing at all: measure
+        # from the last publish, not from the clock.
+        if ($StaleHours -le 0) {
+            return [pscustomobject]@{ Due = $false; Today = $today; Why = "before ${HourLocal}:00 local (it is $($Now.ToString('HH:mm'))) - the day's work is not done yet" }
+        }
+        $lastInstant = $null
+        if ($LastAt) { try { $lastInstant = [datetime]::Parse($LastAt) } catch { $lastInstant = $null } }
+        if ($null -eq $lastInstant -and $last -match '^\d{4}-\d{2}-\d{2}$') {
+            try { $lastInstant = ([datetime]::ParseExact($last, 'yyyy-MM-dd', $null)).AddHours($HourLocal) } catch { $lastInstant = $null }
+        }
+        if ($null -eq $lastInstant) {
+            return [pscustomobject]@{ Due = $true; Today = $today; Why = "nothing has ever been published - not waiting for ${HourLocal}:00 to ship the first one" }
+        }
+        $hours = ($Now - $lastInstant).TotalHours
+        if ($hours -ge $StaleHours) {
+            return [pscustomobject]@{
+                Due   = $true
+                Today = $today
+                Why   = "catch-up: $([math]::Round($hours))h since the last publish ($last) and it is only $($Now.ToString('HH:mm')) - a day that stalled before ${HourLocal}:00 still ships"
+            }
+        }
+        return [pscustomobject]@{ Due = $false; Today = $today; Why = "before ${HourLocal}:00 local (it is $($Now.ToString('HH:mm'))) - the day's work is not done yet, and the last publish was only $([math]::Round($hours))h ago" }
     }
     # A watermark from the FUTURE is not a reason to refuse forever (a clock
     # change, a restored profile). It is also not today, so it does not block.
@@ -175,17 +252,24 @@ function Resolve-DailyPublishVersion {
     return [pscustomobject]@{ Version = $next; Why = "daily patch walk on win-v$($winNewest.Text)" }
 }
 
-# The two things a publish needs that this loop cannot go and arrange, plus the
-# one it can: the commit being released must already be on the remote.
+# What a publish needs before it is worth starting. In the default TAG mode that
+# is one thing, and it is one the loop arranges for itself: the commit being
+# released must already be on the remote, because CI builds the tag. Docker and
+# gh are preconditions of the -Local packaging path ONLY - keeping them in the
+# default set is what made this script structurally unable to ship (T1292).
 function Test-PublishPreconditions {
     param(
         [bool]$DockerUp,
         [bool]$GhAuthenticated,
-        [bool]$HeadPushed
+        [bool]$HeadPushed,
+        # 'tag' (CI builds the pushed tag) or 'local' (this box packages).
+        [string]$Mode = 'tag'
     )
     $missing = @()
-    if (-not $DockerUp) { $missing += 'Docker Desktop is not running (wixl packages the MSI inside the msitools image, and starting Docker is the user''s call)' }
-    if (-not $GhAuthenticated) { $missing += 'gh is not authenticated (`gh auth login`) - the release cannot be created' }
+    if ($Mode -eq 'local') {
+        if (-not $DockerUp) { $missing += 'Docker Desktop is not running (wixl packages the MSI inside the msitools image, and starting Docker is the user''s call)' }
+        if (-not $GhAuthenticated) { $missing += 'gh is not authenticated (`gh auth login`) - the release cannot be created' }
+    }
     if (-not $HeadPushed) { $missing += 'HEAD is not on any remote branch - the release tag must point at a pushed commit' }
     return [pscustomobject]@{
         Ok     = ($missing.Count -eq 0)
@@ -196,7 +280,7 @@ function Test-PublishPreconditions {
 # Read a watermark that may be this script's JSON or the older single date line.
 function Read-PublishWatermark {
     param([string]$Text = '')
-    $empty = [pscustomobject]@{ Date = ''; Tag = ''; Commit = ''; Result = '' }
+    $empty = [pscustomobject]@{ Date = ''; At = ''; Tag = ''; Commit = ''; Result = '' }
     if (-not $Text) { return $empty }
     $t = $Text.Trim()
     if ($t.StartsWith('{')) {
@@ -204,6 +288,7 @@ function Read-PublishWatermark {
             $o = $t | ConvertFrom-Json
             return [pscustomobject]@{
                 Date   = [string]$o.date
+                At     = [string]$o.at
                 Tag    = [string]$o.tag
                 Commit = [string]$o.commit
                 Result = [string]$o.result
@@ -211,7 +296,7 @@ function Read-PublishWatermark {
         } catch { return $empty }
     }
     $first = ($t -split "`n")[0].Trim()
-    if ($first -match '^\d{4}-\d{2}-\d{2}$') { return [pscustomobject]@{ Date = $first; Tag = ''; Commit = ''; Result = '' } }
+    if ($first -match '^\d{4}-\d{2}-\d{2}$') { return [pscustomobject]@{ Date = $first; At = ''; Tag = ''; Commit = ''; Result = '' } }
     return $empty
 }
 
@@ -221,7 +306,10 @@ if ($env:GHOZTTY_DAILY_PUBLISH_DOTSOURCE -eq '1') { return }
 
 # ---- side effects --------------------------------------------------------
 
-if (-not $PublishScript) { $PublishScript = Join-Path $PSScriptRoot 'publish-windows-release.ps1' }
+$mode = if ($Local) { 'local' } else { 'tag' }
+if (-not $PublishScript) {
+    $PublishScript = Join-Path $PSScriptRoot $(if ($Local) { 'publish-windows-release.ps1' } else { 'publish-windows-tag.ps1' })
+}
 
 $log = Join-Path $env:TEMP 'ghoztty-daily-publish.log'
 function Log($m) {
@@ -239,14 +327,60 @@ function Invoke-Probe([scriptblock]$block) {
     return $LASTEXITCODE
 }
 
+# Rewrite an existing watermark with a new outcome, keeping everything else it
+# recorded. Used by the confirmation pass above: the day, the tag and the commit
+# are history, only the verdict moves.
+function Write-Confirmed-Watermark {
+    param([string]$Path, $Mark, [string]$Result)
+    try {
+        $json = [ordered]@{
+            date   = $Mark.Date
+            at     = $Mark.At
+            tag    = $Mark.Tag
+            commit = $Mark.Commit
+            result = $Result
+        } | ConvertTo-Json -Compress
+        [IO.File]::WriteAllText($Path, "$json`n", (New-Object Text.UTF8Encoding($false)))
+    } catch {
+        Log "WARNING: could not update the watermark $Path ($($_.Exception.Message))"
+    }
+}
+
 Set-Location $Repo
 
-$now = if ($Now) { [datetime]::Parse($Now) } else { Get-Date }
+# NOT `$now`: PowerShell variable names are case-insensitive, so that is the
+# [string]$Now parameter, and assigning a DateTime to it converts straight back
+# to a string. Every consumer that wanted a real DateTime then had to be lucky.
+$nowDt = if ($Now) { [datetime]::Parse($Now) } else { Get-Date }
 $mark = Read-PublishWatermark -Text $(
     if (Test-Path -LiteralPath $WatermarkPath) { try { [IO.File]::ReadAllText($WatermarkPath) } catch { '' } } else { '' }
 )
 
-$d = Test-DailyPublishDue -Now $now -LastDate $mark.Date -HourLocal $HourLocal -Force:$Force
+# Confirm a tag from an earlier run actually became a release before deciding
+# anything else. A pushed tag is a promise CI keeps ten minutes later, or does
+# not: without this, a red release run reads exactly like a good publish for the
+# rest of the day and the health line says `ok` about a release that does not
+# exist. Cheap, and only when there is something to confirm.
+if ($mark.Result -eq 'tagged' -and $mark.Tag) {
+    $seen = (Invoke-Probe { gh release view $mark.Tag --repo dzearing/ghoztty --json tagName })
+    if ($seen -eq 0) {
+        $mark.Result = 'published'
+        Write-Confirmed-Watermark -Path $WatermarkPath -Mark $mark -Result 'published'
+        Log "CONFIRMED $($mark.Tag) is published."
+    } elseif ((Invoke-Probe { gh auth status }) -eq 0) {
+        # gh works and still cannot see the release. Give CI an hour before
+        # calling it dead: the tag is normally pushed minutes before this runs.
+        $tagAge = 999.0
+        if ($mark.At) { try { $tagAge = ((Get-Date) - [datetime]::Parse($mark.At)).TotalHours } catch { } }
+        if ($tagAge -ge 1) {
+            $mark.Result = 'failed'
+            Write-Confirmed-Watermark -Path $WatermarkPath -Mark $mark -Result 'failed'
+            Log "PUBLISH DID NOT LAND: $($mark.Tag) was pushed $([math]::Round($tagAge))h ago and there is still no release. Check the Release (Windows) run for that tag."
+        }
+    }
+}
+
+$d = Test-DailyPublishDue -Now $nowDt -LastDate $mark.Date -LastAt $mark.At -HourLocal $HourLocal -StaleHours $StaleHours -Force:$Force
 if (-not $d.Due) {
     Log "NOT DUE: $($d.Why)"
     exit 0
@@ -259,7 +393,7 @@ $ghOk = (Invoke-Probe { gh auth status }) -eq 0
 $headPushed = $false
 try { $headPushed = [bool](@(git branch -r --contains HEAD 2>$null).Count) } catch { $headPushed = $false }
 
-$pre = Test-PublishPreconditions -DockerUp $dockerUp -GhAuthenticated $ghOk -HeadPushed $headPushed
+$pre = Test-PublishPreconditions -DockerUp $dockerUp -GhAuthenticated $ghOk -HeadPushed $headPushed -Mode $mode
 if (-not $pre.Ok) {
     Log "SKIP: due ($($d.Why)) but $($pre.Reason). Nothing published; the watermark is untouched, so a later push today can still publish."
     exit 0
@@ -304,6 +438,7 @@ function Stamp([string]$result, [string]$tag) {
         if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         $json = [ordered]@{
             date   = $d.Today
+            at     = $nowDt.ToString('yyyy-MM-ddTHH:mm:ssK')
             tag    = $tag
             commit = $hash
             result = $result
@@ -338,8 +473,17 @@ if ($DryRun) { & $PublishScript -Version $v.Version -DryRun } else { & $PublishS
 $code = $LASTEXITCODE
 
 if ($code -eq 0) {
-    Stamp $(if ($DryRun) { 'dry-run' } else { 'published' }) "win-v$($v.Version)" | Out-Null
-    Log "PUBLISHED win-v$($v.Version) ($hash). The installed terminal offers it at its next update check."
+    # 'tagged' rather than 'published' in tag mode: the release exists once CI
+    # finishes, and the confirmation pass at the top of the next run is what
+    # turns this into 'published' or 'failed'. Claiming 'published' here is the
+    # exact lie this task existed to remove.
+    $result = if ($DryRun) { 'dry-run' } elseif ($mode -eq 'tag') { 'tagged' } else { 'published' }
+    Stamp $result "win-v$($v.Version)" | Out-Null
+    if ($result -eq 'tagged') {
+        Log "TAGGED win-v$($v.Version) ($hash). Release (Windows) builds it; the next run confirms the release exists."
+    } else {
+        Log "PUBLISHED win-v$($v.Version) ($hash). The installed terminal offers it at its next update check."
+    }
     exit 10
 }
 

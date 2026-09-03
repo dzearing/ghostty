@@ -1,10 +1,11 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-02T13:32:44-07:00",
-    "commit":  "2e717485b",
+    "generated":  "2026-09-03T09:14:00-07:00",
+    "commit":  "18f45d5ea",
     "uncommitted":  [
-                        "test/win32/ipc-relay.ps1"
+                        "test/win32/daily-publish.ps1",
+                        "test/win32/go-loop-guard.ps1"
                     ],
     "files":  {
                   "src/cli/ghostty.zig":  "ef54b501298cfda9306cfb958c1094db24ee30f355b25865656b3e2bc713bcd7",
@@ -83,7 +84,7 @@
                   "test/win32/crash-diagnostics.ps1":  "c09555c22faad0c3914229d756c7df9423369c0e13b2f32422e04d3eeaed8aca",
                   "test/win32/crash-first-chance.ps1":  "f30c24b2753b983c7ec6533559e706ccc099a858d955958b914a92605ae26d8e",
                   "test/win32/crash-stacks.ps1":  "a0c6fa51f11530a9915fcb8477517a6757b48ced7a9aff89aaf5c1313c33e710",
-                  "test/win32/daily-publish.ps1":  "1622d021c6fe10739ff686383d9550b68972e22dd834cc4c54a8729d7440049f",
+                  "test/win32/daily-publish.ps1":  "89b3bb6b8b5417ec26da3722180fe0db9786f37f791aa9faadb4c26fdce3217d",
                   "test/win32/dark-menus.ps1":  "ab97be43af44188040463ebf9c6ab7b4a96139a623445aeb145eec3e4c9f906f",
                   "test/win32/deliver-windows-build.ps1":  "e3bd97324b317cc164f69a9bb78514e21ef94be11c773186cbfe1f7e4ffab17d",
                   "test/win32/desktop-launch-audit.ps1":  "df0f8241a82fb625a5309378e3d96de7951876f8d2c394564e3f3326d8889a53",
@@ -100,7 +101,7 @@
                   "test/win32/fork-identity.ps1":  "2a83e77b4f6fc5127e583e44175dc00a350ef16cacf5b9404c9e6e8fb388ab71",
                   "test/win32/gate-negatives.ps1":  "2f760aa588f0f18e7a1c26986dde9f8843c48e60c7d37d7abf02ace70528fd6d",
                   "test/win32/ghoztty-cleanup.ps1":  "81bfcb6cb5b018195e1056d6ce7203f18235763916bcec4cffcdafa811e73f76",
-                  "test/win32/go-loop-guard.ps1":  "556b89c9c29dec22c135b67114cfa0bf1038b464250ffbbcc4b979090ae36ee0",
+                  "test/win32/go-loop-guard.ps1":  "641bd752fa6b1582dd18a6db730e58e75a64076ba0d318bce79c5703757de544",
                   "test/win32/go-loop-uptime.ps1":  "a97005d970a564088741646542ffaca3cb9ffe03d2eb30c55b96841607948b82",
                   "test/win32/guard-due.ps1":  "7d19009608a80312171a80eb68f9324dc2ff0ff248990c8a3ab4b4f43398c743",
                   "test/win32/gui-launch-command.ps1":  "92343e0db67fea906f08a1a8ef37ec38c4bd2ca90b859269451d543e33ec6202",

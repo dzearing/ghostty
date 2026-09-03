@@ -28,9 +28,14 @@
 #   C  the preconditions, each one named in the reason when it is missing.
 #   D  the watermark reader: this script's JSON, the older bare date, garbage.
 #   E  live -Check: decides out loud, stamps nothing, publishes nothing.
-#   F  live SKIP with Docker down / gh unauthenticated: exit 0, reason named,
-#      watermark untouched, publish script never invoked.
+#   F  live SKIP paths: Docker down no longer stops the default publish (the
+#      whole of T1292), and under -Local it is still a skip with the reason
+#      named, exit 0, watermark untouched, publish script never invoked.
 #   G  live -NoPublish: stamps the day and reports the tag it would publish.
+#   H  a real publish run stamps `tagged`, not `published`: CI has not built the
+#      tag yet, and claiming otherwise is what hid a three-day outage.
+#   I  the tag publisher's refusals (bad version, a version already tagged) and
+#      its dry-run happy path.
 #
 # Hermetic: a sandbox watermark under %TEMP%, a fake `docker`/`gh` on PATH, and
 # a sentinel publish script that records if it was ever run. No Docker, no
@@ -75,7 +80,10 @@ try { . $publishDecider } finally { Remove-Item Env:\GHOZTTY_DAILY_PUBLISH_DOTSO
 $evening = [datetime]'2026-09-01T18:30:00'
 $morning = [datetime]'2026-09-01T09:00:00'
 
-$a1 = Test-DailyPublishDue -Now $morning -LastDate '' -HourLocal 17
+# The catch-up rule (T1292) reads the last publish's INSTANT, so an ordinary
+# morning push - yesterday evening's publish still recent - is the arm that has
+# to stay quiet.
+$a1 = Test-DailyPublishDue -Now $morning -LastDate '2026-08-31' -LastAt '2026-08-31T18:00:00' -HourLocal 17
 Assert 'A1 a push before the cutoff hour is not due' (-not $a1.Due)
 AssertMatch 'A1 and says why' 'the day''s work is not done yet' $a1.Why
 
@@ -98,6 +106,33 @@ Assert 'A6 a watermark from the future does not wedge the publish forever' $a6.D
 
 $a7 = Test-DailyPublishDue -Now ([datetime]'2026-09-01T17:00:00') -LastDate '' -HourLocal 17
 Assert 'A7 the cutoff hour itself counts as due' $a7.Due
+
+# ---- A8..A12. the catch-up rule (T1292) ----------------------------------
+#
+# 2026-09-02: the loop's last push was 14:28 and it then stalled, so 17:00 never
+# arrived while anything was running and the day shipped nothing - silently. The
+# evening hour assumes a workday this loop does not have. These arms are the
+# rule that makes "work ships within a day" true rather than aspirational, and
+# the FIRST one is the case that used to be missed.
+$a8 = Test-DailyPublishDue -Now $morning -LastDate '2026-08-30' -LastAt '2026-08-30T18:00:00' -HourLocal 17
+Assert 'A8 a morning push after a day that stalled before 17:00 IS due' $a8.Due
+AssertMatch 'A8 and says it is catching up' 'catch-up' $a8.Why
+
+$a9 = Test-DailyPublishDue -Now $morning -LastDate '' -HourLocal 17
+Assert 'A9 nothing ever published does not wait for the evening' $a9.Due
+AssertMatch 'A9 and says so' 'nothing has ever been published' $a9.Why
+
+$a10 = Test-DailyPublishDue -Now $morning -LastDate '2026-09-01' -LastAt '2026-09-01T02:00:00' -HourLocal 17
+Assert 'A10 the one-per-day rule still wins over the catch-up rule' (-not $a10.Due)
+AssertMatch 'A10 and says which' 'already published today' $a10.Why
+
+# An old bare-date watermark has no instant; the fallback is that date at the
+# cutoff hour, so it ages into the catch-up rule the same way.
+$a11 = Test-DailyPublishDue -Now $morning -LastDate '2026-08-25' -HourLocal 17
+Assert 'A11 a bare-date watermark still ages into a catch-up publish' $a11.Due
+
+$a12 = Test-DailyPublishDue -Now $morning -LastDate '2026-08-25' -HourLocal 17 -StaleHours 0
+Assert 'A12 -StaleHours 0 restores the pure evening gate' (-not $a12.Due)
 
 # ---- B. the version scheme ----------------------------------------------
 "== B. version scheme =="
@@ -138,27 +173,40 @@ Assert 'B10 the chosen version is never one that already has a release' (
 )
 
 # ---- C. preconditions ----------------------------------------------------
+#
+# The -Local arm is the pre-T1292 packaging path and keeps the old pair. The
+# default tag arm is the point of the task: Docker down must NOT be able to stop
+# a publish, because Docker is deliberately down on this box and asking for it
+# every evening is what shipped nothing for three days.
 "== C. preconditions =="
-$c1 = Test-PublishPreconditions -DockerUp $true -GhAuthenticated $true -HeadPushed $true
+$c1 = Test-PublishPreconditions -DockerUp $true -GhAuthenticated $true -HeadPushed $true -Mode 'local'
 Assert 'C1 everything present is a go' $c1.Ok
 AssertEq 'C1 with no reason to name' '' $c1.Reason
 
-$c2 = Test-PublishPreconditions -DockerUp $false -GhAuthenticated $true -HeadPushed $true
-Assert 'C2 Docker down blocks the publish' (-not $c2.Ok)
+$c2 = Test-PublishPreconditions -DockerUp $false -GhAuthenticated $true -HeadPushed $true -Mode 'local'
+Assert 'C2 Docker down blocks the LOCAL packaging publish' (-not $c2.Ok)
 AssertMatch 'C2 and is named' 'Docker' $c2.Reason
 
-$c3 = Test-PublishPreconditions -DockerUp $true -GhAuthenticated $false -HeadPushed $true
-Assert 'C3 an unauthenticated gh blocks the publish' (-not $c3.Ok)
+$c3 = Test-PublishPreconditions -DockerUp $true -GhAuthenticated $false -HeadPushed $true -Mode 'local'
+Assert 'C3 an unauthenticated gh blocks the local publish' (-not $c3.Ok)
 AssertMatch 'C3 and is named' 'gh' $c3.Reason
 
-$c4 = Test-PublishPreconditions -DockerUp $true -GhAuthenticated $true -HeadPushed $false
+$c4 = Test-PublishPreconditions -DockerUp $true -GhAuthenticated $true -HeadPushed $false -Mode 'local'
 Assert 'C4 an unpushed HEAD blocks the publish' (-not $c4.Ok)
 AssertMatch 'C4 and is named' 'remote branch' $c4.Reason
 
-$c5 = Test-PublishPreconditions -DockerUp $false -GhAuthenticated $false -HeadPushed $false
+$c5 = Test-PublishPreconditions -DockerUp $false -GhAuthenticated $false -HeadPushed $false -Mode 'local'
 Assert 'C5 every missing precondition is named, not just the first' (
     $c5.Reason -match 'Docker' -and $c5.Reason -match 'gh' -and $c5.Reason -match 'remote branch'
 )
+
+$c6 = Test-PublishPreconditions -DockerUp $false -GhAuthenticated $false -HeadPushed $true
+Assert 'C6 in the default tag mode a down Docker cannot stop the publish (T1292)' $c6.Ok
+AssertEq 'C6 and nothing is named as missing' '' $c6.Reason
+
+$c7 = Test-PublishPreconditions -DockerUp $true -GhAuthenticated $true -HeadPushed $false
+Assert 'C7 tag mode still refuses a commit the remote does not have' (-not $c7.Ok)
+AssertMatch 'C7 and says which' 'remote branch' $c7.Reason
 
 # ---- D. the watermark reader --------------------------------------------
 "== D. watermark reader =="
@@ -167,8 +215,13 @@ AssertEq 'D1 JSON date' '2026-09-01' $d1.Date
 AssertEq 'D1 JSON tag' 'win-v1.36.1' $d1.Tag
 AssertEq 'D1 JSON result' 'published' $d1.Result
 
+$d1b = Read-PublishWatermark -Text '{"date":"2026-09-01","at":"2026-09-01T18:04:11-07:00","tag":"win-v1.36.1","commit":"abc1234","result":"tagged"}'
+AssertEq 'D1b the instant the catch-up rule measures from' '2026-09-01T18:04:11-07:00' $d1b.At
+AssertEq 'D1b and the unconfirmed outcome a pushed tag starts at' 'tagged' $d1b.Result
+
 $d2 = Read-PublishWatermark -Text "2026-08-31`n"
 AssertEq 'D2 an older bare-date watermark still blocks a second publish' '2026-08-31' $d2.Date
+AssertEq 'D2 and carries no instant, so the date-at-cutoff fallback is used' '' $d2.At
 
 $d3 = Read-PublishWatermark -Text 'not a watermark'
 AssertEq 'D3 garbage reads as never published' '' $d3.Date
@@ -232,14 +285,22 @@ try {
     Assert 'E4 and runs no publish' (-not (Test-Path -LiteralPath $ranMarker))
 
     "== F. live skips =="
-    $f1 = Invoke-Decider -Extra @() -DockerCode 1 -GhCode 0
-    AssertEq 'F1 Docker down is a skip, not a failure' 0 $f1.Exit
+    # The T1292 arm, and the one that matters most: with Docker down - which is
+    # its permanent state on this box - the default publish RUNS. For three days
+    # it did not, and the only evidence was a SKIP line in a temp log.
+    $f0 = Invoke-Decider -Extra @('-NoPublish') -DockerCode 1 -GhCode 0
+    AssertEq 'F0 Docker down no longer stops the default publish' 10 $f0.Exit
+    Assert 'F0 and nothing in the log calls Docker a reason to skip' ($f0.Text -notmatch 'SKIP.*Docker')
+    Remove-Item -LiteralPath $watermark -Force -ErrorAction SilentlyContinue
+
+    $f1 = Invoke-Decider -Extra @('-Local') -DockerCode 1 -GhCode 0
+    AssertEq 'F1 under -Local, Docker down is a skip, not a failure' 0 $f1.Exit
     AssertMatch 'F1 with Docker named in the log' 'SKIP.*Docker' $f1.Text
     Assert 'F1 and the watermark untouched, so a later push can publish' (-not (Test-Path -LiteralPath $watermark))
     Assert 'F1 and nothing published' (-not (Test-Path -LiteralPath $ranMarker))
 
-    $f2 = Invoke-Decider -Extra @() -DockerCode 0 -GhCode 1
-    AssertEq 'F2 an unauthenticated gh is a skip, not a failure' 0 $f2.Exit
+    $f2 = Invoke-Decider -Extra @('-Local') -DockerCode 0 -GhCode 1
+    AssertEq 'F2 under -Local, an unauthenticated gh is a skip, not a failure' 0 $f2.Exit
     AssertMatch 'F2 with gh named in the log' 'SKIP.*gh' $f2.Text
     Assert 'F2 and the watermark untouched' (-not (Test-Path -LiteralPath $watermark))
 
@@ -256,6 +317,52 @@ try {
     AssertEq 'G6 the stamp makes a second push the same evening a no-op' 0 $g2.Exit
     AssertMatch 'G6 saying it already published today' 'already published today' $g2.Text
     Assert 'G7 and the publish script was never run' (-not (Test-Path -LiteralPath $ranMarker))
+
+    "== H. a pushed tag is not yet a release =="
+    # The publish succeeded here means "the tag went out". CI still has to build
+    # it, and a red release run leaves a tag with no release behind - which used
+    # to be indistinguishable from a good publish, and is what let the health
+    # line say everything was fine while nothing had shipped.
+    Remove-Item -LiteralPath $watermark -Force -ErrorAction SilentlyContinue
+    $h = Invoke-Decider -Extra @() -DockerCode 1 -GhCode 0
+    AssertEq 'H1 a real publish run reports 10' 10 $h.Exit
+    Assert 'H2 and the publish script actually ran, with Docker down' (Test-Path -LiteralPath $ranMarker)
+    $hStamp = Read-PublishWatermark -Text ([IO.File]::ReadAllText($watermark))
+    AssertEq 'H3 the outcome is tagged, not published - CI has not built it yet' 'tagged' $hStamp.Result
+    AssertMatch 'H4 and the instant is recorded for the catch-up rule' '^\d{4}-\d{2}-\d{2}T' $hStamp.At
+    AssertMatch 'H5 and the log says a tag went out rather than a release' 'TAGGED' $h.Text
+
+    "== I. the tag publisher's refusals =="
+    # publish-windows-tag.ps1 is the whole publish now, so its refusals are the
+    # last thing between a bad version and a release nobody can install.
+    $tagScript = Join-Path $Repo 'scripts\publish-windows-tag.ps1'
+    Assert 'I0 the tag publisher exists' (Test-Path -LiteralPath $tagScript -PathType Leaf)
+    function Invoke-TagPublisher([string[]]$TagArgs) {
+        $out = Join-Path $sandbox 'tag-out.txt'
+        & powershell -NoProfile -ExecutionPolicy Bypass -File $tagScript @TagArgs > $out 2>&1
+        return [pscustomobject]@{ Exit = $LASTEXITCODE; Text = (Get-Content -Raw -LiteralPath $out) }
+    }
+    $i1 = Invoke-TagPublisher @('-Version', '1.36', '-DryRun')
+    AssertEq 'I1 a malformed version is refused' 1 $i1.Exit
+    AssertMatch 'I1 and says what it wanted' 'X\.Y\.Z' $i1.Text
+
+    # A version that already has a tag must never be re-pushed: the push would be
+    # rejected as a non-fast-forward and read as a mysterious publish failure.
+    $existing = @(git -C $Repo tag --list 'win-v[0-9]*.[0-9]*.[0-9]*')
+    Assert 'I2 the repo has at least one published win-v tag to refuse' ($existing.Count -gt 0)
+    $taken = if ($existing.Count) { ($existing[-1] -replace '^win-v', '') } else { '1.0.0' }
+    $i2 = Invoke-TagPublisher @('-Version', $taken, '-DryRun')
+    AssertEq 'I2 a version that is already tagged is refused' 1 $i2.Exit
+    AssertMatch 'I2 and says so' 'already exists' $i2.Text
+
+    # The happy path, as far as it can be taken without pushing: a fresh version
+    # gets all the way to the push and stops there.
+    $i3 = Invoke-TagPublisher @('-Version', '99.99.99', '-DryRun')
+    AssertEq 'I3 a fresh version reaches the push and stops under -DryRun' 0 $i3.Exit
+    AssertMatch 'I3 naming the tag it would push' 'win-v99\.99\.99' $i3.Text
+    Assert 'I4 and no tag was created by a dry run' (
+        -not (@(git -C $Repo tag --list 'win-v99.99.99')).Count
+    )
     Complete-TestBody
 } finally {
     Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue

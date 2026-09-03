@@ -20400,3 +20400,54 @@ asserts that order today.
 Validation: `scripts\floor-lane.ps1 -Lane all` all four green, P1-P3 all pass
 (25/20/16 assertions), `test-reach-audit.ps1` and `printclient-audit.ps1` ALL
 PASS and re-stamped.
+
+## 2026-09-03 - T1292: the publish stops asking this box for something it is not allowed to have
+
+Nineteen tasks closed between 2026-08-31 and 2026-09-03 and the user spent all
+three days installing `win-v1.36.0`. Their report is the whole diagnosis: "i see
+tasks complete but there is no release."
+
+The publish designed by T1220 had never once succeeded, and the reason was
+structural rather than a bug. It ran `publish-windows-release.ps1`, which
+packages the MSI with wixl inside the msitools **Docker** image - and Docker
+Desktop is deliberately kept down on this box, which is why every script here
+says starting it is the user's call. So every evening the publish asked for a
+precondition it was forbidden to satisfy, wrote a polite SKIP into a temp log,
+and shipped nothing. The failure mode was "nothing happens", which is the one
+shape no gate in the turn was watching for.
+
+The path that works was already in the repo: `release-windows.yml` builds the
+same artifacts on ubuntu-latest with msitools from source - no Docker, no local
+wixl - and fires on a `win-v*` tag push. That is how win-v1.35.0 and win-v1.36.0
+were published. So the publish is now a tag push:
+`scripts\publish-windows-tag.ps1` refuses a malformed version, a tag that
+already exists locally or on origin, and a HEAD the remote does not have, then
+tags and pushes to **origin by name** (a bare push in this repo can resolve to
+the upstream Ghostty remote). `-Local` keeps the packaging path for a box that
+wants it, with its Docker and gh preconditions intact.
+
+Three things went in with it, because the outage had three independent halves.
+
+**The 17:00 gate encoded a workday this loop does not have.** On 2026-09-02 the
+last push was at 14:28 and the loop then stalled, so the evening never arrived
+while anything was running: the day published nothing and said nothing. A
+publish is now ALSO due at the first push once 24h have passed since the last
+one, whatever the hour. One per local day still caps it, so the two rules cannot
+double-publish.
+
+**A pushed tag is not a release.** CI builds for ten minutes afterwards and can
+go red, which used to be indistinguishable from a good publish. The watermark
+records `tagged`, and every later run reconciles it against `gh release view`:
+`published` when the release exists, `failed` once an hour has passed and it
+does not.
+
+**And the outage is now visible where the missed digest already is.**
+`publish=` on `go-loop-health.ps1` reads that watermark and reports
+`ok` / `stale-<n>d` / `failed` / `never`, degrading the run when nothing has
+shipped for a day. Fed this box's real state it reads
+`publish=stale-3d ... nothing has shipped since 2026-08-31`.
+
+Validation: `test\win32\daily-publish.ps1` ALL PASS (88 assertions, up from 64;
+negative control 88/88 red), `test\win32\go-loop-guard.ps1` ALL PASS with the
+new section Z, both guards re-stamped, `scripts\floor-lane.ps1 -Lane all` green.
+The end-to-end path was then exercised for real rather than described.

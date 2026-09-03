@@ -1733,6 +1733,56 @@ Assert 'Y6 before 05:00 the digest is not-due even with the loop turning' ($y -m
 
 Remove-Item -LiteralPath $yRoot -Recurse -Force -ErrorAction SilentlyContinue
 
+# --- Z. delivery is on the health line too (T1292) --------------------------
+#
+# The digest field above exists because an omission with no signal eventually
+# stops happening. Delivery had the same shape and it was worse: the daily
+# publish DID report its skips, one line an evening into a temp log nobody
+# reads, while the user spent three days installing a build from before the fix
+# they had asked for. `publish=` puts "nothing shipped" where "no digest"
+# already lives. First arm is the stale case, not the happy one (T1133).
+$zRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("gz-publish-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$zRepo = Join-Path $zRoot 'repo'
+New-Item -ItemType Directory -Force -Path (Join-Path $zRepo 'temp') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $zRepo 'docs\design\windows-parity-digests') | Out-Null
+$zWm = Join-Path $zRoot 'daily-publish'
+$zHealth = Join-Path $Repo 'scripts\go-loop-health.ps1'
+$zNow = [datetime]'2026-09-03T09:00:00'
+
+function ZHealth([string]$json) {
+    if ($null -eq $json) {
+        Remove-Item -LiteralPath $zWm -Force -ErrorAction SilentlyContinue
+    } else {
+        Set-Content -LiteralPath $zWm -Encoding ascii -Value $json
+    }
+    return (& powershell -NoProfile -ExecutionPolicy Bypass -File $zHealth `
+            -Repo $zRepo -PublishWatermark $zWm -PublishAsOf $zNow.ToString('o') `
+            -DigestAsOf $zNow.ToString('o') 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
+}
+
+# Three days since anything shipped - the exact state of this box on 2026-09-03.
+$z = ZHealth '{"date":"2026-08-31","at":"2026-08-31T19:31:00-07:00","tag":"win-v1.36.0","commit":"abc1234","result":"published"}'
+Assert 'Z1 a three-day-old publish reads stale on the plain line' ($z -match 'publish=stale-3d')
+Assert 'Z2 and the note says the landed work is not on the user''s machine' `
+    ($z -match 'nothing has shipped since 2026-08-31')
+Assert 'Z3 and the run is degraded, not healthy' ($z -match 'DEGRADED')
+
+# The positive control for Z1: yesterday's publish is the normal cadence.
+$z = ZHealth '{"date":"2026-09-02","at":"2026-09-02T18:02:00-07:00","tag":"win-v1.36.2","commit":"abc1234","result":"published"}'
+Assert 'Z4 yesterday''s publish reads ok, and stops nagging' `
+    ($z -match 'publish=ok' -and $z -notmatch 'nothing has shipped since')
+
+# A tag CI never turned into a release used to be indistinguishable from a good
+# publish; daily-publish.ps1 reconciles it and this is where that surfaces.
+$z = ZHealth '{"date":"2026-09-03","at":"2026-09-03T06:10:00-07:00","tag":"win-v1.36.3","commit":"abc1234","result":"failed"}'
+Assert 'Z5 a tag that never became a release reads failed, even dated today' ($z -match 'publish=failed')
+Assert 'Z6 and the note names the tag to go and look at' ($z -match 'win-v1\.36\.3')
+
+$z = ZHealth $null
+Assert 'Z7 no watermark at all reads never, not ok' ($z -match 'publish=never')
+
+Remove-Item -LiteralPath $zRoot -Recurse -Force -ErrorAction SilentlyContinue
+
 # --- cleanup --------------------------------------------------------------
 Kill-Sleepers
 Stop-DebugGhoztty

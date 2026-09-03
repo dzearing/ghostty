@@ -657,6 +657,7 @@ $GuardTable = @(
         Covers = @(
             'scripts\daily-publish.ps1',
             'scripts\publish-windows-release.ps1',
+            'scripts\publish-windows-tag.ps1',
             'test\win32\daily-publish.ps1'
         )
     },
