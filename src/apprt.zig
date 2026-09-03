@@ -67,6 +67,13 @@ test {
     // Pure win32 unfocused-split dim logic (T74), same no-OS-imports deal.
     _ = @import("apprt/win32/dim_math.zig");
 
+    // Pure win32 split-tree leaf reference counting (T371): the arithmetic
+    // `PaneView` and `Surface` share, including the underflow rule that keeps
+    // a pane the tree never accepted from leaking everything underneath. The
+    // real leaves need an App, a Window and a child HWND, so this is the only
+    // seam their counting can be tested through. Every lane.
+    _ = @import("apprt/win32/pane_refcount.zig");
+
     // Pure win32 erase-vs-preserve rule for the resize paint path (T1031),
     // same no-OS-imports deal.
     _ = @import("apprt/win32/resize_paint.zig");

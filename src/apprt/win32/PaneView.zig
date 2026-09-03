@@ -32,6 +32,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 
 const w32 = @import("win32.zig");
+const RefCount = @import("pane_refcount.zig").RefCount;
 const Surface = @import("Surface.zig");
 const ViewerPane = @import("ViewerPane.zig");
 const Window = @import("Window.zig");
@@ -46,8 +47,10 @@ kind: union(Kind) {
 
 /// Reference count for SplitTree ownership. Starts at 0 because
 /// `SplitTree.init`/`split` call `ref()` to take the first reference,
-/// exactly as `Surface.ref_count` used to.
-ref_count: u32 = 0,
+/// exactly as `Surface.ref_count` used to. The arithmetic — and the
+/// underflow rule that keeps a failed-into-the-tree pane from leaking — lives
+/// in `pane_refcount.zig`, which is unit-tested in every lane (T371).
+ref_count: RefCount = .{},
 
 /// Wrap an existing Surface as a terminal pane. Takes one reference on the
 /// surface, which is released when this PaneView is freed. The surface's
@@ -77,15 +80,14 @@ pub fn createViewer(alloc: Allocator, v: *ViewerPane) Allocator.Error!*PaneView 
 /// SplitTree view protocol: increment reference count.
 pub fn ref(self: *PaneView, alloc: Allocator) Allocator.Error!*PaneView {
     _ = alloc;
-    self.ref_count += 1;
+    self.ref_count.retain();
     return self;
 }
 
 /// SplitTree view protocol: decrement reference count, freeing the pane (and
 /// the leaf it owns) at zero.
 pub fn unref(self: *PaneView, alloc: Allocator) void {
-    self.ref_count -= 1;
-    if (self.ref_count != 0) return;
+    if (!self.ref_count.release()) return;
     switch (self.kind) {
         // Surface.unref runs its own hide/deinit/destroy at zero. The
         // back-pointer stays valid across it ON PURPOSE: Surface teardown
@@ -110,8 +112,7 @@ pub fn eql(self: *const PaneView, other: *const PaneView) bool {
 /// so the count is still zero and calling `unref` directly would underflow
 /// it to `maxInt(u32)` and leak everything underneath.
 pub fn destroyUnowned(self: *PaneView, alloc: Allocator) void {
-    std.debug.assert(self.ref_count == 0);
-    self.ref_count = 1;
+    self.ref_count.adoptUnowned();
     self.unref(alloc);
 }
 

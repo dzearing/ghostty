@@ -20361,3 +20361,42 @@ payload covered.
 Validation: `scripts\floor-lane.ps1 -Lane all` all four green, P1-P3 all pass
 (25/20/16 assertions), `test\win32\ipc-relay.ps1` ALL PASS - it is the
 `guard-due` row that covers `list.zig`, and it stamped.
+
+## 2026-09-02 - T371: the pane refcount is arithmetic now, and arithmetic can be tested
+
+Every pane in a window is kept alive by a counter: `SplitTree` refs and unrefs
+whatever it stores, and when the last holder lets go the pane tears its contents
+down. `PaneView` had one of those counters and `Surface` had a second, both
+open-coded as a `u32` with a `+= 1` in one method and a `-= 1` in another, and
+neither could be reached by a test - the `.terminal` arm needs a live Surface,
+which needs an App, a Window and a child HWND.
+
+So the counting moved to `src/apprt/win32/pane_refcount.zig`, which imports
+nothing but `std`. `RefCount` is `retain` / `release` / `isUnowned` /
+`adoptUnowned`, `PaneView` and `Surface` both compose it, and the two rules that
+used to live in comments are now code:
+
+- `release` on a count that is already zero is an assertion, not a wrap to
+  `maxInt(u32)`. That wrap is how "free at zero" turns into a leak of everything
+  underneath - the count goes enormous, the free never runs, and nothing says so.
+  The user's symptom would have been a terminal that grows heavier over a long
+  session, which is exactly what the T53 bar exists to keep out.
+- `adoptUnowned` is the only way to release a leaf the tree never accepted (a
+  `SplitTree.init` that failed after the pane was created), so that failure path
+  frees through the same code as the ordinary one rather than a second teardown
+  that can drift.
+
+Six unit tests, registered from `apprt.zig` so they run in EVERY app-runtime
+lane rather than only win32. A green test that was never actually executed is
+the failure mode here, so it was proven in-lane rather than assumed: inverting
+one assertion turned `zig build test -Dapp-runtime=none
+-Dtest-filter=pane_refcount` red, and reverting it turned it green again.
+
+Filed: T1294, for the slice this could not reach - the ordering contract between
+`Surface.deinit` (which reaches back into the IPC registry to forget a name
+keyed on the PaneView) and the PaneView freeing itself afterwards. Nothing
+asserts that order today.
+
+Validation: `scripts\floor-lane.ps1 -Lane all` all four green, P1-P3 all pass
+(25/20/16 assertions), `test-reach-audit.ps1` and `printclient-audit.ps1` ALL
+PASS and re-stamped.

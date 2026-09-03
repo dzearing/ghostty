@@ -22,6 +22,7 @@ const AgentIntegrationsDialog = @import("AgentIntegrationsDialog.zig");
 const ActivityMonitor = @import("ActivityMonitor.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const PaneView = @import("PaneView.zig");
+const RefCount = @import("pane_refcount.zig").RefCount;
 const RenameDialog = @import("RenameDialog.zig");
 const ViewerPane = @import("ViewerPane.zig");
 const Window = @import("Window.zig");
@@ -392,8 +393,9 @@ snap_dib_seq: u32 = 0,
 
 /// Reference count for SplitTree ownership. Starts at 0 because the owning
 /// `PaneView` calls ref() to take initial ownership (before T90c the tree
-/// held this reference directly; the counting is unchanged).
-ref_count: u32 = 0,
+/// held this reference directly; the counting is unchanged). Same tested
+/// arithmetic as the PaneView above it — see `pane_refcount.zig` (T371).
+ref_count: RefCount = .{},
 
 /// The split-tree leaf that owns this surface (T90c), or null before the
 /// wrapper exists / after the surface is orphaned. Lets the destroy paths
@@ -403,18 +405,16 @@ pane_view: ?*PaneView = null,
 /// SplitTree view protocol: increment reference count.
 pub fn ref(self: *Surface, alloc: Allocator) Allocator.Error!*Surface {
     _ = alloc;
-    self.ref_count += 1;
+    self.ref_count.retain();
     return self;
 }
 
 /// SplitTree view protocol: decrement reference count.
 pub fn unref(self: *Surface, alloc: Allocator) void {
-    self.ref_count -= 1;
-    if (self.ref_count == 0) {
-        if (self.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
-        self.deinit();
-        alloc.destroy(self);
-    }
+    if (!self.ref_count.release()) return;
+    if (self.hwnd) |h| _ = w32.ShowWindow(h, w32.SW_HIDE);
+    self.deinit();
+    alloc.destroy(self);
 }
 
 /// SplitTree view protocol: identity comparison.
