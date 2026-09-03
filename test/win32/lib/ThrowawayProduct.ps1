@@ -111,8 +111,20 @@ function Get-ThrowawayPackage {
         & gh release download $Tag --repo dzearing/ghoztty --pattern '*.msi' --dir $Work --clobber 2>&1 | Out-Null
     }
     if (-not (Test-Path $published)) { return $null }
+    # Stale against the REWRITER as well as the package (T1301). The cache used
+    # to key on the published bytes alone, so a fix to msi-test-identity.ps1
+    # changed nothing that either harness ran: on 2026-09-03 both went green
+    # over a package rewritten before the fix, installed it, and left the Start
+    # Menu shortcut the fix exists to make removable. What is under test here is
+    # the rewriter's output, so its source is part of the input.
+    $rewriter = Join-Path $Repo 'scripts\msi-test-identity.ps1'
+    $inputStamp = (Get-Item $published).LastWriteTimeUtc
+    if (Test-Path $rewriter) {
+        $rs = (Get-Item $rewriter).LastWriteTimeUtc
+        if ($rs -gt $inputStamp) { $inputStamp = $rs }
+    }
     if (-not (Test-Path $rewritten) -or
-        (Get-Item $rewritten).LastWriteTimeUtc -lt (Get-Item $published).LastWriteTimeUtc) {
+        (Get-Item $rewritten).LastWriteTimeUtc -lt $inputStamp) {
         $rewriteArgs = @('-Msi', $published, '-Out', $rewritten, '-Identity', $Identity)
         if ($AsProductVersion) { $rewriteArgs += @('-ProductVersion', $AsProductVersion) }
         & powershell -NoProfile -File (Join-Path $Repo 'scripts\msi-test-identity.ps1') @rewriteArgs 2>&1 | Out-Null

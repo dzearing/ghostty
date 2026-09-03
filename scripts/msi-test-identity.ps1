@@ -65,7 +65,14 @@ param(
     # bumped-up copy would fail to detect the installed product and install
     # BESIDE it - a side-by-side pair that passes every version check while
     # testing the opposite of an upgrade.
-    [string]$ProductVersion = ''
+    [string]$ProductVersion = '',
+    # NEGATIVE CONTROL ONLY (T1301). Blank one component's ComponentId after
+    # every repair pass and immediately before verification, to demonstrate that
+    # the "every Component row is registered" gate below can actually go red. A
+    # component with no GUID installs fine and can never be UNINSTALLED, which
+    # is precisely the failure that hid here for three harnesses; a gate nobody
+    # has watched fail is indistinguishable from a gate that cannot fail.
+    [string]$NegativeControlBlankComponent = ''
 )
 $ErrorActionPreference = 'Stop'
 
@@ -95,6 +102,19 @@ $intendedCells = @(
     'Registry|Key',
     'Shortcut|Name'
 )
+
+# What every rewritten cell is SUPPOSED to hold, filled in by Update-MsiColumn
+# and re-asserted in session 4. Keyed "<table>|<column>|<primary key>".
+#
+# The repair pass cannot speak for these cells: they are on $intendedCells, so a
+# cell that went BLANK there reads as "changed on purpose" and is skipped. T1301
+# is what that costs. Rewriting `Shortcut`.`Name` freed the pool entry for
+# "Ghoztty", and `Component`.`ComponentId` for C_StartMenuShortcut - already
+# rewritten, and sharing that entry no longer - read back as ''. A component
+# with no ComponentId is never registered, so the install still worked and the
+# UNINSTALL silently left the Start Menu shortcut behind, once per run, in three
+# harnesses, for as long as the rewriter has existed.
+$expectedCells = @{}
 
 function New-DerivedGuid {
     <#
@@ -243,6 +263,18 @@ function Update-MsiColumn {
     try {
         foreach ($row in $rows) {
             $new = & $Rewrite $row[$colIdx] $row
+            # Record what this cell must hold when the dust settles - including
+            # the rows the rewrite leaves alone, which are just as free to be
+            # blanked by a later write to a string they share. An EMPTY
+            # expectation is not recorded: it asserts nothing, and re-asserting
+            # it would undo a repair rather than confirm one.
+            $want = if ($null -eq $new) { $row[$colIdx] } else { $new }
+            if (-not [string]::IsNullOrEmpty($want)) {
+                $script:expectedCells["$Table|$Column|$($row[$keyIdx])"] = @{
+                    Table = $Table; Column = $Column; KeyColumn = $KeyColumn
+                    Key = $row[$keyIdx]; Value = $want
+                }
+            }
             if ($null -eq $new -or $new -eq $row[$colIdx]) { continue }
             $rec = $installer.CreateRecord(2)
             $rec.StringData(1) = $new
@@ -693,9 +725,55 @@ function Set-MsiCell([string]$Update, [string]$Value) {
     [void][Runtime.InteropServices.Marshal]::ReleaseComObject($v)
 }
 
+function Get-DriftedIntendedCells {
+    <#
+    Every cell $expectedCells speaks for that does not currently hold what the
+    rewrite decided it should - typically because a later write freed the string
+    pool entry it shared (see $expectedCells, and Restore-DamagedKeys for the
+    same defect arriving through a primary key).
+
+    Read one TABLE at a time rather than one cell at a time: a package has
+    several hundred components, and this file already carries the postmortem for
+    a few hundred leaked MSI views taking the process down mid-Commit.
+    #>
+    $drift = @()
+    $byTable = @{}
+    foreach ($e in $script:expectedCells.Values) {
+        $tk = "$($e.Table)|$($e.Column)|$($e.KeyColumn)"
+        if (-not $byTable.ContainsKey($tk)) { $byTable[$tk] = @() }
+        $byTable[$tk] += $e
+    }
+    foreach ($tk in $byTable.Keys) {
+        $p = $tk -split '\|'
+        $rows = Get-MsiRows ("SELECT " + (Get-ColumnList @($p[2], $p[1])) + " FROM ``$($p[0])``") 2
+        $cur = @{}
+        foreach ($row in $rows) { $cur[$row[0]] = $row[1] }
+        foreach ($e in $byTable[$tk]) {
+            if (-not $cur.ContainsKey($e.Key)) { continue }
+            if ($cur[$e.Key] -ne $e.Value) { $drift += $e }
+        }
+    }
+    # Plain, never `return ,$drift`: PS 5.1 hands an EMPTY array to a caller's
+    # `@(...)` as ONE element, which would report phantom drift forever.
+    return $drift
+}
+
+function Set-IntendedCells {
+    param($Cells)
+    foreach ($e in $Cells) {
+        Set-MsiCell ("UPDATE ``$($e.Table)`` SET ``$($e.Column)``=? WHERE ``$($e.KeyColumn)``='$($e.Key)'") $e.Value
+    }
+}
+
 for ($pass = 1; $pass -le 3; $pass++) {
     Open-MsiDb
     $wrong = @()
+    # The rewritten cells the repair pass is not allowed to touch. Checked in
+    # the same loop as the identity properties because the remedy is the same
+    # one and so is the reason it has to iterate: a write here can free the next
+    # string in turn.
+    $drifted = @(Get-DriftedIntendedCells)
+    foreach ($e in $drifted) { $wrong += "$($e.Table).$($e.Key).$($e.Column)" }
     foreach ($k in $propMap.Keys) {
         $cur = Get-MsiValue "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='$k'"
         if ($cur -ne $propMap[$k]) { $wrong += "Property.$k" }
@@ -707,6 +785,7 @@ for ($pass = 1; $pass -le 3; $pass++) {
         if ($row[2] -ne $want[1]) { $wrong += "Upgrade.$($row[0]).VersionMax" }
     }
     if ($wrong.Count -eq 0) { Close-MsiDb; break }
+    Set-IntendedCells $drifted
     foreach ($k in $propMap.Keys) {
         $cur = Get-MsiValue "SELECT ``Value`` FROM ``Property`` WHERE ``Property``='$k'"
         if ($cur -ne $propMap[$k]) {
@@ -731,11 +810,14 @@ for ($pass = 1; $pass -le 3; $pass++) {
         [void][Runtime.InteropServices.Marshal]::ReleaseComObject($v)
     }
     Close-MsiDb
-    Write-Host "  identity p${pass}: $($wrong.Count) cell(s) re-asserted ($($wrong -join ', '))"
+    # Named, but capped: a freed string can take several hundred component rows
+    # with it, and a line that long buries the one fact worth reading.
+    $shown = ($wrong | Select-Object -First 6) -join ', '
+    if ($wrong.Count -gt 6) { $shown += ", +$($wrong.Count - 6) more" }
+    Write-Host "  identity p${pass}: $($wrong.Count) cell(s) re-asserted ($shown)"
     if ($pass -eq 3) {
         Remove-Item -LiteralPath $Out -Force -ErrorAction SilentlyContinue
-        throw ('rewrite could not hold the identity cells after 3 passes (package deleted): ' +
-            ($wrong -join ', '))
+        throw ('rewrite could not hold the identity cells after 3 passes (package deleted): ' + $shown)
     }
 }
 
@@ -743,6 +825,16 @@ for ($pass = 1; $pass -le 3; $pass++) {
 # a separate open-write-persist, and it needs the database handle to be gone
 # first: `Database.SummaryInformation` on a live handle takes the process down
 # with an AccessViolation.
+# The negative control, applied where nothing will put it back: after every
+# repair and re-assert pass, before the verification that has to catch it.
+if ($NegativeControlBlankComponent) {
+    Open-MsiDb
+    Set-MsiCell ("UPDATE ``Component`` SET ``ComponentId``=? WHERE " +
+        "``Component``='$NegativeControlBlankComponent'") ''
+    Close-MsiDb
+    Write-Host "  NEGATIVE CONTROL: blanked ComponentId of $NegativeControlBlankComponent"
+}
+
 $si = $installer.SummaryInformation($Out, 2)
 $si.Property(9) = $newPackage
 [void]$si.Persist()
@@ -796,13 +888,32 @@ Check ($upgradeAfter.Count -eq $actionProps.Count) "Upgrade row count ($($upgrad
 $comps = Get-MsiRows "SELECT ``Component``,``ComponentId`` FROM ``Component``" 2
 $compIds = @()
 $stray = 0
+# EVERY row must still have a GUID (T1301). A component with no ComponentId is
+# never registered, so Windows Installer does not believe it is installed and
+# will not remove it: `Component: C_StartMenuShortcut; Installed: Null; Request:
+# Absent; Action: Null`. The install succeeds, which is the whole reason this
+# went unnoticed - the package installs and cannot be uninstalled, and each run
+# leaves another dead Start Menu entry behind. Blanks used to be SKIPPED here,
+# so the checks below were asked only of the rows that survived.
+$blank = @()
 foreach ($row in $comps) {
-    if ($row[1] -eq '') { continue }
+    if ($row[1] -eq '') { $blank += $row[0]; continue }
     $compIds += $row[1]
     if ($row[1] -ne (New-DerivedGuid -Identity $Identity -Seed ("component::" + $row[0]))) { $stray++ }
 }
+$blankShown = ($blank | Select-Object -First 5) -join ', '
+Check ($blank.Count -eq 0) ("Component.ComponentId blank on $($blank.Count) row(s) - never registered, so never uninstalled: $blankShown")
 Check ($stray -eq 0) "Component.ComponentId ($stray outside the derived namespace)"
+Check ($compIds.Count -eq $comps.Count) "Component.ComponentId (registered $($compIds.Count) of $($comps.Count) rows)"
 Check ((@($compIds | Sort-Object -Unique).Count) -eq $compIds.Count) 'Component.ComponentId (duplicates)'
+
+# The Start Menu name, which decides what the user sees and what an uninstall
+# takes away. A blanked one would leave the shortcut named after the real
+# product - the exact entry this rewrite exists to keep out of the Start Menu.
+$scRows = Get-MsiRows "SELECT ``Shortcut``,``Name`` FROM ``Shortcut``" 2
+$scBad = @()
+foreach ($row in $scRows) { if ($row[1] -notlike "*$Identity") { $scBad += ($row[0] + "='" + $row[1] + "'") } }
+Check ($scBad.Count -eq 0) ("Shortcut.Name: " + ($scBad -join ', '))
 
 $regRows = Get-MsiRows "SELECT ``Registry``,``Key`` FROM ``Registry``" 2
 $regBad = @()

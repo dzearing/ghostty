@@ -20581,3 +20581,46 @@ Filed: T1299 (nobody has ever installed the MSI and clicked through it on this
 box - three installer defects in a row reached the user before any harness
 could) and T1300 (Apps & Features still offers no Repair, now that there is one
 to offer).
+
+## 2026-09-03 - a throwaway test product can be uninstalled again (T1301)
+
+Three harnesses install a throwaway copy of Ghoztty so the installer can be
+exercised without touching the terminal the user is sitting in. The uninstall
+was quietly doing less than it said: the Start Menu entry stayed behind,
+pointing at a folder that no longer existed, once per run, since the rewriter
+existed. Two leftovers from earlier runs were still on this box.
+
+`scripts\msi-test-identity.ps1` rewrites `Component`.`ComponentId` for all 582
+components, and `C_StartMenuShortcut`'s came back EMPTY. A component with no
+GUID is never registered, so Windows Installer does not believe it is installed
+- `Component: C_StartMenuShortcut; Installed: Null; Request: Absent; Action:
+Null` - and the install still succeeds, which is what hid it. The cause is the
+wixl string-pool defect this script already documents twice, arriving through a
+third door: rewriting `Shortcut`.`Name` freed the pool entry that the
+already-remapped GUID shared. The repair pass could not speak for it, because
+`Component|ComponentId` is on the intended-cells list and a blank there reads as
+"changed on purpose".
+
+So `Update-MsiColumn` now records what every intended cell must hold, and the
+identity pass re-asserts the ones that drifted - the same treatment
+`Property.ProductVersion` already had, generalised. Verification fails on any
+blank ComponentId, and `-NegativeControlBlankComponent` is the demonstration
+that it can: it exits 1 and deletes the package. `install-walkthrough.ps1`
+asserts both as A4/A5 and its F5 skip is gone.
+
+The second half is why the first would have looked fixed while still shipping.
+`Get-ThrowawayPackage` cached the rewritten package and re-made it only when the
+PUBLISHED bytes were newer - so a fix to the rewriter invalidated nothing.
+`update-real-msi` and `update-graceful` both went green over a pre-fix package,
+installed it, and left the shortcut behind anyway. The rewriter's own mtime is
+part of that comparison now, because its output is what those harnesses test.
+
+Evidence: install-walkthrough ALL PASS (33 assertions, D skipped - this
+published package predates the maintenance prompt), update-real-msi ALL PASS
+(30), update-graceful ALL PASS (42), and afterwards `HKCU\Software\dzearing`
+holds only `Ghoztty` and the Start Menu only `Ghoztty.lnk`. Floor lanes all
+PASS, P1-P3 ALL PASS.
+
+Filed: T1303 (section E's 30-second wait for the post-update sweep goes red
+under box load and green solo, minutes apart, over the same code - a real leak
+and a slow box are currently indistinguishable).

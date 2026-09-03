@@ -328,14 +328,29 @@ $customActions = @(Get-MsiTableColumn -Package $pkgNew -Query 'SELECT `Action` F
 $hasMaintenancePrompt = ($customActions -contains 'MaintenancePrompt')
 Write-Host "  maintenance prompt in this package: $hasMaintenancePrompt"
 
-# T1301, found by F5 on this harness's first run: the identity rewriter leaves
-# C_StartMenuShortcut with an EMPTY ComponentId, and a component with no GUID is
-# never registered - so Windows Installer does not believe it is installed and
-# does not remove its shortcut. That is a defect in OUR tooling, not in the
-# package, so the shortcut half of F is asked only of a package that can answer.
-$shortcutComponent = @(Get-MsiTableColumn -Package $pkgNew `
-    -Query 'SELECT `ComponentId` FROM `Component` WHERE `Component`=''C_StartMenuShortcut''')
-$shortcutRegistered = ($shortcutComponent.Count -ge 1 -and $shortcutComponent[0] -ne '')
+# T1301, found by F5 on this harness's first run and fixed in the rewriter: a
+# component with an EMPTY ComponentId is never registered, so Windows Installer
+# does not believe it is installed and does not remove it. The install still
+# succeeds, which is what hid it - what fails is the UNINSTALL, silently, and
+# C_StartMenuShortcut was the row it happened to. Asked of every row, because
+# the next freed string will land somewhere else.
+$compIds = @(Get-MsiTableColumn -Package $pkgNew -Query 'SELECT `ComponentId` FROM `Component`')
+$blankComps = @($compIds | Where-Object { $_ -eq '' })
+Assert "A4 every component in the rewritten package is registered ($($compIds.Count - $blankComps.Count) of $($compIds.Count) have a GUID)" `
+    ($compIds.Count -gt 0 -and $blankComps.Count -eq 0)
+
+# ... and the gate that says so can say no. A rewrite whose verification is
+# never watched failing is indistinguishable from one that cannot fail, which is
+# how T1301 survived three harnesses: the package it produced installed fine.
+$negOut = Join-Path $work 'walk-negative-control.msi'
+Remove-Item -LiteralPath $negOut -Force -ErrorAction SilentlyContinue
+& powershell -NoProfile -ExecutionPolicy Bypass `
+    -File (Join-Path $Repo 'scripts\msi-test-identity.ps1') `
+    -Msi $source -Out $negOut -Identity $Identity `
+    -NegativeControlBlankComponent 'C_StartMenuShortcut' 2>&1 |
+    ForEach-Object { $_.ToString() } | Out-Null
+Assert 'A5 a rewrite that blanks one ComponentId is REFUSED, and the package deleted' `
+    (-not (Test-Path -LiteralPath $negOut))
 
 # Start from empty, whatever a previous run left behind.
 Stop-ThrowawayInstances -InstallDir $installDir -RealLocalAppData $realLocalAppData
@@ -518,12 +533,7 @@ Assert 'F3 no Apps & Features entry is left' `
     ((@(Get-ThrowawayUninstallEntries -Identity $Identity)).Count -eq 0)
 Assert "F4 the PATH entry is gone (was $pathHitsBefore before this run)" `
     ((Get-UserPathHits -Dir $installDir) -eq $pathHitsBefore)
-if ($shortcutRegistered) {
-    Assert 'F5 the Start Menu shortcut is gone' (-not (Test-Path -LiteralPath $shortcut))
-} else {
-    Skip 'F5 the Start Menu shortcut is gone' `
-        'the identity rewriter blanked this package''s shortcut ComponentId, so no installer would remove it (T1301)'
-}
+Assert 'F5 the Start Menu shortcut is gone' (-not (Test-Path -LiteralPath $shortcut))
 
 # =================================================== G. the user's Ghoztty
 Write-Host "`n-- G. and the user's own Ghoztty, before and after --"
@@ -546,10 +556,11 @@ Complete-TestBody
     if (-not $KeepInstall) {
         Stop-ThrowawayInstances -InstallDir $installDir -RealLocalAppData $realLocalAppData
         Remove-ThrowawayProduct -Identity $Identity -InstallDir $installDir -RealLocalAppData $realLocalAppData
-        # What the T1301 blanking leaves the uninstaller unable to remove. Named
-        # by the THROWAWAY identity and refused otherwise, so this can never
-        # reach for the user's shortcut or the user's key: those are called
-        # 'Ghoztty', and this run's identity is not.
+        # Belt and braces after F4/F5 have already asserted these are gone: a
+        # run that FAILED partway must not leave the box holding a shortcut or a
+        # registry key of its own. Named by the THROWAWAY identity and refused
+        # otherwise, so this can never reach for the user's shortcut or the
+        # user's key: those are called 'Ghoztty', and this run's identity is not.
         if ($Identity -ne 'Ghoztty') {
             Remove-Item -LiteralPath $shortcut -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath "HKCU:\Software\dzearing\$Identity" -Recurse -Force -ErrorAction SilentlyContinue
