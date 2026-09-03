@@ -20451,3 +20451,15 @@ Validation: `test\win32\daily-publish.ps1` ALL PASS (88 assertions, up from 64;
 negative control 88/88 red), `test\win32\go-loop-guard.ps1` ALL PASS with the
 new section Z, both guards re-stamped, `scripts\floor-lane.ps1 -Lane all` green.
 The end-to-end path was then exercised for real rather than described.
+
+The path was then exercised for real rather than described: `daily-publish.ps1`
+ran with Docker down, pushed `win-v1.36.2` at a5c770836, CI built it, and the
+release carries `Ghoztty-1.36.2-x64.msi` and
+`Ghoztty-portable-1.36.2-x64.zip`. The following run reconciled the watermark
+`tagged` -> `published`, and the health line went from `publish=stale-3d`
+("nothing has shipped since 2026-08-31") to `publish=ok`. The user's terminal
+offers the update at its next check.
+
+Filed: T1295 (a red release build leaves a health-line colour and nothing else -
+no task, no retry) and T1296 (`git-commit-guard.ps1` refuses its own commit when
+`-Paths` carries a glob, after making it, and blames another session for it).
