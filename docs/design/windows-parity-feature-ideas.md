@@ -199,3 +199,13 @@ as the digest that showed them.
 - Hide the tab strip when there is only one tab
 - Which pane is eating my CPU (per-pane child-process CPU/memory readout)
 - Quieter on battery (power-aware render cadence when unplugged and unfocused)
+
+## 2026-09-03
+
+- Copy out of a remote or WSL pane and have it land in Windows (clipboard bridge for remote/WSL panes)
+- Blur the secrets before you share it (secret redaction in screenshots and feedback captures)
+- Turn what you just ran into a script (select command history, save a runnable .ps1/.sh)
+- A scratch pad beside the shell (non-terminal notes pane, persisted with the session)
+- Choose where a link opens (viewer pane vs browser, remembered per link kind)
+- Tidy a window full of tabs (close others / close to the right, with a preview of what goes)
+- Respect Windows high contrast (chrome and palette follow the OS high-contrast theme)
