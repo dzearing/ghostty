@@ -20684,3 +20684,41 @@ lib/none/win32/agent all PASS; P1-P3 ALL PASS; and the eleven meta-audits that
 police a new harness - body-complete, asserted-nothing, verdict-exit,
 isolation-meta, launch-preflight, cleanslate, stderr-capture, desktop-launch,
 test-reach, printclient-audit, control-char-scan - all green over it.
+
+## 2026-09-03 - a second Mac message handler can no longer arrive unnoticed (T385)
+
+The viewer pane on Windows reaches native through exactly one channel -
+`window.webkit.messageHandlers.viewerTOC`, manufactured by the ten-line shim in
+`viewer_bridge.zig` on top of WebView2's own bridge - because that is the only
+handler the Mac app registers. A unit test already proved the NAME agrees across
+the shim and the shared JS, which catches a rename. It could not catch an
+addition, and an addition is the likelier drift: a Mac commit registering a
+second handler would leave the shared script looking up a name the shim never
+installed, getting `undefined`, and posting into nothing. No error on either
+side - the feature would simply be absent on Windows, with nothing to say so.
+
+Option 2 of the two the task weighed: keep one name and make the drift loud,
+rather than turning `messageHandlers` into a name-forwarding Proxy. The proxy
+would have bought coverage for a handler nobody has written by changing the wire
+shape - `{handler, body}` instead of the object Mac's `WKScriptMessage.body`
+carries - and that shape is the reason the parser is a straight port of Mac's.
+
+So the detector reads both ends of the drift. `ViewerView.swift` is embedded as
+data (`macos_viewer_view_swift`, the same arrangement T370 made for the Mac
+`+list` encoder, since this lane never compiles Swift), comment-stripped, and
+scanned for every `userContentController.add(..., name:)`: there must be exactly
+one, it must name `Self.tocMessageName`, and that constant must still be the
+string the shim installs. The second test scans the shared scripts themselves -
+selection.js, links.js, find.js and viewer.js, embedded verbatim - and requires
+every `messageHandlers.<name>` in them to be the name we install, because that
+is the vector by which a Mac addition would actually reach Windows.
+
+Both were demonstrated red before being trusted: a fake
+`add(..., name: "viewerFake")` in ViewerView.swift fails the first, and pointing
+links.js at `messageHandlers.viewerFake2` fails the second. T1306 records the
+one hole left - the Swift scan reads a single file, so a future move of the
+web-view configuration out of ViewerView.swift would disarm it quietly.
+
+Evidence: `-Dtest-filter=T385` green, both negative controls red then reverted;
+floor lanes lib/none/win32/agent all PASS; P1-P3 ALL PASS (25/20/16); the
+test-reach audit re-run and re-stamped for the touched module.

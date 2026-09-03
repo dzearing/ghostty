@@ -164,6 +164,18 @@ pub fn add(
         .root_source_file = b.path("macos/Sources/Features/IPC/IPCMessage.swift"),
     });
 
+    // The Mac viewer's web-view configuration, embedded as data (T385). The
+    // win32 shim installs exactly ONE `window.webkit.messageHandlers.<name>`
+    // because that is all Mac registers; a Mac commit that added a second one
+    // would leave the shared JS posting into `undefined` on Windows, silently,
+    // with the feature simply missing. The drift detector in
+    // `src/apprt/win32/viewer_bridge.zig` reads the checked-in Swift text and
+    // fails when the registered set stops being the one the shim covers. Like
+    // the embed above, it is referenced only from a test.
+    step.root_module.addAnonymousImport("macos_viewer_view_swift", .{
+        .root_source_file = b.path("macos/Sources/Features/Viewer/ViewerView.swift"),
+    });
+
     // C imports needed to manage/create PTYs
     switch (target.result.os.tag) {
         .freebsd,

@@ -993,3 +993,135 @@ test "T1184: nonsense counts read as zero rather than as a number" {
     try testing.expectEqual(@as(u32, 0), parsed.message.find.total);
     try testing.expectEqual(@as(u32, 0), parsed.message.find.index);
 }
+
+// ---------------------------------------------------------------------------
+// T385 — the drift detector for the handler SET, not just its name.
+//
+// The shim installs exactly one `window.webkit.messageHandlers.<name>`, and
+// the test above proves that name is the one the shared JS looks up. What it
+// cannot see is an ADDITION: if a Mac commit registers a second handler and
+// the shared JS starts posting through it, Windows looks up a name the shim
+// never installed, gets `undefined`, and `post()` returns quietly. No error on
+// either side — the feature is simply absent here, and nothing says so.
+//
+// So the check reads BOTH ends of that drift. Mac's own source is checked in
+// and therefore readable from this seat even though this lane never compiles
+// Swift: every `userContentController.add(..., name:)` in the viewer's
+// configuration must name the one handler the shim covers. And every
+// `messageHandlers.<name>` in the shared scripts — the delivery vector, since
+// they are embedded verbatim — must be that same name.
+
+/// Swift source with `//` comments removed, so a doc comment naming a call or
+/// a handler cannot be mistaken for one. String literals are preserved, since
+/// the handler name lives in one.
+fn swiftUncommented(alloc: Allocator, src: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(alloc);
+
+    var i: usize = 0;
+    var in_string = false;
+    while (i < src.len) {
+        const c = src[i];
+        if (in_string) {
+            if (c == '\\' and i + 1 < src.len) {
+                try out.appendSlice(alloc, src[i .. i + 2]);
+                i += 2;
+                continue;
+            }
+            if (c == '"') in_string = false;
+            try out.append(alloc, c);
+            i += 1;
+            continue;
+        }
+        if (c == '"') {
+            in_string = true;
+            try out.append(alloc, c);
+            i += 1;
+            continue;
+        }
+        if (c == '/' and i + 1 < src.len and src[i + 1] == '/') {
+            while (i < src.len and src[i] != '\n') i += 1;
+            continue;
+        }
+        try out.append(alloc, c);
+        i += 1;
+    }
+
+    return out.toOwnedSlice(alloc);
+}
+
+test "T385: Mac registers exactly one message handler, and the shim covers it" {
+    const alloc = testing.allocator;
+    const swift = try swiftUncommented(alloc, @embedFile("macos_viewer_view_swift"));
+    defer alloc.free(swift);
+
+    // `Self.tocMessageName` is what the registration names; this is the literal
+    // behind it, and it has to be the string the shim installs.
+    try testing.expect(std.mem.indexOf(
+        u8,
+        swift,
+        "tocMessageName = \"" ++ handler_name ++ "\"",
+    ) != null);
+
+    // Every handler registration, by the argument it names. A second call —
+    // whatever it is called — makes the count wrong and the test red.
+    var registrations: usize = 0;
+    var i: usize = 0;
+    while (std.mem.indexOfPos(u8, swift, i, "userContentController.add(")) |at| {
+        registrations += 1;
+        const after = at + "userContentController.add(".len;
+
+        // The proxy argument carries parentheses of its own
+        // (`ViewerTOCMessageProxy(viewer: self)`), so the argument list ends at
+        // the BALANCED close, and the `name:` label is the one at depth zero.
+        var close = after;
+        var name_at: ?usize = null;
+        var depth: usize = 0;
+        while (close < swift.len) : (close += 1) {
+            switch (swift[close]) {
+                '(' => depth += 1,
+                ')' => {
+                    if (depth == 0) break;
+                    depth -= 1;
+                },
+                'n' => if (depth == 0 and std.mem.startsWith(u8, swift[close..], "name:")) {
+                    name_at = close + "name:".len;
+                },
+                else => {},
+            }
+        }
+        const value_at = name_at orelse {
+            // A registration whose name this scan cannot read is drift too:
+            // the one thing the shim needs to know is unreadable.
+            return error.TestUnexpectedResult;
+        };
+        const named = std.mem.trim(u8, swift[value_at..close], " \t\r\n");
+        try testing.expectEqualStrings("Self.tocMessageName", named);
+        i = close;
+    }
+    try testing.expectEqual(@as(usize, 1), registrations);
+}
+
+test "T385: every handler the shared JS posts through is the one we install" {
+    // The scripts are embedded verbatim (P1), so a Mac-side addition arrives
+    // here as text in one of these files before it can go quiet at runtime.
+    // `viewer.js` rides the render template rather than the injected blob, but
+    // it posts through the same bridge, so it is scanned with the rest.
+    const scripts = [_][]const u8{
+        selection_js,
+        links_js,
+        find_js,
+        @embedFile("../../viewer/viewer.js"),
+    };
+    const needle = "messageHandlers.";
+    for (scripts) |js| {
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, js, i, needle)) |at| {
+            const after = at + needle.len;
+            var end = after;
+            while (end < js.len and (std.ascii.isAlphanumeric(js[end]) or js[end] == '_')) end += 1;
+            try testing.expectEqualStrings(handler_name, js[after..end]);
+            i = end;
+        }
+    }
+}
