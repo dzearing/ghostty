@@ -20463,3 +20463,43 @@ offers the update at its next check.
 Filed: T1295 (a red release build leaves a health-line colour and nothing else -
 no task, no retry) and T1296 (`git-commit-guard.ps1` refuses its own commit when
 `-Paths` carries a glob, after making it, and blames another session for it).
+
+
+## 2026-09-03 - T1290: the health line stops mistaking a nudge for work
+
+The loop sat inert from 2026-09-02 14:29 to 05:07 the next morning - no turn, no
+commit, fourteen and a half hours - and `go-loop-health.ps1` said HEALTHY for all
+of it. The watchdog had done its job: it found the lock stale at 04:59, nudged
+the pane, and logged that the pane moved. Six minutes later the health check
+measured that nudge and called it activity. The cure manufactured the symptom of
+health.
+
+Every clock on that line measured LIVENESS - a pid, a port, a pane that produced
+output - and the newest of them was refreshed by the supervisor's own poke. None
+of them measured work. So there is now a third one that cannot be poked:
+`turn_started`, written by `go-loop-lock.ps1` on `acquire` and by nothing else.
+Only a completed turn reaches go.md step 0 again, so only a completed turn moves
+it. `status` reports `turn_age`, and `go-loop-health.ps1` reddens the verdict
+past `-TurnStaleMinutes` (180, deliberately generous - a long acceptance sweep is
+legitimate; fourteen hours is not). A lock written before the field existed falls
+back to the heartbeat and never to the transcript, or the upgrade itself would
+have re-introduced the bug for every lock already on disk.
+
+The note that comes with it sends the reader to the pane. The trigger this time
+was `API Error: 529 Overloaded`, which reads as a perfectly live session to every
+other probe, and three stalls running were theorised about from the ledger while
+`ghoztty +read --name=<pane>` had the answer. `-Postmortem` now prints that tail
+without being asked.
+
+Validation: `test\win32\go-loop-guard.ps1` ALL PASS (286 assertions) with the new
+section AA, which opens on the STALL rather than the happy case and whose teeth
+arm diffs the note list against the same fixture with the gate widened - exactly
+one complaint is added, so the arm cannot pass on an unrelated grumble.
+`scripts\floor-lane.ps1 -Lane all` green, P1-P3 ALL PASS, and the seven audit
+harnesses the edit made due (isolation-meta, launch-preflight, verdict-exit,
+cleanslate, stderr-capture, merge-terminology, desktop-launch) all re-run green
+and re-stamped.
+
+Filed: T1297 (the watchdog answers a 529 by re-submitting into it, with no
+backoff and no notion of waiting on something transient) and T1298 (the dashboard
+still shows liveness only - a human watching the board cannot see this shape).

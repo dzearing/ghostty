@@ -22,10 +22,18 @@
 # (`publish=`, T1292), which had the same shape and cost three days of finished
 # work sitting on the branch while the user ran a build from before it.
 #
+# And it answers the question all of those presuppose: "is the loop doing WORK?"
+# (`turn_age=`, T1290). Every other clock here measures liveness - a pid, a port,
+# a pane that produced output - and on 2026-09-03 the loop was inert for 14.5
+# hours while this line said HEALTHY, because the watchdog's nudge had refreshed
+# the transcript six minutes earlier. A nudge is a treatment, not evidence; only
+# a completed turn moves `turn_started`, so only a completed turn clears this.
+#
 # Exit codes are the verdict, so a caller can branch without parsing:
-#   0 healthy      - a live owner, recent activity, a marked window
+#   0 healthy      - a live owner, recent activity, a turning loop, a marked window
 #   1 degraded     - running, but something is off (no marked window, no
-#                    watchdog, dashboard down, activity going stale)
+#                    watchdog, dashboard down, activity going stale, no turn
+#                    completed inside -TurnStaleMinutes)
 #   2 down         - no live loop owner at all
 #   3 stopped      - quiet ON PURPOSE: somebody ran `go-loop-exec.ps1 stop`.
 #                    Distinct from `down` because a supervisor that cannot tell
@@ -38,10 +46,21 @@ param(
     [string]$Repo,
     [int]$Port = 7788,
     [string]$StopPath,
+    # The loop lock to read. Defaults to whatever go-loop-lock.ps1 resolves for
+    # ITS repo, which is the real one - deliberately not derived from -Repo, so
+    # a fixture repo cannot make a live loop read as free. The harness passes an
+    # explicit path when the lock IS the subject.
+    [string]$LockPath,
     # Activity older than this means the loop is not turning even if the
     # process is alive. Deliberately generous: a build-and-test task legitimately
     # runs long, and a false "stalled" is worse than a late one.
     [int]$StaleMinutes = 45,
+    # How long a single turn may run before "the loop is working" stops being a
+    # believable reading of a quiet pane (T1290). Much more generous than
+    # -StaleMinutes because this clock only moves at turn boundaries: a
+    # build-and-test task with a long acceptance sweep genuinely runs over an
+    # hour, and the shape this exists to catch was FOURTEEN AND A HALF hours.
+    [int]$TurnStaleMinutes = 180,
     # The instant the daily-digest window is judged against. Defaults to now;
     # the harness passes an explicit one so "before 05:00" and "after 05:00"
     # are both reachable without waiting for a particular hour of the day.
@@ -66,6 +85,15 @@ if (-not $PublishWatermark) { $PublishWatermark = Join-Path $env:LOCALAPPDATA 'g
 $IsoFmt = 'yyyy-MM-ddTHH:mm:ssK'
 function Now-Iso { (Get-Date).ToString($IsoFmt) }
 
+function Format-Age([double]$minutes) {
+    if ([double]::IsInfinity($minutes)) { return 'unknown' }
+    if ($minutes -lt 0) { $minutes = 0 }
+    $t = [TimeSpan]::FromMinutes($minutes)
+    if ($t.TotalDays -ge 1) { return '{0}d {1:00}h {2:00}m' -f $t.Days, $t.Hours, $t.Minutes }
+    if ($t.TotalHours -ge 1) { return '{0}h {1:00}m' -f [math]::Floor($t.TotalHours), $t.Minutes }
+    return '{0}m' -f [math]::Floor($t.TotalMinutes)
+}
+
 function Test-Port([int]$P) {
     $c = New-Object System.Net.Sockets.TcpClient
     try { $c.Connect('127.0.0.1', $P); return $true } catch { return $false } finally { $c.Dispose() }
@@ -75,7 +103,9 @@ function Test-Port([int]$P) {
 
 $lock = $null
 try {
-    $raw = & powershell -NoProfile -File (Join-Path $PSScriptRoot 'go-loop-lock.ps1') status -Json 2>$null
+    $lockArgs = @('status', '-Json')
+    if ($LockPath) { $lockArgs += @('-LockPath', $LockPath, '-NoPaneProbe') }
+    $raw = & powershell -NoProfile -File (Join-Path $PSScriptRoot 'go-loop-lock.ps1') @lockArgs 2>$null
     if ($raw) { $lock = ($raw | Out-String | ConvertFrom-Json) }
 } catch { }
 
@@ -86,6 +116,8 @@ $turn = 0
 $pane = ''
 $loopPid = 0
 $ageMin = [double]::PositiveInfinity
+$turnAgeMin = [double]::PositiveInfinity
+$turnStarted = ''
 if ($lock -and $lock.state) {
     $state = [string]$lock.state
     if ($lock.PSObject.Properties.Name -contains 'uptime') { $uptime = [string]$lock.uptime }
@@ -94,6 +126,10 @@ if ($lock -and $lock.state) {
     $pane = [string]$lock.pane_id
     $loopPid = [int]$lock.claude_pid
     if ($lock.PSObject.Properties.Name -contains 'age_minutes') { $ageMin = [double]$lock.age_minutes }
+    if (($lock.PSObject.Properties.Name -contains 'turn_age_minutes') -and $null -ne $lock.turn_age_minutes) {
+        $turnAgeMin = [double]$lock.turn_age_minutes
+    }
+    if ($lock.PSObject.Properties.Name -contains 'turn_started') { $turnStarted = [string]$lock.turn_started }
 }
 
 # --- the marked execution window -------------------------------------------
@@ -229,6 +265,20 @@ if (-not $alive) { $notes += "loop owner is $state" }
 if ($alive -and $marked -eq 0) { $notes += 'no [go-loop]-marked window' }
 if ($alive -and $marked -gt 1) { $notes += "$marked marked windows (duplicate loops)" }
 if ($alive -and $ageMin -gt $StaleMinutes) { $notes += "no activity for $([math]::Round($ageMin))m" }
+# The progress gate (T1290). `age_minutes` above answers "did anything happen in
+# that pane", which the watchdog's own nudge is enough to satisfy - so on
+# 2026-09-03 the loop sat inert from 14:29 to 05:07 the next morning while this
+# line read HEALTHY, six minutes after the nudge that had just refreshed the
+# clock it was reading. A turn counter that has not advanced is the number that
+# describes the thing being supervised, and it is the one that must decide.
+$turnStalled = $false
+if ($alive -and $turnAgeMin -gt $TurnStaleMinutes) {
+    $turnStalled = $true
+    $notes += ("no turn has completed for $(Format-Age $turnAgeMin) (turn $turn started " +
+        "$(if ($turnStarted) { $turnStarted } else { 'before this field existed' })) - the pane may be " +
+        'moving without the loop working; read it with `ghoztty +read --name=<pane>` before theorising ' +
+        '(an API 529 sits there looking exactly like a live session)')
+}
 if (-not $watchdog) { $notes += 'watchdog is not running' }
 if (-not $dashboard) { $notes += "dashboard is not listening on $Port" }
 if ($inProgress.Count -gt 1) { $notes += "$($inProgress.Count) tasks claimed in-progress" }
@@ -259,7 +309,9 @@ if ($stopReq) {
     $notes = @(("stopped by request at $($stopReq.requested_at) by $($stopReq.requested_by)" +
         $(if ($stopReq.reason) { " - $($stopReq.reason)" } else { '' }))) +
         @('resume with: powershell -NoProfile -File scripts\go-loop-exec.ps1 resume') +
-        ($notes | Where-Object { $_ -notmatch '^loop owner is |^watchdog is not running$' })
+        # A loop parked on purpose is not turning BY DESIGN, so the progress
+        # note is dropped here with the other two: nothing is wrong.
+        ($notes | Where-Object { $_ -notmatch '^loop owner is |^watchdog is not running$|^no turn has completed ' })
 }
 
 if ($Json) {
@@ -273,6 +325,9 @@ if ($Json) {
         pane_id        = $pane
         claude_pid     = $loopPid
         age_minutes    = if ([double]::IsInfinity($ageMin)) { $null } else { $ageMin }
+        turn_started     = $turnStarted
+        turn_age_minutes = if ([double]::IsInfinity($turnAgeMin)) { $null } else { $turnAgeMin }
+        turn_stalled     = $turnStalled
         marked_windows = $marked
         watchdog       = $watchdog
         dashboard      = $dashboard
@@ -288,7 +343,7 @@ if ($Json) {
     } | ConvertTo-Json -Depth 4
 } else {
     $task = if ($inProgress.Count) { $inProgress -join ',' } else { 'none' }
-    "$(Now-Iso) $($verdict.ToUpper()) uptime=$uptime turn=$turn state=$state pane=$pane pid=$loopPid " +
+    "$(Now-Iso) $($verdict.ToUpper()) uptime=$uptime turn=$turn turn_age=$(Format-Age $turnAgeMin) state=$state pane=$pane pid=$loopPid " +
     "task=$task decisions_open=$openDecisions digest=$digestState publish=$publishState windows=$marked watchdog=$watchdog dashboard=$dashboard"
     foreach ($n in $notes) { "  - $n" }
 }
@@ -302,6 +357,17 @@ if ($Postmortem) {
     '=== watchdog log ==='
     $wlog = Join-Path $env:TEMP 'ghoztty-go-loop-watchdog.log'
     if (Test-Path $wlog) { Get-Content $wlog -Tail 20 } else { "(none: $wlog)" }
+    ''
+    '=== the loop pane, last 30 lines (T1290) ==='
+    # Three stalls running were theorised about from the ledger when the answer
+    # was one command away in the pane: "API Error: 529 Overloaded" reads as a
+    # perfectly live session to every other probe here.
+    if ($pane) {
+        $exe = "$env:LOCALAPPDATA\Programs\Ghoztty\ghoztty.exe"
+        if (Test-Path -LiteralPath $exe) {
+            try { (& $exe +read "--name=$pane" '--lines=30' 2>&1 | ForEach-Object { $_.ToString() }) } catch { "(read failed: $_)" }
+        } else { "(no ghoztty.exe at $exe)" }
+    } else { '(no pane recorded on the lock)' }
     ''
     '=== ghoztty / agent process ages (a restart kills the loop AND the tracker) ==='
     Get-CimInstance Win32_Process -Filter "Name='ghoztty.exe' OR Name='ghoztty-agent.exe'" |

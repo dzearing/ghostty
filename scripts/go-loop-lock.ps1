@@ -233,6 +233,19 @@ function Get-HeartbeatAgeMinutes($lock) {
     return ((Get-Date) - $hb).TotalMinutes
 }
 
+# How long the CURRENT turn has been running - the progress clock (T1290).
+#
+# Falls back to the heartbeat for a lock written before `turn_started` existed,
+# and only then to `acquired`. Deliberately never falls back to the transcript
+# pulse: the whole point of this number is that it cannot be moved by a nudge.
+function Get-TurnAgeMinutes($lock) {
+    $t = Parse-Iso $lock.turn_started
+    if (-not $t) { $t = Parse-Iso $lock.heartbeat }
+    if (-not $t) { $t = Parse-Iso $lock.acquired }
+    if (-not $t) { return [double]::PositiveInfinity }
+    return ((Get-Date) - $t).TotalMinutes
+}
+
 function Test-Mine($lock) {
     if (-not $lock) { return $false }
     if ($PaneId -and $lock.pane_id -and $lock.pane_id -eq $PaneId) { return $true }
@@ -353,6 +366,15 @@ switch ($Action) {
             repo         = $Repo
             acquired     = $acquired
             heartbeat    = Now-Iso
+            # When THIS turn started, as distinct from when the loop first took
+            # the lock (`acquired`, which survives every own-lock re-acquire and
+            # is therefore uptime, not progress). Only a completed turn moves
+            # this, because only a completed turn reaches step 0 again - which
+            # makes it the one clock that measures WORK DONE rather than signs
+            # of life (T1290). The heartbeat is refreshed mid-turn and the
+            # transcript pulse is refreshed by anything at all, up to and
+            # including the watchdog's own nudge.
+            turn_started = Now-Iso
             turn         = $turn
             reason       = $reason
         }
@@ -463,6 +485,10 @@ switch ($Action) {
         # say "last checkpoint".
         $lock | Add-Member -NotePropertyName age_minutes -NotePropertyValue ([math]::Round($age, 2)) -Force
         $lock | Add-Member -NotePropertyName heartbeat_age_minutes -NotePropertyValue ([math]::Round($hbAge, 2)) -Force
+        # The progress clock (T1290), beside the two liveness clocks. A reader
+        # that wants "is the loop WORKING" wants this one.
+        $turnAge = Get-TurnAgeMinutes $lock
+        $lock | Add-Member -NotePropertyName turn_age_minutes -NotePropertyValue $(if ([double]::IsInfinity($turnAge)) { $null } else { [math]::Round($turnAge, 2) }) -Force
         $lock | Add-Member -NotePropertyName activity_by -NotePropertyValue $activity.By -Force
         $activityIso = ''
         if ($activity.At) { $activityIso = $activity.At.ToString($IsoFmt) }
@@ -474,6 +500,7 @@ switch ($Action) {
         $lock | Add-Member -NotePropertyName now -NotePropertyValue (Now-Iso) -Force
         Emit $lock ("$state pane=$($lock.pane_id) pid=$($lock.claude_pid) alive=$alive(by=$aliveBy) " +
                     "age=$([math]::Round($age, 1))m(by=$($activity.By)) turn=$($lock.turn) " +
+                    "turn_age=$(if ([double]::IsInfinity($turnAge)) { 'unknown' } else { Format-Uptime $turnAge }) " +
                     "uptime=$(Format-Uptime $up) since=$($lock.acquired) mine=$(Test-Mine $lock)")
         exit 0
     }

@@ -769,6 +769,18 @@ and nothing noticed for thirteen hours. Ask it directly with:
 powershell -NoProfile -File scripts\go-loop-watchdog.ps1 -Status
 ```
 
+**And ask whether the loop is WORKING, not merely alive** (T1290).
+`scripts\go-loop-health.ps1` now reports `turn_age=` beside `uptime=`: how long
+the current turn has been running, from a lock field only a completed turn moves.
+Every other clock on that line measures liveness — a pid, a port, a pane that
+produced output — and on 2026-09-03 the loop sat inert for 14.5 hours reading
+HEALTHY, six minutes after the watchdog's own nudge had refreshed the transcript
+the verdict was keying off. A nudge is a treatment, not evidence. Past
+`-TurnStaleMinutes` (180) the run is DEGRADED and the note sends you to read the
+pane — three stalls running were theorised about from the ledger when
+`ghoztty +read --name=<pane>` had the answer, which that week was
+`API Error: 529 Overloaded`. `-Postmortem` prints that tail for you.
+
 The one allowed exception: if the reset probe finds this session is not in a
 Ghoztty pane, say so plainly and ask the user to run `/clear`.
 

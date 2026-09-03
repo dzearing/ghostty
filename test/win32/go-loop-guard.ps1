@@ -58,6 +58,13 @@
 #      loud about it on the way back. Plus the links below that one, which are
 #      ours to hold: the revive task fires AT LOGON, is not battery-gated, and
 #      carries no execution time limit that would kill the watchdog it started.
+#   X. The loop has an off switch and every re-entry path reads it (2026-08-23).
+#   Y. The daily digest is enforced rather than remembered (T1223).
+#   Z. The daily publish is on the health line, so "nothing shipped" is visible
+#      in the same place as "no digest" (T1292).
+#  AA. The health line measures WORK, not keystrokes (T1290): a turn that has
+#      not completed inside -TurnStaleMinutes reddens the verdict however fresh
+#      the pane is, so the watchdog's own nudge can no longer buy health.
 #
 # Hermetic: every lock/state/tracker file lives under a per-run temp dir, the
 # repo's own temp\go-loop.lock.json is never touched, and only ghoztty
@@ -1782,6 +1789,130 @@ $z = ZHealth $null
 Assert 'Z7 no watermark at all reads never, not ok' ($z -match 'publish=never')
 
 Remove-Item -LiteralPath $zRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+# --- AA. the health line measures WORK, not keystrokes (T1290) -------------
+#
+# On 2026-09-03 the loop was inert from 14:29 to 05:07 the next morning - no
+# turn, no commit - and the health line read HEALTHY the whole way through. The
+# watchdog had found the lock stale at 04:59, nudged the pane, and logged that
+# the pane moved; six minutes later the health check measured that nudge and
+# called it activity. The cure manufactured the symptom of health.
+#
+# So there is a third clock beside the heartbeat and the transcript pulse:
+# `turn_started`, which ONLY a completed turn moves, because only a completed
+# turn reaches go.md step 0 again. First arm is the stall, not the happy case
+# (T1133): a green light nobody has watched go red is not a light.
+$aaRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("gz-turn-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$aaRepo = Join-Path $aaRoot 'repo'
+New-Item -ItemType Directory -Force -Path (Join-Path $aaRepo 'temp') | Out-Null
+New-Item -ItemType Directory -Force -Path (Join-Path $aaRepo 'docs\design\windows-parity-digests') | Out-Null
+$aaLock = Join-Path $aaRoot 'go-loop.lock.json'
+$aaTranscript = Join-Path $aaRoot 'transcript.jsonl'
+$aaHealth = Join-Path $Repo 'scripts\go-loop-health.ps1'
+$aaNow = Get-Date
+# Publish and digest are deliberately made CLEAN in this fixture: the arms
+# below assert that the turn gate is the sole reason the verdict moves, and a
+# second standing complaint would let a broken gate pass them.
+$aaWatermark = Join-Path $aaRoot 'daily-publish'
+Set-Content -LiteralPath $aaWatermark -Encoding ascii -Value ('{"date":"' + $aaNow.ToString('yyyy-MM-dd') + '","tag":"win-vAA","result":"published"}')
+# A live owner this fixture can point at without inventing one: THIS process.
+$aaProc = Get-Process -Id $PID
+$aaIso = 'yyyy-MM-ddTHH:mm:ss.fffffffK'
+
+function AAWriteLock([object]$turnStarted, [datetime]$heartbeat) {
+    # The transcript is touched to NOW every time - that is the nudge, and the
+    # thing the old verdict was reading.
+    Set-Content -LiteralPath $aaTranscript -Encoding ascii -Value '{}'
+    $o = [ordered]@{
+        version      = 1
+        pane_id      = 'AA-FIXTURE-PANE'
+        claude_pid   = $PID
+        claude_name  = $aaProc.ProcessName
+        claude_start = $aaProc.StartTime.ToString($aaIso)
+        session_id   = 'aa-fixture'
+        transcript   = $aaTranscript
+        host         = $env:COMPUTERNAME
+        repo         = $aaRepo
+        acquired     = $aaNow.AddDays(-3).ToString($aaIso)
+        heartbeat    = $heartbeat.ToString($aaIso)
+        turn         = 66
+        reason       = 'own-lock'
+    }
+    if ($null -ne $turnStarted) { $o['turn_started'] = ([datetime]$turnStarted).ToString($aaIso) }
+    Set-Content -LiteralPath $aaLock -Encoding ascii -Value ($o | ConvertTo-Json -Depth 4)
+}
+
+function AAHealth([switch]$AsJson, [int]$TurnStaleMinutes = 0) {
+    $a = @('-Repo', $aaRepo, '-LockPath', $aaLock, '-DigestAsOf', $aaNow.ToString('o'),
+           '-PublishAsOf', $aaNow.ToString('o'), '-PublishWatermark', $aaWatermark)
+    if ($AsJson) { $a += '-Json' }
+    if ($TurnStaleMinutes -gt 0) { $a += @('-TurnStaleMinutes', "$TurnStaleMinutes") }
+    return (& powershell -NoProfile -ExecutionPolicy Bypass -File $aaHealth @a 2>&1 |
+        ForEach-Object { $_.ToString() } | Out-String)
+}
+
+# The exact 2026-09-03 shape: transcript touched seconds ago, heartbeat and turn
+# 14.5 hours old, turn counter unchanged.
+AAWriteLock $aaNow.AddHours(-14.5) $aaNow.AddHours(-14.5)
+$aa = AAHealth
+Assert 'AA1 a 14.5h-old turn behind fresh pane activity is not HEALTHY' `
+    ($aa -match 'DEGRADED' -and $aa -notmatch 'HEALTHY')
+# The teeth check: run the SAME fixture with the gate widened out of the way and
+# diff the complaints. Exactly one appears, and it is this one. Without this arm
+# AA1 passes on any unrelated grumble - which is how a gate that cannot fail
+# ships looking like one that can. Asserted on the NOTES rather than the verdict
+# word, because the suite runs on a background desktop where the dashboard port
+# and the marked-window count are legitimately not what a foreground box has.
+$aaNarrowJson = (AAHealth -AsJson) | ConvertFrom-Json
+$aaWideJson = (AAHealth -AsJson -TurnStaleMinutes 100000) | ConvertFrom-Json
+# Unwrapped inline, not through a helper: a PS 5.1 function that returns an
+# EMPTY array unrolls it to $null at the call site, and the widened run's note
+# list is empty by construction - so the helper form failed this arm for a
+# reason that had nothing to do with the gate.
+$aaNarrowNotes = @($aaNarrowJson.notes)
+$aaWideNotes = @($aaWideJson.notes)
+Assert 'AA1b and it is the turn gate alone that reddens it - one added note, no others' `
+    ($aaNarrowNotes.Count -eq ($aaWideNotes.Count + 1) -and
+     @($aaWideNotes | Where-Object { $_ -match 'no turn has completed' }).Count -eq 0 -and
+     @($aaNarrowNotes | Where-Object { $_ -match 'no turn has completed' }).Count -eq 1)
+Assert 'AA2 the plain line carries the progress clock, not just the liveness one' `
+    ($aa -match 'turn_age=14h')
+Assert 'AA3 and the note names the last completed turn and how long ago it started' `
+    ($aa -match 'no turn has completed for 14h' -and $aa -match 'turn 66 started')
+Assert 'AA4 the note sends the reader to the pane, where a 529 is visible' `
+    ($aa -match '\+read' -and $aa -match '529')
+
+# THE arm this task exists for: nudging again refreshes the transcript and must
+# change nothing. AAWriteLock re-touches it on every call.
+AAWriteLock $aaNow.AddHours(-14.5) $aaNow.AddHours(-14.5)
+$aa = AAHealth
+Assert 'AA5 a second nudge does not buy health - only a completed turn does' `
+    ($aa -match 'DEGRADED' -and $aa -match 'no turn has completed')
+
+# Back-compat: a lock written before turn_started existed falls back to the
+# HEARTBEAT, never to the transcript pulse - otherwise the upgrade itself would
+# have re-introduced the bug for every lock already on disk.
+AAWriteLock $null $aaNow.AddHours(-14.5)
+$aa = AAHealth
+Assert 'AA6 a pre-T1290 lock falls back to the heartbeat, so it still reads stalled' `
+    ($aa -match 'no turn has completed for 14h')
+
+# The positive control for AA1: a turn that started four minutes ago. Only the
+# progress note is asserted away - this fixture cannot speak for the dashboard
+# or the watchdog, which have notes of their own.
+AAWriteLock $aaNow.AddMinutes(-4) $aaNow.AddMinutes(-4)
+$aa = AAHealth
+Assert 'AA7 a turn that started minutes ago produces no progress complaint' `
+    ($aa -match 'turn_age=4m' -and $aa -notmatch 'no turn has completed')
+
+$aa = AAHealth -AsJson
+$aaJson = $null
+try { $aaJson = $aa | ConvertFrom-Json } catch { }
+Assert 'AA8 -Json carries turn_age_minutes and turn_stalled for the dashboard' `
+    ($null -ne $aaJson -and $aaJson.turn_age_minutes -ge 3 -and $aaJson.turn_age_minutes -le 6 -and
+     $aaJson.turn_stalled -eq $false)
+
+Remove-Item -LiteralPath $aaRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 # --- cleanup --------------------------------------------------------------
 Kill-Sleepers
