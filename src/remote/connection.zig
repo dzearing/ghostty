@@ -2827,6 +2827,17 @@ pub const Connection = struct {
         timeout_ns: ?u64,
         canceller: ?*const RpcCanceller,
     ) !RpcResult {
+        // Every RPC's reply type must be DECLARED as one (T403). This is the
+        // half of the guard that bites when somebody adds an RPC and forgets
+        // the reply side: the control reader dispatches from
+        // `protocol.isRpcReply`, so an undeclared reply is silently ignored
+        // there and the caller here waits out its whole timeout — the T96
+        // shape, which read like a hang in the agent and was a missing arm in
+        // the client. Asserting at the REQUEST end turns that into a loud
+        // failure on the first call in any lane, instead of a stall nobody
+        // sees until they time a real round trip on a box.
+        assert(protocol.isRpcReply(want));
+
         var slot: PendingRpc = .{
             .want = want,
             .reply_channel = channel,
@@ -3170,37 +3181,17 @@ pub const Connection = struct {
 
     /// Internal control-frame handling done by the control reader BEFORE the user
     /// handler (increment 2 + 3). Consumes health/lifecycle semantics additively:
-    ///   - `.opened`/`.attached` → wake the parked RPC caller for that channel (§4.2).
+    ///   - every `protocol.isRpcReply` type → wake the parked RPC caller for that
+    ///     channel (§4.2). Dispatched from that declaration rather than from a
+    ///     per-reply arm, so a new reply is wired the moment it is declared (T403).
     ///   - `.pong`  → match by hb_seq, sample RTT, reset misses, FSM → connected.
     ///   - `.ping`  → reply with a `.pong` echoing the timestamp (bidirectional).
     ///   - `.detached` → record eviction (§5.3) and drive the FSM to DEAD.
+    ///   - `.exit`/`.meta` → signalled onto the pane's inbound ring; `.metrics` and
+    ///     `.session_cpu` → handed to their push handlers.
     /// Other frame types are ignored here (the user handler still sees them).
     fn handleControlInternal(self: *Connection, frame: protocol.Frame) void {
         switch (frame.type) {
-            .opened, .attached, .open_failed, .attach_failed => {
-                // Reply to an OPEN/ATTACH RPC: hand the payload to the parked caller
-                // keyed by this channel id. If no caller is waiting (stale/duplicate
-                // reply), it's dropped here; the user handler still observes it.
-                //
-                // `.open_failed`/`.attach_failed` ride the same path on purpose —
-                // each is its request's negative answer, not a separate event
-                // (T469, T657). An unsolicited one (no parked caller) is simply
-                // dropped, exactly like a late OPENED.
-                _ = self.deliverRpcReply(frame);
-            },
-            .cwd => {
-                // Reply to a GET_CWD RPC (§WP4). Same-channel correlation: the agent
-                // echoes CWD on the request channel, so `deliverRpcReply` matches it
-                // via the `pending` map keyed by `frame.channel`. Dropped if no
-                // caller is parked (a late reply after a timeout).
-                _ = self.deliverRpcReply(frame);
-            },
-            .proc_snapshot => {
-                // Reply to a PROC_LIST RPC (§9.3 process view). Same-channel
-                // correlation, exactly like CWD: the agent echoes PROC_SNAPSHOT on the
-                // request channel. Dropped if no caller is parked (late reply).
-                _ = self.deliverRpcReply(frame);
-            },
             .sessions => {
                 // Two sources share this frame type, distinguished by channel:
                 //
@@ -3221,42 +3212,6 @@ pub const Connection = struct {
                     if (handler) |h| h(ctx, frame.payload);
                     return;
                 }
-                _ = self.deliverRpcReply(frame);
-            },
-            .proc_kill_result, .proc_spawn_result => {
-                // Replies to PROC_KILL / PROC_SPAWN RPCs (§9.3 process control, inc
-                // 4+5). Same-channel correlation, like PROC_SNAPSHOT. Dropped if no
-                // caller is parked (a late reply after a timeout).
-                _ = self.deliverRpcReply(frame);
-            },
-            .set_layout_result, .layouts => {
-                // Replies to SET_LAYOUT / GET_LAYOUTS RPCs (§5.4 "Resume all",
-                // T18). Same-channel correlation, like CWD/SESSIONS: the agent
-                // echoes the reply on the request channel. Dropped if no caller
-                // is parked (a late reply after a timeout).
-                _ = self.deliverRpcReply(frame);
-            },
-            .close_session_result => {
-                // Reply to a CLOSE_SESSION RPC (T96). Same-channel correlation, like
-                // CWD/SESSIONS: the agent echoes CLOSE_SESSION_RESULT on the request
-                // channel. Dropped if no caller is parked — which is the normal case
-                // for `closeSessionNoWait`, whose reply lands on a channel nobody
-                // claimed by design.
-                //
-                // This arm is what makes `closeSession` an RPC at all. Without it the
-                // reply reached the reader and stopped there, so EVERY close-by-id
-                // burned the caller's full timeout and then reported failure over a
-                // session the agent had already killed ~30 ms in — the chooser's Kill
-                // and `remote-test-client --close-session` both. It read like a hang
-                // in the agent's pty teardown; it was a missing dispatch arm here.
-                _ = self.deliverRpcReply(frame);
-            },
-            .relaunched => {
-                // Reply to a RELAUNCH RPC (§5.4 reboot floor, T12c). The agent echoes
-                // RELAUNCHED on the SESSION's channel (the relaunchable path), which is
-                // exactly the channel the client sent RELAUNCH on, so `deliverRpcReply`
-                // matches it via the `pending` map keyed by `frame.channel`. Dropped if
-                // no caller is parked (a late reply after a timeout).
                 _ = self.deliverRpcReply(frame);
             },
             .pong => {
@@ -3373,7 +3328,30 @@ pub const Connection = struct {
                 self.write_mutex.unlock();
                 if (handler) |h| h(ctx, parsed.value.sessions, parsed.value.interval_ms);
             },
-            else => {},
+            else => {
+                // Every OTHER reply is dispatched FROM the declared reply set
+                // rather than from an arm somebody had to remember to write
+                // (T403). `protocol.isRpcReply` is exhaustive over `FrameType`,
+                // so a new opcode does not compile until it is classified, and
+                // classifying it as a reply wires it HERE in the same edit —
+                // which is the whole T96 defect class: `close_session_result`
+                // had no arm, so the reply reached this reader and stopped, and
+                // every close-by-id burned its caller's full timeout and then
+                // reported failure over a session the agent had already killed
+                // ~30 ms in.
+                //
+                // The `else` itself stays load-bearing and correct: pushes and
+                // frame types this build does not know must be ignorable here
+                // (the user `ctrl_handler` still observes every frame in
+                // `controlReaderLoop`). What changed is that "ignore it" is now
+                // the answer only for frames the declaration says are not
+                // answers.
+                //
+                // A reply with no parked caller is dropped exactly as before —
+                // a late reply after a timeout, or `closeSessionNoWait`, whose
+                // reply lands on a channel nobody claimed by design.
+                if (protocol.isRpcReply(frame.type)) _ = self.deliverRpcReply(frame);
+            },
         }
     }
 
@@ -5723,6 +5701,71 @@ test "EXIT frame: signals the pane's ring so the consumer can close the pane" {
 
     try testing.expect(a.err == null);
     h.conn.closeChannel(pane);
+}
+
+test "T403: every declared RPC reply wakes a parked caller; nothing else does" {
+    // The generalized T96 oracle. T96 was one missing `switch` arm: the reply
+    // reached the control reader and stopped there, so every close-by-id burned
+    // its caller's full timeout and then reported failure over a session the
+    // agent had already killed. Nothing anywhere said which frame types are
+    // replies, so nothing could notice.
+    //
+    // This walks EVERY `FrameType` — not the reply set, the whole enum — parks a
+    // caller on it, feeds the control reader a frame of that type, and asserts
+    // delivery matches `protocol.isRpcReply` exactly.
+    //
+    // What it catches is an ARM that shadows the declaration and then forgets
+    // to deliver. `.sessions` is that shape today and the only one: it needs
+    // its own arm because one frame type carries both the LIST_SESSIONS reply
+    // and the roster push, so its delivery is hand-written and can regress
+    // independently of the set. Any future dual-purpose reply inherits the
+    // same risk and the same coverage here.
+    //
+    // What it deliberately does NOT claim to catch is a reply removed from the
+    // declaration: the reader dispatches FROM that declaration, so the two
+    // cannot disagree. That direction is guarded at the other end, by
+    // `rpcCall`'s `assert(protocol.isRpcReply(want))` — demote a reply and
+    // every test that issues that RPC trips the assert by name.
+    const alloc = testing.allocator;
+    const h = try LifecycleHarness.create(alloc);
+    defer h.destroy();
+
+    inline for (@typeInfo(protocol.FrameType).@"enum".fields, 0..) |field, i| {
+        const ftype: protocol.FrameType = @enumFromInt(field.value);
+        // A distinct channel per type, and never the control channel: a
+        // `sessions` frame there is the roster PUSH, not the LIST_SESSIONS
+        // reply, and this test is about answers.
+        const channel: u128 = 0x7403_0000 + i;
+
+        var slot: PendingRpc = .{ .want = ftype, .reply_channel = channel };
+        h.conn.rpc_mutex.lock();
+        try h.conn.pending.put(alloc, channel, &slot);
+        h.conn.rpc_mutex.unlock();
+
+        h.conn.handleControlInternal(.{
+            .type = ftype,
+            .channel = channel,
+            .seq = 0,
+            .payload = "{}",
+        });
+
+        const delivered = slot.done.isSet();
+
+        h.conn.rpc_mutex.lock();
+        _ = h.conn.pending.remove(channel);
+        h.conn.rpc_mutex.unlock();
+        if (delivered) {
+            if (slot.result) |owned| alloc.free(owned) else |_| {}
+        }
+
+        if (protocol.isRpcReply(ftype) != delivered) {
+            std.debug.print(
+                "frame type {s}: isRpcReply={}, but the control reader {s} the parked caller\n",
+                .{ @tagName(ftype), protocol.isRpcReply(ftype), if (delivered) "woke" else "never woke" },
+            );
+            return error.RpcReplyDispatchMismatch;
+        }
+    }
 }
 
 test "META foreground_pid: routed to the pane's ring; unknown channel dropped (wp3)" {

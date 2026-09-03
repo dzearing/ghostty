@@ -20730,3 +20730,40 @@ web-view configuration out of ViewerView.swift would disarm it quietly.
 Evidence: `-Dtest-filter=T385` green, both negative controls red then reverted;
 floor lanes lib/none/win32/agent all PASS; P1-P3 ALL PASS (25/20/16); the
 test-reach audit re-run and re-stamped for the touched module.
+
+## 2026-09-03 - a remote reply nobody wired up now fails loudly instead of stalling (T403)
+
+T96 was one missing `switch` arm and it cost a ten-second hang on every
+close-by-id: `close_session_result` had no case in the client's control reader,
+so the agent's answer arrived, was ignored, and the caller waited out its whole
+timeout before reporting failure over a session that had already been killed
+~30 ms in. The arm was added; the SHAPE that allowed it was not touched. Nothing
+declared which frame types are replies - it lived in a comment column and in
+which `rpcCall` site passed which `want` - and the reader's `else => {}` is
+load-bearing (pushes and unknown opcodes must stay ignorable), so exhaustiveness
+could not simply be demanded of it.
+
+Three pieces close that. `protocol.isRpcReply` names the thirteen A-to-C frames
+a parked caller can be woken by, beside the opcodes it describes and beside
+`onDataLane`, which exists for the same reason; its switch is exhaustive, so a
+new opcode does not compile until somebody classifies it. The control reader
+then dispatches FROM that declaration - the per-reply arms that only called
+`deliverRpcReply` are gone - so classifying a new reply wires it in the same
+edit. `.sessions` keeps its own arm, because that one frame type carries both
+the LIST_SESSIONS reply and the roster push and is told apart by channel.
+
+The third piece is the one the negative control forced. Dispatching from the
+declaration makes a test comparing the two tautological, and the first attempt
+here was exactly that: demoting `close_session_result` from the set left it
+GREEN. So the guard moved to the request end - `rpcCall` now asserts
+`protocol.isRpcReply(want)`, and an RPC whose reply is undeclared fails by name
+on its first call in any lane instead of stalling on a box. Re-run, the same
+demotion panics inside `test.closeSession: the agent's CLOSE_SESSION_RESULT
+wakes the RPC (T96)`.
+
+Filed while here: T1307 - neither `src/remote/connection.zig` nor
+`src/remote/protocol.zig` appears in any `guard-due.ps1` `Covers` set, so this
+entire diff left every acceptance harness reading as current.
+
+Evidence: floor lanes lib/none/win32/agent all PASS; P1-P3 ALL PASS (25/20/16);
+negative control observed red, restored, re-run green.

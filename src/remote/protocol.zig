@@ -263,6 +263,101 @@ pub fn onDataLane(t: FrameType) bool {
     };
 }
 
+/// True for the A→C frame types that are the ANSWER to a client RPC — the
+/// frames `Connection.rpcCall` parks on and `deliverRpcReply` must be handed.
+///
+/// This is the declaration the client's control reader DISPATCHES FROM, and it
+/// lives here, beside the opcodes it describes, for the same reason
+/// `onDataLane` does. Before T403 "which frame types are replies" was written
+/// nowhere: it lived in the comment column above and in which `rpcCall` site
+/// passed which `want`, and the actual wiring was one `switch` arm per reply in
+/// a second file whose `else => {}` is load-bearing (pushes and future opcodes
+/// must stay ignorable). So a reply with no arm was **silently dropped** — the
+/// parked caller burned its whole timeout and then reported failure over an
+/// operation that had in fact succeeded. That is exactly T96: every
+/// close-by-id, from the chooser's Kill to `remote-test-client
+/// --close-session`, waited out its timeout because `close_session_result` was
+/// missing from that switch, and it read like a hang in the agent's pty
+/// teardown.
+///
+/// The switch is EXHAUSTIVE on purpose — no `else` — so a new opcode does not
+/// compile until somebody says which side of this line it falls on. That is the
+/// structural half of the guard; the behavioral half is the `none`-lane test in
+/// `connection.zig` that drives every member of this set through the control
+/// reader and fails if one does not wake a parked caller.
+pub fn isRpcReply(t: FrameType) bool {
+    return switch (t) {
+        // Session establishment. The refusals ride the same slot as their
+        // positive answer on purpose (T469/T657): a refusal is the request's
+        // ANSWER, not a separate event, and dropping it here is what made a
+        // refused OPEN cost the full 10 s `rpc_open_timeout_ns`.
+        .opened,
+        .open_failed,
+        .attached,
+        .attach_failed,
+        // Same-channel replies: the agent echoes each on the request channel.
+        .cwd,
+        .sessions,
+        .relaunched,
+        .set_layout_result,
+        .layouts,
+        .proc_snapshot,
+        .proc_kill_result,
+        .proc_spawn_result,
+        .close_session_result,
+        => true,
+
+        // Requests (C→A), pushes (A→C), and the stream/heartbeat/flow
+        // machinery. Nothing parks on any of these.
+        //
+        // `sessions` is deliberately absent from this half even though it is
+        // ALSO a push: one frame type carries both the LIST_SESSIONS reply and
+        // the `sessions_sub` roster push, told apart by channel, and the
+        // control reader keeps its own arm for that. Being a reply is what this
+        // predicate answers.
+        //
+        // `rpc_result` is the JSON-RPC lane (§9.5), which has no client caller
+        // yet; when one lands it parks through `rpcCall` like everything else
+        // and moves up.
+        .hello,
+        .open,
+        .attach,
+        .detached,
+        .data,
+        .data_repaint,
+        .resize,
+        .signal,
+        .detach,
+        .close,
+        .exit,
+        .meta,
+        .get_cwd,
+        .list_sessions,
+        .relaunch,
+        .set_layout,
+        .get_layouts,
+        .close_session,
+        .rpc,
+        .rpc_result,
+        .tunnel,
+        .ping,
+        .pong,
+        .flow,
+        .proc_list,
+        .metrics_sub,
+        .metrics,
+        .metrics_unsub,
+        .proc_kill,
+        .proc_spawn,
+        .session_cpu_sub,
+        .session_cpu,
+        .session_cpu_unsub,
+        .sessions_sub,
+        .sessions_unsub,
+        => false,
+    };
+}
+
 // -----------------------------------------------------------------------------
 // Transfer encoding (§4.2)
 // -----------------------------------------------------------------------------
@@ -2507,6 +2602,37 @@ test "T739: onDataLane keeps both data-lane opcodes off the control lane" {
         .close, .ping,  .pong,   .rpc,    .rpc_result,
         .open_failed,   .attach_failed,
     }) |t| try testing.expect(!onDataLane(t));
+}
+
+test "T403: the RPC reply set is the frames a parked caller can be woken by" {
+    // Companion to the T739 test above, for the same reason: the predicate is
+    // the single declaration two other places now depend on — the client's
+    // control reader dispatches from it, and `rpcCall` asserts on it — so the
+    // membership itself is worth pinning. Demote one of these and this goes red
+    // here, next to the opcodes, rather than as a panic in whichever RPC test
+    // happened to run first.
+    for ([_]FrameType{
+        .opened,            .open_failed,
+        .attached,          .attach_failed,
+        .cwd,               .sessions,
+        .relaunched,        .set_layout_result,
+        .layouts,           .proc_snapshot,
+        .proc_kill_result,  .proc_spawn_result,
+        .close_session_result,
+    }) |t| try testing.expect(isRpcReply(t));
+
+    // Requests are not answers, and neither are the pushes — including the two
+    // A→C streams whose frames look most like replies (`metrics`, `session_cpu`)
+    // and the lifecycle notices nobody parks on (`exit`, `meta`, `detached`).
+    for ([_]FrameType{
+        .hello,        .open,          .attach,        .close_session,
+        .get_cwd,      .list_sessions, .relaunch,      .set_layout,
+        .get_layouts,  .proc_list,     .proc_kill,     .proc_spawn,
+        .data,         .data_repaint,  .exit,          .meta,
+        .detached,     .metrics,       .session_cpu,   .sessions_sub,
+        .ping,         .pong,          .flow,          .rpc,
+        .rpc_result,
+    }) |t| try testing.expect(!isRpcReply(t));
 }
 
 test "negotiate: repaint_data capability is the intersection of both HELLOs" {
