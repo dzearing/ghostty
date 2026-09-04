@@ -131,6 +131,14 @@ param(
     # produces the same unreadable `error: Unexpected` as one that starts at
     # zero. -MinFreeGB 0 disables the gate.
     [double]$MinFreeGB = 10,
+    # Refuse to launch a zig lane when system COMMIT free is below this, and
+    # warn below -WarnCommitFreeGB (T453). 8 GB, not 16: a lane draws about
+    # 16 GB, so 8 is where it cannot finish rather than where it is merely
+    # tight -- free commit is a whole-machine number a browser can move by
+    # 12 GB, and a refusal keyed on "tight" would wedge the loop for a
+    # condition that had already passed. -MinCommitFreeGB 0 disables the gate.
+    [double]$MinCommitFreeGB = 8,
+    [double]$WarnCommitFreeGB = 24,
     # Skip the solo confirm pass a red lane triggers (T1170). It costs one
     # narrowed re-run of an already-red lane, and it is on by default for the
     # same reason -NoCatch is: "remember to pass a flag next time" means the
@@ -167,6 +175,10 @@ $ErrorActionPreference = 'Stop'
 # possibly build says "the drive is full" instead of relaying zig's
 # `error: Unexpected`.
 . "$PSScriptRoot\lib\BuildCache.ps1"
+# The same question asked of MEMORY rather than disk (T453): a lane launched
+# with less than a lane's worth of commit free dies mid-compile in a fault that
+# reads as broken code.
+. "$PSScriptRoot\lib\CommitHeadroom.ps1"
 # Names the tests a red lane blamed, and words the verdict of the narrowed
 # re-run that follows (T1170) -- the pure half of the solo confirm pass below.
 . "$PSScriptRoot\lib\LaneSolo.ps1"
@@ -838,6 +850,42 @@ if ($MinFreeGB -gt 0) {
         Write-Host "  (no lane was launched; zig would have failed with a bare 'error: Unexpected')"
         Write-Host ''
         Write-Host "FLOOR SUMMARY: preflight=FAIL"
+        Write-Host 'FLOOR NOT GREEN'
+        exit $EXIT_FAIL
+    }
+}
+
+# COMMIT PREFLIGHT (T453). The disk gate above asks whether the build can write
+# its output; this asks whether it can allocate. When the commit limit is
+# exhausted `VirtualAlloc` returns null, and a compiler that does not check
+# every allocation faults on it -- T449 chased exactly that shape of `zig.exe`
+# access violation for a whole task before measuring commit and clearing it.
+# One lane draws about 16 GB on this box, so a run that starts with less than
+# that free is not a result: it is the box, reported as red code.
+#
+# WARN is the normal voice here and FAIL is the floor, because free commit is a
+# whole-machine number -- a browser can move it 12 GB between the check and the
+# first compile -- so the refusal is set where a lane cannot complete at all
+# rather than where it is merely tight.
+if ($MinCommitFreeGB -gt 0 -or $WarnCommitFreeGB -gt 0) {
+    $commit = Get-SystemCommit
+    $state = Get-CommitHeadroomState -CommittedGB $(if ($commit) { $commit.CommittedGB } else { $null }) `
+        -LimitGB $(if ($commit) { $commit.LimitGB } else { $null }) `
+        -FailFreeGB $MinCommitFreeGB -WarnFreeGB $WarnCommitFreeGB
+    if ($state.Verdict -ne 'ok') {
+        $pageFile = Get-PageFileGB
+        Write-Host ''
+        Write-Host "COMMIT: $($state.Reason)"
+        foreach ($a in (Get-CommitHeadroomAdvice -Verdict $state.Verdict -PageFileGB $pageFile `
+                    -LimitGB $(if ($commit) { $commit.LimitGB } else { $null }))) {
+            Write-Host "  $a"
+        }
+    }
+    if ($state.Verdict -eq 'fail') {
+        Write-Host "FLOOR PREFLIGHT FAIL: less than $MinCommitFreeGB GB of system commit free."
+        Write-Host '  (no lane was launched; a lane that starts here dies mid-compile in a fault that reads as broken code)'
+        Write-Host ''
+        Write-Host 'FLOOR SUMMARY: preflight=FAIL'
         Write-Host 'FLOOR NOT GREEN'
         exit $EXIT_FAIL
     }

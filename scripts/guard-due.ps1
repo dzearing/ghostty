@@ -1579,6 +1579,20 @@ $GuardTable = @(
             'test\win32\floor-lane-solo-confirm.ps1'
         )
     },
+    # The commit preflight (T453) speaks only on a box that is already out of
+    # memory, which is rarer still than a red lane -- and a gate nobody has ever
+    # seen refuse is indistinguishable from one that cannot refuse. Same
+    # coverage rule as the rows around it: the library and this harness gate,
+    # scripts\floor-lane.ps1 does not; the wiring arms prove the wiring.
+    [pscustomobject]@{
+        Name   = 'lane-commit-headroom'
+        Script = 'test\win32\floor-lane-commit-headroom.ps1'
+        Stamp  = 'test\win32\floor-lane-commit-headroom.stamp.json'
+        Covers = @(
+            'scripts\lib\CommitHeadroom.ps1',
+            'test\win32\floor-lane-commit-headroom.ps1'
+        )
+    },
     # The compiler-crash retry (T451) is the same shape again: it speaks only
     # when zig.exe itself has faulted, which is roughly weekly, so a classifier
     # that has quietly stopped matching is indistinguishable from a month with

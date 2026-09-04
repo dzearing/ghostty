@@ -21613,3 +21613,43 @@ for the win32 modules, and nothing guards it for `src/remote/`.
 Floor: all four lanes PASS (lib 5s, none 136s, win32 367s, agent 372s), and the
 agent lane five times over - PASS / PASS / PASS / PASS / PASS, no leaked test
 binaries on any run.
+
+## 2026-09-04 - A floor lane that starts on an out-of-memory box now says so (T453)
+
+T453 was filed a month ago out of T449's crash hunt, with a number that looked
+alarming: one test lane peaked at 73% of this machine's commit limit, and the
+limit was essentially just RAM because the page file was 4 GB on a 64 GB box.
+Re-measuring it today was the first thing this task owed, and the answer is
+that the condition is gone - Windows' auto-managed page file has since grown to
+**76 GB on D:**, the commit limit is **139.7 GB**, and 33.1 GB is in use at
+idle. There is nothing to ask the user to click.
+
+What is still worth building is the part T449 could not: the floor asking
+whether a lane can allocate before it launches one. When commit is exhausted
+`VirtualAlloc` returns null, a compiler that does not check every allocation
+faults on it, and the lane goes red in a way that reads exactly like broken
+code - T449 spent an entire task on that shape before measuring commit and
+clearing it. That is the same class of fault as T1054's full disk and T243's
+cross-drive cache, and it gets the same treatment: when the ENVIRONMENT is the
+fault, the run says so instead of relaying a message about something else.
+
+`scripts\lib\CommitHeadroom.ps1` holds the verdict and `floor-lane.ps1` asks
+it beside the disk preflight. It is deliberately not symmetric with that gate.
+Free commit is a whole-machine number that a browser can move by 12 GB between
+the check and the first compile, so a refusal keyed on "tight" would wedge the
+loop for a condition that had already passed by the time anyone read it: the
+refusal floor is 8 GB, half the ~16 GB a lane draws, and the band above it
+(24 GB, `-WarnCommitFreeGB`) warns and launches anyway. A counter that cannot
+be read is `unknown` and never refuses - a gate that cannot measure must not
+pretend it did.
+
+Evidence, per T1133: `test\win32\floor-lane-commit-headroom.ps1` is ALL PASS
+(14 assertions) and its negative control is an impossible commit floor, which
+refuses before any lane launches, names the number it refused on, and exits as
+`preflight=FAIL` rather than as a red lane. The other half - that it does not
+fire on a healthy box - is the run below.
+
+Floor: all four lanes PASS (lib, none 278s, win32 368s, agent), measured
+through `commit-pressure-probe.ps1` over 1024s and 508 samples: **peak commit
+44.8 GB against the 139.7 GB limit, 32%, no crashes**, where a month ago the
+same question answered 49.4 GB against 67.7 GB and 73%.
