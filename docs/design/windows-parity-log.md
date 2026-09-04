@@ -21018,3 +21018,47 @@ lane), and `T1295: a redundant dim-overlay show does not re-blend` in
 window and asserts that three identical `show()` calls in a row touch nothing
 while a move, an opacity change, a fill change and a hide/show flip each get
 through.
+
+## 2026-09-03 - a session resumed from another machine keeps the name you gave its window (T1296)
+
+The user reported that restoring a window on the other machine "did not bring
+over the window name". The obvious suspect was **Restore All**, and it was
+innocent: its capture, its blob and its rebuild carry the name end to end, which
+the cross-machine fixture now asserts rather than assumes
+(`chooser-restore-all-remote.ps1`, A2 and E2 - a window renamed before the
+machine is taken away comes back on this side still wearing that name).
+
+The loss was in the OTHER gesture, the single-window one: picking a session off
+the machine chooser's roster and pressing Return. That path built a window from
+a session id and nothing else, so the title fell through to whatever the shell
+said next - the negative control reproduces the user's screen exactly,
+`C:\WINDOWS\system32\cmd.exe`. And there was nothing to name it with anyway: a
+window's name lives only in the layout record, `LIST_SESSIONS` has a `title`
+field that no agent has ever filled in, and the chooser's only other source was
+this box's own manifest, which says nothing about another machine. macOS has no
+such gap - `resumeBrowsedSession` sets `titleOverride` from the resumed session
+on both arms.
+
+So the session roster now pulls the machine's **layout blobs alongside its
+roster** for a remote target - one more RPC on the connection the pool already
+holds - and decodes them into the same shape the local manifest parses to. One
+accessor then answers "what was this session's window called" for either
+machine, and a remote row is no longer nameless in the chooser list either,
+which it had been for the same reason.
+
+The answer carries **whether the user chose the name**, and that distinction is
+load-bearing: a window's `title_override` is a name somebody typed, so it goes
+back as a pin and outranks whatever the shell says next; a pane's last
+terminal-reported title goes in on the terminal-reported path, so the resumed
+shell's first title replaces it normally - the rule `restoreLeafPresentation`
+already follows for a full restore. Collapsing the two would either freeze a
+shell title forever or let a shell quietly overwrite a name the user chose, and
+both have a symptom the user would see.
+
+Acceptance: four unit tests in the win32 lane covering both arms of the lookup
+(the local manifest and the remote blobs), a machine change dropping the view
+with its rows, and a failed pull keeping the names the last fetch landed; on the
+box, `chooser-resume-remote.ps1` C2 and `chooser-restore-all-remote.ps1` A2/E2 -
+all three over the fake relay with this box's manifest deleted, so a name can
+only have crossed the wire. C2 was DEMONSTRATED red against a build with the fix
+disabled before it was believed green.

@@ -34,6 +34,7 @@ const chooser_session_sort = @import("chooser_session_sort.zig");
 const chooser_sessions = @import("chooser_sessions.zig");
 const chrome_theme = @import("chrome_theme.zig");
 const icon_button = @import("icon_button.zig");
+const layout_blobs = @import("layout_blobs.zig");
 const LocalAgent = @import("LocalAgent.zig");
 const machine_pool = @import("machine_pool.zig");
 const MachineConnectionPool = @import("MachineConnectionPool.zig");
@@ -129,6 +130,19 @@ killed_count: usize = 0,
 /// manifest (persistence off, or a first run).
 manifest: ?session_layout.Parsed = null,
 
+/// The REMOTE machine's own layout view (T1296): the blobs its agent holds,
+/// pulled with the roster and decoded into the same `session_layout.Window`
+/// shape the local manifest parses to. Null for the local target (the manifest
+/// above is that machine's layout view) and whenever the pull failed.
+///
+/// Why the roster carries it at all: everything a row can SAY about a session
+/// beyond its id — the window it belonged to, the name the user gave that
+/// window, the pane's own title — lives in the layout record and NOWHERE on the
+/// wire (`LIST_SESSIONS` has a `title` field but no agent ever fills it in). A
+/// remote row was therefore anonymous, and so was the window a resume built
+/// from it, which is exactly what the user reported.
+layouts: ?layout_blobs.Decoded = null,
+
 /// Whether the CPU meter's column is reserved in every row (T462). A statement
 /// about the MACHINE — its agent advertised `session_cpu` and a subscription is
 /// live on it — set by the chooser from its probe, and read by every geometry
@@ -145,6 +159,12 @@ pub fn deinit(self: *SessionRoster) void {
     self.owned = null;
     if (self.manifest) |*m| m.deinit();
     self.manifest = null;
+    self.dropLayouts();
+}
+
+fn dropLayouts(self: *SessionRoster) void {
+    if (self.layouts) |d| d.deinit();
+    self.layouts = null;
 }
 
 /// Load the session-layout manifest for the persisted-title rung. Best effort:
@@ -177,6 +197,10 @@ const Request = struct {
     /// makes it safe for the last lease to drop mid-RPC: the pool's own
     /// reference can go while this one keeps the transport alive.
     entry: ?*MachineConnectionPool.Entry = null,
+    /// Pull the machine's layout blobs alongside the roster (T1296). Only ever
+    /// set for a REMOTE target: the local machine's layout view is the on-disk
+    /// manifest, which costs no RPC at all.
+    want_layouts: bool = false,
 
     fn destroy(self: *Request) void {
         if (self.kill_id) |k| self.alloc.free(k);
@@ -194,9 +218,14 @@ pub const Result = struct {
     /// Whether a requested Kill was confirmed by the agent. Null when this
     /// fetch did not carry one.
     killed_ok: ?bool = null,
+    /// The machine's decoded layout blobs (T1296), or null when the pull was
+    /// not asked for or did not land. A failed pull is not a failed fetch: the
+    /// rows are still worth showing, they just cannot name their windows.
+    layouts: ?layout_blobs.Decoded = null,
 
     pub fn destroy(self: *Result) void {
         if (self.roster) |*r| r.deinit();
+        if (self.layouts) |d| d.deinit();
         self.alloc.destroy(self);
     }
 };
@@ -244,6 +273,11 @@ pub fn show(
 fn clear(self: *SessionRoster) void {
     if (self.owned) |*o| o.deinit();
     self.owned = null;
+    // The layout view is a statement about the machine we are leaving, exactly
+    // like the rows: keeping it would let the new machine's session ids match
+    // the OLD one's records by coincidence and name a window after somebody
+    // else's work.
+    self.dropLayouts();
     self.state = .loading;
     self.scroll = 0;
     self.hover_kill = -1;
@@ -305,6 +339,9 @@ pub fn fetch(
         // would silently list THIS box's sessions under another machine's name.
         .warm = if (self.target == .local) app.local_agent.sharedConnectionIfWarm() else null,
         .kill_id = null,
+        // T1296: a remote machine's layout view has to be asked for; the local
+        // one is already on this box's disk.
+        .want_layouts = self.target == .remote,
     };
     if (self.target == .remote) {
         // No credential at all is the signed-out case, and it gets the SAME
@@ -369,6 +406,7 @@ fn worker(req: *Request) void {
 
     var killed_ok: ?bool = null;
     var roster: ?remote_connection.OwnedSessions = null;
+    var layouts: ?layout_blobs.Decoded = null;
     if (conn) |c| {
         if (req.kill_id) |id| {
             killed_ok = c.closeSession(id, rpc_timeout_ns) catch |err| ok: {
@@ -383,6 +421,21 @@ fn worker(req: *Request) void {
             log.warn("chooser roster: LIST_SESSIONS failed err={}", .{err});
             break :r null;
         };
+        // T1296: the machine's own layout view, on the same connection and the
+        // same thread. Best effort in both directions — an agent too old to
+        // answer, or a payload we cannot read, costs the rows their window names
+        // and nothing else.
+        if (req.want_layouts) {
+            if (c.requestLayouts(rpc_timeout_ns)) |payload| {
+                defer alloc.free(payload);
+                layouts = layout_blobs.decodeLayouts(alloc, payload) catch |err| d: {
+                    log.warn("chooser roster: layouts payload unreadable err={}", .{err});
+                    break :d null;
+                };
+            } else |err| {
+                log.warn("chooser roster: GET_LAYOUTS failed err={}", .{err});
+            }
+        }
     }
     // T328 (resolved): a Kill on a REMOTE row used to lose its connection here
     // — both RPCs came back `error.ConnectionClosed`/`error.Timeout` — but the
@@ -399,6 +452,7 @@ fn worker(req: *Request) void {
 
     const res = alloc.create(Result) catch {
         if (roster) |*r| r.deinit();
+        if (layouts) |d| d.deinit();
         return;
     };
     res.* = .{
@@ -407,6 +461,7 @@ fn worker(req: *Request) void {
         .serial = req.serial,
         .roster = roster,
         .killed_ok = killed_ok,
+        .layouts = layouts,
     };
     if (w32.PostMessageW(req.hwnd, WM_APP_CHOOSER_SESSIONS, @intFromPtr(res), 0) == 0) {
         // The app is going away; nothing will ever collect this.
@@ -422,6 +477,16 @@ pub fn adopt(self: *SessionRoster, res: *Result) bool {
         return false;
     }
     self.inflight = false;
+
+    // T1296: adopted independently of the roster — a landed layout view is
+    // worth keeping even if the LIST_SESSIONS half failed, and a failed pull
+    // must not blank the view a previous fetch left behind (a refetch that
+    // could not read the layouts would otherwise make every row lose its name).
+    if (res.layouts) |d| {
+        self.dropLayouts();
+        self.layouts = d;
+        res.layouts = null; // adopted
+    }
 
     if (res.roster) |r| {
         if (self.owned) |*old| old.deinit();
@@ -629,14 +694,17 @@ pub fn visible(self: *const SessionRoster, app: *App, out: []VisibleRow) []const
         if (self.isKilled(s.id)) continue;
 
         // The live rung works for a remote machine too: a pane of ours attached
-        // to one of ITS sessions carries that session's id. The manifest rung
-        // does not — the saved layout is this box's, so its titles say nothing
-        // about another machine and matching one would be a coincidence.
+        // to one of ITS sessions carries that session's id. The layout rung used
+        // to be local-only for a good reason — this box's saved layout says
+        // nothing about another machine, and matching one would be a
+        // coincidence — but since T1296 a remote roster carries the FAR
+        // machine's own layout view, so the rung is answered from the right
+        // record on both and a remote row is no longer nameless.
         const live = liveTitleFor(app, s.id);
         out[n] = .{
             .session = row,
             .live_title = live,
-            .persisted_title = if (self.target == .local) self.persistedTitleFor(s.id) else null,
+            .persisted_title = self.persistedTitleFor(s.id),
             .open_locally = live != null,
             .orphan = chooser_sessions.orphaned(row, live != null, self.target == .local),
         };
@@ -740,9 +808,64 @@ fn liveTitleFor(app: *App, id: []const u8) ?[]const u8 {
     return null;
 }
 
+/// The layout view for the machine this roster is pointed at (T1296): the
+/// on-disk manifest for the local one, the blobs pulled with the roster for a
+/// remote one. Empty when there is none — persistence off, a first run, an
+/// agent too old to answer `GET_LAYOUTS`.
+///
+/// One accessor rather than two call sites choosing, because every question
+/// asked of it ("what was this session's pane called", "what did the user name
+/// the window it lived in") has the same answer shape on both machines and only
+/// ever differed in where the record came from.
+fn layoutWindows(self: *const SessionRoster) []const session_layout.Window {
+    if (self.target == .local) {
+        const parsed = self.manifest orelse return &.{};
+        return parsed.value.windows;
+    }
+    const decoded = self.layouts orelse return &.{};
+    return decoded.windows;
+}
+
+/// The name the user would recognise for the window `id` lived in, or null.
+/// `pinned` distinguishes the two kinds, and the distinction is the whole point:
+///
+///   * **pinned** — the window's `title_override`: a name the USER typed, via
+///     the rename dialog or `+rename`. It outranks anything the shell says, so a
+///     resumed window takes it as a pin too.
+///   * **not pinned** — the pane's last terminal-reported title. It is the best
+///     label available, but it is the SHELL's to change: a resumed window shows
+///     it and then lets the first title the live shell emits take over, exactly
+///     as `App.restoreLeafPresentation` does for a full restore.
+///
+/// Collapsing the two would either freeze a shell title forever or let a shell
+/// overwrite the name the user chose, and both have a user-visible symptom.
+pub const WindowName = struct {
+    text: []const u8,
+    pinned: bool,
+};
+
+pub fn persistedWindowNameFor(self: *const SessionRoster, id: []const u8) ?WindowName {
+    for (self.layoutWindows()) |win| {
+        for (win.tabs) |tab| {
+            for (tab.nodes) |node| {
+                const leaf = node.leaf orelse continue;
+                const sid = leaf.session_id orelse continue;
+                if (!std.mem.eql(u8, sid, id)) continue;
+                if (win.title_override) |t| {
+                    if (t.len > 0) return .{ .text = t, .pinned = true };
+                }
+                if (leaf.title) |t| {
+                    if (t.len > 0) return .{ .text = t, .pinned = false };
+                }
+                return null;
+            }
+        }
+    }
+    return null;
+}
+
 fn persistedTitleFor(self: *const SessionRoster, id: []const u8) ?[]const u8 {
-    const parsed = self.manifest orelse return null;
-    for (parsed.value.windows) |win| {
+    for (self.layoutWindows()) |win| {
         for (win.tabs) |tab| {
             for (tab.nodes) |node| {
                 const leaf = node.leaf orelse continue;
@@ -1666,4 +1789,134 @@ test "clampScrollTo pulls a parked offset back into a roster that shrank" {
         roster.scroll,
     );
     try testing.expect(roster.scroll < parked);
+}
+
+// ---------------------------------------------------------------------
+// T1296: the window name a resumed session gets back
+// ---------------------------------------------------------------------
+
+/// A decoded layout view standing in for what a remote fetch would have pulled:
+/// one window with a user-set name over two panes, and one with none.
+fn testLayoutsPayload(alloc: Allocator) ![]u8 {
+    const win_named =
+        \\{"id":"w0","ipc_name":"deploy","title_override":"Deploy watch",
+        \\ "active_tab":0,"tabs":[{"nodes":[
+        \\   {"leaf":{"session_id":"aaaa","title":"pwsh"}}],"active":true}]}
+    ;
+    const win_plain =
+        \\{"id":"w1","active_tab":0,"tabs":[{"nodes":[
+        \\   {"leaf":{"session_id":"bbbb","title":"build log"}},
+        \\   {"leaf":{"session_id":"cccc"}}],"active":true}]}
+    ;
+    return std.fmt.allocPrint(
+        alloc,
+        "{{\"layouts\":[{{\"key\":\"k0\",\"blob\":{f}}},{{\"key\":\"k1\",\"blob\":{f}}}]}}",
+        .{ std.json.fmt(win_named, .{}), std.json.fmt(win_plain, .{}) },
+    );
+}
+
+test "a remote roster names a resumed window from the FAR machine's layout view (T1296)" {
+    const alloc = testing.allocator;
+    var roster: SessionRoster = .init(alloc);
+    defer roster.deinit();
+    roster.target = .{ .remote = "dev-remote" };
+
+    const payload = try testLayoutsPayload(alloc);
+    defer alloc.free(payload);
+    roster.layouts = try layout_blobs.decodeLayouts(alloc, payload);
+
+    // The user's own name for the window wins, and says so: a resume applies it
+    // as a PIN, so the shell cannot overwrite it a second later.
+    const named = roster.persistedWindowNameFor("aaaa").?;
+    try testing.expectEqualStrings("Deploy watch", named.text);
+    try testing.expect(named.pinned);
+
+    // No name of the user's: the pane's own title is the best label there is,
+    // and it is NOT pinned - the live shell's next title takes over.
+    const shell = roster.persistedWindowNameFor("bbbb").?;
+    try testing.expectEqualStrings("build log", shell.text);
+    try testing.expect(!shell.pinned);
+
+    // A leaf with neither, and a session no record mentions, are both "no name"
+    // rather than an empty one - the resume then leaves the window alone.
+    try testing.expect(roster.persistedWindowNameFor("cccc") == null);
+    try testing.expect(roster.persistedWindowNameFor("zzzz") == null);
+}
+
+test "leaving a machine drops its layout view with its rows (T1296)" {
+    const alloc = testing.allocator;
+    var roster: SessionRoster = .init(alloc);
+    defer roster.deinit();
+    roster.target = .{ .remote = "dev-remote" };
+
+    const payload = try testLayoutsPayload(alloc);
+    defer alloc.free(payload);
+    roster.layouts = try layout_blobs.decodeLayouts(alloc, payload);
+    try testing.expect(roster.persistedWindowNameFor("aaaa") != null);
+
+    // Otherwise the NEXT machine's session ids would match these records by
+    // coincidence and a window would be named after somebody else's work.
+    roster.clear();
+    try testing.expect(roster.layouts == null);
+    try testing.expect(roster.persistedWindowNameFor("aaaa") == null);
+}
+
+test "a failed layout pull keeps the names the last fetch landed (T1296)" {
+    const alloc = testing.allocator;
+    var roster: SessionRoster = .init(alloc);
+    defer roster.deinit();
+    roster.target = .{ .remote = "dev-remote" };
+    roster.serial = 3;
+
+    const payload = try testLayoutsPayload(alloc);
+    defer alloc.free(payload);
+    var first: Result = .{
+        .alloc = alloc,
+        .chooser_id = 1,
+        .serial = 3,
+        .roster = null,
+        .layouts = try layout_blobs.decodeLayouts(alloc, payload),
+    };
+    defer if (first.layouts) |d| d.deinit();
+    try testing.expect(roster.adopt(&first));
+    try testing.expect(roster.persistedWindowNameFor("aaaa") != null);
+
+    // A refetch whose GET_LAYOUTS did not answer: the rows must not all lose
+    // their names because one RPC of one fetch missed.
+    var second: Result = .{
+        .alloc = alloc,
+        .chooser_id = 1,
+        .serial = 3,
+        .roster = null,
+        .layouts = null,
+    };
+    try testing.expect(roster.adopt(&second));
+    try testing.expectEqualStrings("Deploy watch", roster.persistedWindowNameFor("aaaa").?.text);
+}
+
+test "the LOCAL arm answers the same question from this box's manifest (T1296)" {
+    const alloc = testing.allocator;
+    var roster: SessionRoster = .init(alloc);
+    defer roster.deinit();
+    roster.target = .local;
+
+    const body =
+        \\{"version":1,"windows":[{"id":"w0","title_override":"Deploy watch",
+        \\ "active_tab":0,"tabs":[{"nodes":[
+        \\   {"leaf":{"session_id":"aaaa","title":"pwsh"}}],"active":true}]},
+        \\ {"id":"w1","active_tab":0,"tabs":[{"nodes":[
+        \\   {"leaf":{"session_id":"bbbb","title":"build log"}}],"active":true}]}]}
+    ;
+    roster.manifest = try session_layout.parse(alloc, body);
+
+    // Same two answers as the remote arm, from the record this box keeps on
+    // disk: a resumed LOCAL session is named too, which is the half a user hits
+    // after relaunching the app and resuming an orphan.
+    const named = roster.persistedWindowNameFor("aaaa").?;
+    try testing.expectEqualStrings("Deploy watch", named.text);
+    try testing.expect(named.pinned);
+    const shell = roster.persistedWindowNameFor("bbbb").?;
+    try testing.expectEqualStrings("build log", shell.text);
+    try testing.expect(!shell.pinned);
+    try testing.expect(roster.persistedWindowNameFor("zzzz") == null);
 }

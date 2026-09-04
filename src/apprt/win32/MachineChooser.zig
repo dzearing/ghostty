@@ -3080,6 +3080,30 @@ fn resumeCursor(self: *MachineChooser) bool {
     return true;
 }
 
+/// The longest resumed-window name carried across `close` (T1296). A window
+/// title is displayed through a 256-unit buffer upstream, so anything past this
+/// could never be read back in full anyway; a longer name is TRUNCATED rather
+/// than dropped, because half a name still tells the user which window this is.
+const max_resume_name = 256;
+
+/// Copy a borrowed window name into caller-owned stack storage. Returns null
+/// for "no name", so the resume paths keep one unambiguous absent case.
+fn copyResumeName(
+    buf: *[max_resume_name]u8,
+    name: ?SessionRoster.WindowName,
+) ?SessionRoster.WindowName {
+    const n = name orelse return null;
+    if (n.text.len == 0) return null;
+    var len = @min(n.text.len, buf.len);
+    // Never cut a codepoint in half: the title is re-encoded to UTF-16 for the
+    // caption, and that conversion FAILS on a broken sequence — which would turn
+    // "too long" into "no name at all", the very outcome this exists to fix.
+    while (len > 0 and len < n.text.len and (n.text[len] & 0xC0) == 0x80) len -= 1;
+    if (len == 0) return null;
+    @memcpy(buf[0..len], n.text[0..len]);
+    return .{ .text = buf[0..len], .pinned = n.pinned };
+}
+
 /// Resume ONE browsed session (T320): dismiss the chooser and open a local
 /// window whose pane ATTACHes to that session — the local agent's, or a relay
 /// machine's over its own transport.
@@ -3122,9 +3146,15 @@ fn resumeRow(self: *MachineChooser, row: SessionRoster.VisibleRow) void {
                 break :blk pane_buf[0..p.len];
             } else null;
 
+            // The window name the layout record has for this session (T1296),
+            // copied out for the same reason the id and the pane id are: `close`
+            // frees what it borrows.
+            var name_buf: [max_resume_name]u8 = undefined;
+            const name = copyResumeName(&name_buf, self.roster.persistedWindowNameFor(sid));
+
             const app = self.window.app;
             self.close(true);
-            _ = app.resumeLocalSession(id, pane_id) catch |err| {
+            _ = app.resumeLocalSession(id, pane_id, name) catch |err| {
                 log.warn("machine chooser: resume local session failed err={}", .{err});
             };
         },
@@ -3133,11 +3163,14 @@ fn resumeRow(self: *MachineChooser, row: SessionRoster.VisibleRow) void {
                 self.setHint("Not signed in - use Sign in with Google above.");
                 return;
             };
+            var name_buf: [max_resume_name]u8 = undefined;
+            const name = copyResumeName(&name_buf, self.roster.persistedWindowNameFor(r.session));
+
             const app = self.window.app;
             // Dial synchronously while the chooser is still alive (relay_base,
             // token and the ids are borrowed from it); close only on success,
             // exactly as `openSelection` does for a new remote window.
-            _ = app.resumeRelaySession(self.relay_base, r.device, tok, r.session) catch |err| {
+            _ = app.resumeRelaySession(self.relay_base, r.device, tok, r.session, name) catch |err| {
                 log.warn("machine chooser: resume relay session failed err={}", .{err});
                 self.setHint(switch (err) {
                     error.DialFailed => "Couldn't reach that machine - is its agent running?",

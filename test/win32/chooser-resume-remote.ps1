@@ -205,6 +205,19 @@ function Get-AllPaneIds {
     return @($ids)
 }
 
+# The DISPLAY title of the window holding $paneId - what the user reads off the
+# title bar and out of Alt-Tab (T1296). Empty when no window holds that pane.
+function Get-WindowTitleForPane($paneId) {
+    $tree = Get-ListTree
+    if ($null -eq $tree) { return '' }
+    foreach ($w in @($tree.windows)) {
+        foreach ($t in @($w.tabs)) {
+            if (@(Get-LeafIds $t.splits) -contains $paneId) { return [string]$w.title }
+        }
+    }
+    return ''
+}
+
 # The pane ids of the window whose ipc name is $name.
 function Get-WindowPaneIds($name) {
     $tree = Get-ListTree
@@ -317,6 +330,12 @@ $DEV = 'dev-remote'
 # Space-free on purpose: +send-keys concatenates adjacent TEXT positionals, and
 # a marker with spaces cannot be matched back once a pane has wrapped it.
 $MARK = "T331ATTACH$($PID)Z"
+# T1296: the user's own name for the fixture window. A resume used to build a
+# window with no name at all, so a user who resumed three sessions on another
+# machine got three windows they could not tell apart. Space-free so a `-like`
+# prefix match is not confused by the activity suffix or the debug marker the
+# window title also carries.
+$T1296NAME = "T1296Resumed$($PID)"
 $devicesJson = '{"devices":[{"id":"' + $DEV + '","name":"E2E-Remote","hostname":"remote.local","online":true}]}'
 
 $errlogA = Join-Path $env:TEMP "ghoztty-t331-stderrA-$PID.log"
@@ -368,6 +387,16 @@ try {
     $markedPanes = @(Get-WindowPaneIds 't331-w2')
     Assert (Wait-PaneText $markedPanes $MARK 'fixture') `
         "the marked pane really printed '$MARK' before the machine went away"
+
+    # T1296: the NAME the user gave this window. `+rename` pins the display
+    # title (the same path as the rename dialog), and the pin rides the layout
+    # blob the machine's agent keeps - which is the only place app B can learn
+    # it from, since section 2 deletes this box's own manifest.
+    & $Exe +rename --target=t331-w2 --title=$T1296NAME 2>$null | Out-Null
+    Start-Sleep -Seconds 2
+    $namedBefore = if ($markedPanes.Count -ge 1) { Get-WindowTitleForPane $markedPanes[0] } else { '' }
+    Assert ($namedBefore -like "$T1296NAME*") `
+        "the fixture window really carries its user-set name before the machine goes away ($namedBefore)"
 
     # --- 2. take the machine away, hand it back only over the relay ---------
     Write-Host ''
@@ -482,6 +511,13 @@ try {
     Write-Host '6. a resumed window does not take the machine''s default working directory'
     $resumedPanes = @(@(Get-AllPaneIds) | Where-Object { $panesBefore -notcontains $_ })
     Assert ($resumedPanes.Count -ge 1) "the resumed pane is addressable ($($resumedPanes.Count) new pane(s))"
+
+    # C2 (T1296): the reported loss. This box's own manifest was deleted in
+    # section 2, so the only place the name can have come from is the FAR
+    # machine's layout blobs, pulled with the roster over the relay.
+    $resumedTitle = if ($resumedPanes.Count -ge 1) { Get-WindowTitleForPane $resumedPanes[0] } else { '' }
+    Assert ($resumedTitle -like "$T1296NAME*") `
+        "C2 the resumed window came back with the name the user gave it ($resumedTitle)"
     $resumedText = ''
     if ($resumedPanes.Count -ge 1) {
         Assert (Wait-PaneText $resumedPanes $MARK 'resumed') `

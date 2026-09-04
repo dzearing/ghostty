@@ -5503,10 +5503,43 @@ pub fn openRelayWindow(
 /// `pane_id` is the layout manifest's recorded id for that session when the
 /// caller found one (T113: the shell we are attaching to still carries it in
 /// `$GHOZTTY_PANE_ID`). Both slices are borrowed for the duration of the call.
+/// Give a window built by a single-session resume the name its layout record
+/// carries (T1296). A resume is a restore of ONE leaf, and until this it was the
+/// only restore path that rebuilt a pane without rebuilding what the pane was
+/// called — so a user who resumed three sessions on another machine got three
+/// windows they could not tell apart.
+///
+/// The two kinds of name are applied differently, and deliberately so:
+///
+///   * a PINNED name is the one the user typed (`+rename` / the rename dialog),
+///     so it goes back as a pin and outranks whatever the shell says next;
+///   * an unpinned one is the pane's last terminal-reported title, so it goes in
+///     on the terminal-reported path and the first title the resumed shell emits
+///     replaces it normally — the same rule `restoreLeafPresentation` follows
+///     for a full restore, and the reason a shell title can never masquerade as
+///     a name the user chose.
+fn applyResumeName(window: *Window, name: ?SessionRoster.WindowName) void {
+    const n = name orelse return;
+    if (n.text.len == 0) return;
+    if (n.pinned) {
+        window.setTitleOverride(n.text);
+        return;
+    }
+    if (window.tab_count == 0) return;
+    const surface = window.tab_active_pane[window.active_tab].surface() orelse return;
+    const alloc = window.app.core_app.alloc;
+    const z = alloc.dupeZ(u8, n.text) catch return;
+    defer alloc.free(z);
+    surface.setTitle(z);
+}
+
 pub fn resumeLocalSession(
     self: *App,
     session_id: []const u8,
     pane_id: ?[]const u8,
+    /// The name the machine's layout record has for this session's window, or
+    /// null when it has none (persistence off, a session no window recorded).
+    name: ?SessionRoster.WindowName,
 ) !*Window {
     // No agent ⇒ nothing to attach to. Opening a plain window instead would
     // silently give the user a fresh shell in place of the session they picked.
@@ -5524,6 +5557,7 @@ pub fn resumeLocalSession(
     };
     log.info("resume session: attaching local session id={s}", .{session_id});
     const window = try self.createWindow(.{ .surface_overrides = &ov });
+    applyResumeName(window, name);
     if (window.hwnd) |hwnd| _ = w32.SetForegroundWindow(hwnd);
     return window;
 }
@@ -5840,6 +5874,9 @@ pub fn resumeRelaySession(
     device: []const u8,
     token: []const u8,
     session_id: []const u8,
+    /// The name the FAR machine's layout record has for this session's window
+    /// (T1296), or null when it has none.
+    name: ?SessionRoster.WindowName,
 ) RemoteOpenError!*Window {
     const alloc = self.core_app.alloc;
     const dialed = try alloc.create(relay_dial.Dialed);
@@ -5852,10 +5889,18 @@ pub fn resumeRelaySession(
         return error.DialFailed;
     };
     log.info("resume session: attaching remote session id={s} device={s}", .{ session_id, device });
-    return self.openDialedWindow(.{ .relay = dialed }, .{
+    // The PINNED half rides `openDialedWindow`'s own `title` option (it applies
+    // it as an override, which is exactly what a pin is); the unpinned half is
+    // applied here, after the window exists, so it lands on the pane's
+    // terminal-reported title instead of freezing over it.
+    const pinned: ?[]const u8 = if (name) |n| (if (n.pinned) n.text else null) else null;
+    const window = try self.openDialedWindow(.{ .relay = dialed }, .{
         .session_id = session_id,
         .machine = .{ .relay = .{ .base = relay_base, .device = device, .token = token } },
+        .title = pinned,
     });
+    if (pinned == null) applyResumeName(window, name);
+    return window;
 }
 
 /// T68: the "New Window" action on a focused REMOTE window — dial the same

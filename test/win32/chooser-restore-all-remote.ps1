@@ -182,7 +182,11 @@ function Get-WindowShapes {
         foreach ($t in @($w.tabs)) { $panes += (Count-Leaves $t.splits) }
         # `target` is the registered ipc name in +list --json (`name` is the
         # PANE-level field); reading the wrong one silently matches nothing.
-        $out += [pscustomobject]@{ Name = $w.target; Panes = $panes }
+        # `title` is the window's DISPLAY name - the `+rename` pin when one is
+        # set, else the active tab's title. T1296: the cross-machine rebuild was
+        # asserted to keep `target` and its topology and nothing ever looked at
+        # the name the user actually reads off the title bar.
+        $out += [pscustomobject]@{ Name = $w.target; Panes = $panes; Title = $w.title }
     }
     return @($out)
 }
@@ -343,6 +347,12 @@ $DEV = 'dev-remote'
 # concatenates adjacent text, and a marker with spaces in it cannot be matched
 # back reliably once the pane has wrapped it (the T109 script's lesson).
 $T413MARK = "T413RINGREPLAY$($PID)Z"
+# T1296: the window's user-set NAME (a `+rename` title pin). The user reported a
+# cross-machine restore bringing a window back anonymous, and every assertion
+# here was about `target` and topology - neither of which is what they read off
+# the title bar. Space-free so a `-like` prefix match cannot be confused by the
+# activity suffix or the debug marker the title also carries.
+$T1296NAME = "T1296Pinned$($PID)"
 $devicesJson = '{"devices":[{"id":"' + $DEV + '","name":"E2E-Remote","hostname":"remote.local","online":true}]}'
 
 $errlogA = Join-Path $env:TEMP "ghoztty-t336-stderrA-$PID.log"
@@ -385,9 +395,26 @@ try {
     $alive = @(Wait-AliveCount 4)
     Assert ($alive.Count -ge 4) "the machine has four live sessions ($($alive.Count))"
 
+    # T1296: give the window the NAME the user would give it, before the machine
+    # is taken away. `+rename` pins the display title (`Window.setTitleOverride`,
+    # the same path as the rename dialog) and marks the layout dirty, so the pin
+    # rides the very next blob push.
+    & $Exe +rename --target=t336-multi --title=$T1296NAME 2>$null | Out-Null
+    Start-Sleep -Seconds 1
+    $namedBefore = @(Get-WindowShapes | Where-Object { $_.Name -eq 't336-multi' }) | Select-Object -First 1
+    Assert ($null -ne $namedBefore -and $namedBefore.Title -like "$T1296NAME*") `
+        "the fixture window really carries its user-set name before the machine goes away ($(if ($namedBefore) { $namedBefore.Title } else { '<no window>' }))"
+
     $blob = Wait-BlobIds 't336-multi' 3
     Assert ($null -ne $blob -and @($blob.session_ids).Count -eq 3) `
         "A the agent holds the window's layout with its three session ids ($(@($blob.session_ids).Count))"
+    # The other half of the fixture control: if the name never reached the blob
+    # this is a CAPTURE bug, and no assertion about the rebuild could tell the
+    # two apart.
+    $blobName = $null
+    if ($null -ne $blob) { try { $blobName = ($blob.blob | ConvertFrom-Json).title_override } catch {} }
+    Assert ($blobName -eq $T1296NAME) `
+        "A2 the stored blob carries the window's user-set name ($(if ($blobName) { $blobName } else { '<absent>' }))"
     $multiIds = if ($null -ne $blob) { @($blob.session_ids) } else { @() }
 
     # --- 2. take the machine away, and hand it back only over the relay ----
@@ -539,6 +566,11 @@ try {
     Assert ($null -ne $restored) 'the rebuilt window kept its ipc name'
     Assert ($null -ne $restored -and $restored.Panes -eq 3) `
         "and its recorded split topology - three panes ($(if ($restored) { $restored.Panes } else { 0 }))"
+    # T1296: the reported loss. A restored set of windows the user cannot tell
+    # apart is the symptom; `target` surviving is not a substitute, because it is
+    # not what the title bar shows.
+    Assert ($null -ne $restored -and $restored.Title -like "$T1296NAME*") `
+        "E2 the rebuilt window came back with its user-set name ($(if ($restored) { $restored.Title } else { '<no window>' }))"
 
     # F: per-window transport ownership. The pull dials once for itself and each
     # rebuilt window dials its own, so the restore spends 1 + N connects. Fewer

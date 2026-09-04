@@ -1,11 +1,11 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-09-03T20:20:46-07:00",
-    "commit":  "75a55a0d0",
+    "generated":  "2026-09-03T21:57:25-07:00",
+    "commit":  "38192df6c",
     "uncommitted":  [
-                        "test/win32/daily-publish.ps1",
-                        "test/win32/go-loop-guard.ps1"
+                        "test/win32/chooser-restore-all-remote.ps1",
+                        "test/win32/chooser-resume-remote.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -50,9 +50,9 @@
                   "test/win32/chooser-orphan-badge.ps1":  "94aea913d64668ad537094bdd2dc030259a005617bfc0f931975d3eab9bea5e7",
                   "test/win32/chooser-restore-all.ps1":  "ced0ad850d422bf42cd4040a41863b5a1a1158d57a2937e485ff60468d716ceb",
                   "test/win32/chooser-restore-all-adopt.ps1":  "d05f84d8d6e52dcd0996ccbe3992b584cb5ba20969b41f3f21943a47361b2241",
-                  "test/win32/chooser-restore-all-remote.ps1":  "6190184881ee2a80a0fa0330d2e8a2b310901b695c1e6c417650bddec1d46744",
+                  "test/win32/chooser-restore-all-remote.ps1":  "a2addfc7741bd91fd9e685414f7638da78908ab5d94534b80b09fecce383916a",
                   "test/win32/chooser-resume.ps1":  "8d950d41d9e293abdcdbcb6dfbb6669008d6fab86a6ba4030efc6b4e02f136c6",
-                  "test/win32/chooser-resume-remote.ps1":  "603e9a875589185a0a10243b4941acf1ae523c96c650ea633865ab2c3719f2f9",
+                  "test/win32/chooser-resume-remote.ps1":  "53d6417f7b8334aaf2bce8e5e83051697c96cc160eb0a51cf0febcb0d582830a",
                   "test/win32/chooser-roster-refetch.ps1":  "34bbe1abdec86abedc09684df617d9e4f54c72d68609159e012049c94efd2579",
                   "test/win32/chooser-selection.ps1":  "8810962da8559557b577daba7bbbcd43eb6c3ac8ce3771beec06c5553b7b9bc7",
                   "test/win32/chooser-session-cpu.ps1":  "91c3195e8a940e442ab166a2af770267375605b16b169fd649af969fe162238a",
