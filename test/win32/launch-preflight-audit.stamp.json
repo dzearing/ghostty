@@ -1,11 +1,11 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-09-04T13:45:38-07:00",
-    "commit":  "f07b0d33e",
+    "generated":  "2026-09-04T14:14:28-07:00",
+    "commit":  "cb97596a2",
     "uncommitted":  [
-                        "test/win32/release-artifacts.ps1",
-                        "test/win32/website-windows-download.ps1"
+                        "test/win32/conformance.ps1",
+                        "test/win32/ipc-p3.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -75,7 +75,7 @@
                   "test/win32/command-registry.ps1":  "4b451ab5f58c9456cee43a4127d2b26db4d0285accb0d1c8592fff49ac57fd01",
                   "test/win32/config-errors.ps1":  "1d64c1391b3f98388d3d4cdee2f6a23c4c30d952f005b977afb40b32625fe8c3",
                   "test/win32/confirm-dialogs.ps1":  "3025926c2faa030f749ffe0bc6ba75beb407a5b1b27cb5d62304b4006cb75fbf",
-                  "test/win32/conformance.ps1":  "d92e4bb3cadc62e6ed7f19f2d2ac3fb76b237b3cc50992ba0d5f00759349d180",
+                  "test/win32/conformance.ps1":  "c2f6486404a9ccfa710968614aa1ae24ea7ccced0d4677ffc1bd42c853aa73da",
                   "test/win32/context-menu.ps1":  "96cd8f69074d080153835cdd04ff18c1239ee835898eaea289cceb680caf12f4",
                   "test/win32/context-menu-real-input.ps1":  "1ed95195613db5481f91e8aa0aef1cd1cfa77d63810c5d0b845e93dfeb482fae",
                   "test/win32/control-char-scan.ps1":  "0e6725c84ae641d646628368de8bfc251f063d56923401c170111928f361f451",
@@ -136,7 +136,7 @@
                   "test/win32/ipc-machine-chooser.ps1":  "29e2d0e11798d558abee6cec752b534687e7d8acc189b430f9ee5cae7d84a0b3",
                   "test/win32/ipc-p1.ps1":  "ae20e5c98cb3ad2fae143e4e9b1292c12c0b57aec65dd030ed2fd8b599566b4e",
                   "test/win32/ipc-p2.ps1":  "1f20cfe50e0517943b8629cf65236c69b68d1c893925cea4920179278e6359b3",
-                  "test/win32/ipc-p3.ps1":  "6b34a13686be3969ceb27466b352c69d90a4a13c5c4e3c3fc22ffde52bf60eeb",
+                  "test/win32/ipc-p3.ps1":  "a5b0e3d15cae250bf7b30de29d28cc62fcbb6ebfd1e0a5562e47392edec17871",
                   "test/win32/ipc-read-race.ps1":  "ff6f89cab2e92dae0fa13e1ea2f9a89f2579175ddcc2b8b55c53b8b7f330bee6",
                   "test/win32/ipc-relay.ps1":  "7d6837579539a1624fabf31916cfc3923ca91f6db356d1aaae8db7560dcbe02f",
                   "test/win32/ipc-remote.ps1":  "861e93ef7522e4559ccd66cccea2cddc89f363df666bfe4b135da2bd143d0ea9",

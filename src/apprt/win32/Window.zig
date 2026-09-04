@@ -4534,11 +4534,15 @@ pub fn updateWindowTitle(self: *Window) void {
     }
 
     // Activity suffix (`+set-state` / OSC 7777), matching the Mac's
-    // " (busy)" / " (needs_input)" title decoration.
+    // " (busy)" / " (question)" title decoration. The title shows the state's
+    // HUMAN name (`displayLabel`), never its machine token — `needs_input`
+    // reads " (question)" here while the CLI flag, the OSC payload and the
+    // accessibility attribute keep saying `needs_input` (T465).
     const suffix: ?[]const u16 = switch (self.activityAggregate()) {
         .idle => null,
-        .busy => std.unicode.utf8ToUtf16LeStringLiteral(" (busy)"),
-        .needs_input => std.unicode.utf8ToUtf16LeStringLiteral(" (needs_input)"),
+        inline else => |state| comptime std.unicode.utf8ToUtf16LeStringLiteral(
+            " (" ++ state.displayLabel() ++ ")",
+        ),
     };
     if (suffix) |s| {
         @memcpy(buf[len..][0..s.len], s);

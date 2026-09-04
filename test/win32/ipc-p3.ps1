@@ -119,13 +119,14 @@ Start-Sleep -Seconds 1
 Assert "window busy suffix" ((Get-P3Title) -match '\(busy\)( \[DEBUG\])?$')
 [void](Ghoz @('+set-state', '--target=p3a', '--state=needs_input'))
 Start-Sleep -Seconds 1
-Assert "needs_input outranks busy" ((Get-P3Title) -match '\(needs_input\)( \[DEBUG\])?$')
+# The title shows the HUMAN label: needs_input reads "(question)" (T465).
+Assert "needs_input outranks busy" ((Get-P3Title) -match '\(question\)( \[DEBUG\])?$')
 [void](Ghoz @('+set-state', '--target=p3a', '--state=idle'))
 Start-Sleep -Seconds 1
 Assert "back to busy" ((Get-P3Title) -match '\(busy\)( \[DEBUG\])?$')
 [void](Ghoz @('+set-state', '--target=p3', '--state=idle'))
 Start-Sleep -Seconds 1
-Assert "suffix cleared" (-not ((Get-P3Title) -match '\(busy\)|\(needs_input\)'))
+Assert "suffix cleared" (-not ((Get-P3Title) -match '\(busy\)|\(question\)|\(needs_input\)'))
 $r = Ghoz @('+set-state', '--target=p3', '--state=bogus')
 Assert "invalid state errors" ($r.ExitCode -ne 0)
 

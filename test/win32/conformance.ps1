@@ -147,22 +147,23 @@ Start-Sleep -Seconds 1
 Assert "busy suffix" ((Get-IdeTitle) -match '\(busy\)( \[DEBUG\])?$')
 [void](Ghoz @('+set-state', '--target=term', '--state=needs_input'))
 Start-Sleep -Seconds 1
-Assert "needs_input beats busy" ((Get-IdeTitle) -match '\(needs_input\)( \[DEBUG\])?$')
+# The title shows the HUMAN label: needs_input reads "(question)" (T465).
+Assert "needs_input beats busy" ((Get-IdeTitle) -match '\(question\)( \[DEBUG\])?$')
 [void](Ghoz @('+set-state', '--target=term', '--state=idle'))
 Start-Sleep -Seconds 1
 Assert "back to busy" ((Get-IdeTitle) -match '\(busy\)( \[DEBUG\])?$')
 [void](Ghoz @('+set-state', '--target=ide', '--state=idle'))
 Start-Sleep -Seconds 1
-Assert "idle clears" (-not ((Get-IdeTitle) -match '\(busy\)|\(needs_input\)'))
+Assert "idle clears" (-not ((Get-IdeTitle) -match '\(busy\)|\(question\)|\(needs_input\)'))
 # OSC 7777 from inside a pane (tabchk sits at a cmd prompt now).
 $osc = "powershell -NoProfile -Command `"[console]::Write([char]27+']7777;needs_input'+[char]7)`""
 [void](Ghoz @('+send-keys', '--target=tabchk', $osc, 'Enter'))
 Start-Sleep -Seconds 6
-Assert "OSC needs_input set" ((Get-IdeTitle) -match '\(needs_input\)( \[DEBUG\])?$')
+Assert "OSC needs_input set" ((Get-IdeTitle) -match '\(question\)( \[DEBUG\])?$')
 $osc = "powershell -NoProfile -Command `"[console]::Write([char]27+']7777;idle'+[char]7)`""
 [void](Ghoz @('+send-keys', '--target=tabchk', $osc, 'Enter'))
 Start-Sleep -Seconds 6
-Assert "OSC idle clears" (-not ((Get-IdeTitle) -match '\(needs_input\)'))
+Assert "OSC idle clears" (-not ((Get-IdeTitle) -match '\(question\)|\(needs_input\)'))
 
 "== S8.6: +rename / +rearrange / +list per docs/claude/cli.md"
 $r = Ghoz @('+rename', '--target=ide', '--title=CONF-OVERRIDE')

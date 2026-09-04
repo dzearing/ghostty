@@ -171,6 +171,27 @@ pub const Command = union(Key) {
         idle = 0,
         busy = 1,
         needs_input = 2,
+
+        /// The machine token for this state: what `+set-state --state=`
+        /// accepts, what the OSC 7777 payload carries, and what the
+        /// accessibility attribute publishes. These are a public API — user
+        /// hooks invoke the CLI and external tools read the attribute — so
+        /// they must never follow a change made for readability.
+        pub fn token(self: ActivityState) []const u8 {
+            return @tagName(self);
+        }
+
+        /// The human-facing name for this state, used wherever it is rendered
+        /// for a person to read (today: the window title suffix).
+        ///
+        /// Deliberately distinct from `token`; see the note there. Matches the
+        /// Mac's `Ghostty.ActivityState.displayLabel`.
+        pub fn displayLabel(self: ActivityState) []const u8 {
+            return switch (self) {
+                .idle, .busy => @tagName(self),
+                .needs_input => "question",
+            };
+        }
     };
 
     pub const SemanticPrompt = parsers.semantic_prompt.Command;
@@ -862,4 +883,24 @@ pub const Parser = struct {
 test {
     _ = parsers;
     _ = encoding;
+}
+
+// The two names of an activity state are a public API split (T465, mirroring
+// the Mac's ActivityStateLabelTests): `token` is the machine name that
+// `+set-state --state=`, the OSC 7777 payload and the accessibility attribute
+// all speak, and it must never move for readability's sake; `displayLabel` is
+// the human name and is the only thing a window title is allowed to show.
+
+test "activity state: display labels are the human names" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("idle", Command.ActivityState.idle.displayLabel());
+    try testing.expectEqualStrings("busy", Command.ActivityState.busy.displayLabel());
+    try testing.expectEqualStrings("question", Command.ActivityState.needs_input.displayLabel());
+}
+
+test "activity state: machine tokens are unchanged" {
+    const testing = std.testing;
+    try testing.expectEqualStrings("idle", Command.ActivityState.idle.token());
+    try testing.expectEqualStrings("busy", Command.ActivityState.busy.token());
+    try testing.expectEqualStrings("needs_input", Command.ActivityState.needs_input.token());
 }

@@ -21775,3 +21775,31 @@ deployed page and nothing writes them back. Its drift gate was three releases
 behind and red for nobody's mistake, which is how the unpublished hand-edit it
 exists to catch would get waved through. Re-synced by hand here; the recurrence
 is the task.
+
+## 2026-09-04 - A window waiting on you says (question), not (needs_input) (T465)
+
+When an agent in a pane stopped to ask something, the Windows title bar read
+`(needs_input)` - the machine's name for the state, printed where a person
+reads it. It now reads `(question)`, the same word the Mac shows.
+
+The two names are split apart rather than renamed, which is how the Mac fix
+(d0c056ee5) did it and the only shape that is safe here:
+`terminal.osc.Command.ActivityState` gains `token()`, the machine name that
+`+set-state --state=`, the OSC 7777 payload and the accessibility attribute all
+speak, and `displayLabel()`, the human name that a window title is the only
+thing allowed to show. Those tokens are a public API - user hooks invoke the
+CLI, external tools read the attribute - so a change made for readability must
+not reach them. Unit tests in `src/terminal/osc.zig` assert both halves, the way
+`ActivityStateLabelTests.swift` does on the Mac.
+
+The title's switch is now an `inline else` capture over `displayLabel()`, so the
+suffix stays comptime and a state added later cannot quietly go back to
+interpolating its raw token.
+
+Floor: all four lanes PASS. `ipc-p1` (25), `ipc-p2` (20), `ipc-p3` (16) and
+`conformance.ps1` ALL PASS - the last two are the ones that matter here, since
+between them they drive the suffix through both `+set-state --state=needs_input`
+and an OSC 7777 payload and assert the title reads `(question)` while both
+inputs keep saying `needs_input`. The nine audit guards that my test-script and
+`docs/claude/cli.md` edits made due were re-run green; `guard-due.ps1 check`
+exits 0 with only the three pre-existing advisory rows.
