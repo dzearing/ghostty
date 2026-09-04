@@ -60,8 +60,7 @@ $script:NT_STATUS_BY_LOW_BYTE = @{
 # with -ExtraTestExeNames for a fixture run.
 $script:CRASHDIAG_TEST_EXES = @(
     'ghostty-test.exe',
-    'ghoztty-agent-test.exe',
-    'ghoztty-agent-core-test.exe'
+    'ghoztty-agent-test.exe'
 )
 
 function Get-NtStatusCandidate {

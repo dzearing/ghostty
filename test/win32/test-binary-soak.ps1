@@ -471,7 +471,12 @@ New-Item -ItemType Directory -Force -Path $oDir | Out-Null
 # the end of the PE image, which the loader ignores -- the fixture still runs,
 # and the resolution under test is the real one rather than a bypass.
 $agentMarkers = "`nremote.agent.server.test.fixture remote.protocol.test.fixture remote.pipe_stream.test.fixture`n"
-foreach ($fixName in @('ghoztty-agent-test.exe', 'ghoztty-agent-core-test.exe')) {
+# Since T434 the agent lane builds ONE binary, so the second name here is a
+# FIXTURE name declared through -ExtraTestExeNames rather than something the
+# build produces -- which is the only way the per-binary paths below (a log per
+# binary, per-exe attribution) still get exercised.
+$fixExtra = 'ghoztty-agent-fixture-test.exe'
+foreach ($fixName in @('ghoztty-agent-test.exe', $fixExtra)) {
     $fixPath = Join-Path $oDir $fixName
     Copy-Item -LiteralPath $psExe -Destination $fixPath -Force
     $fixFs = [IO.File]::Open($fixPath, 'Append', 'Write')
@@ -481,31 +486,31 @@ foreach ($fixName in @('ghoztty-agent-test.exe', 'ghoztty-agent-core-test.exe'))
 }
 # Single-quoted so $PID reaches the fixture unexpanded; the exe name is the
 # only thing that tells the two binaries apart, since both get the same args.
-$body509 = 'Write-Output ((Get-Process -Id $PID).Path); if ((Get-Process -Id $PID).Path -like ''*-core-*'') { exit 0 } else { exit 1 }'
+$body509 = 'Write-Output ((Get-Process -Id $PID).Path); if ((Get-Process -Id $PID).Path -like ''*-fixture-*'') { exit 0 } else { exit 1 }'
 $out509 = Join-Path $work 'out509'
 $r = Invoke-Soak @{
     Lane = 'agent'; Mode = 'standalone'; Runs = 2; Label = 'twobin'
     Arguments = @('-NoProfile', '-Command', $body509)
-    Repo = $fakeRepo; OutDir = $out509
+    Repo = $fakeRepo; OutDir = $out509; ExtraTestExeNames = @($fixExtra)
 }
 $logs = @(Get-ChildItem -LiteralPath $out509 -Filter 'twobin-*.log' -ErrorAction SilentlyContinue)
 Check 'a two-binary standalone soak keeps a distinct log per run per binary (4 files)' `
 ($logs.Count -eq 4) "found $($logs.Count): $(($logs | ForEach-Object Name) -join ', ')"
 Check 'each log name carries the exe basename' `
 ((@($logs | Where-Object { $_.Name -match '^twobin-\d{8}-\d{6}-ghoztty-agent-test-\d\d\.log$' }).Count -eq 2) -and
-    (@($logs | Where-Object { $_.Name -match '^twobin-\d{8}-\d{6}-ghoztty-agent-core-test-\d\d\.log$' }).Count -eq 2)) `
+    (@($logs | Where-Object { $_.Name -match '^twobin-\d{8}-\d{6}-ghoztty-agent-fixture-test-\d\d\.log$' }).Count -eq 2)) `
     (($logs | ForEach-Object Name) -join ', ')
 $firstLog = @($logs | Where-Object { $_.Name -match '-ghoztty-agent-test-01\.log$' })
 $firstText = if ($firstLog.Count -eq 1) { (Get-Content -LiteralPath $firstLog[0].FullName -ErrorAction SilentlyContinue) -join "`n" } else { '' }
 Check 'the FIRST binary''s failing run is still readable after the second binary finished' `
-($firstText -match 'ghoztty-agent-test\.exe' -and -not ($firstText -match '-core-')) `
+($firstText -match 'ghoztty-agent-test\.exe' -and -not ($firstText -match '-fixture-')) `
     "log content: $firstText"
 Check 'the totals line covers both binaries' `
 ($r.Text -match 'SOAK twobin: mode=standalone runs=4 concurrency=1 pass=2 fail=2 crash=0') `
     ($r.Text -replace '\s+', ' ')
 Check 'the summary attributes fails per binary' `
 (($r.Text -match 'ghoztty-agent-test\.exe: runs=2 pass=0 fail=2 crash=0') -and
-    ($r.Text -match 'ghoztty-agent-core-test\.exe: runs=2 pass=2 fail=0 crash=0')) `
+    ($r.Text -match 'ghoztty-agent-fixture-test\.exe: runs=2 pass=2 fail=0 crash=0')) `
     ($r.Text -replace '\s+', ' ')
 # Negative control: with one binary there is nothing to attribute, and an
 # always-on breakdown would just repeat the totals line.

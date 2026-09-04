@@ -33,8 +33,9 @@
         Program Files). Match on `--webview-exe-name=` instead.
       * It counts -- and explains, and reaps -- the lane's own TEST BINARIES
         when they outlive the verdict (T837). The agent lane was measured
-        leaving `ghoztty-agent-test.exe` and `ghoztty-agent-core-test.exe`
-        alive 25 minutes past `LANE agent PASS`, wedged with frozen CPU, and
+        leaving `ghoztty-agent-test.exe` and the since-removed (T434)
+        `ghoztty-agent-core-test.exe` alive 25 minutes past `LANE agent PASS`,
+        wedged with frozen CPU, and
         nothing looked: the webview sweep above filters on a different exe
         entirely. Every run now ends with a `leaked test binaries: N` number,
         so a recurrence is counted rather than noticed by accident, and each

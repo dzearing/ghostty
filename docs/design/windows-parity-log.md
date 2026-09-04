@@ -21486,3 +21486,50 @@ over the mirror). T1325's fourth criterion is recorded as deferred with that
 reasoning rather than ticked.
 
 Floor: all four lanes PASS, P1/P2/P3 ALL PASS.
+## 2026-09-04 - The agent lane stops running every test twice (T434)
+
+`zig build test-agent` wired two test artifacts and the build runner ran them
+concurrently: `ghoztty-agent-test`, rooted at the agent exe, and
+`ghoztty-agent-core-test`, rooted at the `src/remote/agent_test.zig` aggregator.
+The aggregator's 13 files are all reachable from `remote/agent/main.zig`, so the
+second binary was a strict SUBSET of the first - which the task said had to be
+established rather than assumed, and now is: the exe binary reported 5443 passed
+/ 78 skipped against the aggregator's 5335 / 72, and a per-file diff of the test
+names embedded in both 103 MB binaries found ZERO files present in the
+aggregator's binary and absent from the exe's (the exe adds twelve, all of them
+agent-exe-only: `main`, `pty_child`, `pty_holder_child`, `pty_host_proto`,
+`pty_host_spec`, `single_instance`, `tray_account`, `adopt`, `handoff`,
+`holder_adopt`, `link_control`, `relay_creds`).
+
+So the artifact and its two now-dead test roots are gone. The lane runs
+**5443 / 78 - the same numbers, from one binary** - in **3m35s against 6m10s**,
+and five repeats landed at 210 / 210 / 210 / 215 / 210s with `leaked test
+binaries: 0` on every one. That last number is the T430 answer this task was
+also asked for: the two same-test processes that raced each other for the
+machine's ports, pipes and temp files no longer exist to race.
+
+The crash tooling knew the lane by its binaries, so `CrashCatch.ps1`,
+`CrashDiag.ps1` and `floor-lane.ps1` stop naming one the build no longer
+produces. That would have quietly deleted the only coverage of the multi-binary
+paths - a log per binary, per-exe attribution in the soak summary - since no
+lane builds two any more, so `Resolve-LaneTestBinary` grew `-ExtraExeNames` and
+`test-binary-soak.ps1` grew `-ExtraTestExeNames` (mirroring floor-lane's
+parameter of the same name), and the acceptance fixture declares its second name
+instead of borrowing a real one.
+
+Filed as **T1331**: the half of T434 that is not an agent-lane edit. The agent's
+test binary carries the whole win32 app suite - 5443 tests against the agent's
+own 13 files, `ViewerPane` and `EBWebView` linked in, a WebView2 host it can
+start - and the import path the task could not find by reading
+`remote/agent/main.zig` is now known: `src/os/main.zig` re-exports
+`src/os/open.zig`, which imports `../apprt.zig` for one type, and `apprt.zig`'s
+test block is the T59a aggregator of 112 win32 files. Essentially every file
+under `src/` reaches it, so this is a shared-core decoupling that moves what all
+three lanes compile, not something to fold in here.
+
+Floor: all four lanes PASS (lib 47s, none 277s, win32 372s, agent 215s), agent
+x5 PASS, and the ten acceptance harnesses the crash-tooling edit made due are
+green - test-binary-soak (77), crash-first-chance (49), crash-stacks,
+crash-databreak, isolation-meta (13), launch-preflight-audit (19),
+verdict-exit-audit, cleanslate-audit (21), stderr-capture-audit (25),
+desktop-launch-audit (29).

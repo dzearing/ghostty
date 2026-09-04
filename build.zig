@@ -127,7 +127,7 @@ pub fn build(b: *std.Build) !void {
 
         // `zig build test-agent` runs the agent's tests, including the real-pty
         // child end-to-end tests (which need pty-c + os deps, so they can't run
-        // under the pure `agent_test.zig` standalone command).
+        // under a pure logic-only test root).
         const agent_test = b.addTest(.{
             .name = "ghoztty-agent-test",
             .filters = test_filters,
@@ -157,38 +157,17 @@ pub fn build(b: *std.Build) !void {
         const agent_test_run = b.addRunArtifact(agent_test);
         test_agent_step.dependOn(&agent_test_run.step);
 
-        // The agent-core aggregator (`src/remote/agent_test.zig`: server,
-        // session store, metrics, keepalive, socket stream). Previously only
-        // runnable by hand via `zig test -Mroot=src/remote/agent_test.zig`,
-        // so its ~140 tests ran in NO build step; wire it into `test-agent`.
-        const agent_core_test = b.addTest(.{
-            .name = "ghoztty-agent-core-test",
-            .filters = test_filters,
-            .root_module = b.createModule(.{
-                // Rooted at `src/agent_core_test.zig` (a thin wrapper around
-                // `remote/agent_test.zig`) so the module root is `src/`, letting
-                // the session store's grid-snapshot emulator reach src/terminal
-                // via its relative import (grid_snapshot.zig).
-                .root_source_file = b.path("src/agent_core_test.zig"),
-                .target = config.target,
-                .optimize = test_optimize,
-            }),
-            .use_llvm = test_llvm,
-        });
-        // The grid-snapshot emulator pulls src/terminal into this aggregator, so
-        // it needs the shared terminal deps (terminal_options, unicode tables,
-        // simd) and the `ghostty.h` module the terminal enum-vs-header tests use.
-        if (!config.emit_lib_vt) _ = try deps.add(agent_core_test);
-        agent_core_test.root_module.addImport(
-            "ghostty.h",
-            b.addTranslateC(.{
-                .root_source_file = b.path("include/ghostty.h"),
-                .target = config.baselineTarget(),
-                .optimize = .Debug,
-            }).createModule(),
-        );
-        const agent_core_test_run = b.addRunArtifact(agent_core_test);
-        test_agent_step.dependOn(&agent_core_test_run.step);
+        // There is exactly ONE test binary in this lane, on purpose (T434).
+        // `remote/agent/main.zig` imports server, session, grid_snapshot,
+        // session_meta, ring_snapshot, metrics, foreground, descendants,
+        // keepalive, self_update, socket_stream, socket_rw and pipe_stream, and
+        // a zig test binary carries the tests of every file in its import
+        // graph — so the `src/remote/agent_test.zig` aggregator that used to be
+        // wired here as `ghoztty-agent-core-test` was a strict SUBSET of this
+        // one. Measured 2026-09-04: 5443 passed / 78 skipped here against
+        // 5335 / 72 there, with no file present in the aggregator's binary and
+        // absent from this one. The lane built and ran the same tests twice,
+        // concurrently, which is also the shape T430 recorded frozen.
     }
 
     // Ghoztty remote-machines test client (WP: TCP transport). A headless native

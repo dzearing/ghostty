@@ -192,7 +192,13 @@ param(
     [string]$Label = '',
     [int]$TimeoutSeconds = 900,
     [string]$OutDir = "$env:TEMP\ghoztty-soak",
-    [string]$Repo = 'D:\git\ghoztty'
+    [string]$Repo = 'D:\git\ghoztty',
+    # Extra exe names to resolve beside the lane's own, for a fixture run that
+    # needs a lane to present TWO binaries. Every real lane builds one since
+    # T434, so without this the per-binary log naming and the per-exe
+    # attribution in the summary have nothing to exercise them. Mirrors
+    # floor-lane.ps1's parameter of the same name.
+    [string[]]$ExtraTestExeNames = @()
 )
 
 $ErrorActionPreference = 'Continue'
@@ -271,7 +277,7 @@ if ($mode -eq 'standalone') {
         # Verified, not newest (T855). A soak's whole output is a count of runs
         # against a named lane; resolving that name by write-time alone let the
         # other lane's binary be soaked and reported under this one.
-        $resolved = @(Resolve-LaneTestBinary -Lane $Lane -Repo $Repo)
+        $resolved = @(Resolve-LaneTestBinary -Lane $Lane -Repo $Repo -ExtraExeNames $ExtraTestExeNames)
         Write-LaneResolution -Resolution $resolved -Prefix "soak: lane $Lane"
         $targets = @($resolved | Where-Object { $_.Ok } | ForEach-Object { $_.Path })
         if ($targets.Count -eq 0) {

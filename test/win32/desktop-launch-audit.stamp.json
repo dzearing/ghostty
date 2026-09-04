@@ -1,10 +1,10 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-04T05:19:37-07:00",
-    "commit":  "4aa61de7b",
+    "generated":  "2026-09-04T06:43:49-07:00",
+    "commit":  "246e67755",
     "uncommitted":  [
-                        "test/win32/guard-due.ps1"
+                        "test/win32/test-binary-soak.ps1"
                     ],
     "files":  {
                   "src/cli/ghostty.zig":  "ef54b501298cfda9306cfb958c1094db24ee30f355b25865656b3e2bc713bcd7",
@@ -238,7 +238,7 @@
                   "test/win32/target-staleness.ps1":  "25c28c99d39716155584ecda6f7a826dae310b3adaad3ae6dbb962c38f7f7d80",
                   "test/win32/task-dashboard.ps1":  "28c4d469a68b7167a6f1c4d70b8637eb35d88f5729c79f075521e31e3b482f20",
                   "test/win32/terminal-link-paths.ps1":  "f3ba874ca9f97125334319222b41e785a24c9168e6bbb3b78205a1c3bc85b161",
-                  "test/win32/test-binary-soak.ps1":  "d8e71bdd9bc25aea4f285cef725d9e1f16839e893cc43dae669419cfdc7d7b69",
+                  "test/win32/test-binary-soak.ps1":  "d467c64271dcab231f453a2172f51239b8677391948065e16e0b75acf143fbce",
                   "test/win32/test-client-build.ps1":  "4151eff034e0de3acacf2e176c97702fd757f2c83f863476a115da9dc34e7b2b",
                   "test/win32/test-desktop-harness.ps1":  "f14b6c0c52ba9c6f2d4ffbbb4a3153f001c60f6698f99ffadd7a87a7b060bc46",
                   "test/win32/test-desktop-spike.ps1":  "fe210e65c149640f7641882b23be4f13d9ec43be05d0b1347de88576950d7b54",

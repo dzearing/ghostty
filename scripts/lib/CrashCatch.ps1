@@ -89,7 +89,7 @@ function Get-CdbPath {
 $script:LANE_TEST_EXES = @{
     'none'  = @('ghostty-test.exe')
     'win32' = @('ghostty-test.exe')
-    'agent' = @('ghoztty-agent-test.exe', 'ghoztty-agent-core-test.exe')
+    'agent' = @('ghoztty-agent-test.exe')
 }
 
 # What a lane's test binary is MADE OF, so a candidate can be checked rather
@@ -115,8 +115,11 @@ $script:LANE_TEST_EXES = @{
 #   NotThis - the other lane's `Only` markers, whose PRESENCE proves the
 #             candidate is that other lane's binary.
 #
-# The agent lane's exes have unique names and cannot be confused with a lane, so
-# they carry Core alone -- there is still a filtered build to catch.
+# The agent lane's exe has a unique name and cannot be confused with a lane, so
+# it carries Core alone -- there is still a filtered build to catch. It is also
+# the lane's ONLY binary since T434; a name that is not in this table resolves
+# with "no lane signature -- not checked", which is what -ExtraExeNames relies
+# on for a fixture run.
 $script:LANE_MARKERS = @{
     'none'  = @{
         'ghostty-test.exe' = @{
@@ -139,12 +142,7 @@ $script:LANE_MARKERS = @{
         }
     }
     'agent' = @{
-        'ghoztty-agent-test.exe'      = @{
-            Core    = @('remote.agent.server.test.', 'remote.protocol.test.', 'remote.pipe_stream.test.')
-            Only    = @()
-            NotThis = @()
-        }
-        'ghoztty-agent-core-test.exe' = @{
+        'ghoztty-agent-test.exe' = @{
             Core    = @('remote.agent.server.test.', 'remote.protocol.test.', 'remote.pipe_stream.test.')
             Only    = @()
             NotThis = @()
@@ -292,6 +290,12 @@ function Resolve-LaneTestBinary {
         How deep to look per exe name. Reading a candidate costs about half a
         second; the cache holds every build of the day, and a lane that is not in
         the newest handful has not been built recently enough to be the subject.
+    .PARAMETER ExtraExeNames
+        Additional exe names to resolve alongside the lane's own. Every real lane
+        builds ONE binary since T434, so the multi-binary paths downstream (a log
+        per binary, per-exe attribution in the soak summary) would have no way to
+        be exercised -- this is how a fixture declares its second name without
+        the table claiming the build produces it.
     .OUTPUTS
         One object per exe name the lane builds: Name, Path, CacheDir, Ok,
         Reason, Verdict, Rejected (path+reason pairs), Candidates.
@@ -299,11 +303,14 @@ function Resolve-LaneTestBinary {
     param(
         [Parameter(Mandatory)][ValidateSet('none', 'win32', 'agent')][string]$Lane,
         [string]$Repo = 'D:\git\ghoztty',
-        [int]$MaxCandidates = 8
+        [int]$MaxCandidates = 8,
+        [string[]]$ExtraExeNames = @()
     )
     $root = Join-Path $Repo '.zig-cache\o'
     $out = @()
-    foreach ($name in $script:LANE_TEST_EXES[$Lane]) {
+    $names = @($script:LANE_TEST_EXES[$Lane])
+    foreach ($n in @($ExtraExeNames)) { if ($n -and $names -notcontains $n) { $names += $n } }
+    foreach ($name in $names) {
         $entry = [pscustomobject]@{
             Name       = $name
             Path       = $null
