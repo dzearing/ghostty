@@ -12,9 +12,14 @@
 //!                   acceptance harness (`test/win32/vendored-assets.ps1`)
 //!                   compares every file against `origin/main`, so drift from
 //!                   the Mac copies is loud.
-//!   - `hooks/`, `skills/`  the copies the app ships. The two SKILL.md files
-//!                   are byte-identical to `upstream/`; both hook scripts are
-//!                   deliberate forks — `ghoztty-banner.sh` replaces its `jq`
+//!   - `hooks/`, `skills/`  the copies the app ships, byte-identical to this
+//!                   branch's `macos/Resources/Ghoztty/` and therefore AHEAD of
+//!                   `upstream/` wherever this branch has edited them —
+//!                   today that is `process-feedback/SKILL.md`, which T1321
+//!                   taught to record a release request and to file deferred
+//!                   work with `-UserReport`, so a fix a person asked for is
+//!                   not left to the ordinary release cadence. Both hook
+//!                   scripts are deliberate forks — `ghoztty-banner.sh` replaces its `jq`
 //!                   plumbing with `ghoztty +json` (native, dependency-free),
 //!                   and `ghoztty-activity-state.sh` adds OSTYPE-guarded
 //!                   Windows owner/liveness probes (T605: MSYS `kill -0`
@@ -64,6 +69,20 @@ test "every named skill resolves and looks like a skill document" {
         // SKILL.md files open with YAML frontmatter.
         try std.testing.expect(std.mem.startsWith(u8, text, "---\n"));
     }
+}
+
+test "the process-feedback skill wires a user report through to a release" {
+    // The deliberate divergence from main (T1321): a report drained from the
+    // viewer feedback queue IS a user report, and until this text existed the
+    // skill ended at "commit and move on" - so the fix rode the ordinary daily
+    // release cadence and the person who reported it downloaded the same
+    // broken build again (the T1294 shape). These are the two sentences that
+    // stop that, and this is the tripwire if a re-vendor ever pastes an older
+    // copy over the shipped asset.
+    const text = try skillMarkdown("process-feedback");
+    try std.testing.expect(std.mem.indexOf(u8, text, "daily-publish.ps1 -Request") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "parity-tasks.ps1 new -UserReport") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "user-report: true") != null);
 }
 
 test "unknown skill is a typed error" {

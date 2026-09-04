@@ -1,13 +1,10 @@
 {
     "guard":  "printclient-audit",
     "script":  "test/win32/printclient-audit.ps1",
-    "generated":  "2026-09-03T23:34:42-07:00",
-    "commit":  "c6e5b376a",
+    "generated":  "2026-09-04T04:05:54-07:00",
+    "commit":  "296e385bd",
     "uncommitted":  [
-                        "src/apprt/win32/App.zig",
-                        "src/apprt/win32/layout_cost.zig",
-                        "src/apprt/win32/layout_refresh.zig",
-                        "src/apprt/win32/Surface.zig"
+                        "src/apprt/win32/GhosttyAssets.zig"
                     ],
     "files":  {
                   "src/apprt/win32/activity_actions.zig":  "9f5cfa4c1238fd023d5c8a1d80790ae21751be5f7389662e2fe1b790fef8ad63",
@@ -67,7 +64,7 @@
                   "src/apprt/win32/DimOverlay.zig":  "eac95cf0bcdd9fe0df7fbc83af479f7cc5d51edcf9ac9e97b0a45e9fd7fd843d",
                   "src/apprt/win32/frame_size.zig":  "f1dc53407ba90d5d50c37bf1f2a5ce9aec1d4cc0db2d00b8ca7472fac29f1086",
                   "src/apprt/win32/gdiplus_decode.zig":  "e35ad6c8d9c8369de68ff38af6dfa794852177141126d9936612e714d7b13fd6",
-                  "src/apprt/win32/GhosttyAssets.zig":  "0e51de1f7906565498d0c84c618b47136ce6a6f37107cebcd881c99441178fd7",
+                  "src/apprt/win32/GhosttyAssets.zig":  "f9aa8e7e582991edfd955e9b6599d2858995baed7242f6abdc9cb06917c207d5",
                   "src/apprt/win32/git_run.zig":  "9f1fd0286c144889782e28f729257564dbc529cc42bb998df676a37e752eeaec",
                   "src/apprt/win32/gui_pump.zig":  "ac66102200ebf3a08b1992846ff7189d4ff80226cfdb6dc750db74501be02782",
                   "src/apprt/win32/hero_math.zig":  "5aa97b9827f5aca6cf1217c0242480dc359b27fbee9e1d5374f9d30a7538d67f",

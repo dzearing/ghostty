@@ -230,6 +230,21 @@ each report keeps `git log` a readable trail of what the queue produced and
 leaves a clean tree for the next report's reproduction step. The queue itself
 lives under gitignored `temp/`, so the report folders never enter a commit.
 
+**Then say a person is waiting on it.** A report that arrived through the
+feedback button is by definition a user report, and unless something records
+that, the fix ships on whatever the project's ordinary release cadence happens
+to be — which is the whole difference between "fixed" and "fixed as far as the
+user can tell". In a checkout that has the release-request tool, record one:
+
+```bash
+powershell -NoProfile -File scripts/daily-publish.ps1 -Request   -Reason "feedback report $stem: <one-line paraphrase of the ask>"
+```
+
+That publishes nothing by itself; it records that the next release must not
+wait for tomorrow, and the release machinery honours it on the next push. Skip
+the step in a repo with no `scripts/daily-publish.ps1` — the queue is not
+specific to one project and the step is a no-op there.
+
 **Not confident** — could not reproduce, the ask is ambiguous, the fix needs a
 product decision, or validation did not come out clean:
 
@@ -241,6 +256,18 @@ Write `blocked/<stem>/blocked.md` first: what you tried, what you observed, and
 the specific question the user needs to answer. Then stop and tell the user —
 do **not** reset context past a blocked report, since the answer has to come
 from them. Leave any partial work uncommitted for them to look at.
+
+**Anything you do not fix in this pass is filed AS a user report**, never as a
+plain follow-up — the blocked report itself, and any adjacent gap Step 6 turned
+up and deliberately left. In a checkout with the parity tracker that is:
+
+```bash
+powershell -NoProfile -File scripts/parity-tasks.ps1 new -UserReport   -Title "<the symptom in the user's own terms>" -Tags fix
+```
+
+`-UserReport` writes `user-report: true` into the task, and that flag is what
+makes closing it file the release request above on its own. A follow-up filed
+without it is indistinguishable from internal work and ships whenever.
 
 ### Step 9: Advance to the next report
 

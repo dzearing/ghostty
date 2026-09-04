@@ -6,8 +6,8 @@
 #   A. VENDOR DRIFT - the pristine mirror under
 #      src\apprt\win32\assets\ghoztty\upstream\ must be byte-identical to
 #      tip-of-main's macos/Resources/Ghoztty/ (git blob compare), the two
-#      unforked live copies (the SKILL.md files) byte-identical to the
-#      mirror, and the two deliberate forks each carrying their divergence:
+#      unforked live copy (skills/ghoztty/SKILL.md) byte-identical to the
+#      mirror, and the three deliberate forks each carrying their divergence:
 #      hooks\ghoztty-banner.sh jq-free and +json-native (T866), and
 #      hooks\ghoztty-activity-state.sh carrying the OSTYPE-guarded Windows
 #      owner/liveness probes (T605).
@@ -111,14 +111,36 @@ if (-not $mainOk) {
     }
 }
 
-# The live copies: two unforked (byte-identical to the mirror), two forks.
-foreach ($rel in @('skills/ghoztty/SKILL.md', 'skills/process-feedback/SKILL.md')) {
+# The live copies: one unforked (byte-identical to the mirror), three forks.
+foreach ($rel in @('skills/ghoztty/SKILL.md')) {
     $live = Join-Path $assetRoot ($rel -replace '/', '\')
     $mirror = Join-Path $assetRoot ("upstream\" + ($rel -replace '/', '\'))
     $a = (& git -C $repo hash-object $live 2>$null | Out-String).Trim()
     $b = (& git -C $repo hash-object $mirror 2>$null | Out-String).Trim()
     Assert ($a -and ($a -eq $b)) "live copy of $rel is byte-identical to the mirror"
 }
+
+# The process-feedback fork (T1321). A report drained from the viewer feedback
+# queue IS a user report, and until this text existed the skill ended at "commit
+# and move on" - so the fix rode the ordinary daily release cadence and the
+# person who reported it downloaded the same broken build again (T1294, paid for
+# real on 2026-09-03). The divergence is therefore deliberate and must SURVIVE a
+# re-vendor: the complete path records a release request, the blocked/deferred
+# path files with -UserReport, and the document says what the flag buys. The
+# live copy must also stay byte-identical to the Mac bundle resource, since the
+# two platforms handing an agent different instructions is the divergence
+# CLAUDE.md calls the defect. Full rule + negative control:
+# test\win32\feedback-user-report.ps1.
+$fork3 = Join-Path $assetRoot 'skills\process-feedback\SKILL.md'
+$fork3Text = [System.IO.File]::ReadAllText($fork3)
+foreach ($needle in @('daily-publish.ps1 -Request', 'parity-tasks.ps1 new -UserReport', 'user-report: true')) {
+    Assert ($fork3Text.IndexOf($needle, [StringComparison]::Ordinal) -ge 0) `
+        "process-feedback fork carries '$needle'"
+}
+$fork3Mac = (& git -C $repo hash-object (Join-Path $repo 'macos\Resources\Ghoztty\skills\process-feedback\SKILL.md') 2>$null | Out-String).Trim()
+$fork3Win = (& git -C $repo hash-object $fork3 2>$null | Out-String).Trim()
+Assert ($fork3Win -and ($fork3Win -eq $fork3Mac)) `
+    'process-feedback fork is byte-identical to the mac bundle resource'
 
 $fork = Join-Path $assetRoot 'hooks\ghoztty-banner.sh'
 $forkText = [System.IO.File]::ReadAllText($fork)

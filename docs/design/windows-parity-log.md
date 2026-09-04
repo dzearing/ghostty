@@ -21323,3 +21323,47 @@ line a capability-blocked script prints and the T276 detector cannot tell a call
 from a string that spells one; it carries the `# foreground-audit:` marker now
 and that harness is ALL PASS (40) again. Filed: T1323, the exit-code audit's B3
 spot-check naming a line T1285 legitimately deleted.
+
+## 2026-09-04 - a fix that came from your feedback now asks for a release of its own (T1321)
+
+Press the feedback button in a viewer pane, describe a problem, and an agent
+picks the report up, fixes it and commits. Until now that was where it ended:
+nothing anywhere recorded that a real person was waiting, so the fix sat until
+whatever the next ordinary daily release happened to be. That is the exact
+shape that cost the user twice on 2026-09-03 - they downloaded the same broken
+installer and reported the same bug again, with the fix already on the branch
+(T1294). T1315 built the remedy, `user-report: true`; this wires the queue that
+produces most genuine user reports into it.
+
+The card's premise was wrong and was corrected before any code was written. It
+said the `process-feedback` skill files its tasks with a plain
+`parity-tasks.ps1 new`; the skill files no tracker task at all - it fixes each
+report in place, commits, and moves the folder to `complete/`. So what landed
+wires the OUTCOMES rather than a filing step. The pass that COMPLETES a report
+records a release request (`daily-publish.ps1 -Request`), which the next push
+ships. Anything it does NOT fix in that pass - the blocked report, an adjacent
+gap it deliberately leaves - is filed with `parity-tasks.ps1 new -UserReport`,
+so closing that task later files the request on its own. Both steps are
+conditional on the tool existing, because this skill ships to every Ghoztty user
+and most checkouts have no parity tracker.
+
+The document ships in two copies - the Mac bundle resource and the
+`@embedFile`d Windows asset - so both were edited and both are now held
+together. `upstream/` is deliberately untouched: it mirrors tip-of-main and is
+expected to lag this branch, which is precisely what makes it the wrong thing to
+compare a branch edit against. `skills/process-feedback/SKILL.md` is therefore a
+third declared fork in `hook-json.ps1` alongside the two hook scripts, carrying
+its divergence markers so a re-vendor cannot quietly paste an older copy over
+it, and the none lane asserts the same three phrases on the bytes the exe
+actually embeds. New harness `test\win32\feedback-user-report.ps1` (ALL PASS
+(10)) owns the rule end to end, with a negative control that guts the shipped
+asset and scores the healthy 1 FAILURE.
+
+Floor: all four lanes PASS, P1/P2/P3 ALL PASS.
+
+Filed: T1324 (a stale plugin-cache copy of this same skill on this box, still
+pointing the banner at the path T870 moved, shadowing the app-managed one) and
+T1325 (the vendored asset mirror is red against `origin/main` and has been for a
+while - `guard-due` reopens a harness when OUR files change, and main advancing
+changes none of them, so the check went silently red). The commit for this task
+takes `-NoGuardDue` naming `hook-json` for exactly that pre-existing red.

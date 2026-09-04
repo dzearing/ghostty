@@ -2276,6 +2276,27 @@ $GuardTable = @(
             'test\win32\merge-terminology.ps1'
         )
     },
+    # The feedback user-report rule (T1321): a report drained from the viewer
+    # feedback queue is a USER report, so the pass that fixes one records a
+    # release request and files what it defers with `-UserReport` - otherwise
+    # the fix rides the ordinary daily cadence and the person who reported it
+    # downloads the same broken build again (the T1294 shape, paid for real on
+    # 2026-09-03). The rule lives in a skill document the app SHIPS, in two
+    # copies that must not drift, so an edit to either copy - or to the embedded
+    # asset's tripwire, or to the doc that explains the intake - has to re-prove
+    # it. Static scan, no app, under a second.
+    [pscustomobject]@{
+        Name   = 'feedback-user-report'
+        Script = 'test\win32\feedback-user-report.ps1'
+        Stamp  = 'test\win32\feedback-user-report.stamp.json'
+        Covers = @(
+            'macos\Resources\Ghoztty\skills\process-feedback\SKILL.md',
+            'src\apprt\win32\assets\ghoztty\skills\process-feedback\SKILL.md',
+            'src\apprt\win32\GhosttyAssets.zig',
+            'docs\claude\viewers.md',
+            'test\win32\feedback-user-report.ps1'
+        )
+    },
     # The control-character lint (T1231): a text file holding a real 0x07/0x08/
     # 0x0c where a backslash escape was meant. Fifteen files were in that state,
     # and one of them was THIS file's own coverage table - `src\apprt\win32\...`

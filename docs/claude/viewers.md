@@ -475,6 +475,19 @@ On send it writes a report — plus any pasted screenshots — into
 `<worktree>/temp/feedback/new/` for an external watcher to drain (Ghoztty produces
 the queue; consuming it is separate and not built here).
 
+**Draining it is the `process-feedback` skill**, which the app installs
+alongside the `ghoztty` skill (`GhosttyAssets`/`SkillComponent`) and which
+claims one report at a time, fixes it, and commits. What that skill must do
+that nothing else will (T1321): a report from this button is a **user report**,
+so the pass that fixes one records a release request
+(`scripts\daily-publish.ps1 -Request -Reason "feedback report <stem>: …"`) and
+anything it defers or blocks on is filed with `parity-tasks.ps1 new
+-UserReport`. Without that the fix ships on the ordinary daily cadence — which
+on 2026-09-03 meant the user downloaded the same broken installer and reported
+the same bug twice (T1294). The wiring is asserted on the bytes that actually
+ship, in `GhosttyAssets.zig`'s none-lane tests and
+`test/win32/feedback-user-report.ps1`.
+
 - **Provenance (strategy D — port lookup first, pane-origin fallback).** The
   worktree is derived live from the pane's *current* location, re-resolved on
   every navigation (a pane can move between a file, `localhost:3000`, and a
