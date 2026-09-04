@@ -209,3 +209,13 @@ as the digest that showed them.
 - Choose where a link opens (viewer pane vs browser, remembered per link kind)
 - Tidy a window full of tabs (close others / close to the right, with a preview of what goes)
 - Respect Windows high contrast (chrome and palette follow the OS high-contrast theme)
+
+## 2026-09-04
+
+- Run this one elevated, right here (per-command UAC elevation without a new window)
+- Come back to the environment you left, not just the shell (restore activated virtualenv/conda/module state)
+- What did that command change on disk? (per-command file-change and repo-status summary)
+- Pick the shell from the new-tab button (split-button flavor menu on `+`)
+- Flip back to the pane I was just in (last-focused pane toggle binding)
+- Search a session you are not looking at (cross-session scrollback search with attach)
+- A release you can verify byte for byte (published checksums plus reproducible builds)
