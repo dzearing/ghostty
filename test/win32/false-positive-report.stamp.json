@@ -1,0 +1,15 @@
+{
+    "guard":  "false-positive-report",
+    "script":  "test/win32/false-positive-report.ps1",
+    "generated":  "2026-09-04T02:11:09-07:00",
+    "commit":  "0ece9740e",
+    "uncommitted":  [
+                        "scripts/report-false-positive.ps1",
+                        "test/win32/false-positive-report.ps1"
+                    ],
+    "files":  {
+                  "scripts/report-false-positive.ps1":  "67875bcfc4d235afa9a8810294a7ea9d48fc7cb57f69e74c9617970b65d68534",
+                  "scripts/verify-release-clean.ps1":  "ee41494c52f72b6d60caf4ee8750f3fc760ab4330481a7a16c4b4f1d8830c39b",
+                  "test/win32/false-positive-report.ps1":  "3e4c34e6b40b6b99969d38afbd1c055899802cfa119529c06f84c6ad24a4e981"
+              }
+}

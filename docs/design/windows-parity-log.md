@@ -21198,3 +21198,42 @@ fixture with the turn gate widened out of the way goes back to `ACTION none`, so
 BB17 cannot pass on unrelated staleness. Whole guard ALL PASS, four floor lanes
 green. Filed T1320 - the composer fixture is drawn from what this repo believes
 Claude Code renders, and that chrome has drifted twice before.
+
+## 2026-09-04 - the malware false-positive report is now a generated packet, not a typed table (T1313)
+
+Windows Defender deletes our releases as `Trojan:Script/Wacatac.C!ml` (T1293),
+and the free remedy that reaches every machine is a developer false-positive
+report to Microsoft. T1313 was where the data for that report lived: a
+hand-typed table naming `win-v1.36.2` and its two SHA-256s.
+
+A submission corrects the BYTES it names and nothing else. Between that table
+being written and this turn reading it, the project published four more releases
+- three of them on one day - so filing from the card would have corrected a
+build nobody will ever download again. The problem was not only that nobody had
+filed; it was that what they would have filed was already wrong.
+
+`scripts\report-false-positive.ps1` generates the packet instead, for whatever
+release is current at the moment somebody sits down to file: it resolves the
+newest `win-v*` release, downloads and expands its assets so the binaries a user
+actually runs are attached by name rather than the archive they arrived in,
+hashes them through `verify-release-clean.ps1` (T1312) so the packet and the
+second-opinion scanner can never disagree about what "the release" is, looks up
+the tag's commit and the `release-windows.yml` run that built those bytes on a
+clean hosted runner, and prints the form answers plus a ready-to-paste
+paragraph. The files are left on disk to upload, with a `submission-packet.txt`
+beside them. `-Record` puts the submission id, and later Microsoft's
+determination, onto T1313 and T1293 both - the two facts that outlive the
+session and were otherwise going to live in somebody's memory.
+
+What did NOT happen is the filing. The portal needs a Microsoft account sign-in
+and there is no public submission API without a tenant, so that half stays the
+user's; T1313 parks `blocked` with an `unblock` that says so and says not to
+reopen it to re-derive hashes, since a turn without an account produces the same
+packet again.
+
+Verified end to end against the live release: `win-v1.36.6`, commit
+`859b564925b6`, run 33839494300, three attachments with real hashes.
+Acceptance: `test\win32\false-positive-report.ps1`, 25 assertions ALL PASS,
+negative control 25 FAILURES, registered in `guard-due.ps1` as
+`false-positive-report`. Section E is the demonstration it can decline - no `gh`
+and no `-AssetDir` is exit 4 and no packet, rather than a form full of blanks.

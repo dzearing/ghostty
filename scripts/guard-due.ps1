@@ -1291,6 +1291,23 @@ $GuardTable = @(
             'test\win32\verify-release-clean.ps1'
         )
     },
+    # The false-positive submission packet (T1313): a report to Microsoft
+    # corrects the BYTES it names, and this project publishes new bytes several
+    # times a day -- so the packet is generated from the current release rather
+    # than typed once. Its harness is offline and not in the P1-P3 floor, and
+    # its covered set includes verify-release-clean.ps1 because the packet gets
+    # its hashes from there: if that script's idea of "the files" changes, the
+    # packet's does too and nothing else would notice.
+    [pscustomobject]@{
+        Name   = 'false-positive-report'
+        Script = 'test\win32\false-positive-report.ps1'
+        Stamp  = 'test\win32\false-positive-report.stamp.json'
+        Covers = @(
+            'scripts\report-false-positive.ps1',
+            'scripts\verify-release-clean.ps1',
+            'test\win32\false-positive-report.ps1'
+        )
+    },
     # `--when-idle`'s busy detection (T46 motion, T517 --busy-marker): a broken
     # idle poll only ever fails inside a detached automation send — the loop
     # types into a mid-turn session and the damage reads as "the agent ignored
