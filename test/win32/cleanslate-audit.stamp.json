@@ -1,10 +1,10 @@
 {
     "guard":  "cleanslate",
     "script":  "test/win32/cleanslate-audit.ps1",
-    "generated":  "2026-09-04T09:04:45-07:00",
-    "commit":  "4510d0a36",
+    "generated":  "2026-09-04T09:43:24-07:00",
+    "commit":  "9c0067746",
     "uncommitted":  [
-                        "test/win32/floor-lane-compiler-crash.ps1"
+                        "test/win32/whea-report.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -314,6 +314,7 @@
                   "test/win32/viewer-worktree.ps1":  "b58c40302cdc8cd34690887d581cd2763eef490c3e9387145884a313caee01fd",
                   "test/win32/viewer-worktree-port.ps1":  "74df2c3c92ef08ce58bed2f4ad1912b9f72058f4990c42b84b6039a2fc4a2cea",
                   "test/win32/website-windows-download.ps1":  "285cd624dd0e8dc43f09e9fa3a8ccba905615cb17e3e26450d4d9cb304e0d57d",
+                  "test/win32/whea-report.ps1":  "8fbf6c7a59dded8910e095399d8c3c12f9cb3a773b6078c932870cba18900bbf",
                   "test/win32/wheel-scroll.ps1":  "5ddcfef5925d88800a7bfe738e3df7d75a0df62fe400243070fba6f78cc8a2a1",
                   "test/win32/window-active.ps1":  "9151aa942d89c9db56f8fe9531b66c67285d311d17d50d8c43b8bec7b1b778df",
                   "test/win32/window-color.ps1":  "3b8c5d85c60fad07747da53240ffaf56f75d255d993461163774c30644010fac",

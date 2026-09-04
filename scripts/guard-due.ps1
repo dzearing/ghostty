@@ -1662,6 +1662,22 @@ $GuardTable = @(
             'test\win32\printclient-audit.ps1'
         )
     },
+    # The WHEA report's whole subject is a filter that must never be applied
+    # (T452): corrected hardware errors log at WARNING level, so a query
+    # filtered to Error reads a box logging 8000 of them a month as silent -
+    # which is exactly what T449 recorded. That defect lives in one line of
+    # scripts\whea-report.ps1 and would be trivial to reintroduce while
+    # "tidying" the query, with no symptom at all until the next crash
+    # investigation trusts the answer.
+    [pscustomobject]@{
+        Name   = 'whea-report'
+        Script = 'test\win32\whea-report.ps1'
+        Stamp  = 'test\win32\whea-report.stamp.json'
+        Covers = @(
+            'scripts\whea-report.ps1',
+            'test\win32\whea-report.ps1'
+        )
+    },
     # crash-stacks.ps1 is the acceptance for the catcher ITSELF, and until T478
     # nothing tied it to the library it tests: the `bpe` blind spot -- a Zig
     # panic reported as "ran clean" on 10 runs out of 10 -- went a month without

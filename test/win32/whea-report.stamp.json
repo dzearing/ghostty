@@ -1,0 +1,14 @@
+{
+    "guard":  "whea-report",
+    "script":  "test/win32/whea-report.ps1",
+    "generated":  "2026-09-04T09:42:02-07:00",
+    "commit":  "9c0067746",
+    "uncommitted":  [
+                        "scripts/whea-report.ps1",
+                        "test/win32/whea-report.ps1"
+                    ],
+    "files":  {
+                  "scripts/whea-report.ps1":  "943241a7edbe2cf8de59f2d47b4d99f3a08fd879d35c0fa7551e2a84a269bd17",
+                  "test/win32/whea-report.ps1":  "8fbf6c7a59dded8910e095399d8c3c12f9cb3a773b6078c932870cba18900bbf"
+              }
+}
