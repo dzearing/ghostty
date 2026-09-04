@@ -1566,6 +1566,24 @@ Assert 'W38 a real message file commits normally' `
      (& git -C $wRepo log -1 --pretty=%s 2>$null) -match 'the subject written for this commit')
 Assert 'W39 the message file is consumed, so it cannot be reused stale' (-not (Test-Path $msgPath))
 
+# A UTF-8 BOM is three bytes git commits INTO THE SUBJECT, invisible at the
+# console and permanent in the feed. `Set-Content -Encoding utf8` (PS 5.1)
+# writes one, which is how 2d9959fd6 went out with a mojibake first character.
+# Normalised, not refused: the message is right, only its first three bytes
+# are not.
+Set-Content -Path (Join-Path $wRepo 'msg-bom.txt') -Value 'work behind a BOM-headed message'
+Set-Content -Path $msgPath -Value 'chore(tracker): a subject behind a BOM' -Encoding utf8
+$bomBytes = [System.IO.File]::ReadAllBytes($msgPath)
+Assert 'W39a the fixture really has a BOM (the trap this asserts against)' `
+    ($bomBytes.Length -ge 3 -and $bomBytes[0] -eq 0xEF -and $bomBytes[1] -eq 0xBB -and $bomBytes[2] -eq 0xBF)
+$r = CG @('commit', '-Paths', 'msg-bom.txt', '-MessageFile', $msgPath)
+$bomSubject = (& git -C $wRepo log -1 --pretty=%s 2>$null)
+Assert 'W39b a BOM-headed message file still commits' ($r.Code -eq 0 -and $r.Out -match 'COMMITTED')
+Assert 'W39c and the subject starts at the first REAL character' `
+    ($bomSubject -eq 'chore(tracker): a subject behind a BOM')
+Assert 'W39d the strip is said out loud rather than done silently' ($r.Out -match 'stripped a UTF-8 BOM')
+Assert 'W39e the original message file is still consumed (T1245 unchanged)' (-not (Test-Path $msgPath))
+
 # The 2026-09-01 shape end to end: a second turn commits with the same path and
 # never writes it. Before this it inherited the first turn's subject; now it is
 # the missing-file refusal, which is a stop rather than a wrong feed item.

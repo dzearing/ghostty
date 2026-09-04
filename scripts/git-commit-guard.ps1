@@ -396,6 +396,7 @@ switch ($Action) {
         # describing something the commit does not contain (e4824918e).
         # git resolves a relative -F against its own cwd, which -C makes $Repo.
         $mfResolved = $null
+        $mfNoBom = $null
         if ($MessageFile) {
             $mfResolved = if ([System.IO.Path]::IsPathRooted($MessageFile)) { $MessageFile }
                           else { Join-Path $Repo $MessageFile }
@@ -408,6 +409,25 @@ switch ($Action) {
             if (-not $mfText.Trim()) {
                 Fail ("MESSAGE FILE EMPTY: $mfResolved" + [Environment]::NewLine +
                       "  A commit with no subject is not a commit anybody can read; nothing was committed.") 2
+            }
+            # A UTF-8 BOM at the head of the file is three bytes git puts
+            # STRAIGHT INTO THE SUBJECT, where they are invisible here and
+            # permanent in the history and the dashboard feed. It is not a
+            # typo anybody makes twice on purpose: PowerShell 5.1's
+            # `Set-Content -Encoding utf8` writes one, and that is the obvious
+            # way to write a one-line message from a script. So this is
+            # normalised rather than refused - the message is right, only its
+            # first three bytes are not - and it is said out loud so the shape
+            # is learnable. Cost of learning it the other way: 2d9959fd6.
+            $mfBytes = $null
+            try { $mfBytes = [System.IO.File]::ReadAllBytes($mfResolved) } catch { $mfBytes = $null }
+            if ($mfBytes -and $mfBytes.Length -ge 3 -and
+                $mfBytes[0] -eq 0xEF -and $mfBytes[1] -eq 0xBB -and $mfBytes[2] -eq 0xBF) {
+                $mfNoBom = Join-Path ([System.IO.Path]::GetTempPath()) "ghoztty-commit-nobom-$PID.txt"
+                [System.IO.File]::WriteAllBytes($mfNoBom, $mfBytes[3..($mfBytes.Length - 1)])
+                if (-not $Quiet) {
+                    "note: stripped a UTF-8 BOM from $MessageFile (Set-Content -Encoding utf8 writes one; git would have put it in the subject)"
+                }
             }
         }
         $lp = Get-LockPath
@@ -425,8 +445,16 @@ switch ($Action) {
         $holderText = if ($Holder) { $Holder } else { Default-Holder }
         Write-Lock $lp $k $holderText $ttl
 
+        # The BOM-stripped copy when there was one, so the commit reads the
+        # bytes git should have been given. `$tempMsg` is what the finally
+        # block deletes, and the original -MessageFile is still consumed below
+        # by the same rule as ever (T1245).
         $msgFile = $MessageFile
         $tempMsg = $null
+        if ($mfNoBom) {
+            $msgFile = $mfNoBom
+            $tempMsg = $mfNoBom
+        }
         if (-not $msgFile) {
             $tempMsg = Join-Path ([System.IO.Path]::GetTempPath()) "ghoztty-commit-$PID.txt"
             [System.IO.File]::WriteAllText($tempMsg, $Message, (New-Object System.Text.UTF8Encoding $false))

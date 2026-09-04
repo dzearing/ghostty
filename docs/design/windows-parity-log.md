@@ -21861,3 +21861,28 @@ now reports only the three pre-existing advisory rows.
 Mac owes the same change and does not have it: its chooser still refuses
 (`MachineChooserView.swift:167-168`), and its C API omits `relaunchable` (T322)
 so these rows may not even be listed there. Filed as **T1339**.
+
+## 2026-09-04 - A commit message written by a script no longer starts with three invisible bytes
+
+Written straight after the entry above, because that turn caused it. Its
+tracker commit (2d9959fd6) went out with a subject beginning `﻿` - the
+dashboard's activity feed shows a garbage glyph in front of the headline, and
+history is not re-writable once pushed.
+
+The message file had been written with `Set-Content -Encoding utf8`, which on
+PowerShell 5.1 means "UTF-8 **with** a BOM". `git commit -F` treats those three
+bytes as the first three characters of the subject, and nothing between the two
+looks wrong: the file reads correctly everywhere, and the console prints the
+subject back cleanly.
+
+`git-commit-guard.ps1` now strips a leading UTF-8 BOM from `-MessageFile`
+before it commits, and says it did. Normalised rather than refused, on purpose:
+the message is right, only its first three bytes are not, and the obvious way
+to write a one-line message from a PowerShell script produces them. Sections
+W39a-W39e of `test\win32\go-loop-guard.ps1` are the demonstration - a fixture
+whose BOM is asserted to be really there, then the commit, then the subject
+starting at its first real character, the note being printed, and T1245's
+consume-the-message-file rule still holding over the stripped copy.
+
+`go-loop-guard.ps1` ALL PASS; the six audit guards this edit made due were
+re-run green.
