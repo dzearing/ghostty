@@ -21886,3 +21886,39 @@ consume-the-message-file rule still holding over the stripped copy.
 
 `go-loop-guard.ps1` ALL PASS; the six audit guards this edit made due were
 re-run green.
+
+## 2026-09-04 - Remembering a finished pane no longer costs half a gigabyte
+
+The background service keeps a tombstone for every persistent pane whose
+program has exited, so you can bring it back later. Each one reserved the full
+2 MB output ring a live pane gets - for a session with no process behind it and
+nothing to put in the ring. At the `max_dead_sessions` ceiling of 256 that is
+half a gigabyte held for scrollback that does not exist, and the T278 cap only
+bounded the number of them, not the cost of each.
+
+Measured on box, with a pre-fix agent and a fixed one built from the same tree
+and started on a private pipe against a seeded 256-tombstone roster: **524.7 MB
+working set before, 13.8 MB after**. So Windows really was charging for those
+pages, which is the question T470's own notes had left open - the arithmetic
+was not an over-estimate of what an untouched commit costs.
+
+The fix is the lazy shape the task recommended. `OutputRing` now separates the
+capacity it is *configured* at from the buffer it has *allocated*: `init`
+takes 4 KB, and `append` grows the buffer by doubling toward capacity before it
+writes. Both of a tombstone's only two writers - a reboot snapshot preload and
+the relaunched child - go through `append`, so neither had to learn anything,
+and eviction still happens exactly where it always did, once the buffer really
+is at capacity. Growth failure under memory pressure is swallowed: the smaller
+ring is still correct, it just evicts sooner, and the read pump cannot fail.
+
+Four `OutputRing` unit tests cover growth, the oversized single append, the
+snapshot preload, and the small-ring case the eviction tests rely on; a
+`SessionTable.materialize` test counts the bytes 256 tombstones actually
+request, so the regression is caught in the lane rather than by re-measuring.
+`scripts\t470-ring-measure.ps1` is the measurement itself, kept because the
+number is the interesting part.
+
+All four floor lanes PASS, P1-P3 ALL PASS, and the three guards this edit made
+due (`holder-volume`, `session-vanished`, `agent-relay-session`) re-ran green,
+plus `session-snapshot-reattach`, `session-relaunch-notify` and
+`agent-session-cap`.

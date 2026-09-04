@@ -373,6 +373,17 @@ fn deadTerminate(_: *anyopaque) void {}
 /// the snapshot; only deep scrollback is lost (§7.3 "v1 honesty").
 pub const OutputRing = struct {
     buf: []u8,
+    /// The size `buf` is allowed to reach. `buf.len <= capacity` always, and the
+    /// ring only evicts once `buf.len == capacity` — growth comes first (T470).
+    ///
+    /// The split exists because a ring is allocated long before it is written to.
+    /// Every tombstone loaded from `sessions.json` is a session with `pid = 0` and
+    /// no child producing output, and each one used to reserve the full 2 MB up
+    /// front: 256 of them (the `max_dead_sessions` worst case) reserved half a
+    /// gigabyte for scrollback that does not exist. Now the reservation is a
+    /// promise rather than an allocation, and the bytes are bought when something
+    /// actually writes — the relaunched child, or a disk-snapshot preload.
+    capacity: usize,
     /// Absolute offset (in the channel's raw stream) of `buf[start]`, i.e. the
     /// oldest byte still retained. `tail_offset - base_offset == len`.
     base_offset: u64 = 0,
@@ -382,9 +393,45 @@ pub const OutputRing = struct {
     start: usize = 0,
     alloc: Allocator,
 
+    /// What a ring costs before anything has been written to it. Small enough
+    /// that a full tombstone table is noise (256 × 4 KB = 1 MB), large enough
+    /// that an ordinary pane's first burst of output does not immediately
+    /// re-allocate. A ring configured smaller than this is simply allocated at
+    /// its configured size, so the tests that drive 4- and 8-byte rings are
+    /// unaffected.
+    pub const initial_bytes: usize = 4096;
+
     pub fn init(alloc: Allocator, capacity: usize) Allocator.Error!OutputRing {
         assert(capacity > 0);
-        return .{ .buf = try alloc.alloc(u8, capacity), .alloc = alloc };
+        const initial = @min(capacity, initial_bytes);
+        return .{
+            .buf = try alloc.alloc(u8, initial),
+            .capacity = capacity,
+            .alloc = alloc,
+        };
+    }
+
+    /// Grow `buf` toward `capacity` so `n` more bytes fit without evicting, if
+    /// there is headroom left. Doubling, so a session that streams steadily pays
+    /// O(log) re-allocations to reach its configured size and then never again.
+    ///
+    /// Allocation failure is deliberately swallowed: the ring we already have is
+    /// valid, it just evicts sooner than the configured capacity promises, which
+    /// is the same lossy-but-correct behavior a full ring has. `append` is called
+    /// from the read pump on every chunk of child output and cannot fail.
+    fn growFor(self: *OutputRing, n: usize) void {
+        if (self.buf.len >= self.capacity) return;
+        const want = self.len +| n;
+        if (want <= self.buf.len) return;
+        var next = self.buf.len;
+        while (next < want and next < self.capacity) next = next *| 2;
+        next = @min(next, self.capacity);
+        const grown = self.alloc.alloc(u8, next) catch return;
+        const copied = self.copyRetained(grown[0..self.len]);
+        assert(copied == self.len);
+        self.alloc.free(self.buf);
+        self.buf = grown;
+        self.start = 0;
     }
 
     pub fn deinit(self: *OutputRing) void {
@@ -403,6 +450,8 @@ pub const OutputRing = struct {
     /// current tail offset (output is append-only and contiguous).
     pub fn append(self: *OutputRing, at: u64, bytes: []const u8) void {
         assert(at == self.tailOffset());
+        // Buy the bytes now that there is something to put in them (T470).
+        self.growFor(bytes.len);
         const cap = self.buf.len;
         // If the incoming chunk alone exceeds capacity, keep only its tail.
         var src = bytes;
@@ -1083,8 +1132,9 @@ pub const SessionTable = struct {
     /// replies `dead(relaunchable)` and `RELAUNCH` can respawn under the recorded
     /// `argv`/`cwd`. Copies `argv`/`cwd`/`title` (owned) and `pinned`; preserves the
     /// original `created_ms`, but sets `last_activity_ms = now_ms` so a just-loaded
-    /// session isn't instantly idle-reaped. Allocates a full `ring_bytes` output ring
-    /// (used once relaunched). Returns null (skips) on a malformed id or one already
+    /// session isn't instantly idle-reaped. The output ring is *configured* at
+    /// `ring_bytes` but allocated small (T470) — a tombstone produces no output, so
+    /// it buys the bytes only when a relaunch or a snapshot preload writes to it. Returns null (skips) on a malformed id or one already
     /// present — idempotent across a double load. Enforces `max_dead_sessions`.
     pub fn materialize(
         self: *SessionTable,
@@ -3009,6 +3059,74 @@ test "OutputRing.endsWith: matches across the wrap, and never past the retained 
     try testing.expect(!ring.endsWith("hik"));
 }
 
+test "OutputRing: a fresh ring costs `initial_bytes`, not its configured capacity (T470)" {
+    const alloc = testing.allocator;
+    var ring = try OutputRing.init(alloc, default_ring_bytes);
+    defer ring.deinit();
+    // The whole point: a session that has produced nothing does not hold 2 MB.
+    try testing.expectEqual(OutputRing.initial_bytes, ring.buf.len);
+    try testing.expectEqual(default_ring_bytes, ring.capacity);
+
+    // A ring configured smaller than the floor is allocated at its own size, so
+    // the eviction tests above still drive genuinely tiny rings.
+    var tiny = try OutputRing.init(alloc, 8);
+    defer tiny.deinit();
+    try testing.expectEqual(@as(usize, 8), tiny.buf.len);
+}
+
+test "OutputRing: grows on write up to capacity, then evicts as before (T470)" {
+    const alloc = testing.allocator;
+    var ring = try OutputRing.init(alloc, 64 * 1024);
+    defer ring.deinit();
+
+    // Steady streaming grows the buffer instead of evicting.
+    const chunk = [_]u8{'x'} ** 4096;
+    var written: u64 = 0;
+    while (written < 64 * 1024) : (written += chunk.len) {
+        ring.append(written, &chunk);
+        try testing.expectEqual(written + chunk.len, ring.tailOffset());
+        // Nothing has been dropped while there was headroom to grow into.
+        try testing.expectEqual(@as(u64, 0), ring.base_offset);
+    }
+    try testing.expectEqual(@as(usize, 64 * 1024), ring.buf.len);
+    try testing.expectEqual(@as(usize, 64 * 1024), ring.len);
+
+    // At capacity the ring behaves exactly as it always did: oldest bytes go.
+    ring.append(ring.tailOffset(), "tail");
+    try testing.expectEqual(@as(usize, 64 * 1024), ring.buf.len);
+    try testing.expectEqual(@as(u64, 4), ring.base_offset);
+    try testing.expect(ring.endsWith("tail"));
+}
+
+test "OutputRing: a single oversized append grows to capacity and keeps its tail (T470)" {
+    const alloc = testing.allocator;
+    var ring = try OutputRing.init(alloc, 1024);
+    defer ring.deinit();
+    // Bigger than the configured capacity: growth happens first, then the ring's
+    // existing "keep only the tail" rule applies against the FULL capacity —
+    // never against the small starting buffer.
+    const big = [_]u8{'a'} ** 4096;
+    ring.append(0, &big);
+    try testing.expectEqual(@as(usize, 1024), ring.buf.len);
+    try testing.expectEqual(@as(usize, 1024), ring.len);
+    try testing.expectEqual(@as(u64, 4096 - 1024), ring.base_offset);
+}
+
+test "OutputRing: a snapshot preload grows the ring to fit it (T470)" {
+    const alloc = testing.allocator;
+    var ring = try OutputRing.init(alloc, default_ring_bytes);
+    defer ring.deinit();
+    // The reboot path (`preloadRingSnapshot`) is one of the two writers a
+    // tombstone ever sees; its scrollback must replay byte-for-byte.
+    const snapshot = [_]u8{'s'} ** (32 * 1024);
+    ring.preload(9000, &snapshot);
+    try testing.expectEqual(@as(u64, 9000), ring.base_offset);
+    try testing.expectEqual(snapshot.len, ring.len);
+    const out = try alloc.alloc(u8, snapshot.len);
+    defer alloc.free(out);
+    try testing.expectEqualSlices(u8, &snapshot, out[0..ring.copyRetained(out)]);
+}
+
 test "appendRestartDivider: exactly one divider, whatever put it there (T1264)" {
     const alloc = testing.allocator;
     var sess: Session = undefined;
@@ -3830,6 +3948,38 @@ test "SessionTable.materialize: re-keys a dead relaunchable session from a recor
     try testing.expect((try table.materialize(.{ .id = "nope" }, 1024, 9000)) == null);
     try testing.expect((try table.materialize(rec, 1024, 9000)) == null);
     try testing.expectEqual(@as(usize, 1), table.count());
+}
+
+test "SessionTable.materialize: a full tombstone table costs kilobytes, not half a gig (T470)" {
+    // The T470 measurement, made a test: `max_dead_sessions` tombstones each
+    // CONFIGURED at the production 2 MB must not each ALLOCATE it. Counted in
+    // bytes actually handed out, so the assertion is about memory, not a field.
+    var counting: std.heap.DebugAllocator(.{ .enable_memory_limit = true }) = .init;
+    defer _ = counting.deinit();
+    const alloc = counting.allocator();
+
+    var prng = std.Random.DefaultPrng.init(0x470);
+    var table = SessionTable.init(alloc, prng.random());
+    defer table.deinit();
+
+    var id_buf: [32]u8 = undefined;
+    var i: usize = 0;
+    while (i < max_dead_sessions) : (i += 1) {
+        Session.renderId(@as(u128, i) + 1, &id_buf);
+        const s = (try table.materialize(
+            .{ .id = id_buf[0..], .created_ms = 1 },
+            default_ring_bytes,
+            9000,
+        )).?;
+        try testing.expectEqual(OutputRing.initial_bytes, s.ring.buf.len);
+        try testing.expectEqual(default_ring_bytes, s.ring.capacity);
+    }
+    try testing.expectEqual(max_dead_sessions, table.deadCount());
+
+    // Eagerly this was 256 × 2 MB = 512 MB of ring alone; the whole table is now
+    // comfortably under 8 MB including every session's metadata and both maps.
+    const total = counting.total_requested_bytes;
+    try testing.expect(total < 8 * 1024 * 1024);
 }
 
 test "SessionStore.loadPersisted materializes + persistMeta keeps relaunchable tombstones" {
