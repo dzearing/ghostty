@@ -1,14 +1,15 @@
 {
     "guard":  "chooser-orphan-badge",
     "script":  "test/win32/chooser-orphan-badge.ps1",
-    "generated":  "2026-09-03T22:05:39-07:00",
-    "commit":  "38192df6c",
+    "generated":  "2026-09-04T14:59:32-07:00",
+    "commit":  "292118e19",
     "uncommitted":  [
+                        "src/apprt/win32/chooser_sessions.zig",
                         "src/apprt/win32/SessionRoster.zig"
                     ],
     "files":  {
-                  "src/apprt/win32/chooser_sessions.zig":  "de267bf5e49cea23f0e9e304b718a9169038b159bf185318923b522a2fd48b66",
-                  "src/apprt/win32/SessionRoster.zig":  "65a0e6ca0c577b7f91278b3f61b417e2de9851d805c3bfebf12dbb48f4fd4e32",
+                  "src/apprt/win32/chooser_sessions.zig":  "007f347f893f0ac685376f10aa8654e565ea7b3c5bb20036ca129ae7114ffed4",
+                  "src/apprt/win32/SessionRoster.zig":  "00185ae7599f67823a102b566f8a30b9d4d9723aa20b26a363bfb74497bc1a6a",
                   "test/win32/chooser-orphan-badge.ps1":  "94aea913d64668ad537094bdd2dc030259a005617bfc0f931975d3eab9bea5e7",
                   "test/win32/lib/ChooserCursor.ps1":  "07632267956e7b2647f6227181d98c0ca50e8d68556c7e987e1817424d583e74"
               }

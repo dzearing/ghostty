@@ -757,9 +757,11 @@ pub fn aliveCount(self: *const SessionRoster) usize {
     var n: usize = 0;
     for (roster.sessions) |s| {
         if (self.isKilled(s.id)) continue;
-        // One predicate for "can this be attached", shared with the per-session
-        // resume — a tombstone is listed but is not alive.
-        if (chooser_sessions.isResumable(.{ .id = s.id, .alive = s.alive })) n += 1;
+        // One predicate for "is there a live child here", shared with the
+        // Restore All floor — a tombstone is listed, and since T466 it can be
+        // relaunched from the roster, but it is not ALIVE and a topology
+        // rebuilt out of tombstones is not a restore.
+        if (chooser_sessions.hasLiveChild(.{ .id = s.id, .alive = s.alive })) n += 1;
     }
     return n;
 }
@@ -777,6 +779,22 @@ pub fn logOrphans(self: *const SessionRoster, app: *App) void {
         if (r.orphan) n += 1;
     }
     log.info("chooser roster: {d} session(s) not in any window", .{n});
+}
+
+/// Say the T466 affordance out loud, once per adopted roster: how many rows are
+/// dead-but-relaunchable, and therefore carry the `can relaunch` badge and act
+/// on Return. Same reasoning as `logOrphans` — the rows are owner-drawn, so
+/// there is no HWND to read a badge back from — with one difference: this one is
+/// NOT local-only, because a relay machine's roster carries tombstones too and
+/// Return relaunches them over that machine's own transport. Said even at zero,
+/// so a script can assert the mark's ABSENCE as strongly as its presence.
+pub fn logRelaunchable(self: *const SessionRoster, app: *App) void {
+    var rows: [max_rows]VisibleRow = undefined;
+    var n: usize = 0;
+    for (self.visible(app, &rows)) |r| {
+        if (chooser_sessions.rowAction(r.session) == .relaunch) n += 1;
+    }
+    log.info("chooser roster: {d} session(s) can relaunch", .{n});
 }
 
 /// The title of an OPEN pane bound to `id`, or null. Also the answer to "is
@@ -1182,7 +1200,8 @@ fn paintRow(
     const old_label = if (ctx.label_font) |f| w32.SelectObject(hdc, f) else null;
     _ = w32.SetTextColor(hdc, rgb(chrome_theme.textOn(card_bg)));
 
-    var badge_buf: [2]chooser_sessions.Badge = undefined;
+    // Room for 3 (T466): liveness, openness, and the tombstone's `can relaunch`.
+    var badge_buf: [3]chooser_sessions.Badge = undefined;
     var exit_buf: [32]u8 = undefined;
     const run = chooser_sessions.badges(&badge_buf, &exit_buf, row.session, row.open_locally, row.orphan);
 

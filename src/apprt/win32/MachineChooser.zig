@@ -1693,7 +1693,12 @@ pub fn onSessions(app: *App, res: *SessionRoster.Result) void {
             chooser.clampRosterScroll();
             // The T520 oracle rides every adopted local roster, so a refetch
             // after a resume or a pane close re-states the mark's count.
-            if (chooser.roster.state == .loaded) chooser.roster.logOrphans(app);
+            if (chooser.roster.state == .loaded) {
+                chooser.roster.logOrphans(app);
+                // The T466 oracle rides the same adoption: how many rows offer
+                // RELAUNCH rather than Resume.
+                chooser.roster.logRelaunchable(app);
+            }
             chooser.refreshSessions();
             // The session count in the identity subtitle lives in the band
             // (T602) and just changed with the roster.
@@ -3108,6 +3113,15 @@ fn copyResumeName(
 /// window whose pane ATTACHes to that session — the local agent's, or a relay
 /// machine's over its own transport.
 ///
+/// Since T466 that covers the roster's OTHER kind of row too: a
+/// dead-but-relaunchable tombstone RELAUNCHES, which is the same ATTACH over the
+/// same transport (`termio.Remote` applies `session-relaunch` on finding the
+/// target dead — by default a fresh shell in the recorded cwd with a notice
+/// naming the command), and is exactly what launch-time restore already does
+/// with a tombstone leaf. Only the verb differs, so only the logging does.
+/// Before it, Return on such a row said "it can't be resumed" and the roster
+/// listed offers it could not honour.
+///
 /// The chooser produces a target and closes; the attach itself belongs to `App`
 /// (Mac keeps the same separation via `WindowTarget.resumeSession`, and
 /// `MachineChooser.zig` is large enough without owning an attach path).
@@ -3126,11 +3140,20 @@ fn resumeRow(self: *MachineChooser, row: SessionRoster.VisibleRow) void {
         if (self.focusOpenSession(row.session.id)) return;
     }
 
+    // The VERB, for the log oracle the acceptance script reads: the transport
+    // arms below cannot tell a relaunch from a resume, and the user can.
+    switch (chooser_sessions.rowAction(row.session)) {
+        .none => {},
+        .resume_session => log.info("chooser roster: resuming session id={s}", .{row.session.id}),
+        .relaunch => log.info("chooser roster: relaunching session id={s}", .{row.session.id}),
+    }
+
     switch (target) {
         .none => {
-            // A tombstone row: listed (its command and cwd are worth seeing)
-            // but there is no live child to attach to.
-            self.setHint("That session has exited - it can't be resumed.");
+            // A genuinely exited row. `isConnectable` keeps these out of the
+            // roster, so this is a backstop rather than a path the user meets —
+            // a relaunchable tombstone takes the arms below (T466).
+            self.setHint("That session has exited - there's nothing left to open.");
         },
         .local => |sid| {
             var id_buf: [128]u8 = undefined;

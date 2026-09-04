@@ -21803,3 +21803,61 @@ and an OSC 7777 payload and assert the title reads `(question)` while both
 inputs keep saying `needs_input`. The nine audit guards that my test-script and
 `docs/claude/cli.md` edits made due were re-run green; `guard-due.ps1 check`
 exits 0 with only the three pre-existing advisory rows.
+
+## 2026-09-04 - A finished session in the chooser can be reopened instead of just looked at (T466)
+
+The machine chooser lists the sessions on a machine, and some of them have
+already finished - the program exited, or the box rebooted - but the terminal
+keeps them because the folder and the command they were running are worth
+seeing. Pressing Return on one of those answered "That session has exited - it
+can't be resumed." So the list carried rows that looked exactly like offers and
+were not.
+
+They are offers now. Return on such a row opens a window the same way a live row
+does: a fresh prompt in the session's recorded folder, with a line naming the
+command that used to be running there, after which the old session is retired.
+The row says which kind it is before you press anything - the exit label now has
+a `can relaunch` badge beside it.
+
+Almost nothing new had to be built, which is what settled the design question
+the card carried (hide the rows, or honour them - filed as **D91**, built on the
+recommended option meanwhile). Reviving a dead session is an ATTACH like any
+other: the agent materializes it from disk, and `termio.Remote` applies
+`session-relaunch` on finding the target dead - by default `restore`, which is
+the fresh-shell-plus-notice behavior above and deliberately does NOT re-run the
+recorded command (T230). Launch-time restore has done exactly this with a
+tombstone leaf since T89g. Only the chooser refused, in one predicate.
+
+So the change is small and the invariant is the point: `rowAction` is now the
+single place that names a row's verb, and **listed <=> actionable** - the set
+`isConnectable` lists is exactly the set `rowAction` acts on, asserted over the
+whole domain rather than stated in a comment. `isResumable` became
+`hasLiveChild`, because with the verb split out its only remaining job is
+"Restore All"'s two-live-sessions floor, which must keep ignoring tombstones: a
+topology rebuilt out of dead rows is not a restore.
+
+The badge is read back through a log line (`SessionRoster.logRelaunchable`), for
+the same reason the T520 orphan mark is: the rows are owner-drawn, so there is
+no HWND to read a badge from. Unlike that one it is not local-only - a relay
+machine's roster carries tombstones too, and Return relaunches them over that
+machine's transport.
+
+Validation: `test\win32\chooser-resume.ps1` section 3 was the harness asserting
+the OLD refusal, so it is inverted rather than added to - it builds a real
+tombstone (kill the agent with live sessions, restart it), cross-checks the
+badge count against `ghoztty +sessions --json`, and after Return requires the
+attach, the `relaunching` verb naming the row the cursor was on, the chooser
+dismissing, the tombstone GONE from the agent's roster and one more live session
+than before. Section 4's live-row control stays, reopening the chooser first.
+ALL PASS (32 assertions). Unit tests in `chooser_sessions.zig` cover the verb,
+the listed<=>actionable invariant and the widest badge run (exited + open + can
+relaunch, the third slot the buffer grew for).
+
+Floor: all four lanes PASS, `ipc-p1` (25) / `ipc-p2` (20) / `ipc-p3` (16) ALL
+PASS. Thirteen guards my chooser, test-script and docs edits made due were
+re-run green (the four chooser harnesses and nine audits); `guard-due.ps1 check`
+now reports only the three pre-existing advisory rows.
+
+Mac owes the same change and does not have it: its chooser still refuses
+(`MachineChooserView.swift:167-168`), and its C API omits `relaunchable` (T322)
+so these rows may not even be listed there. Filed as **T1339**.

@@ -263,8 +263,21 @@ From there:
   it, and Return opens a window here whose pane **ATTACHes** to that session
   (the process keeps running on its own machine; only the viewer is local). A
   session already open in one of your panes is focused instead of attached
-  twice. Dead-but-relaunchable rows are listed — their recorded command is worth
-  seeing — but cannot be resumed; reviving one is a RELAUNCH, a different verb.
+  twice.
+- **Relaunch one** — the same key on a **dead-but-relaunchable** row (T466).
+  Those rows are listed because their recorded command and cwd are worth seeing,
+  and since T466 they are also actionable: Return opens a window the same way,
+  over the same ATTACH, and `termio.Remote` applies **`session-relaunch`** on
+  finding the target dead — by default `restore`, a fresh shell in the recorded
+  cwd with a notice naming the command it did **not** re-run (T230), after which
+  the tombstone is retired. It is the same thing launch-time restore does with a
+  tombstone leaf; only the verb differs, and the row says which it is: the exit
+  label plus a **`can relaunch`** badge. Before T466 Return answered "it can't be
+  resumed", so the roster listed offers it would not honour. `rowAction`
+  (`chooser_sessions.zig`) is the one place that names the verb, and the
+  invariant it keeps is **listed ⇔ actionable**: `isConnectable` decides what is
+  listed, and every listed row acts. Mac still refuses the relaunch
+  (`MachineChooserView.swift:167-168`) and owes the same change (T1339).
 - **Restore All** — rebuilds the machine's *whole* window/tab/split topology
   here, every pane attached to its still-running session. The button appears
   only when the selected machine has **two or more live sessions**: with one
