@@ -5961,7 +5961,11 @@ fn savePlacement(self: *Window, maximized: bool) void {
     // transition), so both stores are written in the same breath: manifest
     // FIRST, placement second — a crash between the two writes then leaves
     // only the store restore does not read stale.
-    if (self.app.config.@"session-persistence") self.app.syncSessionLayout();
+    // T412: `.reuse` — a drag moved the FRAME, not the content, and this call
+    // is synchronous on the UI thread at the end of every gesture. Re-dumping
+    // eight busy panes' screens here measured 991 ms, which is the drag
+    // visibly sticking when the user lets go.
+    if (self.app.config.@"session-persistence") self.app.syncSessionLayout(.reuse);
     window_memory.save(self.app.core_app.alloc, .{
         .width = w,
         .height = h,
@@ -7600,7 +7604,9 @@ pub fn windowWndProc(
             // to it; nothing is ending, so there is nothing to flush and
             // certainly nothing to exit.
             if (wparam == 0) return 0;
-            window.app.syncSessionLayout();
+            // The last write before the session ends, so the screens must be
+            // current (T412) — this is what a post-reboot restore paints.
+            window.app.syncSessionLayout(.fresh);
 
             // T1204: when this is the RESTART MANAGER closing us for an
             // installer, somebody is WAITING on this process to end — and an

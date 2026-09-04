@@ -480,6 +480,12 @@ test {
     // same no-OS-imports deal — it is arithmetic over a cursor and a clock.
     _ = @import("apprt/win32/layout_refresh.zig");
 
+    // What one of those syncs COST, and whether it crossed the frame budget
+    // (T412), same no-OS-imports deal — arithmetic over three durations. The
+    // budget it owns is what `test\win32\layout-capture-cost.ps1` asserts
+    // against on box.
+    _ = @import("apprt/win32/layout_cost.zig");
+
     // Pure win32 agent-owned layout blobs — one window in and out of the
     // SET_LAYOUT/GET_LAYOUTS wire shape (T334), same no-OS-imports deal (its
     // only non-std import is `remote/protocol.zig`, which builds in every lane).

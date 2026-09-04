@@ -1941,6 +1941,23 @@ $GuardTable = @(
             'test\win32\session-layout-preserve.ps1'
         )
     },
+    # What a layout sync COSTS the UI thread (T412). The cost is paid on a real
+    # box with real panes under real output pressure, so no unit lane can see
+    # it: eight busy panes measured 991 ms per capture before the reuse rule,
+    # and the only thing standing between that and a regression is this harness
+    # actually being run. The row covers the cost/budget module and the script;
+    # App.zig is deliberately NOT here (it moves daily for unrelated reasons and
+    # would leave a multi-minute GUI run due every turn - the same call the
+    # session-layout-preserve row above makes).
+    [pscustomobject]@{
+        Name   = 'layout-capture-cost'
+        Script = 'test\win32\layout-capture-cost.ps1'
+        Stamp  = 'test\win32\layout-capture-cost.stamp.json'
+        Covers = @(
+            'src\apprt\win32\layout_cost.zig',
+            'test\win32\layout-capture-cost.ps1'
+        )
+    },
     # The deferred launch restore (T976): the retry only ever runs on a launch
     # that found NO agent within its spawn deadline, which no P1-P3 floor run
     # produces - the floor always reaches a healthy agent first. The row covers

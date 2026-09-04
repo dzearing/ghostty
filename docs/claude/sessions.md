@@ -203,6 +203,23 @@ tail and the repaint of it), which is the duplication section D of
 arms of that script (a marker planted before the FIRST kill must still be
 readable after the third).
 
+**How fresh that persisted screen is, and why not fresher** (T922 + T412). The
+manifest is rewritten by two different kinds of trigger and they no longer cost
+the same. A **topology or frame** change — a tab, a split, a rename, a banner, a
+window drag — writes the file but CARRIES the panes' last screens forward
+(`App.ScreenCapture.reuse`, cached in `Surface.last_snapshot`); a pane with none
+yet still captures fresh, so reuse can never mean "restores blank". Only the
+**T922 refresh tick**, which waits for the panes to go quiet first (2 s poll,
+30 s ceiling), and the **quit / `WM_ENDSESSION` flush** re-dump. The split exists
+because a dump takes each pane's `renderer_state.mutex` and the IO thread holds
+it while feeding output: with eight panes printing, one capture measured **991
+ms on the UI thread**, so every window drag ended in a second of frozen window.
+It is now 0.14 ms. The consequence to know when reading a restored pane: its
+screen is as of the last quiet moment, up to 30 s old for a pane that never goes
+quiet — not as of the last time a window moved. Measured by
+`test/win32/layout-capture-cost.ps1`; the budget lives in
+`src/apprt/win32/layout_cost.zig`.
+
 The agent owns the PTYs, keeps a per-session output ring (2 MB default;
 snapshotted to disk for reboot scrollback), persists session metadata to
 `sessions.json`, and is packaged as a per-user LaunchAgent so it comes back

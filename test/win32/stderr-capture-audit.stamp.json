@@ -1,10 +1,10 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-03T17:39:00-07:00",
-    "commit":  "bbf148494",
+    "generated":  "2026-09-03T18:33:23-07:00",
+    "commit":  "2c79f4a2c",
     "uncommitted":  [
-                        "test/win32/log-append.ps1"
+                        "test/win32/layout-capture-cost.ps1"
                     ],
     "files":  {
                   "docs/claude/testing.md":  "353e090f48ab5d8f8eee4042ac2689134b9f082800c4a067d625af97eec7f2c7",
@@ -151,6 +151,7 @@
                   "test/win32/launch-preflight-audit.ps1":  "474a31cc4abb0fc92c75e577bb81e1b5a6e9ff9e6548f2438d6b0fd5eead2178",
                   "test/win32/layout-blob-cross-lineage.ps1":  "87f15d32d375a5262334a59d3e8a0f7f37f8d8647c2000686f532c7df1417324",
                   "test/win32/layout-blobs.ps1":  "d91f5b4afad56f13d8fba4d6f00abf44539b9a5e93afadd26acaec53c5413b75",
+                  "test/win32/layout-capture-cost.ps1":  "c83936ffeb9aa3bbf473771fc8e1902ee5a3b8bf8cf693c02e1854136bc4e73d",
                   "test/win32/lib/ApplierSandbox.ps1":  "82870ff2c01dd3d3e36b1b1f8ff7ed7359059245db8e5d88ac9e30838e177bd8",
                   "test/win32/lib/AssertedNothingAudit.ps1":  "1d6653930bb345709b81aa0c6bc480d8a7c09a28e7efb32f85eace39eda26dc3",
                   "test/win32/lib/BodyCompleteAudit.ps1":  "5adfbff59b4fe5cd317adfdafd798630016f623a4cc94bf5c481544b6c3cd042",

@@ -176,6 +176,22 @@ dim_overlay: ?*DimOverlay = null,
 banner_overlay: ?*BannerOverlay = null,
 banner_text: ?[:0]u8 = null,
 
+/// The last WP-D3 screen snapshot this pane recorded (T412), base64'd exactly
+/// as the manifest carries it, plus the agent-stream offset it reflects. Owned
+/// by the app allocator; replaced by every FULL layout capture and freed here.
+///
+/// It exists because dumping the screen is by far the most expensive part of a
+/// layout sync — it takes `renderer_state.mutex`, which the IO thread holds
+/// while feeding output, so eight busy panes measured **991 ms** on this box —
+/// and most syncs do not need a fresh one. A window drag, a new tab, a rename:
+/// the topology moved, the content did not. Those reuse this, and only the
+/// T922 refresh (which deliberately waits for the panes to go quiet) and the
+/// quit/shutdown flush pay for a re-dump. A pane with none yet — one created
+/// since the last full capture — still captures fresh, so reuse can never mean
+/// "restores blank".
+last_snapshot: ?[]const u8 = null,
+last_snapshot_offset: ?u64 = null,
+
 /// Read-only badge (T445): the corner card that marks this pane as
 /// read-only. Created lazily the first time the mode is entered — a pane
 /// that never goes read-only never pays for a popup — and kept afterwards,
@@ -1002,6 +1018,12 @@ pub fn deinit(self: *Surface) void {
     if (self.banner_text) |t| {
         self.app.core_app.alloc.free(t);
         self.banner_text = null;
+    }
+
+    // T412: the cached screen snapshot dies with the pane it describes.
+    if (self.last_snapshot) |s| {
+        self.app.core_app.alloc.free(s);
+        self.last_snapshot = null;
     }
 
     // Same for the read-only badge (T445).

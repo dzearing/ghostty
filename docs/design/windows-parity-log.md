@@ -20807,3 +20807,59 @@ entire diff left every acceptance harness reading as current.
 
 Evidence: floor lanes lib/none/win32/agent all PASS; P1-P3 ALL PASS (25/20/16);
 negative control observed red, restored, re-run green.
+
+## 2026-09-03 - letting go of a window edge no longer freezes it for a second (T412)
+
+T412 asked for a measurement: what does the per-pane screen dump T109 put into
+every layout sync actually cost? The card's premise was already stale - it
+assumed a window drag re-armed the 250 ms debounce over and over, and T220 had
+moved the frame path off that debounce months earlier - so the question narrowed
+rather than went away. One synchronous whole-app capture at the end of every
+gesture, on the thread that has to repaint.
+
+Measured, six real drag gestures per arm, on box: two panes idle 13.9 ms, eight
+panes idle 19.1 ms, and eight panes printing continuously **1001 ms**, mean 593
+ms. Almost none of it is the dump - the flooded arm encodes twice the bytes of
+the idle one and costs ninety-seven times as much. It is lock wait:
+`sessionSnapshot` takes each pane's `renderer_state.mutex` and the IO thread
+holds it while feeding output. So a user with a build running in a few panes
+paid a second of frozen window every time they let go of an edge, and again on
+the T922 refresh's timer.
+
+The fix is the one the card proposed: make the snapshot conditional on the
+TRIGGER. `App.ScreenCapture` is `.fresh` or `.reuse`. A drag, a tab, a split, a
+rename, a banner move the TOPOLOGY and carry each pane's last screen forward
+(`Surface.last_snapshot`); only the T922 refresh - which waits for the panes to
+go quiet before it asks - and the quit / `WM_ENDSESSION` flush re-dump. The
+snapshot is never DROPPED on a frame sync, only carried, and a pane with nothing
+cached still captures fresh, so reuse can never mean "restores blank". Eight
+flooded panes now cost 8.7 ms per sync, 0.14 ms of it capture.
+
+The measurement is kept rather than reported. `layout_cost.zig` owns the sample
+and the one-frame budget (unit tested); `App.reportLayoutCost` emits a
+machine-readable line per sync at **debug** - the harness channel, and never in
+a release log - and at **info** only when a sync missed the budget, so a field
+report of "dragging hitches" carries its own number and a healthy app writes
+nothing. `test\win32\layout-capture-cost.ps1` drives the real
+ENTERSIZEMOVE/EXITSIZEMOVE path at 2/3/8 panes, idle and flooded, and section F
+asserts that no drag-triggered sync re-dumped - the fix stated as a measurement
+rather than a claim. Its flood control reads a pane back and requires the
+flood's own text on screen, which matters more AFTER the fix than before it: a
+reused snapshot's byte count no longer says anything about how busy the panes
+were, so without that control a flood that failed to start would have measured a
+second idle arm and made the fix look better than it is.
+
+`test-reach-audit.ps1` earned its keep on the way past: `layout_cost.zig` had
+tests that the win32 lane never ran, and the lane was green anyway.
+
+Filed: T1311 - the T922 refresh's 30-second ceiling means a pane that never goes
+quiet still buys one `.fresh` capture at the flooded price every 30 s. That
+ceiling is not removable (a permanently-busy pane must still get its screen
+recorded for D78), so the fix has to be on the cost side.
+
+Evidence: floor lanes lib/none/win32/agent all PASS; P1-P3 ALL PASS (25/20/16);
+`layout-capture-cost.ps1` ALL PASS (16), and the same script scored the 1001 ms
+red before the fix; `session-layout-geometry-race.ps1` (23) and
+`session-snapshot-reattach.ps1` (33) green, so neither T220's write ordering nor
+the WP-D3 restore path moved; every harness `guard-due` named due over these
+edits re-run and re-stamped.

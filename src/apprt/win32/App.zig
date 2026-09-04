@@ -61,6 +61,7 @@ const tray_notify = @import("tray_notify.zig");
 const orphan_notify = @import("orphan_notify.zig");
 const session_layout = @import("session_layout.zig");
 const layout_refresh = @import("layout_refresh.zig");
+const layout_cost = @import("layout_cost.zig");
 const layout_blobs = @import("layout_blobs.zig");
 const restore_frame = @import("restore_frame.zig");
 const window_placement = @import("window_placement.zig");
@@ -1726,7 +1727,9 @@ pub fn terminate(self: *App) void {
     // T976: nor a deferred restore — a window built mid-teardown would be one
     // the quit path has already walked past.
     self.cancelRestoreRetry();
-    self.syncSessionLayout();
+    // The authoritative last write before the app goes away, so the screens
+    // it records must be the ones the user was actually looking at (T412).
+    self.syncSessionLayout(.fresh);
 
     if (self.update_latest_ver) |v| {
         self.core_app.alloc.free(v);
@@ -1969,13 +1972,20 @@ fn tickLayoutRefresh(self: *App) void {
 
     self.layout_refresh_captured = now;
     self.layout_refresh_last_write_ms = ms;
-    self.syncSessionLayout();
+    // Re-dumping the screens IS this tick's job, and `decide` has already
+    // waited for the panes to go quiet — so it pays the idle price (T412).
+    self.syncSessionLayout(.fresh);
 }
 
 /// Capture the live window/tab/split topology and atomically persist it to the
 /// session-layout manifest (T89f). Best-effort. When persistence is off the
 /// stale manifest is deleted so a later launch never restores it.
-pub fn syncSessionLayout(self: *App) void {
+///
+/// `screens` says whether the panes' SCREENS are re-dumped or carried forward
+/// (T412) — see `ScreenCapture`. Every caller whose trigger is a topology or
+/// frame change passes `.reuse`; only the T922 refresh and the quit/shutdown
+/// flush pay for `.fresh`.
+pub fn syncSessionLayout(self: *App, screens: ScreenCapture) void {
     const gpa = self.core_app.alloc;
     if (!self.config.@"session-persistence") {
         session_layout.clear(gpa);
@@ -1995,10 +2005,24 @@ pub fn syncSessionLayout(self: *App) void {
     var arena_state = std.heap.ArenaAllocator.init(gpa);
     defer arena_state.deinit();
     var pending = false;
-    const captured = self.captureSessionLayout(arena_state.allocator(), &pending) catch |err| {
+    // T412: this whole function runs on the UI thread, and the capture below
+    // takes every pane's renderer mutex. Measure it — a drag end and the T922
+    // refresh both land here, so a cost nobody watches is a stutter nobody can
+    // attribute. `Timer.start` cannot fail on a platform with a monotonic
+    // clock; a box without one simply records zeros rather than losing the sync.
+    var cost: layout_cost.Sample = .{ .fresh_screens = screens == .fresh };
+    var timer: ?std.time.Timer = std.time.Timer.start() catch null;
+    const captured = self.captureSessionLayout(
+        arena_state.allocator(),
+        &pending,
+        &cost.snapshot_bytes,
+        screens,
+    ) catch |err| {
         log.warn("session-layout capture failed err={}", .{err});
         return;
     };
+    cost.panes = captured.paneCount();
+    if (timer) |*t| cost.capture_us = t.lap() / std.time.ns_per_us;
     // T590: a wholesale rewrite must not erase the windows the launch restore
     // could not adjudicate (agent unspawnable, probe never landed) — re-read
     // their on-disk entries and carry them forward. `carried_parsed` owns the
@@ -2022,12 +2046,15 @@ pub fn syncSessionLayout(self: *App) void {
         };
     }
     const file: session_layout.File = .{ .windows = windows };
-    _ = session_layout.writeIfChanged(gpa, file, &self.layout_body_id);
+    cost.wrote = session_layout.writeIfChanged(gpa, file, &self.layout_body_id);
+    if (timer) |*t| cost.write_us = t.lap() / std.time.ns_per_us;
     // The blob push is NOT gated on that write. It reconciles against what this
     // process has already pushed, so an unchanged topology costs nothing — but
     // it is also how a re-established agent link gets the whole set back, and
     // that recovery must not wait for the layout to happen to change.
     self.pushLayoutBlobs(file);
+    if (timer) |*t| cost.push_us = t.lap() / std.time.ns_per_us;
+    self.reportLayoutCost(cost);
 
     // If an agent-backed pane hasn't published its session id yet, the manifest
     // just written has a null session_id for it (not re-attachable). Re-arm a
@@ -2039,6 +2066,37 @@ pub fn syncSessionLayout(self: *App) void {
             _ = w32.SetTimer(hwnd, LAYOUT_SYNC_TIMER_ID, LAYOUT_SYNC_RETRY_MS, null);
     } else {
         self.layout_sid_retries = 0;
+    }
+}
+
+/// Emit what the sync just cost (T412).
+///
+/// Two levels on purpose. **Debug** carries every sync, which is what an
+/// on-box measurement reads (`test\win32\layout-capture-cost.ps1`) — a Debug
+/// build logs to stderr, and the debug level never reaches the file sink, so
+/// this cannot grow a user's `ghoztty.log`. **Info** carries only the syncs
+/// that missed the frame budget, so a field report of "dragging the window
+/// hitches" has the number in the log the user already has, and a healthy app
+/// still writes nothing. The shape is `key=value` throughout so a harness can
+/// parse it without a format the prose would drift from.
+fn reportLayoutCost(self: *App, cost: layout_cost.Sample) void {
+    _ = self;
+    const fmt = "session-layout sync total_us={d} capture_us={d} write_us={d} " ++
+        "push_us={d} panes={d} snapshot_bytes={d} wrote={} fresh_screens={}";
+    const args = .{
+        cost.totalUs(),
+        cost.capture_us,
+        cost.write_us,
+        cost.push_us,
+        cost.panes,
+        cost.snapshot_bytes,
+        cost.wrote,
+        cost.fresh_screens,
+    };
+    if (cost.overBudget()) {
+        log.info(fmt ++ " OVER-BUDGET", args);
+    } else {
+        log.debug(fmt, args);
     }
 }
 
@@ -2262,13 +2320,14 @@ fn captureLeaf(
     arena: Allocator,
     surface: *Surface,
     budget: *session_layout.SnapshotBudget,
+    screens: ScreenCapture,
 ) !session_layout.Leaf {
     const sid: ?[]const u8 = if (surface.core_surface_ready)
         surface.core_surface.remoteSessionId()
     else
         null;
     const ipc_name = if (surface.pane_view) |pv| self.ipcNameOf(.{ .pane = pv }) else null;
-    const snap = try captureLeafSnapshot(arena, surface, budget);
+    const snap = try self.captureLeafSnapshot(arena, surface, budget, screens);
     return .{
         .session_id = if (sid) |s| try arena.dupe(u8, s) else null,
         .title = if (surface.getTitle()) |t| try arena.dupe(u8, t) else null,
@@ -2291,6 +2350,26 @@ fn captureLeaf(
 /// null ⇒ this pane records no snapshot and restores the pre-T109 way.
 const CapturedSnapshot = struct { data: ?[]const u8 = null, offset: ?u64 = null };
 
+/// Whether a layout capture must re-dump each pane's SCREEN, or may carry
+/// forward what the pane last recorded (T412).
+///
+/// The screen dump is the expensive half of a sync and it is paid on the UI
+/// thread: measured on this box, eight panes printing continuously cost
+/// **991 ms** per capture, because `sessionSnapshot` takes each pane's
+/// `renderer_state.mutex` and the IO thread holds it while feeding output. Most
+/// triggers do not need a fresh one — a window drag (T220), a tab, a split, a
+/// rename, a banner all move the TOPOLOGY and leave the content alone — so they
+/// ask for `.reuse` and the sync costs milliseconds instead.
+///
+/// `.fresh` belongs to the two triggers whose subject IS the screen: the T922
+/// refresh, which deliberately waits for the panes to go quiet before it asks
+/// (so it pays the idle price, not the flooded one), and the quit / end-session
+/// flush, which is the authoritative last write before the app goes away.
+///
+/// Reuse is never "restore blank": a pane with nothing cached — one created
+/// since the last full capture — falls through and captures fresh.
+const ScreenCapture = enum { fresh, reuse };
+
 /// The WP-D3 snapshot pair for one terminal leaf (T109): the pane's structured
 /// VT screen repaint, base64'd into `arena`, plus the absolute agent-stream byte
 /// offset it reflects.
@@ -2302,12 +2381,28 @@ const CapturedSnapshot = struct { data: ?[]const u8 = null, offset: ?u64 = null 
 /// refuses the pane: a snapshot is an optimization on top of a restore that
 /// already works, so it must never be able to fail the capture it rides in.
 fn captureLeafSnapshot(
+    self: *App,
     arena: Allocator,
     surface: *Surface,
     budget: *session_layout.SnapshotBudget,
+    screens: ScreenCapture,
 ) !CapturedSnapshot {
     const none: CapturedSnapshot = .{};
     if (!surface.core_surface_ready) return none;
+
+    // T412: reuse what this pane last recorded, when the trigger says the
+    // content cannot have changed and there IS something to reuse. This is the
+    // whole saving — see `Surface.last_snapshot`.
+    if (screens == .reuse) {
+        if (surface.last_snapshot) |cached| {
+            if (!budget.take(cached.len)) return none;
+            return .{
+                .data = try arena.dupe(u8, cached),
+                .offset = surface.last_snapshot_offset,
+            };
+        }
+    }
+
     const snap = surface.core_surface.sessionSnapshot(arena) catch |err| {
         log.warn("session-layout: screen snapshot failed err={}", .{err});
         return none;
@@ -2322,7 +2417,20 @@ fn captureLeafSnapshot(
         return none;
     }
     const buf = try arena.alloc(u8, encoded_len);
-    return .{ .data = encoder.encode(buf, snap.data), .offset = snap.byte_offset };
+    const encoded = encoder.encode(buf, snap.data);
+
+    // Remember it for the next reuse. The arena copy dies with this capture, so
+    // the cache owns its own gpa-allocated bytes. A failed dupe simply leaves
+    // the previous cache in place: this is an optimization, and it must never
+    // be able to fail the capture it rides in.
+    const gpa = self.core_app.alloc;
+    if (gpa.dupe(u8, encoded)) |kept| {
+        if (surface.last_snapshot) |old| gpa.free(old);
+        surface.last_snapshot = kept;
+        surface.last_snapshot_offset = snap.byte_offset;
+    } else |_| {}
+
+    return .{ .data = encoded, .offset = snap.byte_offset };
 }
 
 /// Capture one VIEWER leaf's restore metadata (T90h). A viewer owns no agent
@@ -2371,18 +2479,30 @@ fn captureTabTitle(arena: Allocator, win: *Window, ti: usize) !?[]const u8 {
 /// path (T56), not local re-attach — and quick terminals (not restorable). The
 /// flat `nodes` array is a 1:1 copy of the `SplitTree` node array, so child
 /// handles carry over as indices unchanged. Caller frees `arena` after writing.
-fn captureSessionLayout(self: *App, arena: Allocator, pending: *bool) !session_layout.File {
+fn captureSessionLayout(
+    self: *App,
+    arena: Allocator,
+    pending: *bool,
+    /// T412: where the snapshot bytes this capture spent are reported, for the
+    /// cost line. Optional because only the debounced sync measures itself —
+    /// the recovery path has one caller and no budget of its own to read.
+    budget_used: ?*usize,
+    screens: ScreenCapture,
+) !session_layout.File {
     var windows: std.ArrayList(session_layout.Window) = .empty;
     // T109: one budget for the WHOLE file, spent in tree order, so the encoded
     // snapshots can never crowd the topology past `max_file_bytes` (which would
     // fail the next load outright and cost the user every window).
     var snapshot_budget: session_layout.SnapshotBudget = .{};
+    defer if (budget_used) |out| {
+        out.* = snapshot_budget.used;
+    };
     for (self.windows.items, 0..) |win, wi| {
         if (win.is_quick_terminal) continue;
         if (win.remote_dialed != null) continue;
         if (win.tab_count == 0) continue;
 
-        try windows.append(arena, try self.captureWindow(arena, win, wi, &snapshot_budget, pending));
+        try windows.append(arena, try self.captureWindow(arena, win, wi, &snapshot_budget, pending, screens));
     }
     return .{ .windows = try windows.toOwnedSlice(arena) };
 }
@@ -2403,6 +2523,7 @@ fn captureWindow(
     wi: usize,
     snapshot_budget: *session_layout.SnapshotBudget,
     pending: *bool,
+    screens: ScreenCapture,
 ) !session_layout.Window {
     const tabs = try arena.alloc(session_layout.Tab, win.tab_count);
     for (0..win.tab_count) |ti| {
@@ -2417,7 +2538,7 @@ fn captureWindow(
                     const surface = pane.surface() orelse break :leaf .{
                         .leaf = try captureViewerLeaf(self, arena, pane),
                     };
-                    const leaf = try self.captureLeaf(arena, surface, snapshot_budget);
+                    const leaf = try self.captureLeaf(arena, surface, snapshot_budget, screens);
                     // No id yet but this leaf is EXPECTED to be agent-backed
                     // (its window rides the local agent, or the surface's
                     // remote backend is already wired) ⇒ the OPEN is still in
@@ -2489,7 +2610,7 @@ pub fn captureOneWindow(
 ) !session_layout.Window {
     var budget: session_layout.SnapshotBudget = .{};
     var pending = false;
-    return self.captureWindow(arena, win, index, &budget, &pending);
+    return self.captureWindow(arena, win, index, &budget, &pending, .fresh);
 }
 
 /// Bounded wall-clock budget for the launch-time liveness probe (`LIST_SESSIONS`
@@ -4712,7 +4833,7 @@ fn recoverLocalAgentInPlace(self: *App) ?usize {
     // Capture BEFORE re-dialing: the live tree is the source of truth, and the
     // debounced manifest on disk may be up to a full debounce stale.
     var pending = false;
-    const captured = self.captureSessionLayout(arena, &pending) catch |err| {
+    const captured = self.captureSessionLayout(arena, &pending, null, .fresh) catch |err| {
         log.warn("in-place recovery: layout capture failed err={}", .{err});
         return null;
     };
@@ -9553,7 +9674,9 @@ fn msgWndProc(
     // layout/frame/title mutation settled — capture the topology and persist.
     if (msg == w32.WM_TIMER and wparam == LAYOUT_SYNC_TIMER_ID) {
         _ = w32.KillTimer(hwnd, LAYOUT_SYNC_TIMER_ID);
-        app.syncSessionLayout();
+        // Every trigger that arms this timer moved the TOPOLOGY, not the
+        // content, so the screens carry forward (T412).
+        app.syncSessionLayout(.reuse);
         return 0;
     }
 

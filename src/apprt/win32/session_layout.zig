@@ -271,6 +271,24 @@ pub const Window = struct {
 pub const File = struct {
     version: u32 = format_version,
     windows: []const Window = &.{},
+
+    /// How many PANES this manifest describes — every leaf in every tab of
+    /// every window, terminals and viewers alike.
+    ///
+    /// The cost of a capture scales with this number and with nothing else in
+    /// the file (T412), so it is what a cost sample has to be read against: 3
+    /// ms is fine for eight panes and alarming for one.
+    pub fn paneCount(self: File) usize {
+        var n: usize = 0;
+        for (self.windows) |win| {
+            for (win.tabs) |tab| {
+                for (tab.nodes) |node| if (node.isLeaf()) {
+                    n += 1;
+                };
+            }
+        }
+        return n;
+    }
 };
 
 /// A parsed file whose backing memory (including every string) is owned by the
@@ -879,6 +897,31 @@ test "T109: snapshot budget rejects an oversized pane and stops at the file ceil
 
     // The ceiling leaves room for the topology itself.
     try testing.expect(screen_snapshot_total_bytes < max_file_bytes);
+}
+
+test "T412: paneCount counts every leaf and no split, across tabs and windows" {
+    const leaf: Node = .{ .leaf = .{ .pane_id = "p" } };
+    const split: Node = .{ .split = .{ .layout = "horizontal", .ratio = 0.5, .left = 1, .right = 2 } };
+
+    // An empty file, and a file whose windows have no tabs, both cost nothing —
+    // the number has to be honest at zero or it cannot be read as a rate.
+    try testing.expectEqual(@as(usize, 0), (File{}).paneCount());
+    try testing.expectEqual(@as(usize, 0), (File{ .windows = &.{.{ .id = "w" }} }).paneCount());
+
+    // One window, two tabs: a 3-pane tab (root split + two leaves is 3 nodes,
+    // 2 of them leaves) and a single-pane tab.
+    const one: File = .{ .windows = &.{.{ .id = "w0", .tabs = &.{
+        .{ .nodes = &.{ split, leaf, leaf } },
+        .{ .nodes = &.{leaf} },
+    } }} };
+    try testing.expectEqual(@as(usize, 3), one.paneCount());
+
+    // A second window adds its own leaves rather than replacing the count.
+    const two: File = .{ .windows = &.{
+        .{ .id = "w0", .tabs = &.{.{ .nodes = &.{ split, leaf, leaf } }} },
+        .{ .id = "w1", .tabs = &.{.{ .nodes = &.{leaf} }} },
+    } };
+    try testing.expectEqual(@as(usize, 3), two.paneCount());
 }
 
 test "serialize an empty window set is a present empty array" {
