@@ -366,6 +366,10 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/viewer_toc_layout.zig");
 
+    // Pure win32 diff-pane file tree — git's flat list of changed paths turned
+    // into the side panel's nested rows (T464), same no-OS-imports deal.
+    _ = @import("apprt/win32/viewer_file_tree.zig");
+
     // Pure win32 viewer chrome-preference parse/format — the persisted
     // side-panel card width (T160), same no-OS-imports deal.
     _ = @import("apprt/win32/viewer_prefs.zig");

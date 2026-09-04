@@ -78,11 +78,16 @@ pub const danger_base: Rgb = .{ .r = 0xC4, .g = 0x2B, .b = 0x1C };
 /// Hoisted here in T367 because the connection pill needed the very colors the
 /// chooser's session badges had already picked, and a second private copy of
 /// "what green means" is the silent divergence this module exists to stop.
-pub const Tone = enum { neutral, good, warn, danger };
+pub const Tone = enum { neutral, good, info, warn, danger };
 
 /// Mac's `.green` / `.orange` / `.red` as BASES — never drawn raw. `toneInk`
 /// clamps each to the surface it is drawn on.
 pub const good_base: Rgb = .{ .r = 0x34, .g = 0xC7, .b = 0x59 };
+/// The fourth meaning, added in T464 for a diff row's rename/copy badge: a
+/// state that is neither good nor a warning but is still not "nothing to say".
+/// Apple's system blue, the color Mac's own diff badge uses for the same two
+/// git statuses.
+pub const info_base: Rgb = .{ .r = 0x0A, .g = 0x84, .b = 0xFF };
 pub const warn_base: Rgb = .{ .r = 0xFF, .g = 0x95, .b = 0x00 };
 /// Deliberately NOT `danger_base` above: that one is Windows' close-button red,
 /// a CONTROL color, and this one is Apple's status red that the chooser badges
@@ -94,6 +99,7 @@ pub fn toneInk(surface: Rgb, tone: Tone) Rgb {
     return switch (tone) {
         .neutral => textSecondaryOn(surface),
         .good => accentOn(surface, good_base),
+        .info => accentOn(surface, info_base),
         .warn => accentOn(surface, warn_base),
         .danger => accentOn(surface, status_danger_base),
     };

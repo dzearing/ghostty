@@ -1,10 +1,10 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-09-04T10:10:10-07:00",
-    "commit":  "091fc5c82",
+    "generated":  "2026-09-04T11:46:20-07:00",
+    "commit":  "bb610d3c7",
     "uncommitted":  [
-                        "test/win32/floor-lane-commit-headroom.ps1"
+                        "test/win32/viewer-diff-tree.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -259,6 +259,7 @@
                   "test/win32/verify-release-clean.ps1":  "756fee5cbd0b8a1ad8d3d01987658087b62efb6dd8327de4cb9aef10d5107dd3",
                   "test/win32/viewer-composer.ps1":  "a6ee294b66489b65bad593890320052fe11c6677643cff68d4596719fb3e292f",
                   "test/win32/viewer-diff.ps1":  "15b282dfeed59d7764b4b427aa85978ec2c0275188d4c2e3c931e415050765a3",
+                  "test/win32/viewer-diff-tree.ps1":  "5877f359c51ec7de7fdd91e626c11f008e99dac36fcece9733eafad7302a2661",
                   "test/win32/viewer-error-card.ps1":  "bc486ca60cf4eaed7e2bb772a8e6dc80818ef04696f86ea7ea054238dacf2f4c",
                   "test/win32/viewer-feedback.ps1":  "37a77582c173db9725003f5f53911f3955800ad25a5a8a976f63f41eb953727d",
                   "test/win32/viewer-feedback-capture.ps1":  "a365fbd675721a913c7b2e28cdf2a8c789c1da541da66e3bc2c88e2df709d294",

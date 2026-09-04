@@ -87,6 +87,7 @@ const viewer_diff = @import("viewer_diff.zig");
 const viewer_image = @import("viewer_image.zig");
 const build_config = @import("../../build_config.zig");
 const ViewerTOCPanel = @import("ViewerTOCPanel.zig");
+const file_tree = @import("viewer_file_tree.zig");
 const internal_os = @import("../../os/main.zig");
 const pane_id_mod = @import("pane_id.zig");
 const banner_link = @import("banner_link.zig");
@@ -532,6 +533,18 @@ diff_probe: ?ViewerDiffProbe = null,
 /// staged out from under the reader.
 diff_file: ?[]u8 = null,
 
+/// The side panel's file tree for the current diff: the changed files nested
+/// by directory, rebuilt whenever the listing moves (T464). Null whenever the
+/// pane is not showing a diff, which is also what tells the shared side-panel
+/// card to list FILES instead of a document's headings.
+diff_tree: ?file_tree.Tree = null,
+
+/// Folder keys (`<origin>:<path>`) the reader has clicked shut in that tree.
+/// Owned. Kept on the PANE rather than in the tree because it has to survive
+/// every rebuild — a working-tree poll re-runs every two seconds, and a
+/// folder that re-opened itself twice a minute would be unusable.
+diff_collapsed: std.ArrayList([]u8) = .empty,
+
 /// Whether the page has been given a listing since it last loaded. A poll only
 /// redraws when the file list MOVED, so without this a freshly-loaded page
 /// whose diff has not changed would be handed nothing and stay blank — Mac's
@@ -868,6 +881,8 @@ pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     }
     if (self.diff_file) |f| alloc.free(f);
     self.diff_file = null;
+    self.clearDiffTree(alloc);
+    self.diff_collapsed.deinit(alloc);
     // Destroy the dim overlay before the host window (its owner) is gone —
     // the same ordering Surface.deinit keeps for its own (T380).
     if (self.dim_overlay) |d| {
@@ -1524,7 +1539,13 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, requested: []const u8) Allo
     // bar, an in-page link), and a stale mode would render a website through
     // the markdown template.
     const was_template = self.mode.usesTemplate();
+    const was_diff = self.mode == .diff;
     self.mode = content.modeFor(url);
+    // Leaving a diff: the card stops listing files. Symmetrical with the
+    // headings rule below, and for the same reason — nothing will arrive to
+    // retract a file tree whose diff is gone, so a markdown document opened
+    // after a diff would keep the previous pane's changed files down its side.
+    if (was_diff and self.mode != .diff) self.dropDiffTree(alloc);
     // Leaving the TEMPLATE — for the web, or for a rendered `.html` page, which
     // the web view loads itself: whatever headings the template last reported
     // are gone with it, and nothing will arrive to clear them, because the
@@ -1776,9 +1797,17 @@ fn applyDiffListing(self: *ViewerPane, alloc: Allocator) void {
     if (files == 0) {
         if (self.diff_file) |f| alloc.free(f);
         self.diff_file = null;
+        self.rebuildDiffTree(alloc, true);
         return;
     }
     self.openDiffFile(alloc, self.reselectDiffFile(), null);
+
+    // The side panel lists the same files this listing counts, so it is
+    // rebuilt from the same answer rather than from a second read of the probe
+    // later (T464) - and AFTER the file has been chosen, so the card's very
+    // first paint already has its selection rather than acquiring one a
+    // moment later.
+    self.rebuildDiffTree(alloc, true);
 }
 
 /// Which file the page should be showing after a refresh: the same one when it
@@ -2568,7 +2597,7 @@ fn setHeadings(self: *ViewerPane, alloc: Allocator, items: []const bridge.Headin
     // padding, so the next layout pass must re-push the gutter even when its
     // width did not change.
     self.toc_gutter_css = -1;
-    if (self.toc) |panel| panel.setItems();
+    if (self.toc) |panel| panel.setItems(false);
     self.updateTOC(alloc);
 }
 
@@ -2599,7 +2628,7 @@ fn clearHeadings(self: *ViewerPane, alloc: Allocator) void {
     // no contents. No script push here: the page this padding belonged to is
     // being replaced or torn down.
     if (self.toc) |panel| {
-        panel.setItems();
+        panel.setItems(false);
         panel.hide();
     }
     self.toc_mode = .hidden;
@@ -2650,9 +2679,22 @@ fn updateTOC(self: *ViewerPane, alloc: Allocator) void {
     }
 
     const pane_w_dip = @as(f32, @floatFromInt(width)) / self.scale;
-    const wanted = toc_layout.mode(pane_w_dip, self.headings.len);
+    // What the card would be listing: a diff's files, else the document's
+    // headings. The two-item floor is the same question for both — one file
+    // is not a tree worth taking a strip of the pane for, the same way one
+    // heading is not a table of contents.
+    //
+    // For a diff that is the number of files the DIFF has, not the number the
+    // tree is currently showing: shutting folders until one file is left would
+    // otherwise retract the card, and with it the only way to open them again.
+    const items = if (self.diff_tree != null)
+        (if (self.diff_probe) |*p| p.files.items.len else 0)
+    else
+        self.headings.len;
+    const wanted = toc_layout.mode(pane_w_dip, items);
 
     if (wanted == .hidden) {
+        self.logPanelLayout(.hidden, items);
         self.toc_mode = .hidden;
         self.toc_open = false;
         if (self.toc) |panel| panel.hide();
@@ -2668,7 +2710,7 @@ fn updateTOC(self: *ViewerPane, alloc: Allocator) void {
             log.warn("viewer TOC panel could not be created; document has no contents card", .{});
             return;
         };
-        panel.setItems();
+        panel.setItems(false);
     }
     const panel = self.toc.?;
 
@@ -2677,6 +2719,7 @@ fn updateTOC(self: *ViewerPane, alloc: Allocator) void {
     // therefore always reachable, because the bar itself always is (T1185) -
     // which is what the compact layout used to need its own pin for.
     if (wanted == .compact and self.toc_mode != .compact) self.toc_open = false;
+    self.logPanelLayout(wanted, items);
     self.toc_mode = wanted;
     if (self.nav) |nav| nav.setContentsButton(wanted == .compact);
 
@@ -2697,6 +2740,24 @@ fn updateTOC(self: *ViewerPane, alloc: Allocator) void {
     else
         0;
     self.pushGutter(alloc, css);
+}
+
+/// Report a CHANGE in the side panel's presentation, once per change.
+///
+/// The acceptance oracle for the gutter/overlay switch (T160, T464). It has to
+/// be the GUI's own stderr for the same reason the diff listing does: `+list`
+/// cannot see a child window's contents and the suite runs on a background
+/// desktop where nothing can photograph one. Only on a change, because
+/// `updateTOC` runs on every bounds sync and a line per sync would be noise
+/// that hid the transition it exists to show.
+fn logPanelLayout(self: *ViewerPane, wanted: toc_layout.Mode, items: usize) void {
+    if (wanted == self.toc_mode) return;
+    log.info("viewer panel pane={s} layout={s} kind={s} items={d}", .{
+        self.paneId(),
+        @tagName(wanted),
+        if (self.diff_tree != null) "files" else "contents",
+        items,
+    });
 }
 
 /// Hand the page how much left padding to reserve for the card (CSS px; the
@@ -2742,6 +2803,132 @@ pub fn tocRowClicked(self: *ViewerPane, id: []const u8) void {
         self.toc_open = false;
         self.updateTOC(p.alloc);
     }
+}
+
+// -------------------------------------------------------------------------
+// The changed-files card (T464)
+// -------------------------------------------------------------------------
+
+/// The file tree the side panel should list, or null when this pane is not
+/// showing a diff. The card reads this to decide WHAT it is a card of.
+pub fn diffTree(self: *const ViewerPane) ?*const file_tree.Tree {
+    if (self.diff_tree) |*t| return t;
+    return null;
+}
+
+fn clearDiffTree(self: *ViewerPane, alloc: Allocator) void {
+    if (self.diff_tree) |*t| t.deinit();
+    self.diff_tree = null;
+    for (self.diff_collapsed.items) |k| alloc.free(k);
+    self.diff_collapsed.clearRetainingCapacity();
+}
+
+/// Rebuild the file tree from the probe's current listing and hand it to the
+/// card. Called from the same place the page's listing is pushed, so what the
+/// panel lists and what the page renders can never describe different diffs.
+///
+/// The collapsed set is deliberately NOT cleared here: a poll that adds a file
+/// must not re-open every folder the reader shut.
+fn rebuildDiffTree(self: *ViewerPane, alloc: Allocator, keep_scroll: bool) void {
+    const probe = if (self.diff_probe) |*p| p else return;
+    if (self.diff_tree) |*t| t.deinit();
+    self.diff_tree = null;
+
+    // A transient view of the probe's entries: `file_tree.build` copies
+    // everything it keeps, so nothing outlives this call.
+    const views = alloc.alloc(viewer_diff.File, probe.files.items.len) catch return;
+    defer alloc.free(views);
+    for (probe.files.items, 0..) |*e, i| views[i] = e.view();
+
+    const keys = alloc.alloc([]const u8, self.diff_collapsed.items.len) catch return;
+    defer alloc.free(keys);
+    for (self.diff_collapsed.items, 0..) |k, i| keys[i] = k;
+
+    self.diff_tree = file_tree.build(alloc, views, keys) catch null;
+    if (self.toc) |panel| panel.setItems(keep_scroll);
+    self.updateTOC(alloc);
+
+    // The acceptance oracle for the card, and it has to be the GUI's own
+    // stderr for the same reason the listing line does (T463): `+list` cannot
+    // see a child window's contents and the suite runs on a background desktop
+    // where nothing can photograph one. This is the ONE line that says what
+    // the panel is showing.
+    var rows: usize = 0;
+    var folders: usize = 0;
+    var sections: usize = 0;
+    var files_shown: usize = 0;
+    if (self.diff_tree) |*t| {
+        rows = t.rows.len;
+        for (t.rows) |r| switch (r.kind) {
+            .folder => folders += 1,
+            .section => sections += 1,
+            .file => files_shown += 1,
+        };
+    }
+    log.info(
+        "viewer tree pane={s} rows={d} files={d} folders={d} sections={d} shut={d} layout={s} selected={s}",
+        .{
+            self.paneId(),
+            rows,
+            files_shown,
+            folders,
+            sections,
+            self.diff_collapsed.items.len,
+            @tagName(self.toc_mode),
+            self.diff_file orelse "-",
+        },
+    );
+}
+
+/// Leaving diff mode: the card goes back to listing headings.
+fn dropDiffTree(self: *ViewerPane, alloc: Allocator) void {
+    if (self.diff_tree == null) return;
+    self.clearDiffTree(alloc);
+    if (self.toc) |panel| panel.setItems(false);
+    self.updateTOC(alloc);
+}
+
+/// A file row was clicked: open that file's patch. There is no scroll spy to
+/// pin — the page shows one file at a time — so the selection moves as soon as
+/// the pane knows which file it is, rather than waiting for the patch.
+pub fn diffFileClicked(self: *ViewerPane, path: []const u8) void {
+    const p = self.pending orelse return;
+    const probe = if (self.diff_probe) |*probe| probe else return;
+    for (probe.files.items, 0..) |f, i| {
+        if (!std.mem.eql(u8, f.path, path)) continue;
+        self.openDiffFile(p.alloc, i, null);
+        if (self.toc) |panel| panel.syncActiveFromPane(true);
+        // The overlay is a menu in the narrow layout: using it dismisses it.
+        if (self.toc_mode == .compact and self.toc_open) {
+            self.toc_open = false;
+            self.updateTOC(p.alloc);
+        }
+        return;
+    }
+}
+
+/// A folder row was clicked: open it or shut it. The list stays where it is —
+/// the row you clicked must not slide out from under the pointer.
+pub fn diffFolderClicked(self: *ViewerPane, key: []const u8) void {
+    const p = self.pending orelse return;
+    var found: ?usize = null;
+    for (self.diff_collapsed.items, 0..) |k, i| {
+        if (std.mem.eql(u8, k, key)) {
+            found = i;
+            break;
+        }
+    }
+    if (found) |i| {
+        p.alloc.free(self.diff_collapsed.orderedRemove(i));
+    } else {
+        const owned = p.alloc.dupe(u8, key) catch return;
+        self.diff_collapsed.append(p.alloc, owned) catch {
+            p.alloc.free(owned);
+            return;
+        };
+    }
+    log.info("viewer tree pane={s} folder={s}", .{ self.paneId(), key });
+    self.rebuildDiffTree(p.alloc, true);
 }
 
 /// A resize drag is moving the card's right edge (called continuously with

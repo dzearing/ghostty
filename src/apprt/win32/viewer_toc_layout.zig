@@ -322,6 +322,71 @@ pub fn rowTextWidth(card_w: i32, depth: u8, scale: f32) i32 {
     return @max(card_w - rowTextLeft(depth, scale) - right, 1);
 }
 
+/// The gap between the parts of a diff pane's file-tree row — the `sm` step of
+/// the 4 DIP spacing scale, the same one the type ramp's leading uses. One
+/// number for the badge-to-name gap and the name-to-counts gap, because two
+/// numbers here is exactly the per-component fudge the margin rule forbids.
+pub const row_gap_dip: f32 = 4;
+
+/// The x extents of a diff-tree row's parts, in CARD coordinates (T464).
+///
+/// A file row is `[status] name … +N −M`; a folder row is `[chevron] title`
+/// with no counts. Both are the same three boxes, so both come out of one
+/// function: the leading box is the badge or the chevron, `counts_w` is zero
+/// for a folder, and a `.section` row simply uses `rowTextLeft` the way a
+/// heading does.
+///
+/// Composed from the SAME `rowTextLeft` / `rowTextWidth` insets the table of
+/// contents uses, so the two things the one card can show line up with each
+/// other and with the document beside them.
+pub const RowBoxes = struct {
+    badge_left: i32,
+    badge_right: i32,
+    name_left: i32,
+    name_right: i32,
+    counts_left: i32,
+    counts_right: i32,
+
+    pub fn nameWidth(self: RowBoxes) i32 {
+        return @max(self.name_right - self.name_left, 1);
+    }
+};
+
+pub fn treeRowBoxes(
+    card_w: i32,
+    depth: u8,
+    scale: f32,
+    badge_w: i32,
+    counts_w: i32,
+) RowBoxes {
+    const gap = px(row_gap_dip, scale);
+    const badge_left = rowTextLeft(depth, scale);
+    const badge_right = badge_left + @max(badge_w, 0);
+    const name_left = badge_right + (if (badge_w > 0) gap else 0);
+    const right = card_w - px(text_inset_dip, scale) - px(fill_inset_dip, scale);
+    const counts_left = if (counts_w > 0) right - counts_w else right;
+    const name_right = @max(
+        name_left + 1,
+        if (counts_w > 0) counts_left - gap else right,
+    );
+    return .{
+        .badge_left = badge_left,
+        .badge_right = badge_right,
+        .name_left = name_left,
+        .name_right = name_right,
+        .counts_left = counts_left,
+        .counts_right = right,
+    };
+}
+
+/// A status chip's width for its measured label: a capsule that is never
+/// narrower than it is tall, so a one-letter badge is a circle rather than a
+/// squashed lozenge. The design system's named capsule exception (a chip
+/// reports a state, it does not offer a command).
+pub fn badgeWidth(text_w: i32, line_h: i32, scale: f32) i32 {
+    return @max(line_h, text_w + 2 * px(row_gap_dip, scale));
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -527,5 +592,52 @@ test "header height is the caption line plus its padding" {
     for (scales) |scale| {
         const line = px(16, scale);
         try testing.expectEqual(line + 2 * px(header_pad_v_dip, scale), headerHeight(line, scale));
+    }
+}
+
+test "tree row boxes: one inset scheme, shared with the table of contents" {
+    for (scales) |scale| {
+        const card_w = px(240, scale);
+        for ([_]u8{ 0, 1, 2, 3 }) |depth| {
+            const b = treeRowBoxes(card_w, depth, scale, px(14, scale), px(30, scale));
+            // The leading box starts exactly where a heading's text would, so
+            // a contents card and a file card line up on the same left edge.
+            try testing.expectEqual(rowTextLeft(depth, scale), b.badge_left);
+            // And the row ends on the same right inset the heading text does.
+            try testing.expectEqual(
+                rowTextLeft(depth, scale) + rowTextWidth(card_w, depth, scale),
+                b.counts_right,
+            );
+            // The gap is the one step, on both sides of the name.
+            try testing.expectEqual(px(row_gap_dip, scale), b.name_left - b.badge_right);
+            try testing.expectEqual(px(row_gap_dip, scale), b.counts_left - b.name_right);
+            try testing.expect(b.nameWidth() >= 1);
+        }
+    }
+}
+
+test "tree row boxes: a folder has no counts and reaches the right inset" {
+    for (scales) |scale| {
+        const card_w = px(240, scale);
+        const b = treeRowBoxes(card_w, 1, scale, px(12, scale), 0);
+        try testing.expectEqual(b.counts_right, b.name_right);
+        try testing.expectEqual(b.counts_right, b.counts_left);
+    }
+}
+
+test "tree row boxes: a starved card still yields a positive name box" {
+    for (scales) |scale| {
+        // Narrower than the insets themselves, at the deepest indent.
+        const b = treeRowBoxes(px(40, scale), max_depth, scale, px(14, scale), px(40, scale));
+        try testing.expect(b.nameWidth() >= 1);
+    }
+}
+
+test "badgeWidth: never narrower than tall, so a letter chip is a circle" {
+    for (scales) |scale| {
+        const line_h = px(15, scale);
+        try testing.expectEqual(line_h, badgeWidth(px(4, scale), line_h, scale));
+        const wide = badgeWidth(px(40, scale), line_h, scale);
+        try testing.expectEqual(px(40, scale) + 2 * px(row_gap_dip, scale), wide);
     }
 }

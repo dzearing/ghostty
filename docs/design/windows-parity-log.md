@@ -21653,3 +21653,68 @@ Floor: all four lanes PASS (lib, none 278s, win32 368s, agent), measured
 through `commit-pressure-probe.ps1` over 1024s and 508 samples: **peak commit
 44.8 GB against the 139.7 GB limit, 32%, no crashes**, where a month ago the
 same question answered 49.4 GB against 67.7 GB and 73%.
+
+## 2026-09-04 - A diff pane gets a file tree down its side (T464)
+
+A diff that touches thirty files was one very long scroll: the win32 pane
+rendered one file's patch and picked which one for you (the first), with no way
+to reach the other twenty-nine. On the Mac that pane has a file tree down its
+side - the changed files nested by folder, each with its git status and line
+counts, click one to open it. Windows has it now.
+
+**One card, two subjects.** `ViewerTOCPanel` already owned the glass card, the
+gutter/overlay switch at 720 DIP, the drag-to-resize handle, the scroll, the
+hover and the selection pill. None of that is duplicated: the only things that
+differ between a table of contents and a file tree are which list the rows come
+from, what a row draws, and what a click means. That is the same factoring Mac
+arrived at - `ViewerDiffTree.swift` landed in the commit that cut 217 lines out
+of `ViewerTOC.swift` - and it is why the whole feature is one new pure module
+plus a row kind.
+
+- **`src/apprt/win32/viewer_file_tree.zig`** (new) - the transform from git's
+  flat list of changed paths to the rows on screen, with no window anywhere
+  near it: folder nesting, folders before files, a chain of single-child
+  directories collapsed into ONE row (`src/apprt/win32`, not three rows of
+  indentation carrying no information), the working-tree sections in git status
+  order, natural-order sorting, and the git-status-to-tone mapping the badges
+  colour by.
+- **`viewer_toc_layout.zig`** - `treeRowBoxes` and `badgeWidth`: where a tree
+  row's three parts sit, composed from the SAME insets the heading rows use, so
+  a contents card and a file card line up on the same left and right edges at
+  every scale.
+- **`ViewerTOCPanel.zig`** - the row kind, the status chip (a capsule, per the
+  design system's named exception for a mark that reports a state), the
+  `+12 -3` counts as two coloured runs, the `FILES` caption with its file
+  count, and the click routing.
+- **`ViewerPane.zig`** - owns the tree and the set of folders the reader has
+  shut, which deliberately survives every two-second working-tree poll: a
+  folder that re-opened itself twice a minute would be unusable.
+- **`chrome_theme.zig`** - a fourth `Tone`, `info`, for the rename/copy badge.
+  Mac paints those blue and the three existing tones had no meaning for it; a
+  private RGB beside the shared tones is precisely the divergence that module
+  exists to stop.
+
+**Two things the work found.** The selection does not track a scroll position,
+because there is nothing to track - the win32 diff page renders one file's
+patch at a time, so the open file IS the selection and a scroll spy would have
+nothing to say. And the shared two-item floor had a bite in it: counting the
+files the tree is *currently showing* meant shutting folders until one file was
+left retracted the card, and with it the only way to open them again. The floor
+now counts the files the DIFF has.
+
+Evidence, per T1133: `test\win32\viewer-diff-tree.ps1` is ALL PASS (28
+assertions) against a scratch repository whose shape is known exactly - four
+files in three directories, one of them a three-deep single-child chain, so a
+flat list would report zero folder rows and an uncollapsed tree would report
+four. Its negative control inverts that one assertion and scores exactly one
+failure. The clicks are posted `WM_LBUTTONUP` at screen points scanned down the
+list until something happens, and WHAT happened is read from the log, so the
+assertion is "a click on the list does the right thing" rather than "a click at
+y=91 does". Floor: all four lanes PASS, plus the guards the change made due -
+`viewer-narrow-pane` (56), `viewer-nav-pin` (24), `chrome-theme` (64),
+`printclient-audit` (8) and the eight harness audits.
+
+Filed on the way past: **T1336** (the card has no filter box - Mac pins a
+search field under the header, and it is the one piece of that panel this port
+left out) and **T1337** (next-change dead-ends at a file boundary because
+nothing on this side handles `diffNavOverflow`).

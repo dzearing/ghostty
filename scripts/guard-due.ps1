@@ -320,6 +320,23 @@ $GuardTable = @(
             'src\apprt\win32\ViewerNavBar.zig'
         )
     },
+    # The diff pane's file tree (T464): the only thing that proves the tree the
+    # `none` lane builds ever reaches a card. The pure module asserts the
+    # nesting, the chain collapsing and the sections exhaustively and cannot
+    # see whether a row was drawn, whether clicking one opened a file, or
+    # whether the card switched from listing headings to listing files. Covers
+    # the transform, the card that paints it, and the pane that owns which of
+    # the two subjects it is showing.
+    [pscustomobject]@{
+        Name   = 'viewer-diff-tree'
+        Script = 'test\win32\viewer-diff-tree.ps1'
+        Stamp  = 'test\win32\viewer-diff-tree.stamp.json'
+        Covers = @(
+            'test\win32\viewer-diff-tree.ps1',
+            'src\apprt\win32\viewer_file_tree.zig',
+            'src\apprt\win32\ViewerTOCPanel.zig'
+        )
+    },
     # Image panes (T1183): the only thing that proves the zoom rules reach a
     # real picture. The none lane asserts the arithmetic exhaustively and
     # cannot see whether the number ever left the process - the whole feature

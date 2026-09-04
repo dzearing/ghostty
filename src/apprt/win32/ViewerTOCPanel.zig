@@ -42,6 +42,8 @@ const system_colors = @import("system_colors.zig");
 const banner_card = @import("banner_card.zig");
 const type_ramp = @import("type_ramp.zig");
 const toc = @import("viewer_toc_layout.zig");
+const file_tree = @import("viewer_file_tree.zig");
+const diff = @import("viewer_diff.zig");
 const ViewerPane = @import("ViewerPane.zig");
 
 const log = std.log.scoped(.viewer_toc);
@@ -59,15 +61,45 @@ pub fn documentBackground(dark: bool) color_math.Rgb {
         .{ .r = 255, .g = 255, .b = 255 };
 }
 
+/// What a row IS, which decides how it paints and what clicking it does.
+/// A contents card is all `.heading`; a diff card is the other three.
+const Kind = enum { heading, section, folder, file };
+
 /// One display row: a borrowed id, owned UTF-16 label, indent depth, and its
 /// measured slot in the list (list coordinates: y=0 at the top of the first
 /// row's padding, i.e. just under the header's own inset).
+///
+/// A diff row carries two more owned labels — the one-letter git status and
+/// the `+12 −3` line counts — because they are drawn on their own baselines
+/// beside the name rather than being part of it.
 const Row = struct {
     id: []const u8,
     text16: []u16,
     depth: u8,
+    kind: Kind = .heading,
+    /// `.file` rows: the status badge's letter, and what it means. `.folder`
+    /// rows: the disclosure chevron.
+    badge16: []u16 = &.{},
+    tone: chrome_theme.Tone = .neutral,
+    /// `.file` rows: the line counts, as two runs so each can carry its own
+    /// color — `+12` in the added green and `−3` in the removed red, the
+    /// idiom every diff tool shares. A binary file has no counts, so `adds16`
+    /// carries `bin` and `binary` says to draw it neutral.
+    adds16: []u16 = &.{},
+    dels16: []u16 = &.{},
+    binary: bool = false,
+    /// `.folder` rows: whether the reader has clicked it shut.
+    collapsed: bool = false,
     y: i32 = 0,
     h: i32 = 0,
+    /// Measured widths of the two side labels, filled by `measureRows`.
+    badge_w: i32 = 0,
+    counts_w: i32 = 0,
+
+    /// A row a click selects or toggles. A section header is a label.
+    fn interactive(self: Row) bool {
+        return self.kind != .section;
+    }
 };
 
 hwnd: w32.HWND,
@@ -222,22 +254,67 @@ fn fromHwnd(hwnd: w32.HWND) ?*ViewerTOCPanel {
 // -------------------------------------------------------------------------
 
 fn clearRows(self: *ViewerTOCPanel) void {
-    for (self.rows.items) |r| self.alloc.free(r.text16);
+    for (self.rows.items) |r| {
+        self.alloc.free(r.text16);
+        if (r.badge16.len > 0) self.alloc.free(r.badge16);
+        if (r.adds16.len > 0) self.alloc.free(r.adds16);
+        if (r.dels16.len > 0) self.alloc.free(r.dels16);
+    }
     self.rows.clearRetainingCapacity();
     self.list_h = 0;
 }
 
-/// Rebuild the display rows from the pane's current headings. Called by the
-/// pane in the same breath as it replaces `pane.headings`, so the borrowed
-/// ids can never dangle. Measurement is deferred to `place` (it needs the
-/// card width).
-pub fn setItems(self: *ViewerTOCPanel) void {
+/// True when this card is listing a diff's changed files rather than a
+/// document's headings. The pane owns the mode; the card simply follows it,
+/// which is what makes one card serve both (Mac's `ViewerSidePanel`, with
+/// `ViewerTOC` or `ViewerDiffPanel` inside it).
+fn showsFiles(self: *const ViewerTOCPanel) bool {
+    return self.pane.diffTree() != null;
+}
+
+/// How many FILE rows the card is showing — not how many rows it has, so the
+/// header counts files rather than the folders between them.
+fn fileRowCount(self: *const ViewerTOCPanel) usize {
+    var n: usize = 0;
+    for (self.rows.items) |r| {
+        if (r.kind == .file) n += 1;
+    }
+    return n;
+}
+
+/// Rebuild the display rows from whichever list the pane is showing. Called by
+/// the pane in the same breath as it replaces that list, so the borrowed ids
+/// can never dangle. Measurement is deferred to `place` (it needs the card
+/// width).
+///
+/// `keep_scroll` holds the list where it is — what shutting a folder wants,
+/// since the row you clicked must not jump out from under the pointer. A new
+/// document (or a new diff) starts at the top.
+pub fn setItems(self: *ViewerTOCPanel, keep_scroll: bool) void {
+    const scroll_before = self.scroll;
     self.clearRows();
     self.active = -1;
     self.hover = -1;
     self.scroll = 0;
     self.dirty = true;
 
+    if (self.pane.diffTree()) |tree| {
+        self.buildFileRows(tree);
+    } else {
+        self.buildHeadingRows();
+    }
+
+    if (keep_scroll) {
+        self.scroll = scroll_before;
+        self.clampScroll();
+    }
+    // Keep the selection continuous across a re-index (a live reload posts a
+    // fresh headings list, then an active id; a diff poll rebuilds the tree
+    // while the same file stays open).
+    self.syncActiveFromPane(false);
+}
+
+fn buildHeadingRows(self: *ViewerTOCPanel) void {
     const items = self.pane.headings;
     // Depth is relative to the document's own top level (Mac's
     // `ViewerTOCItem.list`), so a file whose headings start at ## is not
@@ -250,14 +327,76 @@ pub fn setItems(self: *ViewerTOCPanel) void {
             .id = h.id,
             .text16 = text16,
             .depth = toc.depthOf(h.level, top),
+            .kind = .heading,
         }) catch {
             self.alloc.free(text16);
             return;
         };
     }
-    // Keep the selection continuous across a re-index (a live reload posts a
-    // fresh headings list, then an active id).
-    self.syncActiveFromPane(false);
+}
+
+/// The disclosure chevrons: a right-pointing single angle quote for a shut
+/// folder, a down-pointing one for an open one.
+const chevron_shut = std.unicode.utf8ToUtf16LeStringLiteral("\u{203A}");
+const chevron_open = std.unicode.utf8ToUtf16LeStringLiteral("\u{2304}");
+
+fn buildFileRows(self: *ViewerTOCPanel, tree: *const file_tree.Tree) void {
+    for (tree.rows) |r| {
+        const text16 = std.unicode.utf8ToUtf16LeAlloc(self.alloc, r.title) catch continue;
+        var row: Row = .{
+            .id = r.id,
+            .text16 = text16,
+            // The indent cap is the card's, not the tree's: a path nested
+            // deeper than the card can indent still has to fit inside it.
+            .depth = @min(r.depth, toc.max_depth),
+            .collapsed = r.collapsed,
+        };
+        switch (r.kind) {
+            .section => row.kind = .section,
+            .folder => {
+                row.kind = .folder;
+                const glyph = if (r.collapsed) chevron_shut else chevron_open;
+                row.badge16 = self.alloc.dupe(u16, glyph) catch &.{};
+            },
+            .file => {
+                row.kind = .file;
+                row.tone = file_tree.statusTone(r.status);
+                row.badge16 = std.unicode.utf8ToUtf16LeAlloc(
+                    self.alloc,
+                    r.status.letter(),
+                ) catch &.{};
+                self.fillCounts(&row, r);
+            },
+        }
+        self.rows.append(self.alloc, row) catch {
+            self.alloc.free(text16);
+            if (row.badge16.len > 0) self.alloc.free(row.badge16);
+            if (row.adds16.len > 0) self.alloc.free(row.adds16);
+            if (row.dels16.len > 0) self.alloc.free(row.dels16);
+            return;
+        };
+    }
+}
+
+/// `+12` and `−3` for a text file, `bin` for one git would not diff. The minus
+/// is U+2212, matching the page's own summary line rather than a hyphen. A
+/// zero side is omitted rather than drawn as `+0`: a pure deletion should read
+/// as a deletion at a glance.
+fn fillCounts(self: *ViewerTOCPanel, row: *Row, f: file_tree.Row) void {
+    if (f.binary) {
+        row.binary = true;
+        row.adds16 = std.unicode.utf8ToUtf16LeAlloc(self.alloc, "bin") catch &.{};
+        return;
+    }
+    var buf: [24]u8 = undefined;
+    if (f.additions > 0) {
+        const t = std.fmt.bufPrint(&buf, "+{d}", .{f.additions}) catch return;
+        row.adds16 = std.unicode.utf8ToUtf16LeAlloc(self.alloc, t) catch &.{};
+    }
+    if (f.deletions > 0) {
+        const t = std.fmt.bufPrint(&buf, "\u{2212}{d}", .{f.deletions}) catch return;
+        row.dels16 = std.unicode.utf8ToUtf16LeAlloc(self.alloc, t) catch &.{};
+    }
 }
 
 /// Re-derive the highlighted row from `pane.active_heading` and reveal it.
@@ -265,7 +404,10 @@ pub fn setItems(self: *ViewerTOCPanel) void {
 /// `proxy.scrollTo`); a plain re-sync after a rebuild skips that so a restore
 /// does not yank the list around.
 pub fn syncActiveFromPane(self: *ViewerTOCPanel, reveal: bool) void {
-    const id = self.pane.active_heading;
+    // A diff card's selection is the file the pane has OPEN — there is no
+    // scroll spy, because the page shows one file's patch at a time and the
+    // click that opened it is the whole story.
+    const id = if (self.showsFiles()) self.pane.diff_file else self.pane.active_heading;
     var next: i32 = -1;
     if (id) |wanted| {
         for (self.rows.items, 0..) |r, i| {
@@ -373,6 +515,26 @@ fn measureRows(self: *ViewerTOCPanel, card_w: i32) void {
     var y: i32 = 0;
     for (self.rows.items, 0..) |*row, i| {
         if (i != 0) y += gap;
+
+        // A tree row is one line by construction: its name is a file or folder
+        // NAME, and wrapping one across two lines would make a list of them
+        // impossible to scan. It is the side labels that decide how much room
+        // the name gets, so they are measured first.
+        if (row.kind != .heading) {
+            row.badge_w = if (row.badge16.len > 0)
+                toc.badgeWidth(measureText(hdc, row.badge16), self.line_h, self.scale)
+            else
+                0;
+            const adds_w = measureText(hdc, row.adds16);
+            const dels_w = measureText(hdc, row.dels16);
+            const both = if (adds_w > 0 and dels_w > 0) self.px(toc.row_gap_dip) else 0;
+            row.counts_w = adds_w + both + dels_w;
+            row.y = y;
+            row.h = toc.rowHeight(1, self.line_h, self.scale);
+            y += row.h;
+            continue;
+        }
+
         const text_w = toc.rowTextWidth(card_w, row.depth, self.scale);
         var r = w32.RECT{ .left = 0, .top = 0, .right = text_w, .bottom = 0 };
         _ = w32.DrawTextW(
@@ -392,6 +554,20 @@ fn measureRows(self: *ViewerTOCPanel, card_w: i32) void {
     self.measured_w = card_w;
     self.measured_scale = self.scale;
     self.dirty = false;
+}
+
+/// One run's width in the DC's current font.
+fn measureText(hdc: w32.HDC, text: []const u16) i32 {
+    if (text.len == 0) return 0;
+    var r = w32.RECT{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    _ = w32.DrawTextW(
+        hdc,
+        text.ptr,
+        @intCast(text.len),
+        &r,
+        w32.DT_CALCRECT | w32.DT_SINGLELINE | w32.DT_NOPREFIX,
+    );
+    return @max(r.right - r.left, 0);
 }
 
 /// The card content's needed height: header + list inset above and below.
@@ -747,8 +923,10 @@ fn paint(self: *ViewerTOCPanel, hdc: w32.HDC, width: i32, height: i32) void {
             if (top + row.h < list_top) continue;
             if (top > l.card.bottom) break;
 
-            const is_active = self.active == @as(i32, @intCast(i));
-            const is_hover = self.hover == @as(i32, @intCast(i));
+            // A section header is a label, not a target: it never fills, so
+            // it can never look like something a click would do anything to.
+            const is_active = row.interactive() and self.active == @as(i32, @intCast(i));
+            const is_hover = row.interactive() and self.hover == @as(i32, @intCast(i));
             const fill_rect = w32.RECT{
                 .left = l.card.left + fill_inset,
                 .top = top,
@@ -779,6 +957,11 @@ fn paint(self: *ViewerTOCPanel, hdc: w32.HDC, width: i32, height: i32) void {
             } else if (is_hover) {
                 const wash = hoverFill(self.card_fill);
                 fillRoundRect(hdc, fill_rect, row_radius, w32.RGB(wash.r, wash.g, wash.b));
+            }
+
+            if (row.kind != .heading) {
+                self.paintTreeRow(hdc, row, top, color, is_active and emphasized);
+                continue;
             }
 
             const text_left = l.card.left + toc.rowTextLeft(row.depth, self.scale);
@@ -841,7 +1024,11 @@ fn paint(self: *ViewerTOCPanel, hdc: w32.HDC, width: i32, height: i32) void {
         }
         if (self.header_font) |f| _ = w32.SelectObject(hdc, @ptrCast(f));
         _ = w32.SetTextColor(hdc, self.secondary_ref);
-        var caption = std.unicode.utf8ToUtf16LeStringLiteral("CONTENTS").*;
+        // The card names what it is listing. One card, two subjects: a
+        // document's sections, or a diff's changed files.
+        var contents = std.unicode.utf8ToUtf16LeStringLiteral("CONTENTS").*;
+        var files = std.unicode.utf8ToUtf16LeStringLiteral("FILES").*;
+        const caption: []u16 = if (self.showsFiles()) &files else &contents;
         var cr = w32.RECT{
             .left = l.card.left + self.px(toc.label_inset_dip),
             .top = l.card.top,
@@ -850,9 +1037,191 @@ fn paint(self: *ViewerTOCPanel, hdc: w32.HDC, width: i32, height: i32) void {
         };
         _ = w32.DrawTextW(
             hdc,
-            &caption,
-            caption.len,
+            caption.ptr,
+            @intCast(caption.len),
             &cr,
+            w32.DT_SINGLELINE | w32.DT_VCENTER | w32.DT_NOPREFIX,
+        );
+        // …and, for a diff, how many there are, right-aligned in the same
+        // band. The page's own summary line carries the +/- totals, so the
+        // header does not repeat them.
+        if (self.showsFiles()) {
+            var buf: [32]u8 = undefined;
+            const n = self.fileRowCount();
+            const text = std.fmt.bufPrint(
+                &buf,
+                "{d} {s}",
+                .{ n, if (n == 1) "file" else "files" },
+            ) catch "";
+            if (text.len > 0) {
+                var text16: [32]u16 = undefined;
+                const len = std.unicode.utf8ToUtf16Le(&text16, text) catch 0;
+                if (len > 0) {
+                    _ = w32.DrawTextW(
+                        hdc,
+                        &text16,
+                        @intCast(len),
+                        &cr,
+                        w32.DT_SINGLELINE | w32.DT_VCENTER | w32.DT_RIGHT | w32.DT_NOPREFIX,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// One diff-tree row: `[status] name -- +12 -3` for a file, `[chevron] path`
+/// for a folder, and a plain caption for a section header.
+///
+/// `ink` is the label color the row loop already resolved (selection, hover
+/// and unemphasized states are its business, not this function's);
+/// `on_accent` says the row is sitting on the accent pill, which is the one
+/// state where the badge and the counts drop their own colors -- nothing else
+/// clears contrast against a saturated fill.
+fn paintTreeRow(
+    self: *ViewerTOCPanel,
+    hdc: w32.HDC,
+    row: Row,
+    top: i32,
+    ink: u32,
+    on_accent: bool,
+) void {
+    const l = self.layout;
+    const boxes = toc.treeRowBoxes(
+        l.card.width(),
+        row.depth,
+        self.scale,
+        row.badge_w,
+        row.counts_w,
+    );
+    const text_top = top + self.px(toc.row_v_pad_dip);
+    const text_bottom = top + row.h - self.px(toc.row_v_pad_dip);
+
+    // A section header is the card's own caption voice, one indent in.
+    if (row.kind == .section) {
+        var sr = w32.RECT{
+            .left = l.card.left + toc.rowTextLeft(row.depth, self.scale),
+            .top = text_top,
+            .right = l.card.right - self.px(toc.label_inset_dip),
+            .bottom = text_bottom,
+        };
+        _ = w32.SetTextColor(hdc, self.secondary_ref);
+        _ = w32.DrawTextW(
+            hdc,
+            row.text16.ptr,
+            @intCast(row.text16.len),
+            &sr,
+            w32.DT_SINGLELINE | w32.DT_VCENTER | w32.DT_END_ELLIPSIS | w32.DT_NOPREFIX,
+        );
+        return;
+    }
+
+    // The leading box: a status chip for a file, a disclosure chevron for a
+    // folder. The chip is a capsule (the design system's named exception for a
+    // mark that reports a state), tinted with its own ink so the badge beside
+    // a file and the lines inside it agree about what green means.
+    if (row.badge16.len > 0) {
+        const badge_top = top + @divTrunc(row.h - self.line_h, 2);
+        const badge = w32.RECT{
+            .left = l.card.left + boxes.badge_left,
+            .top = badge_top,
+            .right = l.card.left + boxes.badge_right,
+            .bottom = badge_top + self.line_h,
+        };
+        var badge_ink = ink;
+        if (row.kind == .file) {
+            if (on_accent) {
+                // On the pill: a translucent wash of the pill's own text, with
+                // the pill's text color on top.
+                const accent = system_colors.accentCached();
+                const fill = color_math.mix(accent, chrome_theme.textOn(accent), 0.22);
+                fillRoundRect(
+                    hdc,
+                    badge,
+                    @divTrunc(self.line_h, 2),
+                    w32.RGB(fill.r, fill.g, fill.b),
+                );
+            } else {
+                const fill = chrome_theme.toneFill(self.card_fill, row.tone);
+                fillRoundRect(
+                    hdc,
+                    badge,
+                    @divTrunc(self.line_h, 2),
+                    w32.RGB(fill.r, fill.g, fill.b),
+                );
+                const tint = chrome_theme.toneInk(self.card_fill, row.tone);
+                badge_ink = w32.RGB(tint.r, tint.g, tint.b);
+            }
+        } else if (!on_accent) {
+            badge_ink = self.secondary_ref;
+        }
+        var br = badge;
+        _ = w32.SetTextColor(hdc, badge_ink);
+        _ = w32.DrawTextW(
+            hdc,
+            row.badge16.ptr,
+            @intCast(row.badge16.len),
+            &br,
+            w32.DT_SINGLELINE | w32.DT_VCENTER | w32.DT_CENTER | w32.DT_NOPREFIX,
+        );
+    }
+
+    // The name. Ellipsized through the MIDDLE rather than at the end, which is
+    // the readable half of Mac's head truncation: a card this narrow truncates
+    // a lot of names, and `Viewer...` identifies nothing while
+    // `Viewer...Leaf.zig` keeps both the distinguishing tail and the
+    // extension. A folder row's title is a joined path, which is exactly what
+    // the flag is for.
+    var nr = w32.RECT{
+        .left = l.card.left + boxes.name_left,
+        .top = text_top,
+        .right = l.card.left + boxes.name_right,
+        .bottom = text_bottom,
+    };
+    const name_ink = if (row.kind == .folder and !on_accent) self.secondary_ref else ink;
+    _ = w32.SetTextColor(hdc, name_ink);
+    _ = w32.DrawTextW(
+        hdc,
+        row.text16.ptr,
+        @intCast(row.text16.len),
+        &nr,
+        w32.DT_SINGLELINE | w32.DT_VCENTER | w32.DT_PATH_ELLIPSIS | w32.DT_NOPREFIX,
+    );
+
+    if (row.counts_w == 0) return;
+
+    // The counts, right-aligned against the card's own text inset.
+    var x = l.card.left + boxes.counts_left;
+    const added = chrome_theme.toneInk(self.card_fill, .good);
+    const removed = chrome_theme.toneInk(self.card_fill, .danger);
+    if (row.adds16.len > 0) {
+        const w = measureText(hdc, row.adds16);
+        var r = w32.RECT{ .left = x, .top = text_top, .right = x + w, .bottom = text_bottom };
+        const c: u32 = if (on_accent)
+            ink
+        else if (row.binary)
+            self.secondary_ref
+        else
+            w32.RGB(added.r, added.g, added.b);
+        _ = w32.SetTextColor(hdc, c);
+        _ = w32.DrawTextW(
+            hdc,
+            row.adds16.ptr,
+            @intCast(row.adds16.len),
+            &r,
+            w32.DT_SINGLELINE | w32.DT_VCENTER | w32.DT_NOPREFIX,
+        );
+        x += w + self.px(toc.row_gap_dip);
+    }
+    if (row.dels16.len > 0) {
+        const w = measureText(hdc, row.dels16);
+        var r = w32.RECT{ .left = x, .top = text_top, .right = x + w, .bottom = text_bottom };
+        _ = w32.SetTextColor(hdc, if (on_accent) ink else w32.RGB(removed.r, removed.g, removed.b));
+        _ = w32.DrawTextW(
+            hdc,
+            row.dels16.ptr,
+            @intCast(row.dels16.len),
+            &r,
             w32.DT_SINGLELINE | w32.DT_VCENTER | w32.DT_NOPREFIX,
         );
     }
@@ -1011,7 +1380,17 @@ fn wndProc(
             const hit = self.hitRow(x, y);
             if (hit >= 0) {
                 const row = self.rows.items[@intCast(hit)];
-                self.pane.tocRowClicked(row.id);
+                switch (row.kind) {
+                    // A heading scrolls the document to itself.
+                    .heading => self.pane.tocRowClicked(row.id),
+                    // A file OPENS: the page shows one patch at a time, so
+                    // selecting the row and loading it are the same act.
+                    .file => self.pane.diffFileClicked(row.id),
+                    // A folder is a disclosure triangle wearing a row.
+                    .folder => self.pane.diffFolderClicked(row.id),
+                    // A section header is a label.
+                    .section => {},
+                }
             }
             return 0;
         },
