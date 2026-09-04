@@ -47,6 +47,25 @@
 # excused. -Local reinstates the old path for a box that genuinely wants to
 # package locally.
 #
+# AND AN ON-DEMAND RULE, because one publish per day strands everything that
+# lands after it (T1294). On 2026-09-03 the day's release went out at 09:28, the
+# fix for the installer bug the user had just reported landed at 11:01, and the
+# 18:19 run answered `NOT DUE: already published today` - so the user downloaded
+# the same broken installer a second time and reported the same bug again, with
+# 24 commits sitting behind that date. The daily cadence is the FLOOR (work ships
+# at least once a day), not the CEILING. So a turn that lands something somebody
+# is waiting for records a request:
+#
+#   powershell -NoProfile -File scripts\daily-publish.ps1 -Request ^
+#       -Reason "T1291: the installer dies silently on a same-version install"
+#
+# which publishes nothing itself - the next task-boundary run, seconds later in
+# the loop and after the commit is pushed, sees it and publishes despite the
+# date. The noise guard survives intact, because an ordinary turn files no
+# request and still gets exactly one release a day. A request with nothing behind
+# it (HEAD is already the published commit) is cleared rather than honoured, so
+# "ship it" can never mint an empty release.
+#
 # WHAT IT NEVER DOES: touch the installed app. See scripts\install-ownership.ps1
 # and decision D85. Publishing is the only delivery path this repo has.
 #
@@ -72,6 +91,12 @@
 #   exit 10 -> published (tag printed). Finish the turn.
 #   exit 1  -> it was due and the publish failed. Nothing was released; finish
 #              the turn normally so a bad publish cannot stall the loop.
+#
+# And two calls that publish nothing at all:
+#
+#   -Request -Reason "<why>"  record that work is waiting; the next run ships it.
+#   -Status                   what shipped, and every commit that has landed
+#                             since - the digest's stranded-work line.
 #
 # VERSION SCHEME (the thing this script decides, so nobody has to remember it).
 # A Windows release is `win-v<X.Y.Z>`; the Mac releases are `v<X.Y.Z>` in the
@@ -138,7 +163,20 @@ param(
     [switch]$Local,
     # Empty = publish-windows-tag.ps1, or publish-windows-release.ps1 under
     # -Local.
-    [string]$PublishScript = ''
+    [string]$PublishScript = '',
+    # T1294. Record that work is WAITING on a publish, and stop. Nothing is
+    # published by this call: the next task-boundary run (go.md step 6.5, which
+    # in the loop is seconds later, after the commit has been pushed) sees the
+    # request and publishes even though the day already has a release.
+    [switch]$Request,
+    # Why the request was made - a task id and a sentence. It is what the log,
+    # the health line and the morning digest quote.
+    [string]$Reason = '',
+    # Where a pending request lives. Defaults beside the watermark.
+    [string]$RequestPath = '',
+    # Report what shipped and what has landed since, and change nothing. This is
+    # what the digest's "what is stranded" line reads.
+    [switch]$Status
 )
 
 $ErrorActionPreference = 'Continue'
@@ -159,24 +197,43 @@ function Test-DailyPublishDue {
         [string]$LastAt = '',
         [int]$HourLocal = 17,
         [int]$StaleHours = 24,
+        # T1294: a pending "somebody is waiting on this" request, and the two
+        # commits that say whether honouring it would ship anything at all.
+        [string]$RequestReason = '',
+        [string]$HeadCommit = '',
+        [string]$LastCommit = '',
+        [switch]$Requested,
         [switch]$Force
     )
     $today = $Now.ToString('yyyy-MM-dd')
     $last = if ($LastDate) { $LastDate.Trim() } else { '' }
+    function Verdict([bool]$due, [string]$why, [bool]$clear = $false) {
+        return [pscustomobject]@{ Due = $due; Today = $today; Why = $why; ClearRequest = $clear }
+    }
     if ($Force) {
-        return [pscustomobject]@{ Due = $true; Today = $today; Why = "forced (last=$(if ($last) { $last } else { 'never' }))" }
+        return Verdict $true "forced (last=$(if ($last) { $last } else { 'never' }))"
+    }
+    # T1294, and it is ordered ABOVE the one-per-day rule deliberately: that rule
+    # is what stranded the fix, so the request is the one thing allowed through
+    # it. Everything below is unchanged for a turn that filed no request.
+    if ($Requested -or $RequestReason) {
+        $why = if ($RequestReason) { $RequestReason } else { '(no reason recorded)' }
+        if ($HeadCommit -and $LastCommit -and $HeadCommit -eq $LastCommit) {
+            return Verdict $false "a publish was requested ($why) but nothing has landed since $LastCommit - clearing the request rather than minting an empty release" $true
+        }
+        return Verdict $true "requested: $why"
     }
     # Ordered before the hour check on purpose: one publish per local day is the
     # invariant BOTH rules below sit under, so neither can double-publish.
     if ($last -eq $today) {
-        return [pscustomobject]@{ Due = $false; Today = $today; Why = "already published today ($today)" }
+        return Verdict $false "already published today ($today) - if work is waiting on a release, record it with -Request -Reason '<why>'"
     }
     if ($Now.Hour -lt $HourLocal) {
         # The evening rule has not fired. The catch-up rule (T1292) is what keeps
         # a day that stalled before 17:00 from shipping nothing at all: measure
         # from the last publish, not from the clock.
         if ($StaleHours -le 0) {
-            return [pscustomobject]@{ Due = $false; Today = $today; Why = "before ${HourLocal}:00 local (it is $($Now.ToString('HH:mm'))) - the day's work is not done yet" }
+            return Verdict $false "before ${HourLocal}:00 local (it is $($Now.ToString('HH:mm'))) - the day's work is not done yet"
         }
         $lastInstant = $null
         if ($LastAt) { try { $lastInstant = [datetime]::Parse($LastAt) } catch { $lastInstant = $null } }
@@ -184,25 +241,17 @@ function Test-DailyPublishDue {
             try { $lastInstant = ([datetime]::ParseExact($last, 'yyyy-MM-dd', $null)).AddHours($HourLocal) } catch { $lastInstant = $null }
         }
         if ($null -eq $lastInstant) {
-            return [pscustomobject]@{ Due = $true; Today = $today; Why = "nothing has ever been published - not waiting for ${HourLocal}:00 to ship the first one" }
+            return Verdict $true "nothing has ever been published - not waiting for ${HourLocal}:00 to ship the first one"
         }
         $hours = ($Now - $lastInstant).TotalHours
         if ($hours -ge $StaleHours) {
-            return [pscustomobject]@{
-                Due   = $true
-                Today = $today
-                Why   = "catch-up: $([math]::Round($hours))h since the last publish ($last) and it is only $($Now.ToString('HH:mm')) - a day that stalled before ${HourLocal}:00 still ships"
-            }
+            return Verdict $true "catch-up: $([math]::Round($hours))h since the last publish ($last) and it is only $($Now.ToString('HH:mm')) - a day that stalled before ${HourLocal}:00 still ships"
         }
-        return [pscustomobject]@{ Due = $false; Today = $today; Why = "before ${HourLocal}:00 local (it is $($Now.ToString('HH:mm'))) - the day's work is not done yet, and the last publish was only $([math]::Round($hours))h ago" }
+        return Verdict $false "before ${HourLocal}:00 local (it is $($Now.ToString('HH:mm'))) - the day's work is not done yet, and the last publish was only $([math]::Round($hours))h ago"
     }
     # A watermark from the FUTURE is not a reason to refuse forever (a clock
     # change, a restored profile). It is also not today, so it does not block.
-    return [pscustomobject]@{
-        Due   = $true
-        Today = $today
-        Why   = "first task-boundary push at/after ${HourLocal}:00 today (last publish: $(if ($last) { $last } else { 'never' }))"
-    }
+    return Verdict $true "first task-boundary push at/after ${HourLocal}:00 today (last publish: $(if ($last) { $last } else { 'never' }))"
 }
 
 # The version scheme, from the set of release tags that exist. See the header.
@@ -300,6 +349,30 @@ function Read-PublishWatermark {
     return $empty
 }
 
+# A pending publish request (T1294). Same tolerance as the watermark reader: a
+# file that is unreadable, truncated or not JSON reads as "no request", because
+# the failure mode of believing garbage here is an unwanted release.
+function Read-PublishRequest {
+    param([string]$Text = '')
+    $empty = [pscustomobject]@{ Requested = $false; At = ''; Reason = ''; Commit = '' }
+    if (-not $Text) { return $empty }
+    $t = $Text.Trim()
+    if (-not $t) { return $empty }
+    if ($t.StartsWith('{')) {
+        try {
+            $o = $t | ConvertFrom-Json
+            return [pscustomobject]@{
+                Requested = $true
+                At        = [string]$o.at
+                Reason    = [string]$o.reason
+                Commit    = [string]$o.commit
+            }
+        } catch { return $empty }
+    }
+    # A bare line is a reason somebody echoed in by hand. Honour it.
+    return [pscustomobject]@{ Requested = $true; At = ''; Reason = ($t -split "`n")[0].Trim(); Commit = '' }
+}
+
 # Dot-sourced by the acceptance test for the functions above; running it that
 # way must publish nothing.
 if ($env:GHOZTTY_DAILY_PUBLISH_DOTSOURCE -eq '1') { return }
@@ -348,6 +421,31 @@ function Write-Confirmed-Watermark {
 
 Set-Location $Repo
 
+if (-not $RequestPath) { $RequestPath = "$WatermarkPath-request" }
+function Read-RequestFile {
+    return Read-PublishRequest -Text $(
+        if (Test-Path -LiteralPath $RequestPath) { try { [IO.File]::ReadAllText($RequestPath) } catch { '' } } else { '' }
+    )
+}
+function Clear-Request([string]$why) {
+    if (Test-Path -LiteralPath $RequestPath) {
+        try { Remove-Item -LiteralPath $RequestPath -Force } catch { Log "WARNING: could not clear the publish request $RequestPath ($($_.Exception.Message))" }
+        if ($why) { Log $why }
+    }
+}
+
+# What has landed since the release the user can actually install (T1294). The
+# number the health line reports and the list the morning digest names, so a
+# stranded fix is a thing somebody reads rather than a thing somebody hits.
+function Get-StrandedCommits([string]$SinceCommit) {
+    if (-not $SinceCommit) { return $null }
+    $ok = (Invoke-Probe { git cat-file -e "$SinceCommit^{commit}" }) -eq 0
+    if (-not $ok) { return $null }
+    $lines = @(& git log --oneline "$SinceCommit..HEAD" 2>$null)
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return @($lines | Where-Object { $_ })
+}
+
 # NOT `$now`: PowerShell variable names are case-insensitive, so that is the
 # [string]$Now parameter, and assigning a DateTime to it converts straight back
 # to a string. Every consumer that wanted a real DateTime then had to be lucky.
@@ -355,6 +453,51 @@ $nowDt = if ($Now) { [datetime]::Parse($Now) } else { Get-Date }
 $mark = Read-PublishWatermark -Text $(
     if (Test-Path -LiteralPath $WatermarkPath) { try { [IO.File]::ReadAllText($WatermarkPath) } catch { '' } } else { '' }
 )
+$headHash = ''
+try { $headHash = (& git rev-parse --short HEAD 2>$null).Trim() } catch { $headHash = '' }
+
+# -Request records that work is waiting and stops. It deliberately does NOT
+# publish here: the request is honoured by the next task-boundary run, which in
+# the loop is step 6.5 seconds later, AFTER the commit guard has pushed - so the
+# tag can never land on a commit the remote has not got.
+if ($Request) {
+    $reasonText = if ($Reason) { $Reason.Trim() } else { '' }
+    if (-not $reasonText) {
+        Log 'REQUEST REFUSED: -Request needs -Reason "<who is waiting, and for what>" - an unexplained release is noise'
+        exit 1
+    }
+    try {
+        $dir = Split-Path -Parent $RequestPath
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+        $json = [ordered]@{
+            at     = $nowDt.ToString('yyyy-MM-ddTHH:mm:ssK')
+            reason = $reasonText
+            commit = $headHash
+        } | ConvertTo-Json -Compress
+        [IO.File]::WriteAllText($RequestPath, "$json`n", (New-Object Text.UTF8Encoding($false)))
+    } catch {
+        Log "REQUEST FAILED: could not write $RequestPath ($($_.Exception.Message))"
+        exit 1
+    }
+    Log "REQUESTED: $reasonText - the next task-boundary publish ships it, whatever the day's watermark says."
+    exit 0
+}
+
+if ($Status) {
+    $req = Read-RequestFile
+    Log "LAST PUBLISH: $(if ($mark.Date) { "$($mark.Date) $($mark.Tag) $($mark.Commit) ($($mark.Result))" } else { 'never' })"
+    $stranded = Get-StrandedCommits $mark.Commit
+    if ($null -eq $stranded) {
+        Log 'STRANDED: unknown (no published commit on this box to measure from)'
+    } elseif ($stranded.Count -eq 0) {
+        Log 'STRANDED: none - the release carries everything on this branch'
+    } else {
+        Log "STRANDED: $($stranded.Count) commit(s) have landed since $($mark.Tag) and are not in any release:"
+        foreach ($line in $stranded) { Log "  $line" }
+    }
+    if ($req.Requested) { Log "REQUEST PENDING: $($req.Reason) (recorded $($req.At))" }
+    exit 0
+}
 
 # Confirm a tag from an earlier run actually became a release before deciding
 # anything else. A pushed tag is a promise CI keeps ten minutes later, or does
@@ -380,8 +523,13 @@ if ($mark.Result -eq 'tagged' -and $mark.Tag) {
     }
 }
 
-$d = Test-DailyPublishDue -Now $nowDt -LastDate $mark.Date -LastAt $mark.At -HourLocal $HourLocal -StaleHours $StaleHours -Force:$Force
+$req = Read-RequestFile
+$d = Test-DailyPublishDue -Now $nowDt -LastDate $mark.Date -LastAt $mark.At `
+    -HourLocal $HourLocal -StaleHours $StaleHours `
+    -Requested:$req.Requested -RequestReason $req.Reason -HeadCommit $headHash -LastCommit $mark.Commit `
+    -Force:$Force
 if (-not $d.Due) {
+    if ($d.ClearRequest -and -not $Check) { Clear-Request '' }
     Log "NOT DUE: $($d.Why)"
     exit 0
 }
@@ -455,6 +603,13 @@ if (-not (Stamp 'attempting' "win-v$($v.Version)")) {
     Log 'refusing to publish, because an unstamped publish would re-fire on the next push'
     exit 1
 }
+
+# The request is consumed by the ATTEMPT, not by the success - same rule as the
+# watermark, and for the same reason: a request that survived a failed publish
+# would re-fire a ten-minute release run on every push for the rest of the day.
+# A SKIP returns above this line, so an absent precondition still leaves the
+# request standing for the next push.
+Clear-Request "request honoured by win-v$($v.Version); cleared"
 
 if ($NoPublish) {
     Log "NO-PUBLISH: would have run $PublishScript -Version $($v.Version)"

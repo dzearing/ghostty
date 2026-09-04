@@ -111,6 +111,17 @@ Concretely, in order, with no stops in between:
        was published, say so and why (a skip names its reason in
        `%TEMP%\ghoztty-daily-publish.log`), because the morning question this
        tab answers is "is what I am running the work I read about yesterday?".
+
+       **And name what is STRANDED** (T1294): the commits that landed after that
+       release and are therefore on nobody's machine. One command answers both
+       halves —
+
+       ```
+       powershell -NoProfile -File scripts\daily-publish.ps1 -Status
+       ```
+
+       — and a stranded list holding a fix somebody is waiting on is exactly what
+       this tab exists to surface. The remedy is a request, per step 6.5.
      - **Today's focus** — what the queue says comes next and why that is the
        right next thing.
      - **Reflection** — a genuine step back: how the work has been going,
@@ -701,6 +712,30 @@ Concretely, in order, with no stops in between:
      shipped nothing for three days while nineteen tasks closed. `-Local`
      reinstates the packaging path for a box that wants it.
 
+     **The daily cadence is the FLOOR, not the ceiling** (T1294). One publish per
+     day strands everything that lands after it: on 2026-09-03 the release went
+     out at 09:28, the fix for the installer bug the user had reported that
+     morning landed at 11:01, and the evening run answered `already published
+     today` — so they downloaded the same broken installer and reported the same
+     bug again, with 24 commits sitting behind that date. **When the work you just
+     landed is something somebody is waiting for — anything filed from a user
+     report, and anything whose task says a user hit it — record a request
+     BEFORE step 6.5**:
+
+     ```
+     powershell -NoProfile -File scripts\daily-publish.ps1 -Request ^
+         -Reason "T1291: the installer dies silently on a same-version install"
+     ```
+
+     It publishes nothing itself; the step 6.5 run seconds later, after the
+     commit guard has pushed, ships it despite the day's watermark. An ordinary
+     turn files no request and the one-a-day cadence is untouched, so this is not
+     a route to publish-per-commit. A request with nothing behind it clears
+     itself rather than minting an empty release, and one the loop has NOT
+     honoured within three hours degrades `go-loop-health.ps1`. **A task closed
+     from a user report is not done from where the user stands until the fix has
+     shipped** — the request is how that stops being a thing to remember.
+
      **A pushed tag is not yet a release**, so the watermark records `tagged` and
      the next run reconciles it against `gh release view`: `published` if CI
      built it, `failed` if an hour passed and no release exists.
@@ -727,6 +762,9 @@ Concretely, in order, with no stops in between:
      `ok` / `stale-<n>d` / `failed` / `never`, degrading the run when nothing has
      shipped for a day - the same shape as `digest=`, for the same reason. The
      morning digest names what shipped, and names the absence when nothing did.
+     Since T1294 it also answers the *other* question that `ok` used to hide:
+     `publish=ok+<n>` means the release exists and **n commits have landed since
+     it**, which was the true and misleading state on 2026-09-03.
    - **To run what you just built, run what you just built.**
      `zig-out\bin\ghoztty.exe` directly, or point the upgrade script at the dev
      install (`%LOCALAPPDATA%\ghoztty\dev-install`), which the loop owns.

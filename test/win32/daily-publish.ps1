@@ -36,6 +36,12 @@
 #      tag yet, and claiming otherwise is what hid a three-day outage.
 #   I  the tag publisher's refusals (bad version, a version already tagged) and
 #      its dry-run happy path.
+#   J  the on-demand request (T1294): it gets through the one-per-day rule, and
+#      nothing else does.
+#   K  the request reader, including the shapes that must NOT read as a request.
+#   L  the 2026-09-03 shape end to end: publish at T, fix at T+90m, shipped the
+#      same day - and the ordinary cadence unchanged around it.
+#   M  -Status: what shipped, and what has landed since.
 #
 # Hermetic: a sandbox watermark under %TEMP%, a fake `docker`/`gh` on PATH, and
 # a sentinel publish script that records if it was ever run. No Docker, no
@@ -232,6 +238,67 @@ AssertEq 'D4 an empty watermark reads as never published' '' $d4.Date
 $d5 = Read-PublishWatermark -Text '{ this is not json'
 AssertEq 'D5 truncated JSON reads as never published rather than throwing' '' $d5.Date
 
+# ---- J. the on-demand request (T1294) ------------------------------------
+#
+# The 2026-09-03 shape, as a decision: the day has published, the fix the user
+# is waiting on lands ninety minutes later, and the old rule answered "already
+# published today" until tomorrow. J1 is that exact input.
+"== J. on-demand request =="
+$publishedAt = [datetime]'2026-09-03T09:28:00'
+$fixLanded = $publishedAt.AddMinutes(90)
+
+$j0 = Test-DailyPublishDue -Now $fixLanded -LastDate '2026-09-03' -LastAt '2026-09-03T09:28:00' -HourLocal 17 `
+    -HeadCommit '65da707' -LastCommit 'aaa1111'
+Assert 'J0 without a request, a fix landing after the day''s publish still waits' (-not $j0.Due)
+
+$j1 = Test-DailyPublishDue -Now $fixLanded -LastDate '2026-09-03' -LastAt '2026-09-03T09:28:00' -HourLocal 17 `
+    -Requested -RequestReason 'T1291: the installer dies silently on a same-version install' `
+    -HeadCommit '65da707' -LastCommit 'aaa1111'
+Assert 'J1 a requested publish ships the same day, past the one-per-day rule' $j1.Due
+AssertMatch 'J1 and quotes who is waiting' 'T1291' $j1.Why
+
+# The noise guard: the request is the ONLY thing that gets through the date, and
+# a turn that files none is unchanged in every arm.
+$j2 = Test-DailyPublishDue -Now ([datetime]'2026-09-03T18:30:00') -LastDate '2026-09-03' -LastAt '2026-09-03T09:28:00' -HourLocal 17
+Assert 'J2 an ordinary evening push after today''s publish is still one-a-day' (-not $j2.Due)
+AssertMatch 'J2 and now says how to ask for a second one' '-Request' $j2.Why
+
+# "Ship it" must never be able to mint an empty release.
+$j3 = Test-DailyPublishDue -Now $fixLanded -LastDate '2026-09-03' -LastAt '2026-09-03T09:28:00' -HourLocal 17 `
+    -Requested -RequestReason 'nothing actually landed' -HeadCommit 'aaa1111' -LastCommit 'aaa1111'
+Assert 'J3 a request with nothing behind it is not due' (-not $j3.Due)
+Assert 'J3 and asks for the request to be cleared rather than left to re-fire' $j3.ClearRequest
+AssertMatch 'J3 saying why' 'nothing has landed since' $j3.Why
+
+# A request from before the day's own publish must not re-fire afterwards: the
+# publish consumes it, and if the file survives, the commit check is the backstop.
+$j4 = Test-DailyPublishDue -Now $fixLanded -LastDate '' -HourLocal 17 -Requested -RequestReason 'first ever'
+Assert 'J4 a request with no watermark at all publishes' $j4.Due
+
+$j5 = Test-DailyPublishDue -Now ([datetime]'2026-09-03T09:00:00') -LastDate '2026-09-03' -LastAt '2026-09-03T08:00:00' -HourLocal 17 `
+    -Requested -RequestReason 'morning ask' -HeadCommit 'bbb2222' -LastCommit 'aaa1111'
+Assert 'J5 the request does not wait for the evening hour either' $j5.Due
+
+# ---- K. the request reader ----------------------------------------------
+"== K. request reader =="
+$k1 = Read-PublishRequest -Text '{"at":"2026-09-03T11:05:00-07:00","reason":"T1291 installer","commit":"65da707"}'
+Assert 'K1 a JSON request reads as pending' $k1.Requested
+AssertEq 'K1 with its reason' 'T1291 installer' $k1.Reason
+AssertEq 'K1 and the commit it was filed at' '65da707' $k1.Commit
+
+$k2 = Read-PublishRequest -Text ''
+Assert 'K2 no file reads as no request' (-not $k2.Requested)
+
+$k3 = Read-PublishRequest -Text '   '
+Assert 'K3 an empty file reads as no request, not an unexplained release' (-not $k3.Requested)
+
+$k4 = Read-PublishRequest -Text '{ truncated'
+Assert 'K4 truncated JSON reads as no request rather than throwing' (-not $k4.Requested)
+
+$k5 = Read-PublishRequest -Text "ship the installer fix`n"
+Assert 'K5 a bare line typed by hand is still honoured' $k5.Requested
+AssertEq 'K5 as its reason' 'ship the installer fix' $k5.Reason
+
 # ---- live sections -------------------------------------------------------
 #
 # A sandbox with a fake `docker`/`gh` ahead of the real ones on PATH, and a
@@ -256,7 +323,9 @@ exit /b $code
 "@
 }
 
-function Invoke-Decider([string[]]$Extra, [int]$DockerCode, [int]$GhCode) {
+$requestFile = Join-Path $sandbox 'watermark-request'
+
+function Invoke-Decider([string[]]$Extra, [int]$DockerCode, [int]$GhCode, [string]$At = '2026-09-01T18:30:00') {
     Set-FakeTool 'docker' $DockerCode
     Set-FakeTool 'gh' $GhCode
     # STDOUT ONLY (T883): the assertions below read this capture as text, and a
@@ -269,7 +338,8 @@ function Invoke-Decider([string[]]$Extra, [int]$DockerCode, [int]$GhCode) {
     try {
         $psArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $publishDecider,
             '-Repo', $Repo, '-WatermarkPath', $watermark, '-PublishScript', $fakePublish,
-            '-Now', '2026-09-01T18:30:00', '-HourLocal', '17') + $Extra
+            '-RequestPath', $requestFile,
+            '-Now', $At, '-HourLocal', '17') + $Extra
         & powershell @psArgs > $out
         $code = $LASTEXITCODE
     } finally { $env:PATH = $prevPath }
@@ -363,6 +433,74 @@ try {
     Assert 'I4 and no tag was created by a dry run' (
         -not (@(git -C $Repo tag --list 'win-v99.99.99')).Count
     )
+
+    "== L. the 2026-09-03 shape, end to end =="
+    # Publish at T; a fix the user is waiting on lands at T+90m; it must be able
+    # to reach a release the same day, without anybody cutting a tag by hand.
+    # Every step below is the real script, with a sentinel publisher.
+    Remove-Item -LiteralPath $watermark, $ranMarker, $requestFile -Force -ErrorAction SilentlyContinue
+    $l1 = Invoke-Decider -Extra @() -DockerCode 1 -GhCode 0 -At '2026-09-03T09:28:00'
+    AssertEq 'L1 the day publishes as usual' 10 $l1.Exit
+    Assert 'L1 and the publisher ran' (Test-Path -LiteralPath $ranMarker)
+    $l1Tag = (Read-PublishWatermark -Text ([IO.File]::ReadAllText($watermark))).Tag
+    Remove-Item -LiteralPath $ranMarker -Force -ErrorAction SilentlyContinue
+    # The morning publish went out at an EARLIER commit than the one the fix
+    # lands on - that is the whole scenario, and the sandbox's HEAD does not move
+    # on its own, so the watermark is rewritten to say so.
+    $l1Wm = [IO.File]::ReadAllText($watermark) -replace '"commit":"[^"]*"', "`"commit`":`"$((git -C $Repo rev-parse --short HEAD~1).Trim())`""
+    [IO.File]::WriteAllText($watermark, $l1Wm)
+
+    # 11:01 - the fix lands. Old behaviour, and the bug this task is about.
+    $l2 = Invoke-Decider -Extra @() -DockerCode 1 -GhCode 0 -At '2026-09-03T11:01:00'
+    AssertEq 'L2 without a request the fix is stranded until tomorrow' 0 $l2.Exit
+    AssertMatch 'L2 exactly as it read on the day' 'already published today' $l2.Text
+    Assert 'L2 and nothing was published' (-not (Test-Path -LiteralPath $ranMarker))
+
+    # The turn that landed the fix records that somebody is waiting on it.
+    $l3 = Invoke-Decider -Extra @('-Request', '-Reason', 'T1291: the installer dies silently on a same-version install') `
+        -DockerCode 1 -GhCode 0 -At '2026-09-03T11:02:00'
+    AssertEq 'L3 recording a request exits 0' 0 $l3.Exit
+    Assert 'L3 and writes the request' (Test-Path -LiteralPath $requestFile)
+    Assert 'L3 and publishes nothing by itself' (-not (Test-Path -LiteralPath $ranMarker))
+
+    $l3b = Invoke-Decider -Extra @('-Request') -DockerCode 1 -GhCode 0 -At '2026-09-03T11:02:00'
+    AssertEq 'L3b a request with no reason is refused - an unexplained release is noise' 1 $l3b.Exit
+
+    # The next task-boundary push, minutes later. This is the whole task.
+    $l4 = Invoke-Decider -Extra @() -DockerCode 1 -GhCode 0 -At '2026-09-03T11:03:00'
+    AssertEq 'L4 the next push ships it the SAME DAY' 10 $l4.Exit
+    Assert 'L4 and the publisher ran a second time today' (Test-Path -LiteralPath $ranMarker)
+    AssertMatch 'L4 naming who was waiting' 'requested: T1291' $l4.Text
+    # The second publish of a day must not re-use the morning's version. The
+    # sentinel publisher creates no tag, so assert the property on the version
+    # scheme directly, over the tag set the real publisher would have left
+    # behind (publish-windows-tag.ps1 creates the tag locally before pushing it).
+    $l5 = Resolve-DailyPublishVersion -Tags (@(git -C $Repo tag --list 'v[0-9]*.[0-9]*.[0-9]*') +
+        @(git -C $Repo tag --list 'win-v[0-9]*.[0-9]*.[0-9]*') + @($l1Tag))
+    Assert "L5 the second publish of a day walks past the morning's tag ($l1Tag)" ("win-v$($l5.Version)" -ne $l1Tag)
+    Assert 'L6 and the request is consumed, so it cannot re-fire every push' (-not (Test-Path -LiteralPath $requestFile))
+    Remove-Item -LiteralPath $ranMarker -Force -ErrorAction SilentlyContinue
+
+    # And the cadence is exactly as it was for a turn that asks for nothing.
+    $l7 = Invoke-Decider -Extra @() -DockerCode 1 -GhCode 0 -At '2026-09-03T18:30:00'
+    AssertEq 'L7 the default cadence is unchanged - no publish-per-commit' 0 $l7.Exit
+    Assert 'L7 and nothing else was published' (-not (Test-Path -LiteralPath $ranMarker))
+
+    # A request left standing with nothing behind it clears itself rather than
+    # minting an empty release on the next push.
+    Set-Content -LiteralPath $requestFile -Encoding ascii -Value '{"at":"2026-09-03T19:00:00-07:00","reason":"nothing landed","commit":"deadbee"}'
+    $l8 = Invoke-Decider -Extra @() -DockerCode 1 -GhCode 0 -At '2026-09-03T19:01:00'
+    AssertEq 'L8 a request with nothing behind it publishes nothing' 0 $l8.Exit
+    AssertMatch 'L8 and says why' 'nothing has landed since' $l8.Text
+    Assert 'L8 and clears itself' (-not (Test-Path -LiteralPath $requestFile))
+    Assert 'L8 and no empty release was minted' (-not (Test-Path -LiteralPath $ranMarker))
+
+    "== M. -Status names what is stranded =="
+    $m = Invoke-Decider -Extra @('-Status') -DockerCode 1 -GhCode 0 -At '2026-09-03T19:05:00'
+    AssertEq 'M1 -Status exits 0' 0 $m.Exit
+    AssertMatch 'M2 and names the last publish' 'LAST PUBLISH' $m.Text
+    AssertMatch 'M3 and answers the stranded question' 'STRANDED' $m.Text
+    Assert 'M4 and publishes nothing' (-not (Test-Path -LiteralPath $ranMarker))
     Complete-TestBody
 } finally {
     Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue

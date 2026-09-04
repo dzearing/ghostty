@@ -70,6 +70,12 @@ param(
     # actually reads.
     [string]$PublishWatermark = '',
     [datetime]$PublishAsOf = [datetime]::MinValue,
+    # A pending "ship this now" request (T1294). Defaults beside the watermark.
+    [string]$PublishRequest = '',
+    # How long a request may sit unhonoured before the run degrades. A request is
+    # filed mid-turn and honoured at that turn's step 6.5, so anything under an
+    # hour is in-flight rather than stuck.
+    [int]$RequestStaleHours = 3,
     [switch]$Json,
     # Gather the evidence a death leaves behind, for dissecting WHY.
     [switch]$Postmortem
@@ -80,6 +86,7 @@ if (-not $Repo) { $Repo = Split-Path -Parent $PSScriptRoot }
 if ($DigestAsOf -eq [datetime]::MinValue) { $DigestAsOf = Get-Date }
 if ($PublishAsOf -eq [datetime]::MinValue) { $PublishAsOf = Get-Date }
 if (-not $PublishWatermark) { $PublishWatermark = Join-Path $env:LOCALAPPDATA 'ghoztty\daily-publish' }
+if (-not $PublishRequest) { $PublishRequest = "$PublishWatermark-request" }
 # Get-LoopStop. loop-session.ps1 is documented as free of load-time side effects.
 . (Join-Path $PSScriptRoot 'loop-session.ps1')
 $IsoFmt = 'yyyy-MM-ddTHH:mm:ssK'
@@ -232,13 +239,29 @@ if (Test-Path -LiteralPath (Join-Path $Repo $digestRel)) {
 # local date. daily-publish.ps1 is what reconciles a pushed tag against the
 # release CI actually created, so by the time a state gets here it is honest.
 #
-#   ok         - published (or tagged and building) today or yesterday
+#   ok         - published (or tagged and building) today or yesterday, and the
+#                release carries everything on this branch
+#   ok+<n>     - the same, except n commits have landed since that release and
+#                are on nobody's machine (T1294)
 #   stale-<n>d - the last publish was n days ago, n >= 2
 #   failed     - the last attempt did not produce a release
 #   never      - nothing has ever been published from this box
+#
+# The `+<n>` suffix exists because `ok` was true and misleading on 2026-09-03:
+# the day HAD published, and 24 commits - including the fix for the bug the user
+# had just reported - sat behind it. "Published" and "current" are different
+# questions, and only the second one is the one a user feels. It is deliberately
+# NOT a degrade: a commit landing after a release is the normal state of an
+# afternoon, and a light that is always red is not a light. What degrades is a
+# publish REQUEST that has gone unhonoured, because that is somebody asking for a
+# release and not getting one.
 $publishState = 'never'
 $publishTag = ''
 $publishDate = ''
+$publishCommit = ''
+$publishBehind = $null
+$requestReason = ''
+$requestAgeHours = $null
 try {
     if (Test-Path -LiteralPath $PublishWatermark) {
         $wmText = [IO.File]::ReadAllText($PublishWatermark).Trim()
@@ -248,6 +271,7 @@ try {
         if ($wm -and $wm.date) {
             $publishDate = [string]$wm.date
             $publishTag = [string]$wm.tag
+            $publishCommit = [string]$wm.commit
             $days = [int]([math]::Floor(($PublishAsOf.Date - ([datetime]::ParseExact($publishDate, 'yyyy-MM-dd', $null)).Date).TotalDays))
             if ([string]$wm.result -eq 'failed') { $publishState = 'failed' }
             elseif ($days -ge 2) { $publishState = "stale-${days}d" }
@@ -256,6 +280,39 @@ try {
         }
     }
 } catch { $publishState = 'never' }
+
+# How far the shipped release is behind this branch. Local git only; a commit the
+# repo does not have (a watermark from another clone) leaves the count unknown
+# rather than guessed.
+if ($publishState -eq 'ok' -and $publishCommit) {
+    try {
+        & git -C $Repo cat-file -e "$publishCommit^{commit}" 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            $n = (& git -C $Repo rev-list --count "$publishCommit..HEAD" 2>$null)
+            if ($LASTEXITCODE -eq 0 -and "$n" -match '^\d+$') {
+                $publishBehind = [int]$n
+                if ($publishBehind -gt 0) { $publishState = "ok+$publishBehind" }
+            }
+        }
+    } catch { $publishBehind = $null }
+}
+
+# A pending request is the loop being ASKED to ship and not having shipped.
+try {
+    if (Test-Path -LiteralPath $PublishRequest) {
+        $rqText = [IO.File]::ReadAllText($PublishRequest).Trim()
+        if ($rqText) {
+            if ($rqText.StartsWith('{')) {
+                $rq = $rqText | ConvertFrom-Json
+                $requestReason = [string]$rq.reason
+                if ($rq.at) { try { $requestAgeHours = ((Get-Date) - [datetime]::Parse([string]$rq.at)).TotalHours } catch { $requestAgeHours = $null } }
+            } else {
+                $requestReason = ($rqText -split "`n")[0].Trim()
+            }
+            if (-not $requestReason) { $requestReason = '(no reason recorded)' }
+        }
+    }
+} catch { $requestReason = '' }
 
 # --- verdict ----------------------------------------------------------------
 
@@ -291,6 +348,11 @@ if ($publishState -eq 'never') {
     $notes += "the last publish did not land: $(if ($publishTag) { $publishTag } else { $publishDate }) was tagged and no release exists - check the Release (Windows) run for that tag"
 } elseif ($publishState -like 'stale-*') {
     $notes += "nothing has shipped since $publishDate ($publishState) - the work that has landed since is not on the user's machine"
+}
+if ($requestReason -and ($null -eq $requestAgeHours -or $requestAgeHours -ge $RequestStaleHours)) {
+    $notes += ("a publish was requested and has not gone out" +
+        $(if ($null -ne $requestAgeHours) { " ($([math]::Round($requestAgeHours))h ago)" } else { '' }) +
+        ": $requestReason - the next task-boundary run of scripts\daily-publish.ps1 ships it")
 }
 
 $verdict = 'healthy'
@@ -338,6 +400,9 @@ if ($Json) {
         publish        = $publishState
         publish_tag    = $publishTag
         publish_date   = $publishDate
+        publish_commit = $publishCommit
+        publish_behind = $publishBehind
+        publish_request = $requestReason
         stopped        = [bool]$stopReq
         notes          = $notes
     } | ConvertTo-Json -Depth 4

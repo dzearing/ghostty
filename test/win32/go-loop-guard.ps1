@@ -1788,6 +1788,54 @@ Assert 'Z6 and the note names the tag to go and look at' ($z -match 'win-v1\.36\
 $z = ZHealth $null
 Assert 'Z7 no watermark at all reads never, not ok' ($z -match 'publish=never')
 
+# --- Z8..Z12. published is not the same question as current (T1294) ---------
+#
+# On 2026-09-03 the day HAD published, so this field read `ok`, and 24 commits
+# sat behind that release - among them the fix for the installer bug the user
+# had reported that morning. They downloaded the same broken installer and
+# reported the same bug again. `ok` was true and it was the wrong true thing.
+$zReqPath = Join-Path $zRoot 'daily-publish-request'
+function ZHealthReq([string]$json, [string]$request, [string]$repo) {
+    if ($null -eq $json) { Remove-Item -LiteralPath $zWm -Force -ErrorAction SilentlyContinue }
+    else { Set-Content -LiteralPath $zWm -Encoding ascii -Value $json }
+    if ($null -eq $request) { Remove-Item -LiteralPath $zReqPath -Force -ErrorAction SilentlyContinue }
+    else { Set-Content -LiteralPath $zReqPath -Encoding ascii -Value $request }
+    return (& powershell -NoProfile -ExecutionPolicy Bypass -File $zHealth `
+            -Repo $repo -PublishWatermark $zWm -PublishRequest $zReqPath `
+            -PublishAsOf $zNow.ToString('o') -DigestAsOf $zNow.ToString('o') 2>&1 |
+        ForEach-Object { $_.ToString() } | Out-String)
+}
+
+# Measured against the REAL repo, because the count is a git question: a
+# watermark pointing three commits back must read ok+3, not ok.
+$zBehindCommit = (& git -C $Repo rev-parse --short HEAD~3 2>$null)
+if ($LASTEXITCODE -eq 0 -and $zBehindCommit) {
+    $zBehindCommit = $zBehindCommit.Trim()
+    $z = ZHealthReq "{`"date`":`"2026-09-03`",`"at`":`"2026-09-03T06:10:00-07:00`",`"tag`":`"win-v1.36.2`",`"commit`":`"$zBehindCommit`",`"result`":`"published`"}" $null $Repo
+    Assert 'Z8 a release three commits behind HEAD reads ok+3, not ok' ($z -match 'publish=ok\+3\b')
+
+    $zHead = (& git -C $Repo rev-parse --short HEAD).Trim()
+    $z = ZHealthReq "{`"date`":`"2026-09-03`",`"at`":`"2026-09-03T06:10:00-07:00`",`"tag`":`"win-v1.36.2`",`"commit`":`"$zHead`",`"result`":`"published`"}" $null $Repo
+    Assert 'Z9 a release that carries HEAD reads plain ok' ($z -match 'publish=ok(?!\+)')
+} else {
+    Assert 'Z8/Z9 SKIP: could not resolve HEAD~3 in this repo' $true
+}
+
+# A request that has gone unhonoured is the loop being ASKED to ship and not
+# shipping - that one DOES degrade, because somebody is waiting on it.
+$zOld = (Get-Date).AddHours(-9).ToString('yyyy-MM-ddTHH:mm:sszzz')
+$z = ZHealthReq '{"date":"2026-09-03","at":"2026-09-03T06:10:00-07:00","tag":"win-v1.36.2","commit":"abc1234","result":"published"}' `
+    "{`"at`":`"$zOld`",`"reason`":`"T1291: the installer dies silently`",`"commit`":`"abc1234`"}" $zRepo
+Assert 'Z10 an unhonoured publish request degrades the run' ($z -match 'DEGRADED')
+Assert 'Z11 and the note quotes what is waiting' ($z -match 'T1291: the installer dies silently')
+
+# A request filed minutes ago is in flight - this turn's step 6.5 ships it - and
+# must not paint the loop red on its way past.
+$zFresh = (Get-Date).ToString('yyyy-MM-ddTHH:mm:sszzz')
+$z = ZHealthReq '{"date":"2026-09-03","at":"2026-09-03T06:10:00-07:00","tag":"win-v1.36.2","commit":"abc1234","result":"published"}' `
+    "{`"at`":`"$zFresh`",`"reason`":`"filed this minute`",`"commit`":`"abc1234`"}" $zRepo
+Assert 'Z12 a request filed this minute is in flight, not a fault' ($z -notmatch 'filed this minute')
+
 Remove-Item -LiteralPath $zRoot -Recurse -Force -ErrorAction SilentlyContinue
 
 # --- AA. the health line measures WORK, not keystrokes (T1290) -------------

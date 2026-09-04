@@ -20924,3 +20924,47 @@ And **D89** puts the signing question back to the user, because the facts under
 D87 changed: that decision weighed a warning most people click through, and the
 worst case is now a machine where the program has been deleted. Signing is the
 single largest input to the model that made the call.
+
+## 2026-09-03 - a fix that lands after the day's release can ship the same day (T1294)
+
+The loop published `win-v1.36.2` at 09:28. The fix for the installer bug the
+user had reported that morning landed at 11:01. At 18:19 the publish step
+answered `NOT DUE: already published today` - so the user downloaded the same
+installer, hit the same bug, and reported it a second time, with 24 commits
+sitting behind that one date. T1292 had just fixed *whether* a publish can
+happen; this was *when*.
+
+**The daily cadence is now the floor, not the ceiling.** `daily-publish.ps1`
+takes `-Request -Reason "<who is waiting, and for what>"`, which records a
+durable request beside the watermark and publishes nothing itself. The next
+task-boundary run - step 6.5, seconds later, after the commit guard has pushed -
+sees the request and publishes despite the day's date. A turn that files no
+request is unchanged in every arm, so this is not a route to publish-per-commit;
+the request is the only thing allowed through the one-per-day rule, and it is
+consumed by the ATTEMPT rather than the success, so a failed publish cannot
+re-fire a release run on every push for the rest of the evening.
+
+**"Ship it" can never mint an empty release.** A request whose HEAD is already
+the published commit is cleared rather than honoured, and says so.
+
+**`publish=ok` was true and misleading, so it now answers the other question.**
+`go-loop-health.ps1` reports `publish=ok+<n>` when the release exists and n
+commits have landed since it - `ok+31` on this box as this was written.
+Deliberately not a degrade: a commit landing after a release is the normal state
+of an afternoon, and a light that is always red is not a light. What degrades is
+a request the loop has NOT honoured within three hours, because that is somebody
+asking for a release and not getting one.
+
+**And the morning read names what is stranded.** `daily-publish.ps1 -Status`
+prints the last release and every commit that has landed since; go.md step 0.5
+now requires the digest's Commentary to name them, so a stranded fix is
+something read over coffee rather than something hit twice.
+
+Acceptance: sections J (the request gets through the date rule and nothing else
+does), K (the reader, including the shapes that must NOT read as a request), L
+(the exact 2026-09-03 shape end to end - publish at T, fix at T+90m, shipped the
+same day, with the ordinary cadence unchanged around it) and M (`-Status`) of
+`test\win32\daily-publish.ps1`, 130 assertions ALL PASS with the negative
+control scoring 130 failures; and Z8-Z12 of `test\win32\go-loop-guard.ps1` for
+`ok+n`, plain `ok` when the release carries HEAD, an unhonoured request
+degrading the run, and a request filed this minute NOT doing so.
