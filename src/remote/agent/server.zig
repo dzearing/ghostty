@@ -2783,7 +2783,7 @@ const FakeChild = struct {
     /// asserts the second fails whenever it wins that gap (~1 run in 8 here).
     /// The product ordering is correct; the tests were watching the wrong edge.
     fn waitTerminated(self: *FakeChild) bool {
-        return waitUntil(wasTerminated, .{self});
+        return waitUntil("the child to be terminated", wasTerminated, .{self});
     }
     fn inputCopy(self: *FakeChild, alloc: Allocator) ![]u8 {
         self.mutex.lock();
@@ -3392,7 +3392,7 @@ test "METRICS_SUB pushes metrics frames; METRICS_UNSUB stops the pump cleanly" {
             return s.metrics_thread == null;
         }
     };
-    try testing.expect(waitUntil(P.pumpGone, .{h.server}));
+    try testing.expect(waitUntil("the pump thread to exit", P.pumpGone, .{h.server}));
 }
 
 test "concurrent METRICS_UNSUB and shutdown: exactly one of them joins the pump (T420)" {
@@ -3509,7 +3509,7 @@ test "SESSION_CPU_SUB pushes per-session CPU; SESSION_CPU_UNSUB stops the pump c
             return s.session_cpu_thread == null;
         }
     };
-    try testing.expect(waitUntil(P.pumpGone, .{h.server}));
+    try testing.expect(waitUntil("the pump thread to exit", P.pumpGone, .{h.server}));
 }
 
 test "suppressCapabilities: turns a capability off at the source, in the HELLO (T469)" {
@@ -3759,7 +3759,7 @@ test "SESSIONS_SUB pushes the roster immediately and again when it changes" {
             return !s.sessions_push;
         }
     };
-    try testing.expect(waitUntil(P.unsubscribed, .{h.server}));
+    try testing.expect(waitUntil("the connection to unsubscribe", P.unsubscribed, .{h.server}));
 }
 
 test "sessions_push: an OLDER client that never advertises it leaves the stream off" {
@@ -4022,7 +4022,7 @@ test "client DATA reaches the child (input round-trip)" {
             return std.mem.eql(u8, got, "ls -la\n");
         }
     };
-    try testing.expect(waitUntil(P.sawInput, .{ &fc, alloc }));
+    try testing.expect(waitUntil("the child to see the written input", P.sawInput, .{ &fc, alloc }));
     const got = try fc.inputCopy(alloc);
     defer alloc.free(got);
     try testing.expectEqualSlices(u8, "ls -la\n", got);
@@ -4840,11 +4840,17 @@ test "RELAUNCH: ATTACH to a materialized session is dead+relaunchable; RELAUNCH 
     // The session is now alive + not relaunchable, and streams fresh output.
     // The sampled foreground command was CLEARED (T429): it described the old
     // child's world, and the respawn starts at a fresh prompt.
+    // Read under the lock, assert after it (T436): a `try` that returns while
+    // holding `store.mutex` re-enters it in the test's own `defer h.deinit()`
+    // and the failure reports as a deadlock in `shutdown` instead of as itself.
     h.server.store.mutex.lock();
     const s = h.server.store.table.getByChannel(channel).?;
-    try testing.expect(s.alive and !s.relaunchable);
-    try testing.expect(s.fg_cmd == null);
+    const alive = s.alive;
+    const relaunchable = s.relaunchable;
+    const fg_cmd_cleared = s.fg_cmd == null;
     h.server.store.mutex.unlock();
+    try testing.expect(alive and !relaunchable);
+    try testing.expect(fg_cmd_cleared);
 
     h.server.onChildOutput(channel, "back!");
     const d = try h.client.nextData();
@@ -5225,8 +5231,9 @@ test "OPEN records cwd → sessions.json carries it (T132 reboot floor)" {
     // there. Before T132 `cwd` was dropped here and the record had none.
     h.store.mutex.lock();
     const s = h.store.table.getByIdStr(op.value.session_id).?;
-    try testing.expectEqualStrings("/work/ghoztty", s.cwd.?);
+    const s_cwd = s.cwd;
     h.store.mutex.unlock();
+    try testing.expectEqualStrings("/work/ghoztty", s_cwd.?);
 
     // `handleOpen` persists on its own thread right after OPENED; persist here
     // so the read below is ordered rather than racing that write.
@@ -5336,14 +5343,15 @@ test "RESIZE and SIGNAL are recorded on the child" {
             return c.lastResize() != null and c.lastSignalIs("INT");
         }
     };
-    try testing.expect(waitUntil(P.both, .{&fc}));
+    try testing.expect(waitUntil("the child to see both the resize and the signal", P.both, .{&fc}));
     try testing.expectEqual([4]u16{ 50, 120, 1, 2 }, fc.lastResize().?);
     try testing.expect(fc.lastSignalIs("INT"));
     // Session dims updated.
     h.server.store.mutex.lock();
     const s = h.server.store.table.getByChannel(o.channel).?;
-    try testing.expectEqual(@as(u16, 50), s.rows);
+    const s_rows = s.rows;
     h.server.store.mutex.unlock();
+    try testing.expectEqual(@as(u16, 50), s_rows);
 }
 
 test "FLOW pause halts streaming; resume continues from buffered offset" {
@@ -5381,7 +5389,7 @@ test "FLOW pause halts streaming; resume continues from buffered offset" {
             return !streaming(s, ch);
         }
     };
-    try testing.expect(waitUntil(P.paused, .{ h.server, o.channel }));
+    try testing.expect(waitUntil("the session to stop streaming (paused)", P.paused, .{ h.server, o.channel }));
     h.server.onChildOutput(o.channel, "PAUSED"); // ringed at offset 0, not sent
 
     // Resume → subsequent output streams live (the buffered bytes recover via
@@ -5392,7 +5400,7 @@ test "FLOW pause halts streaming; resume continues from buffered offset" {
         _ = fl.encodeInto(&buf);
         break :blk &buf;
     });
-    try testing.expect(waitUntil(P.streaming, .{ h.server, o.channel }));
+    try testing.expect(waitUntil("the session to resume streaming", P.streaming, .{ h.server, o.channel }));
     h.server.onChildOutput(o.channel, "LIVE"); // streams at offset 6
 
     const d = try h.client.nextData();
@@ -5444,12 +5452,14 @@ test "DETACH stops streaming but keeps the session alive" {
             return !sess.streaming and sess.alive;
         }
     };
-    try testing.expect(waitUntil(P.detached, .{ h.server, o.channel }));
+    try testing.expect(waitUntil("the session to detach (alive, not streaming)", P.detached, .{ h.server, o.channel }));
     h.server.store.mutex.lock();
     const s = h.server.store.table.getByChannel(o.channel).?;
-    try testing.expect(!s.streaming);
-    try testing.expect(s.alive);
+    const s_streaming = s.streaming;
+    const s_alive = s.alive;
     h.server.store.mutex.unlock();
+    try testing.expect(!s_streaming);
+    try testing.expect(s_alive);
 }
 
 test "unknown channel DATA is ignored (no crash, no child write)" {
@@ -5479,7 +5489,7 @@ test "unknown channel DATA is ignored (no crash, no child write)" {
             return std.mem.eql(u8, got, "real");
         }
     };
-    try testing.expect(waitUntil(P.sawInput, .{ &fc, alloc }));
+    try testing.expect(waitUntil("the child to see the written input", P.sawInput, .{ &fc, alloc }));
     const got = try fc.inputCopy(alloc);
     defer alloc.free(got);
     try testing.expectEqualSlices(u8, "real", got); // "ghost" never landed
@@ -5570,10 +5580,12 @@ test "P1: session survives connection drop; reattach replays the ring gap (catch
     // The session must STILL be in the shared store, alive, ringing.
     h.store.mutex.lock();
     const survived = h.store.table.getByChannel(o.channel);
-    try testing.expect(survived != null);
-    try testing.expect(survived.?.alive);
-    try testing.expect(!survived.?.bound); // orphaned now
+    const survived_alive = if (survived) |sv| sv.alive else false;
+    const survived_bound = if (survived) |sv| sv.bound else false;
     h.store.mutex.unlock();
+    try testing.expect(survived != null);
+    try testing.expect(survived_alive);
+    try testing.expect(!survived_bound); // orphaned now
 
     // While disconnected, the child keeps producing — recorded into the ring even
     // though no connection is bound (offsets 5..16).
@@ -5638,11 +5650,14 @@ test "P1: explicit DETACH orphans the session (kept alive, unbound, not streamin
             return !s.streaming and !s.bound and s.alive;
         }
     };
-    try testing.expect(waitUntil(P.orphaned, .{ h.store, o.channel }));
+    try testing.expect(waitUntil("the session to be orphaned (alive, unbound, not streaming)", P.orphaned, .{ h.store, o.channel }));
     h.store.mutex.lock();
     const s = h.store.table.getByChannel(o.channel).?;
-    try testing.expect(s.alive and !s.streaming and !s.bound);
+    const s_alive = s.alive;
+    const s_streaming = s.streaming;
+    const s_bound = s.bound;
     h.store.mutex.unlock();
+    try testing.expect(s_alive and !s_streaming and !s_bound);
 }
 
 test "T534: unattached_since stamps the detach, resets on re-attach, and rides the roster" {
@@ -5755,8 +5770,11 @@ test "WP-D1: stale DETACH from a superseded connection must not silence the new 
     // The session must STILL be bound + streaming to conn 2...
     h.store.mutex.lock();
     const s = h.store.table.getByChannel(o.channel).?;
-    try testing.expect(s.alive and s.bound and s.streaming);
+    const s_alive = s.alive;
+    const s_bound = s.bound;
+    const s_streaming = s.streaming;
     h.store.mutex.unlock();
+    try testing.expect(s_alive and s_bound and s_streaming);
 
     // ...and live output must still reach conn 2.
     h.server.onChildOutput(o.channel, "+live");
@@ -5819,9 +5837,10 @@ test "stale CLOSE from a superseded connection must not kill the new owner's ses
     // must NOT have been terminated.
     h.store.mutex.lock();
     const s = h.store.table.getByChannel(o.channel);
-    try testing.expect(s != null);
-    try testing.expect(s.?.alive and s.?.bound and s.?.streaming);
+    const s_live = if (s) |sess| sess.alive and sess.bound and sess.streaming else false;
     h.store.mutex.unlock();
+    try testing.expect(s != null);
+    try testing.expect(s_live);
     try testing.expect(!fc.wasTerminated());
 
     // ...and live output must still reach conn 2.
@@ -5951,13 +5970,14 @@ test "OPEN records the session cwd so a RELAUNCH respawns in it" {
     // across the agent restart the reboot floor exists for.
     h.server.store.mutex.lock();
     const s = h.server.store.table.getByIdStr(op.value.session_id).?;
-    try testing.expectEqualStrings("/tmp/worktree", s.cwd.?);
+    const s_cwd = s.cwd;
     // Fake a reboot-materialized tombstone in place: the child is gone but the
     // relaunch metadata is what came back off disk.
     s.alive = false;
     s.relaunchable = true;
     const sid = s.id_str;
     h.server.store.mutex.unlock();
+    try testing.expectEqualStrings("/tmp/worktree", s_cwd.?);
 
     // The `restore` client sends a plain login-shell argv, which nulls the
     // recorded command in the synthesized OPEN. The cwd must survive that.

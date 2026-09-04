@@ -21533,3 +21533,59 @@ green - test-binary-soak (77), crash-first-chance (49), crash-stacks,
 crash-databreak, isolation-meta (13), launch-preflight-audit (19),
 verdict-exit-audit, cleanslate-audit (21), stderr-capture-audit (25),
 desktop-launch-audit (29).
+## 2026-09-04 - A failing agent assertion now reports the assertion, not a deadlock (T436)
+
+When one of the agent's automated checks failed, it blamed the wrong part of the
+program. Nine test sites in `src/remote/agent/server.zig` read a session's
+fields with `store.mutex` held by hand and asserted while still holding it, so a
+failing `try` returned out of the test WITH THE LOCK - and the test's own
+`defer h.deinit()` immediately took that same lock again in
+`shutdown -> detachAll`. Zig's Debug mutex called that what it looks like:
+
+```
+thread 46036 panic: Deadlock detected
+  ... in detachAll
+  ... in shutdown
+```
+
+So "the session was still bound" reported as a mutex deadlock in shutdown code
+that is working perfectly, and whoever hit it spent the next hour there. The
+same flip, measured both ways on `test "P1: session survives connection drop;
+reattach replays the ring gap (catch-up)"`, is the before/after: old shape ->
+`Deadlock detected` and exit code 3; new shape -> the assertion itself, named,
+at the line that failed.
+
+The fix is the boring one the task specified: read the fields under the lock,
+assert after it. The sites were found by scanning for a `try` sitting between a
+hand-written `lock()` and its `unlock()` rather than by the line numbers on the
+card, which had shifted twice - nine, not the eight last surveyed - and the same
+scan over all of `src/**.zig` now finds none left, in test code or product code.
+
+The other half of the card was the wait underneath the flake. `waitUntil` gave
+up silently after its 60-second liveness bound and left a bare `false` to the
+assertion after it, which reads as `expected true, found false` - naming neither
+what the test was waiting for nor that a minute of the lane had just gone into
+it. Every wait now carries a plain-words label and prints it on the deadline:
+
+```
+waitUntil TIMEOUT after 8 ms waiting for: the deliberately unsatisfiable condition ...
+```
+
+All ten call sites are labelled ("the pump thread to exit", "the session to be
+orphaned (alive, unbound, not streaming)"), and a new `waitUntilFor` takes an
+explicit deadline so the timeout path is testable in milliseconds instead of
+spending the shared bound.
+
+Testing that timeout is what turned up the surprise: the four tests in
+`src/remote/test_util.zig` - the file that encodes the whole T346/T258 wait
+discipline - ran in **no lane at all**. Zig runs a file's tests only when its
+CONTAINER is referenced from an analyzed one, and `agent/test_util.zig`
+re-exports the decls, which is not the same thing. A deliberately broken
+assertion inside them went green through the entire agent lane. They are now
+referenced from the agent test root's import list and run with everything else.
+Filed as **T1332**: this is the same shape T1191's `test-reach-audit.ps1` guards
+for the win32 modules, and nothing guards it for `src/remote/`.
+
+Floor: all four lanes PASS (lib 5s, none 136s, win32 367s, agent 372s), and the
+agent lane five times over - PASS / PASS / PASS / PASS / PASS, no leaked test
+binaries on any run.

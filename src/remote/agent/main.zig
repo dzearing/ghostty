@@ -3054,6 +3054,12 @@ test {
     _ = @import("../agent_lineage.zig");
     _ = @import("descendants.zig");
     _ = @import("proc.zig");
+    // The shared test-wait helpers. Their own tests ran in NO lane until T436:
+    // the re-export in `test_util.zig` references the decls, which is not the
+    // same as referencing the container, so the file's `test` blocks were
+    // skipped in silence - the same shape `test-reach-audit.ps1` guards for the
+    // win32 modules.
+    _ = @import("../test_util.zig");
 }
 
 test "decideRelayCred: env token wins over relay.env" {

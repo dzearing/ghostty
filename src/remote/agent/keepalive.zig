@@ -283,7 +283,7 @@ test "keepalive: live link keeps getting pinged and is never closed" {
             return f.pings.load(.monotonic) >= 3;
         }
     };
-    try testing.expect(test_util.waitUntil(P.pinged, .{&fake}));
+    try testing.expect(test_util.waitUntil("the keepalive thread to send a ping", P.pinged, .{&fake}));
     ka.requestStop();
     t.join();
 
