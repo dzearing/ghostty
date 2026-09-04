@@ -21367,3 +21367,57 @@ T1325 (the vendored asset mirror is red against `origin/main` and has been for a
 while - `guard-due` reopens a harness when OUR files change, and main advancing
 changes none of them, so the check went silently red). The commit for this task
 takes `-NoGuardDue` naming `hook-json` for exactly that pre-existing red.
+
+## T1323 - the exit-code audit stops naming lines and starts deleting them
+
+`test\win32\harness-exitcode-audit.ps1` was red, and nothing was wrong. Section
+B's B3 asserted that the literal text `$null = $second.Handle` still appeared in
+`test\win32\ipc-p1.ps1`; T1285 had rewritten P1's step 9 to run its second GUI
+launch through `Invoke-OnTestDesktop`, which parses an exit code out of a native
+helper's result string and never holds a PowerShell `Process` object at all. The
+guarded line was right to go. The check looking for it was what had gone stale -
+and a harness that is red on correct code is the exact failure this suite spends
+the most effort avoiding, because a colour nobody believes stops reporting the
+defects it was built for.
+
+The fix is not to re-add the line, and not simply to delete the check either.
+B3's stated purpose was that "a later edit that drops the line is caught by
+name, not only by the analyzer", and that purpose is real: B1's sweep passing
+proves no guard is MISSING today, but it would read identically if the analyzer
+had regressed into never reporting anything. What was wrong was the method. A
+by-name assertion cannot tell a DROPPED guard from a line correctly deleted
+along with the object it guarded, so it must go red on the second case
+eventually, and it did.
+
+So B3, B4 and B5 - three spot-checks naming three lines in three named files -
+are now one MUTATION sweep. It walks every `$null = $x.Handle` in `test\win32`
+and `scripts`, deletes each one in memory, and re-runs the analyzer over the
+result: a guard whose removal produces a new finding is load-bearing. That
+answers the question the spot-checks were reaching for, directly, and it names
+no line - a file that legitimately loses its Process object simply leaves the
+set instead of reddening the harness. It reads 55 of 108 guards load-bearing
+today; the other 53 guard a site that gates on OUTPUT, which the analyzer never
+reports either way and which the rule still asks for on every site. Both of the
+old B4/B5 subjects (`lib\PaneLiveness.ps1`, `scripts\loop-session.ps1`) are in
+the load-bearing set, so nothing they covered was dropped.
+
+A new gate ships with the demonstration that it can fail, so both directions
+were constructed rather than asserted. Deleting the real guard at
+`scripts\loop-session.ps1:626` turned the run red (`VIOLATION ... $p reads
+ExitCode at line 631 - handle never cached`, `FAIL B1`, exit 1) and moved the
+load-bearing count 55 -> 54. Neutering the analyzer to return no findings left
+B1 PASSING - the vacuous pass B3 exists to catch - and turned B3/B4 red at
+`0/108`. Both mutations were reverted.
+
+Floor: all four lanes PASS, P1/P2/P3 ALL PASS. The six audit harnesses
+`guard-due` reopened over this edit (`isolation-meta`, `launch-preflight`,
+`verdict-exit`, `cleanslate`, `stderr-capture`, `desktop-launch`) are all ALL
+PASS.
+
+Filed nothing new: the one red found on the way (`hook-json`'s vendor-drift
+section, still failing against `origin/main`) is already T1325, filed by the
+T1321 turn. T1326 was opened for it before that was noticed and is closed as a
+duplicate, with what this turn measured - the blob identity of all four copies,
+and the image-viewer prose main added that this branch has not taken - folded
+into T1325 instead. This commit takes `-NoGuardDue` naming `hook-json` for the
+same pre-existing red.

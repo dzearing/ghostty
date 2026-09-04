@@ -1,11 +1,10 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-04T04:19:06-07:00",
-    "commit":  "296e385bd",
+    "generated":  "2026-09-04T04:45:10-07:00",
+    "commit":  "e773482e2",
     "uncommitted":  [
-                        "test/win32/feedback-user-report.ps1",
-                        "test/win32/hook-json.ps1"
+                        "test/win32/harness-exitcode-audit.ps1"
                     ],
     "files":  {
                   "docs/claude/testing.md":  "353e090f48ab5d8f8eee4042ac2689134b9f082800c4a067d625af97eec7f2c7",
@@ -107,7 +106,7 @@
                   "test/win32/go-loop-uptime.ps1":  "a97005d970a564088741646542ffaca3cb9ffe03d2eb30c55b96841607948b82",
                   "test/win32/guard-due.ps1":  "7d19009608a80312171a80eb68f9324dc2ff0ff248990c8a3ab4b4f43398c743",
                   "test/win32/gui-launch-command.ps1":  "92343e0db67fea906f08a1a8ef37ec38c4bd2ca90b859269451d543e33ec6202",
-                  "test/win32/harness-exitcode-audit.ps1":  "1fdbe9c4d70fd1e9fe80ac17257de1d346a3b5c07c7c69628578eba5ac45f033",
+                  "test/win32/harness-exitcode-audit.ps1":  "9568a9718f2cfba7d2bc2b8f9813a74ba8767a062a20dea8f236fc56fa3ee4e5",
                   "test/win32/harness-process-leak.ps1":  "c62a0f43277632a1bd8506273912a0f73b13ed311d3f84e6a3763b425a9d14a9",
                   "test/win32/hero-mode.ps1":  "bc202bf5cc920c3949969f8dc8576092bc6ac692ea10718257827b3e04fd7a83",
                   "test/win32/hero-nav.ps1":  "85da993c3289f39ca5ec6174dfdd6bf375abccf6a115c2e3aa105a75541ff487",

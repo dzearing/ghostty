@@ -179,14 +179,65 @@ Assert "B1 no unguarded ExitCode read in test\win32 or scripts" ($sweep.Count -e
 $scanned = @(Get-ChildItem -LiteralPath (Join-Path $Repo 'test\win32') -Recurse -Filter *.ps1 -File).Count
 Assert "B2 the sweep really read the suite (>60 scripts)" ($scanned -gt 60)
 
-# The two shapes the fix took, spot-checked where they actually live - so a
-# later edit that drops the line is caught by name, not only by the analyzer.
-$p1 = Get-Content -LiteralPath (Join-Path $Repo 'test\win32\ipc-p1.ps1') -Raw
-Assert "B3 P1's second-instance probe caches the handle" ($p1 -match '\$null = \$second\.Handle')
-$live = Get-Content -LiteralPath (Join-Path $Repo 'test\win32\lib\PaneLiveness.ps1') -Raw
-Assert "B4 the shared liveness CLI caches the handle" ($live -match '\$null = \$p\.Handle')
-$loop = Get-Content -LiteralPath (Join-Path $Repo 'scripts\loop-session.ps1') -Raw
-Assert "B5 the loop's +list probe caches the handle" ($loop -match '\$null = \$p\.Handle')
+# B3 (T1323): the guards in the suite are LOAD-BEARING - shown by deleting
+# each one and watching the analyzer notice, rather than by naming lines.
+#
+# This replaces three by-name spot-checks (P1's second-instance probe,
+# PaneLiveness, the loop's +list probe) that asserted a literal
+# `$null = $x.Handle` still appeared in a named file. Their stated purpose was
+# that "a later edit that drops the line is caught by name, not only by the
+# analyzer" - but a by-name check cannot tell a DROPPED guard from a line that
+# was correctly deleted along with the Process object it guarded. T1285 rewrote
+# P1 step 9 to `Invoke-OnTestDesktop`, which parses an exit code out of a native
+# helper's result string and holds no Process object at all, so the trap cannot
+# arise there and the line was right to go. B3 went red anyway, for weeks, on
+# correct code - which is the fabricated failure this whole audit exists to
+# stop.
+#
+# The mutation asks the question the spot-checks were reaching for and the
+# analyzer sweep alone cannot: B1 passing proves no guard is MISSING today, but
+# it would read exactly the same if the analyzer had regressed into never
+# reporting anything. Removing a guard that matters must produce a finding. If
+# it does not, B1's zero means nothing.
+#
+# It also needs no maintenance: files enter and leave the set as they gain and
+# lose Process objects, and nothing here names a line.
+$guardRx = [regex]'\$null\s*=\s*\$([A-Za-z_]\w*)\.Handle'
+$loadBearing = 0
+$guardsChecked = 0
+$neverCached = 0
+$inert = @()
+foreach ($root in @('test\win32', 'scripts')) {
+    foreach ($f in (Get-ChildItem -LiteralPath (Join-Path $Repo $root) -Recurse -Filter *.ps1 -File)) {
+        # This audit and the analyzer it drives QUOTE the guard as fixture text
+        # and commentary; mutating a fixture measures nothing about the suite.
+        if (@('harness-exitcode-audit.ps1', 'ExitCodeAudit.ps1') -contains $f.Name) { continue }
+        $lines = @(Get-Content -LiteralPath $f.FullName)
+        $idx = @(for ($i = 0; $i -lt $lines.Count; $i++) { if ($guardRx.IsMatch($lines[$i])) { $i } })
+        if ($idx.Count -eq 0) { continue }
+        $rel = $f.FullName.Substring($Repo.Length + 1)
+        $baseline = @(Get-ExitCodeAuditFindings -Text $lines).Count
+        foreach ($i in $idx) {
+            $mutant = @(for ($k = 0; $k -lt $lines.Count; $k++) { if ($k -ne $i) { $lines[$k] } })
+            $after = @(Get-ExitCodeAuditFindings -Text $mutant)
+            $guardsChecked++
+            if ($after.Count -gt $baseline) {
+                $loadBearing++
+                if (@($after | Where-Object { $_.Reason -match 'never cached' }).Count -gt 0) { $neverCached++ }
+            } else {
+                # Not a failure: a guard on a site that never reads ExitCode is
+                # defensive rather than wrong, and the rule is deliberately
+                # enforced on every site (see lib\ExitCodeAudit.ps1).
+                $inert += "$rel`:$($i + 1)"
+            }
+        }
+    }
+}
+"  NOTE $loadBearing of $guardsChecked handle guards are load-bearing; $($inert.Count) guard a site that gates on output and would not be reported either way"
+Assert "B3 deleting a load-bearing guard makes the analyzer report it ($loadBearing/$guardsChecked)" (
+    $loadBearing -ge 20)
+Assert "B4 a deleted guard reads back as the never-cached case ($neverCached)" ($neverCached -ge 20)
+Assert "B5 the mutation reached both roots (>40 guards)" ($guardsChecked -gt 40)
 
 # ============================================================================
 ""
