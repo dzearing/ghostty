@@ -11,6 +11,7 @@ const build_config = @import("build_config.zig");
 const macos = if (builtin.target.os.tag.isDarwin()) @import("macos") else undefined;
 const cli = @import("cli.zig");
 const log_stamp = @import("os/log_stamp.zig");
+const log_rotate = @import("os/log_rotate.zig");
 const renderer = @import("renderer.zig");
 const apprt = @import("apprt.zig");
 
@@ -302,7 +303,11 @@ fn openAppendW(dir: std.fs.Dir, name_w: []const u16) !std.fs.File {
     const w = std.os.windows;
     return .{ .handle = try w.OpenFile(name_w, .{
         .dir = dir.fd,
-        .access_mask = w.SYNCHRONIZE | w.FILE_APPEND_DATA,
+        // FILE_READ_ATTRIBUTES is what lets the writer ask its own handle how
+        // big the sink has become, which is the cheap half of the T410 size
+        // bound. It grants no write access, so the append guarantee above is
+        // untouched.
+        .access_mask = w.SYNCHRONIZE | w.FILE_APPEND_DATA | w.FILE_READ_ATTRIBUTES,
         .creation = w.FILE_OPEN_IF,
     }) };
 }
@@ -387,6 +392,11 @@ fn logFn(
             args,
         ) catch break :windows_file;
         _ = file.write(msg_buf[0 .. stamp.len + body.len]) catch {};
+
+        // T410: bound the file. Asked after the write so this line is always
+        // in the generation it belongs to, and asked on the handle we already
+        // hold so the usual answer (no) costs one size query and no open.
+        if (log_rotate.oversize(file)) log_rotate.rotate(dir);
     }
 
     stderr: {
@@ -480,6 +490,7 @@ test {
     // compiled out of Debug builds — so pull it in explicitly to run its unit
     // tests in every lane on every platform.
     _ = @import("os/log_stamp.zig");
+    _ = @import("os/log_rotate.zig");
 
     // Socket Reader/Writer with panic-free close-race error mappings (T81):
     // the ws transport teardown depends on these staying error-returning.

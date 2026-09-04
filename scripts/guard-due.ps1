@@ -913,6 +913,30 @@ $GuardTable = @(
             'test\win32\rdp-session.ps1'
         )
     },
+    # The shared log sink (T270, T410). `%LOCALAPPDATA%\ghoztty\ghoztty.log` is
+    # the only diagnostic surface a release build leaves behind, and its two
+    # contracts - every line carries a timestamp and a pid inside ONE write, and
+    # the file is bounded to two generations - are measured by nothing in the
+    # P1-P3 floor. They cannot be: the sink is compiled out of Debug builds, so
+    # the only thing that can answer is an acceptance run against a release exe.
+    #
+    # `src\main_ghostty.zig` is deliberately NOT covered, on the `Surface.zig`
+    # argument above: it holds the ~25-line call site, and it is edited most
+    # weeks for startup reasons that cannot reach the sink, while the logic that
+    # decides line SHAPE and the size BOUND is entirely in the two modules
+    # below. A row that is due after every unrelated startup edit is a row
+    # nobody reads - and it would charge each of those edits a ReleaseFast
+    # build, which is what running this harness costs.
+    [pscustomobject]@{
+        Name   = 'log-sink'
+        Script = 'test\win32\log-append.ps1'
+        Stamp  = 'test\win32\log-sink.stamp.json'
+        Covers = @(
+            'src\os\log_stamp.zig',
+            'src\os\log_rotate.zig',
+            'test\win32\log-append.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'release-artifacts-zip'
         Script = 'test\win32\release-artifacts.ps1'

@@ -195,10 +195,115 @@ if ($NegativeControl) {
     Assert "L9 no line is a bare prefix (the prefix rides its message's write)" ($headless.Count -eq 0)
 }
 
+if (-not $NegativeControl) {
+# An exception anywhere below (a path that stopped resolving, a seed that could
+# not be written) would otherwise abandon the rest of the try block and let the
+# run still print ALL PASS - observed while building this section. R10 is the
+# assertion that the section RAN, so a broken premise reads as red.
+$rotationComplete = $false
+try {
+
+# --- T410: the sink is BOUNDED ------------------------------------------
+# The file above is the only diagnostic surface a release build leaves behind,
+# and until T410 nothing ever capped it (9.4 MB on this box, no rotation). The
+# writer now archives it to `ghoztty.log.1` once it reaches `max_bytes` and
+# keeps exactly those two generations.
+#
+# The threshold is read out of the source rather than hard-coded, so raising it
+# there cannot quietly turn this section into a no-op.
+$rotSrc = Get-Content (Join-Path $PSScriptRoot '..\..\src\os\log_rotate.zig') -Raw
+$rotM = [regex]::Match($rotSrc, 'max_bytes: u64 = (\d+) \* 1024 \* 1024')
+Assert "R0 the rotation threshold is readable from src\os\log_rotate.zig" $rotM.Success
+$maxBytes = if ($rotM.Success) { [int]$rotM.Groups[1].Value * 1024 * 1024 } else { 4MB }
+$rotPath = "$logPath.1"
+Say "    rotation threshold: $([math]::Round($maxBytes/1MB,1)) MiB"
+
+# Seed the live log right ON the threshold, so the very next line written
+# crosses it. `Seed <tag>` marks whose bytes these are, which is how the
+# second rotation below is proved to have REPLACED the first archive.
+function Seed($tag) {
+    Remove-Item $logPath -Force -ErrorAction SilentlyContinue
+    $line = ("SEED-$tag " + ('x' * 100) + "`r`n")
+    $chunk = $line * 600                       # ~64 KB
+    $fs = [System.IO.File]::Open($logPath, 'Create', 'Write', 'None')
+    try {
+        $bytes = [System.Text.Encoding]::ASCII.GetBytes($chunk)
+        while ($fs.Length + $bytes.Length -le $maxBytes) { $fs.Write($bytes, 0, $bytes.Length) }
+        $pad = New-Object byte[] ($maxBytes - $fs.Length)
+        for ($i = 0; $i -lt $pad.Length; $i++) { $pad[$i] = 0x2E }
+        if ($pad.Length -gt 0) { $fs.Write($pad, 0, $pad.Length) }
+    } finally { $fs.Dispose() }
+}
+function FirstLine($path) {
+    $r = [System.IO.File]::OpenText($path)
+    try { return $r.ReadLine() } finally { $r.Dispose() }
+}
+function RunOne() {
+    # persistence: n/a - a CLI invocation, which opens no window.
+    $q = Start-Process -FilePath $Exe -ArgumentList @('+list') -WindowStyle Hidden -PassThru `
+        -RedirectStandardOutput (Join-Path $root 'rot.out') -RedirectStandardError (Join-Path $root 'rot.err')
+    $null = $q.Handle
+    $q.WaitForExit(30000) | Out-Null
+    Start-Sleep -Milliseconds 250
+}
+
+Remove-Item $rotPath -Force -ErrorAction SilentlyContinue
+Seed 'A'
+RunOne
+Assert "R1 crossing the threshold archives the log to ghoztty.log.1" (Test-Path $rotPath)
+if (Test-Path $rotPath) {
+    $arch = (Get-Item $rotPath).Length
+    Say "    archive: $([math]::Round($arch/1MB,2)) MiB"
+    Assert "R2 the archive holds the bytes that were there (>= the threshold)" ($arch -ge $maxBytes)
+    Assert "R3 the archive is the seeded generation" ((FirstLine $rotPath) -like 'SEED-A*')
+}
+# The rotation happens mid-process, so the same run recreates the live file for
+# the rest of its lines: a writer must never lose a line to rotating.
+Assert "R4 the live log is recreated and is well under the threshold" (
+    (Test-Path $logPath) -and (Get-Item $logPath).Length -lt $maxBytes)
+if (Test-Path $logPath) {
+    $tail = @(Get-Content $logPath)
+    Assert "R5 the lines written after the rotation are the writer's own" (
+        $tail.Count -ge 1 -and ($tail | Where-Object { $_ -match $shape }).Count -eq $tail.Count)
+}
+
+# Rotate a second time: two generations is the CAP, not a floor. The older
+# archive is replaced, and no `.2` is ever created.
+Seed 'B'
+RunOne
+Assert "R6 a second rotation replaces the archive rather than keeping a pile" (
+    (Test-Path $rotPath) -and (FirstLine $rotPath) -like 'SEED-B*')
+Assert "R7 no third generation is ever created" (-not (Test-Path "$logPath.2"))
+$gens = @(Get-ChildItem (Split-Path $logPath) -Filter 'ghoztty.log*')
+Say "    generations on disk: $($gens.Count) ($(($gens | ForEach-Object { $_.Name }) -join ', '))"
+Assert "R8 the sink is bounded to two generations on disk" ($gens.Count -le 2)
+Assert "R9 the bound holds in bytes, not just in file count" (
+    (($gens | Measure-Object -Property Length -Sum).Sum) -le (2 * $maxBytes + 1MB))
+
+$rotationComplete = $true
+} catch {
+    Say "    rotation section threw: $_"
+}
+Assert "R10 the rotation section ran to completion" $rotationComplete
+
+}
+
 } finally {
     $env:LOCALAPPDATA = $saved.lad
     $env:GHOZTTY_PIPE_SUFFIX = $saved.pipe
     Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+}
+
+# --- stamp (T783/T410) -----------------------------------------------------
+# A clean green run records the covered files so scripts\guard-due.ps1 can
+# answer "has anyone run this harness against the code as it now stands?". The
+# sink is compiled out of Debug builds, so this script is the only thing that
+# can answer it - and it is not in the P1-P3 floor. A negative-control run
+# never stamps: it asserts the OPPOSITE of the contract.
+if ($script:failures -eq 0 -and -not $NegativeControl) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot '..\..\scripts\guard-due.ps1') `
+        update -Guard log-sink -Repo (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path 2>&1 |
+        ForEach-Object { Write-Host "  $_" }
 }
 
 Say ""

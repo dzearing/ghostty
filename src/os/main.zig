@@ -29,6 +29,7 @@ pub const ipc_handoff = @import("ipc_handoff.zig");
 pub const ipc_timeout = @import("ipc_timeout.zig");
 pub const listening_pid = @import("listening_pid.zig");
 pub const log_stamp = @import("log_stamp.zig");
+pub const log_rotate = @import("log_rotate.zig");
 pub const mach = @import("mach.zig");
 pub const path = @import("path.zig");
 pub const path_env = @import("path_env.zig");
@@ -87,6 +88,7 @@ test {
     _ = ipc_timeout;
     _ = listening_pid;
     _ = log_stamp;
+    _ = log_rotate;
     _ = path;
     _ = path_env;
     _ = process_cwd;
