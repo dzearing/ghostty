@@ -362,6 +362,21 @@ if (-not $builtZip) {
             ($rm -match 'not code-signed|unsigned')
         Assert "B4b4 it frames the click as an override, not trust" `
             ($rm -match 'does not recognize|override')
+        # B4c: quarantine is not the same event as a warning (T1293). On
+        # 2026-09-03 the user installed win-v1.36.2 on a second machine and
+        # Defender REMOVED ghoztty.exe and ghoztty.com as
+        # Trojan:Script/Wacatac.C!ml -- there is no Run anyway for that, so
+        # someone who reads only step 3 is left with an empty folder and no
+        # idea why. The recovery path is Windows Security -> Protection
+        # history -> Restore, which almost nobody knows without being told.
+        Assert "B4c it names the quarantine verdict the user is shown" `
+            ($rm -match 'Wacatac')
+        Assert "B4c2 it says the files are quarantined, not merely warned about" `
+            ($rm -match 'QUARANTINE|quarantine')
+        Assert "B4c3 it names the recovery path" `
+            ($rm -match 'Protection history' -and $rm -match 'Restore')
+        Assert "B4c4 it points at the public build provenance" `
+            ($rm -match 'github\.com/dzearing/ghoztty')
     } else {
         Assert "B4b READ-ME-FIRST names SmartScreen and the dialog wording" $false
     }

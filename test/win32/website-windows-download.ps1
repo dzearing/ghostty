@@ -15,9 +15,11 @@
 #      the arch, the portable ZIP alternative is offered as its own asset URL
 #      on that same release (T354), and the minimum-OS
 #      note is there, and the unsigned/SmartScreen caveat warns the user
-#      before they download rather than after the scary dialog (T349). Also
-#      that the card and the caveat reuse existing CSS classes rather than
-#      inventing their own (the design-system rule, applied to the site).
+#      before they download rather than after the scary dialog (T349), and
+#      the Defender caveat says the files may be QUARANTINED and how to get
+#      them back (T1293). Also that the card and the caveats reuse existing
+#      CSS classes rather than inventing their own (the design-system rule,
+#      applied to the site).
 #   B  name agreement: the asset names in the rewrite script are the names the
 #      workflow publishes and the shared build script produces. Three writers,
 #      one convention -- the same check release-artifacts.ps1 makes.
@@ -185,6 +187,42 @@ if ($ssNote.Success) {
 # than introducing a class of its own.
 Assert 'A16 the caveat reuses the existing download-note class' `
     ($html -match 'class="download-note" id="win-smartscreen-note"')
+
+# Defender does not only warn on some machines -- it QUARANTINES, which
+# removes the files rather than offering an override (T1293, reported by the
+# user installing win-v1.36.2 on a second machine on 2026-09-03). A page that
+# explains the SmartScreen dialog and stops there leaves that user with no
+# program and no explanation, and the recovery path (Protection history ->
+# Restore) is not one most people know exists. This note is the page's half of
+# that; the portable ZIP's READ-ME-FIRST carries the same text for someone who
+# never visits the site.
+$dfNote = [regex]::Match($html, '(?s)<p class="download-note" id="win-defender-note">(.*?)</p>')
+Assert 'A17 the page carries the Defender quarantine caveat' $dfNote.Success
+if ($dfNote.Success) {
+    $dfText = $dfNote.Groups[1].Value
+    # Name the verdict the user actually sees, so the page is findable by the
+    # string Defender put on their screen.
+    Assert 'A17b it names the detection the user is shown' `
+        ($dfText -match 'Wacatac')
+    # Say that the files are TAKEN, not merely warned about -- that is the
+    # difference from A15 and the reason this note exists.
+    Assert 'A17c it says the files are quarantined' ($dfText -match 'quarantine')
+    # And say how to get them back. Without this the note is bad news with no
+    # exit, which is worse than saying nothing.
+    Assert 'A17d it names the recovery path' `
+        ($dfText -match 'Protection history' -and $dfText -match 'Restore')
+    # The claim that makes the note credible rather than a plea: the build is
+    # produced in public, so a reader can check where it came from themselves.
+    Assert 'A17e it points at the public build provenance' `
+        ($dfText -match 'github\.com/dzearing/ghoztty')
+}
+Assert 'A17f the quarantine caveat reuses the existing download-note class' `
+    ($html -match 'class="download-note" id="win-defender-note"')
+
+# D87 chose to ship unsigned deliberately, so 'not code-signed yet' promised
+# something nobody intends to deliver (T1270). The page states it as a fact.
+Assert 'A18 the unsigned note is a standing statement, not a promise' `
+    ($html -notmatch 'not code-signed yet')
 
 # The Windows card must live in the SAME .download-cards container as the
 # macOS one -- "alongside the existing platform links", not a section of its

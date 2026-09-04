@@ -120,6 +120,15 @@ No installer. Just run the terminal:
      that button is behind "More info" first. That tells Windows to run
      something it does not recognize, so only do it for a copy you
      downloaded from the Ghoztty releases page yourself.
+  4. Microsoft Defender may go further and QUARANTINE ghoztty.exe and
+     ghoztty.com as "Trojan:Script/Wacatac.C!ml". The "!ml" ending means
+     Defender's machine-learning model guessed rather than matched a known
+     threat, and a new unsigned program is what it guesses about. To get the
+     files back, open Windows Security -> Protection history, find the
+     Ghoztty item and choose Restore, then unzip again. These binaries are
+     compiled in the open by GitHub Actions from
+     github.com/dzearing/ghoztty, so you can check where your copy came
+     from before you do.
 
 Tip: copy this folder to a local disk first so it does not run off a
 network share.

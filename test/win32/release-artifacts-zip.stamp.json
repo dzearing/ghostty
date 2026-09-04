@@ -1,12 +1,12 @@
 {
     "guard":  "release-artifacts-zip",
     "script":  "test/win32/release-artifacts.ps1",
-    "generated":  "2026-09-01T22:47:34-07:00",
-    "commit":  "30c910f03",
+    "generated":  "2026-09-03T19:17:31-07:00",
+    "commit":  "169a8da79",
     "uncommitted":  [
                         "dist/windows-installer/build-portable-zip.sh"
                     ],
     "files":  {
-                  "dist/windows-installer/build-portable-zip.sh":  "26ecb45030039f0ec4e9f15b70da091db2acc9378ad5c6edd56527a103f5320a"
+                  "dist/windows-installer/build-portable-zip.sh":  "5010c6d1b9119c0ff9dbe7b49a0097ca568aa97b1e9e2a135c7338f280b33516"
               }
 }

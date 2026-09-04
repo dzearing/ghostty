@@ -20863,3 +20863,64 @@ red before the fix; `session-layout-geometry-race.ps1` (23) and
 `session-snapshot-reattach.ps1` (33) green, so neither T220's write ordering nor
 the WP-D3 restore path moved; every harness `guard-due` named due over these
 edits re-run and re-stamped.
+
+## 2026-09-03 - the download page says Defender may delete the files, and how to get them back (T1293)
+
+The user installed `win-v1.36.2` on a second machine and Defender did not warn -
+it quarantined `ghoztty.exe` and `ghoztty.com` as `Trojan:Script/Wacatac.C!ml`
+and removed them. Everything the site said about Windows was written for the
+SmartScreen dialog, which has a Run anyway button; a quarantine has no button,
+so that user was left with no program, no explanation, and a recovery path
+(Windows Security -> Protection history -> Restore) that almost nobody knows
+exists.
+
+**The evidence first, because the two readings lead to opposite actions.** The
+PUBLISHED assets were pulled from GitHub and scanned explicitly with Defender's
+own engine rather than inferring anything from the absence of a detection
+history: the MSI, the portable ZIP, `ghoztty.exe`, `ghoztty.com` and
+`ghoztty-agent.exe` all found no threats at engine 1.1.26080.3 / signatures
+1.459.28.0, cloud protection at MAPS Advanced, real-time on, no exclusion
+covering the scan path - and the download and unzip were not intercepted either.
+That rules out a signature match and rules nothing in, because the verdict the
+user hit is a per-machine cloud call. It is explicitly **not** the independent
+confirmation the task asks for: VirusTotal needs an API key this box does not
+hold or a browser session (the Chrome extension is not connected), so that is
+now **T1312**, with the SHA-256s recorded for it.
+
+**The half that could ship, shipped.** The download page carries a second
+caveat, `#win-defender-note`, that names the detection the user is actually
+shown, says plainly that the files are removed rather than warned about, gives
+the restore path, and links the public `release-windows.yml` workflow so the
+provenance can be checked instead of taken on faith. The portable ZIP's
+READ-ME-FIRST carries the same as step 4, for someone who never visits the site.
+The unsigned note also drops "yet" - D87 decided to stay unsigned, so the word
+promised something nobody intends to deliver, which was **T1270**'s complaint.
+
+That prose edit was T1270's blocker, not its content: nothing publishes the
+in-repo mirror's PROSE to gh-pages, so an edit to it breaks section F of
+`website-windows-download.ps1` until somebody hand-pushes the branch. So the new
+page was built FROM the deployed one and pushed to `gh-pages` (b15b1de), which
+also cleared the drift T1202 predicts after every release - the mirror had been
+sitting at `win-v1.36.0` against a deployed `win-v1.36.3`.
+
+Both harnesses were demonstrated red at HEAD before they were made green, per
+go.md step 3: `website-windows-download.ps1` scored A17, A17f and A18 as
+FAILURES with the page reverted (plus F1 for the pre-existing drift) and is now
+ALL PASS including F1; `release-artifacts.ps1` scored B4c/B4c2/B4c3/B4c4 as
+FAILURES with `build-portable-zip.sh` reverted and is ALL PASS (1 skipped, the
+Docker-only FILEVERSION check) with the fix.
+
+**What is left is not this seat's, and it is filed rather than implied.**
+**T1312** (ask a second scanner - and make it a scripted release check rather
+than a one-off), **T1313** (file the developer false-positive report with
+Microsoft; the portal needs an account sign-in, and the hashes and provenance it
+asks for are prepared in the task), and **T1314** (whether the `.com` twin's
+extension/format mismatch is part of the trigger - a hypothesis that waits on
+T1312's per-engine answer, and that shares a fix with T1077's size complaint).
+T1293 is parked `blocked` on the first two with an `unblock:` that says what an
+answer looks like.
+
+And **D89** puts the signing question back to the user, because the facts under
+D87 changed: that decision weighed a warning most people click through, and the
+worst case is now a machine where the program has been deleted. Signing is the
+single largest input to the model that made the call.
