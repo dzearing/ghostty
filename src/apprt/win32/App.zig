@@ -212,6 +212,28 @@ const LAYOUT_REFRESH_MS: u32 = 2_000;
 /// and the agent's ring, are then recorded at the same worst-case rhythm.
 const LAYOUT_REFRESH_MAX_MS: i64 = 30_000;
 
+/// How long a BOUNDED capture waits for one pane's renderer mutex before it
+/// carries that pane's cached screen forward instead (T1311).
+///
+/// Small on purpose: this path only ever runs while panes are flooding, and the
+/// question it asks is "is this pane's lock free right now-ish?", not "please
+/// queue me behind the IO thread". A pane that says no is retried on the next
+/// tick two seconds later, so nothing is lost by asking briefly.
+const LAYOUT_CAPTURE_LOCK_NS: u64 = 2 * std.time.ns_per_ms;
+
+/// How long the whole bounded pass may spend re-dumping screens before it
+/// leaves the rest of the panes for the next tick.
+///
+/// HALF a display frame, out of the frame `layout_cost` judges the whole sync
+/// against — because the capture is not the whole sync. Serializing the
+/// manifest and mirroring it to the agent follow it on the same thread and cost
+/// several milliseconds of their own, and the deadline is checked BEFORE a pane
+/// is started rather than enforced during it, so the pass can also overrun by
+/// one pane's dump plus its `LAYOUT_CAPTURE_LOCK_NS`. Half a frame leaves room
+/// for both and still lands the whole sync inside one frame; measured at eight
+/// flooded panes it lands around 6 ms mean.
+const LAYOUT_CAPTURE_BUDGET_MS: i64 = @intCast(layout_cost.frame_budget_us / std.time.us_per_ms / 2);
+
 /// Timer ID 9: the periodic long-unattached session check (T534). Armed at
 /// startup with a short first fire, then re-armed at the full cadence on every
 /// tick. (Timer 8 is the orphan balloon's icon-cleanup timer, defined beside
@@ -349,6 +371,19 @@ layout_body_id: ?session_layout.BodyId = null,
 layout_refresh_seen: u64 = 0,
 layout_refresh_captured: u64 = 0,
 layout_refresh_last_write_ms: i64 = 0,
+
+/// The BOUNDED round (T1311), which is what a forced capture becomes while the
+/// panes are still printing. `round_ms` is when the current round began — a
+/// pane whose screen was dumped after it is current for this round — and
+/// `incomplete` says the last pass ran out of frame with panes still owing one,
+/// which makes the next tick force again instead of waiting out another
+/// ceiling. `deadline_ms` is the wall clock the in-flight pass must stop
+/// re-dumping at, and `deferred` counts the panes it carried forward; both are
+/// scratch owned by `tickLayoutRefresh` for the duration of one capture.
+layout_round_ms: i64 = 0,
+layout_round_incomplete: bool = false,
+layout_capture_deadline_ms: i64 = std.math.maxInt(i64),
+layout_capture_deferred: usize = 0,
 
 /// The HINSTANCE for this module.
 hinstance: w32.HINSTANCE,
@@ -1963,18 +1998,36 @@ fn tickLayoutRefresh(self: *App) void {
         .captured = self.layout_refresh_captured,
         .since_write_ms = ms - self.layout_refresh_last_write_ms,
         .max_wait_ms = LAYOUT_REFRESH_MAX_MS,
+        .round_incomplete = self.layout_round_incomplete,
     });
     self.layout_refresh_seen = now;
     switch (action) {
         .idle, .wait => return,
-        .capture => {},
+        .capture, .capture_bounded => {},
     }
 
     self.layout_refresh_captured = now;
     self.layout_refresh_last_write_ms = ms;
-    // Re-dumping the screens IS this tick's job, and `decide` has already
-    // waited for the panes to go quiet — so it pays the idle price (T412).
-    self.syncSessionLayout(.fresh);
+
+    if (action == .capture) {
+        // The panes went quiet, so re-dumping every screen IS this tick's job
+        // and it pays the idle price (T412).
+        self.layout_round_incomplete = false;
+        self.syncSessionLayout(.fresh);
+        return;
+    }
+
+    // The ceiling fired while the panes are still printing (T1311). A full
+    // re-dump here is the ~991 ms freeze the user feels every 30 seconds, so
+    // this round spends ONE FRAME on the panes it has not refreshed yet and
+    // finishes on the following ticks. A round is only over once a pass
+    // deferred nobody.
+    if (!self.layout_round_incomplete) self.layout_round_ms = ms;
+    self.layout_capture_deadline_ms = ms + LAYOUT_CAPTURE_BUDGET_MS;
+    self.layout_capture_deferred = 0;
+    self.syncSessionLayout(.fresh_bounded);
+    self.layout_round_incomplete = self.layout_capture_deferred > 0;
+    self.layout_capture_deadline_ms = std.math.maxInt(i64);
 }
 
 /// Capture the live window/tab/split topology and atomically persist it to the
@@ -2010,7 +2063,14 @@ pub fn syncSessionLayout(self: *App, screens: ScreenCapture) void {
     // refresh both land here, so a cost nobody watches is a stutter nobody can
     // attribute. `Timer.start` cannot fail on a platform with a monotonic
     // clock; a box without one simply records zeros rather than losing the sync.
-    var cost: layout_cost.Sample = .{ .fresh_screens = screens == .fresh };
+    var cost: layout_cost.Sample = .{
+        .fresh_screens = screens != .reuse,
+        .mode = switch (screens) {
+            .fresh => .fresh,
+            .fresh_bounded => .bounded,
+            .reuse => .reuse,
+        },
+    };
     var timer: ?std.time.Timer = std.time.Timer.start() catch null;
     const captured = self.captureSessionLayout(
         arena_state.allocator(),
@@ -2022,6 +2082,9 @@ pub fn syncSessionLayout(self: *App, screens: ScreenCapture) void {
         return;
     };
     cost.panes = captured.paneCount();
+    // Only a bounded pass can defer anything; the counter is its scratch, so
+    // reading it for any other sync would report the last round's leftovers.
+    cost.deferred_screens = if (screens == .fresh_bounded) self.layout_capture_deferred else 0;
     if (timer) |*t| cost.capture_us = t.lap() / std.time.ns_per_us;
     // T590: a wholesale rewrite must not erase the windows the launch restore
     // could not adjudicate (agent unspawnable, probe never landed) — re-read
@@ -2082,7 +2145,8 @@ pub fn syncSessionLayout(self: *App, screens: ScreenCapture) void {
 fn reportLayoutCost(self: *App, cost: layout_cost.Sample) void {
     _ = self;
     const fmt = "session-layout sync total_us={d} capture_us={d} write_us={d} " ++
-        "push_us={d} panes={d} snapshot_bytes={d} wrote={} fresh_screens={}";
+        "push_us={d} panes={d} snapshot_bytes={d} wrote={} fresh_screens={} " ++
+        "mode={s} deferred_screens={d}";
     const args = .{
         cost.totalUs(),
         cost.capture_us,
@@ -2092,6 +2156,8 @@ fn reportLayoutCost(self: *App, cost: layout_cost.Sample) void {
         cost.snapshot_bytes,
         cost.wrote,
         cost.fresh_screens,
+        @tagName(cost.mode),
+        cost.deferred_screens,
     };
     if (cost.overBudget()) {
         log.info(fmt ++ " OVER-BUDGET", args);
@@ -2362,13 +2428,24 @@ const CapturedSnapshot = struct { data: ?[]const u8 = null, offset: ?u64 = null 
 /// ask for `.reuse` and the sync costs milliseconds instead.
 ///
 /// `.fresh` belongs to the two triggers whose subject IS the screen: the T922
-/// refresh, which deliberately waits for the panes to go quiet before it asks
-/// (so it pays the idle price, not the flooded one), and the quit / end-session
-/// flush, which is the authoritative last write before the app goes away.
+/// refresh WHEN THE PANES WENT QUIET (so it pays the idle price, not the
+/// flooded one), and the quit / end-session flush, which is the authoritative
+/// last write before the app goes away.
+///
+/// `.fresh_bounded` is the third one, and it exists because the refresh's
+/// 30-second ceiling only ever fires while the panes are flooding — so that one
+/// caller paid the 991 ms worst case every single time, which is a full second
+/// of frozen window every half minute for anyone running a long build (T1311).
+/// It re-dumps too, but it will not queue behind the IO thread and it will not
+/// spend more than a frame: a pane whose renderer mutex is busy, or that the
+/// pass ran out of time to reach, carries its cached screen forward and is
+/// picked up by the next tick two seconds later. Every pane still gets a fresh
+/// screen; the cost is spread over ticks instead of taken in one freeze.
 ///
 /// Reuse is never "restore blank": a pane with nothing cached — one created
-/// since the last full capture — falls through and captures fresh.
-const ScreenCapture = enum { fresh, reuse };
+/// since the last full capture — falls through and captures fresh, bounded pass
+/// or not.
+const ScreenCapture = enum { fresh, fresh_bounded, reuse };
 
 /// The WP-D3 snapshot pair for one terminal leaf (T109): the pane's structured
 /// VT screen repaint, base64'd into `arena`, plus the absolute agent-stream byte
@@ -2394,19 +2471,41 @@ fn captureLeafSnapshot(
     // content cannot have changed and there IS something to reuse. This is the
     // whole saving — see `Surface.last_snapshot`.
     if (screens == .reuse) {
-        if (surface.last_snapshot) |cached| {
-            if (!budget.take(cached.len)) return none;
-            return .{
-                .data = try arena.dupe(u8, cached),
-                .offset = surface.last_snapshot_offset,
-            };
+        if (surface.last_snapshot != null) return self.reuseLeafSnapshot(arena, surface, budget);
+    }
+
+    // T1311: a bounded round re-dumps only what it still owes, and only while
+    // it has frame left. Both tests need a cached screen to fall back on; a
+    // pane without one always captures, however busy it is, because the
+    // alternative is restoring it blank.
+    if (screens == .fresh_bounded and surface.last_snapshot != null) {
+        // Already refreshed since this round began: current, and re-dumping it
+        // would spend the round's frame on a pane that owes nothing.
+        if (surface.last_snapshot_ms >= self.layout_round_ms)
+            return self.reuseLeafSnapshot(arena, surface, budget);
+        if (std.time.milliTimestamp() >= self.layout_capture_deadline_ms) {
+            self.layout_capture_deferred += 1;
+            return self.reuseLeafSnapshot(arena, surface, budget);
         }
     }
 
-    const snap = surface.core_surface.sessionSnapshot(arena) catch |err| {
-        log.warn("session-layout: screen snapshot failed err={}", .{err});
-        return none;
-    } orelse return none;
+    const snap = (if (screens == .fresh_bounded and surface.last_snapshot != null)
+        surface.core_surface.sessionSnapshotTimeout(arena, LAYOUT_CAPTURE_LOCK_NS) catch |err| {
+            if (err == error.WouldBlock) {
+                // The IO thread is mid-chunk. Nothing is wrong and nothing is
+                // lost: this pane keeps the screen it has and the next tick
+                // asks again.
+                self.layout_capture_deferred += 1;
+                return self.reuseLeafSnapshot(arena, surface, budget);
+            }
+            log.warn("session-layout: screen snapshot failed err={}", .{err});
+            return none;
+        }
+    else
+        surface.core_surface.sessionSnapshot(arena) catch |err| {
+            log.warn("session-layout: screen snapshot failed err={}", .{err});
+            return none;
+        }) orelse return none;
     const encoder = std.base64.standard.Encoder;
     const encoded_len = encoder.calcSize(snap.data.len);
     if (!budget.take(encoded_len)) {
@@ -2428,9 +2527,29 @@ fn captureLeafSnapshot(
         if (surface.last_snapshot) |old| gpa.free(old);
         surface.last_snapshot = kept;
         surface.last_snapshot_offset = snap.byte_offset;
+        // T1311: which round this pane has been reached in.
+        surface.last_snapshot_ms = std.time.milliTimestamp();
     } else |_| {}
 
     return .{ .data = encoded, .offset = snap.byte_offset };
+}
+
+/// Hand this pane's CACHED screen to the capture that asked for it, through the
+/// arena and the snapshot budget (T412/T1311). The caller has already decided
+/// that reusing is right; this owns only the copy.
+fn reuseLeafSnapshot(
+    self: *App,
+    arena: Allocator,
+    surface: *Surface,
+    budget: *session_layout.SnapshotBudget,
+) !CapturedSnapshot {
+    _ = self;
+    const cached = surface.last_snapshot orelse return .{};
+    if (!budget.take(cached.len)) return .{};
+    return .{
+        .data = try arena.dupe(u8, cached),
+        .offset = surface.last_snapshot_offset,
+    };
 }
 
 /// Capture one VIEWER leaf's restore metadata (T90h). A viewer owns no agent

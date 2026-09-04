@@ -27,8 +27,16 @@ pub const Action = enum {
     /// Output is still arriving. Capturing mid-burst is wasted work — the
     /// snapshot would be superseded a tick later — so wait for quiet.
     wait,
-    /// Capture and persist now.
+    /// Capture and persist now. The panes are quiet, so every screen can be
+    /// re-dumped at the idle price.
     capture,
+    /// Capture and persist now, but the panes are STILL PRINTING — this is the
+    /// ceiling firing, not quiet arriving. A full re-dump here is the ~991 ms
+    /// UI freeze T1311 was filed for, so this round is INCREMENTAL: the caller
+    /// spends one frame on the panes whose screens this round has not refreshed
+    /// yet and leaves the rest for the next tick, which is what `round_incomplete`
+    /// below asks for.
+    capture_bounded,
 };
 
 /// The state a tick compares, in the units it compares them in.
@@ -47,11 +55,21 @@ pub const State = struct {
     since_write_ms: i64,
     /// That ceiling.
     max_wait_ms: i64,
+    /// The previous bounded round could not refresh every pane's screen within
+    /// its frame, so panes are still owed one. Outranks everything: a round
+    /// that stopped half way is not a reason to wait another 30 seconds, it is
+    /// a reason to spend the next tick's frame finishing it.
+    round_incomplete: bool = false,
 };
 
 pub fn decide(s: State) Action {
+    if (s.round_incomplete) return .capture_bounded;
     if (s.now == s.captured) return .idle;
     if (s.now != s.seen and s.since_write_ms < s.max_wait_ms) return .wait;
+    // Reaching the ceiling with the offsets STILL moving is the flooded case:
+    // the panes never went quiet, so a full dump would pay the contended price
+    // on the UI thread. Spread it instead.
+    if (s.now != s.seen) return .capture_bounded;
     return .capture;
 }
 
@@ -88,8 +106,9 @@ test "quiet after a burst captures: same sum as last tick, newer than disk" {
 test "unbroken output captures anyway once the ceiling is reached" {
     // Without this a pane that never stops printing is the ONE pane whose
     // screen is never persisted — the exact case the user is most likely to
-    // want back after a crash.
-    try testing.expectEqual(Action.capture, decide(.{
+    // want back after a crash. It captures BOUNDED, because the offsets moving
+    // is exactly what makes an unbounded dump expensive (T1311).
+    try testing.expectEqual(Action.capture_bounded, decide(.{
         .now = 1_000_000,
         .seen = 900_000,
         .captured = 1024,
@@ -112,12 +131,56 @@ test "the ceiling cannot fire when there is nothing new to persist" {
 
 test "the first tick after launch captures rather than waiting a cycle" {
     // `since_write_ms` is huge before the first write, so a pane that painted
-    // during startup is persisted on the first tick instead of the second.
-    try testing.expectEqual(Action.capture, decide(.{
+    // during startup is persisted on the first tick instead of the second. It
+    // goes through the bounded path (the offsets moved between the two
+    // samples), which for a pane with no cached screen yet is the same full
+    // capture — reuse can never mean "restores blank".
+    try testing.expectEqual(Action.capture_bounded, decide(.{
         .now = 4096,
         .seen = 0,
         .captured = 0,
         .since_write_ms = std.math.maxInt(i32),
+        .max_wait_ms = 30_000,
+    }));
+}
+
+test "an unfinished round finishes on the next tick, ceiling or not" {
+    // The whole point of spreading the cost: a round that spent its frame and
+    // still owed panes must not wait another 30 seconds, or the panes at the
+    // back of the walk would refresh once every four minutes.
+    try testing.expectEqual(Action.capture_bounded, decide(.{
+        .now = 1_100_000,
+        .seen = 1_000_000,
+        .captured = 1_000_000,
+        .since_write_ms = 0,
+        .max_wait_ms = 30_000,
+        .round_incomplete = true,
+    }));
+}
+
+test "an unfinished round outranks idle" {
+    // `captured` was advanced by the partial pass, so by the ordinary rules
+    // there is nothing new to persist — but some pane's screen is still the one
+    // from before the round. Finish it even though the panes have gone quiet.
+    try testing.expectEqual(Action.capture_bounded, decide(.{
+        .now = 4096,
+        .seen = 4096,
+        .captured = 4096,
+        .since_write_ms = 100,
+        .max_wait_ms = 30_000,
+        .round_incomplete = true,
+    }));
+}
+
+test "quiet at the ceiling still captures unbounded" {
+    // The ceiling is not what makes a capture expensive; concurrent output is.
+    // A pane that happens to fall quiet on the tick the ceiling fires pays the
+    // idle price and gets every screen in one pass.
+    try testing.expectEqual(Action.capture, decide(.{
+        .now = 1_000_000,
+        .seen = 1_000_000,
+        .captured = 1024,
+        .since_write_ms = 30_000,
         .max_wait_ms = 30_000,
     }));
 }

@@ -21062,3 +21062,63 @@ box, `chooser-resume-remote.ps1` C2 and `chooser-restore-all-remote.ps1` A2/E2 -
 all three over the fake relay with this box's manifest deleted, so a name can
 only have crossed the wire. C2 was DEMONSTRATED red against a build with the fix
 disabled before it was believed green.
+
+## 2026-09-03 - a pane printing non-stop no longer freezes the window every 30 seconds (T1311)
+
+Leave a long build or an agent printing in a pane and the whole window stopped
+responding for about a second, roughly every half minute. Clicks queued up, a
+drag stuck, and then it came back as if nothing had happened - which is why it
+read as "this terminal is a bit janky" rather than as a bug anybody would
+report, and why it survived T412 the same day. T412 made every TOPOLOGY trigger
+cheap (a drag, a tab, a split, a rename all carry the panes' last screens
+forward) and left the one caller that must have FRESH screens paying the full
+price.
+
+That caller is the T922 refresh. It waits for the panes to go quiet before it
+re-dumps, which is free almost always - but the wait has a 30-second ceiling,
+and a pane that never pauses walks into it every single time. So the shape this
+terminal exists for was the one shape that always bought the worst case:
+measured on box at eight flooded panes, **194.98 ms** on the UI thread, almost
+none of it the dump and nearly all of it queueing behind each pane's
+`renderer_state.mutex` while the IO thread feeds output.
+
+The ceiling is not removable - it is what guarantees a permanently-busy pane
+still gets its screen recorded, which is what a post-reboot restore paints
+(D78) - so the fix is on the cost side. The forced capture is now an
+**incremental bounded round**. `layout_refresh.decide` grew a `capture_bounded`
+action for "the ceiling fired while the offsets are STILL moving", which is
+precisely the flooded case, plus a `round_incomplete` input that outranks
+everything else: a round that spent its frame with panes still owing a screen
+resumes on the next 2-second tick instead of waiting out another ceiling.
+
+The round itself spends half a frame re-dumping the panes it has not reached
+yet, skips the ones it already refreshed this round (so the first pane cannot
+hog the budget while the last never gets one), and refuses to queue behind any
+single pane: `Surface.sessionSnapshotTimeout` is new in the shared core beside
+`sessionSnapshot` and gives up after two milliseconds, at which point the pane
+carries its cached screen forward and is asked again two seconds later. A pane
+with NO cached screen still captures unbounded, because the alternative is
+restoring it blank. Measured after: **15.13 ms worst case, 3.46 ms mean**,
+inside the 16.67 ms frame budget `layout_cost` judges a sync against.
+
+The cost is spread, not skipped, and the harness says so rather than the prose:
+section G of `test\win32\layout-capture-cost.ps1` holds the panes flooded past
+the ceiling for 45 seconds and asserts both halves - the forced capture fits the
+frame (G3), it actually ran the bounded pass rather than never firing (G4), and
+every flooded pane's recorded `screen_snapshot_offset` MOVES FORWARD across the
+arm (G5), so the screen D78 restores is still being re-recorded. The arm was
+DEMONSTRATED red against the pre-fix build (G3/G4 fail at 194.98 ms) before it
+was believed green.
+
+F1 was retuned in the same pass. It asserted zero fresh samples inside a drag
+arm's log window, which was only ever true by luck - the refresh timer emits
+into the same window and is entitled to re-dump, and since this change it does
+so more often in small bounded passes. It now asserts one REUSE sample per
+gesture, which is the claim it was actually making: a drag caller that regressed
+to the expensive path shows up as MISSING reuse samples.
+
+Acceptance: all four floor lanes, `ipc-p1/p2/p3`, `layout-capture-cost.ps1`
+(25 assertions, section G new) and `session-snapshot-reattach.ps1` (33
+assertions - the restore path that reads these screens is unchanged). Filed
+T1319 for the Mac seat: the same core dump-under-the-renderer-mutex runs on
+macOS's capture path and nothing there has ever put a number on it.

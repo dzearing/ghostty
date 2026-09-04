@@ -44,6 +44,19 @@
 #     feeding output, so a busy pane is the worst case and an idle one says
 #     almost nothing about it.
 #
+# WHAT T412 LEFT BEHIND, and what section G measures. T412 made every TOPOLOGY
+# trigger cheap, and left the one caller that must have fresh screens paying the
+# full price: the T922 refresh waits for the panes to go quiet before it
+# re-dumps, but that wait has a 30-second ceiling, and a pane that never pauses
+# walks into it every time. So a long build in a pane still froze the window for
+# about a second every half minute - the shape the user runs daily, and the one
+# no arm above could see, because every arm above measures a drag. T1311 turned
+# that forced capture into an INCREMENTAL bounded round: it spends one frame on
+# the panes the round has not refreshed yet, carries the rest forward, and
+# finishes on the following ticks. Section G holds the panes flooded past the
+# ceiling and asserts both halves - the forced capture fits the frame, AND every
+# busy pane's recorded screen still moves forward while it is held busy.
+#
 # THE BUDGET is one display frame at 60 Hz (16,667 us), because that is the unit
 # the cost is spent in - the sync blocks the message pump, so a sync that fits
 # in a frame cannot drop one and a sync that does not is a visible hitch at the
@@ -95,7 +108,7 @@ $appLog = Join-Path $root 'app.err'
 # ---------------------------------------------------------------------------
 # Sample parsing
 # ---------------------------------------------------------------------------
-$costRe = [regex]'session-layout sync total_us=(\d+) capture_us=(\d+) write_us=(\d+) push_us=(\d+) panes=(\d+) snapshot_bytes=(\d+) wrote=(\w+) fresh_screens=(\w+)'
+$costRe = [regex]'session-layout sync total_us=(\d+) capture_us=(\d+) write_us=(\d+) push_us=(\d+) panes=(\d+) snapshot_bytes=(\d+) wrote=(\w+) fresh_screens=(\w+)(?: mode=(\w+) deferred_screens=(\d+))?'
 
 # Every cost sample in $appLog from byte $from onward, plus the new end offset.
 function Read-Samples([long]$from) {
@@ -120,6 +133,11 @@ function Read-Samples([long]$from) {
             SnapBytes = [int]$mm.Groups[6].Value
             Wrote     = ($mm.Groups[7].Value -eq 'true')
             Fresh     = ($mm.Groups[8].Value -eq 'true')
+            # T1311. Absent on a pre-fix build, which is exactly how the G arm
+            # tells "the bounded pass fitted the frame" from "there is no
+            # bounded pass".
+            Mode      = $(if ($mm.Groups[9].Success) { $mm.Groups[9].Value } else { '' })
+            Deferred  = $(if ($mm.Groups[10].Success) { [int]$mm.Groups[10].Value } else { -1 })
         }
     }
     return @{ Samples = $out; End = $end }
@@ -243,6 +261,11 @@ function Measure-Arm([string]$label, [int]$expectPanes) {
     $maxCap = ($s | Measure-Object -Property CaptureUs -Maximum).Maximum
     $maxPanes = ($s | Measure-Object -Property Panes -Maximum).Maximum
     $anyFresh = @($s | Where-Object { $_.Fresh }).Count
+    # The cheap path's own count. A gesture ALWAYS syncs with `.reuse`, so this
+    # is how many of the arm's samples a drag could have produced (T1311: the
+    # refresh timer emits its own samples into the same window, so counting
+    # fresh ones is not the same question).
+    $reuseN = @($s | Where-Object { -not $_.Fresh }).Count
     $maxSnap = ($s | Measure-Object -Property SnapBytes -Maximum).Maximum
     $row = [pscustomobject]@{
         Label    = $label
@@ -253,6 +276,7 @@ function Measure-Arm([string]$label, [int]$expectPanes) {
         MaxPanes = $maxPanes
         SnapKB   = [int]($maxSnap / 1024)
         Fresh    = $anyFresh
+        Reuse    = $reuseN
     }
     $script:rows += $row
     "    [$label] n=$($s.Count) panes=$maxPanes max=$([math]::Round($max/1000,2))ms mean=$([math]::Round($mean/1000,2))ms capture_max=$([math]::Round($maxCap/1000,2))ms snapshot=$($row.SnapKB)KB fresh=$anyFresh/$($s.Count)"
@@ -308,11 +332,95 @@ try {
     Assert "D4 the captures carry a real screen for every pane ($($d1.SnapKB) KB)" ($d1.SnapKB -gt 0)
 
     "== F: the drag path carries screens forward"
-    # The whole fix, stated as a measurement rather than as a claim: not one
-    # sample produced by a drag gesture may have re-dumped the screens. A
-    # `.fresh` sample here means some caller regressed to the 991 ms path.
-    $dragFresh = ($script:rows | Measure-Object -Property Fresh -Sum).Sum
-    Assert "F1 no drag-triggered sync re-dumped the panes' screens ($dragFresh fresh samples)" ($dragFresh -eq 0)
+    # T412's fix, stated as a measurement rather than as a claim: every gesture
+    # syncs, and every gesture's sync must have taken the cheap path. Counted as
+    # "at least one reuse sample per gesture" rather than "zero fresh samples in
+    # the window", because the refresh timer emits into the same window and is
+    # entitled to re-dump - since T1311 it does so more often, in small bounded
+    # passes, and an arm that happened to contain one used to read as a
+    # regression it was not. A drag caller that regressed to the 991 ms path
+    # would show up here as MISSING reuse samples, which is the actual claim.
+    foreach ($r in $script:rows) {
+        Assert ("F1 {0}: every gesture's sync carried the screens forward ({1} reuse samples for {2} gestures)" -f
+            $r.Label, $r.Reuse, $Gestures) ($r.Reuse -ge $Gestures)
+    }
+
+    "== G: the FORCED refresh, with the panes never going quiet (T1311)"
+    # The one caller T412 could not make cheap. `layout_refresh.decide` waits
+    # for the panes to fall quiet before it re-dumps, which is free - except
+    # that the wait has a 30 s ceiling, and a pane that NEVER pauses (a long
+    # build, an agent thinking out loud) walks into it every single time. So the
+    # user running the one shape this terminal exists for bought a full second
+    # of frozen window every half minute, and no arm above could see it: every
+    # arm above measures a DRAG, which carries the screens forward.
+    #
+    # Hold the panes flooded past the ceiling and read the refresh's own
+    # samples. A refresh sample is a sync that re-dumped screens
+    # (`fresh_screens=true`) with no gesture anywhere near it.
+    $manifest = Join-Path $tmp 'ghoztty\session-layout-debug.json'
+    function Get-PaneOffsets {
+        if (-not (Test-Path $manifest)) { return @{} }
+        try { $j = Get-Content $manifest -Raw -ErrorAction Stop | ConvertFrom-Json } catch { return @{} }
+        # `nodes` is FLAT - a split names its children by index - so every leaf
+        # in the tab is simply every node that has one.
+        $out = @{}
+        foreach ($w in @($j.windows)) {
+            foreach ($t in @($w.tabs)) {
+                foreach ($n in @($t.nodes)) {
+                    if ($null -eq $n.leaf) { continue }
+                    if (-not $n.leaf.pane_id) { continue }
+                    if ($null -eq $n.leaf.screen_snapshot_offset) { continue }
+                    $out[$n.leaf.pane_id] = [int64]$n.leaf.screen_snapshot_offset
+                }
+            }
+        }
+        return $out
+    }
+
+    $floodedG = Start-Flood
+    Assert 'G1 flood control: the panes are actually printing for the forced arm' $floodedG
+    # Past the ceiling: the refresh waits up to LAYOUT_REFRESH_MAX_MS (30 s) for
+    # quiet that will not come, then forces. Sample from BEFORE the first force
+    # so the window is guaranteed to contain one.
+    $gMark = Get-LogEnd
+    $offsetsBefore = Get-PaneOffsets
+    Start-Sleep -Seconds 45
+    $gRead = Read-Samples $gMark
+    $offsetsAfter = Get-PaneOffsets
+    Stop-Flood
+
+    $forced = @(@($gRead.Samples) | Where-Object { $_.Fresh })
+    Assert "G2 the flooded refresh actually fired (negative control: $($forced.Count) fresh samples in 45 s)" ($forced.Count -gt 0)
+    if ($forced.Count -gt 0) {
+        $gMax = ($forced | Measure-Object -Property TotalUs -Maximum).Maximum
+        $gMean = [int](($forced | Measure-Object -Property TotalUs -Average).Average)
+        $gPanes = ($forced | Measure-Object -Property Panes -Maximum).Maximum
+        $gModes = (@($forced | ForEach-Object { $_.Mode }) | Sort-Object -Unique) -join ','
+        $gDef = ($forced | Measure-Object -Property Deferred -Maximum).Maximum
+        "    [forced refresh] n=$($forced.Count) panes=$gPanes max=$([math]::Round($gMax/1000,2))ms mean=$([math]::Round($gMean/1000,2))ms mode=$gModes deferred_max=$gDef"
+        # THE ASSERTION THIS SECTION EXISTS FOR. Before the fix this is the
+        # ~991 ms capture; after it the pass spends one frame on the panes the
+        # round still owes and leaves the rest for the next tick.
+        Assert ("G3 the forced refresh fits the frame budget (max {0} ms vs {1} ms)" -f
+            [math]::Round($gMax / 1000, 2), [math]::Round($budgetUs / 1000, 2)) ($gMax -le $budgetUs)
+        Assert "G4 the forced refresh ran the bounded pass (mode=$gModes)" ($gModes -eq 'bounded')
+    }
+
+    # ...and the cost must not have been bought by giving up on the screens.
+    # D78 restores what these offsets point at, so a pane held busy for the
+    # whole arm still has to be RE-recorded, not merely still present. Only the
+    # SPLITS are flooded - the two root panes sit at a prompt, and their offsets
+    # standing still is them being idle, not the refresh skipping them.
+    $advanced = 0
+    $checked = 0
+    foreach ($k in $offsetsBefore.Keys) {
+        if ($offsetsAfter.ContainsKey($k)) {
+            $checked++
+            if ($offsetsAfter[$k] -gt $offsetsBefore[$k]) { $advanced++ }
+        }
+    }
+    Assert ("G5 every busy pane's recorded screen moved forward while it was held busy ({0} of {1} panes advanced, {2} flooded)" -f
+        $advanced, $checked, $script:panes.Count) ($checked -gt 0 -and $advanced -ge $script:panes.Count)
 
     "== E: the budget"
     foreach ($r in $script:rows) {
@@ -324,7 +432,7 @@ try {
     'measured cost of one session-layout sync:'
     $script:rows | Format-Table Label, Count, MaxPanes, @{n = 'max_ms'; e = { [math]::Round($_.MaxUs / 1000, 2) } },
     @{n = 'mean_ms'; e = { [math]::Round($_.MeanUs / 1000, 2) } },
-    @{n = 'capture_max_ms'; e = { [math]::Round($_.MaxCapUs / 1000, 2) } }, SnapKB, Fresh | Out-String | Write-Host
+    @{n = 'capture_max_ms'; e = { [math]::Round($_.MaxCapUs / 1000, 2) } }, SnapKB, Fresh, Reuse | Out-String | Write-Host
 } finally {
     Remove-TestDesktop
     [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 700)

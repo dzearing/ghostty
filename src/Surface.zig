@@ -2630,7 +2630,53 @@ const session_snapshot_max_rows: usize = 600;
 pub fn sessionSnapshot(self: *Surface, alloc: Allocator) !?SessionSnapshot {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
+    return self.sessionSnapshotLocked(alloc);
+}
 
+/// `sessionSnapshot`, but it gives up rather than queueing behind the IO thread
+/// (T1311). Returns `error.WouldBlock` when the pane's renderer mutex could not
+/// be taken within `timeout_ns`.
+///
+/// The plain version blocks, and on a pane that is printing without a pause
+/// that block is not short: the IO thread re-takes this mutex for every chunk
+/// it applies and the mutex is not fair, so a caller on the UI thread measured
+/// ~124 ms per busy pane (T412). That is affordable for the quit flush, which
+/// happens once and must not lose the screen, and it is affordable for a
+/// capture that waited for the panes to go quiet first. It is NOT affordable
+/// for the periodic refresh's 30-second ceiling, which by definition only ever
+/// fires while the panes are flooding — the one caller that pays the worst case
+/// every time. That caller asks for a few milliseconds and carries the screen
+/// it already has forward when it does not get them.
+pub fn sessionSnapshotTimeout(
+    self: *Surface,
+    alloc: Allocator,
+    timeout_ns: u64,
+) !?SessionSnapshot {
+    if (!lockWithin(self.renderer_state.mutex, timeout_ns)) return error.WouldBlock;
+    defer self.renderer_state.mutex.unlock();
+    return self.sessionSnapshotLocked(alloc);
+}
+
+/// Take `mutex` within `timeout_ns`, or report that it could not be. False is
+/// an ordinary answer, not a failure.
+///
+/// `std.Thread.Mutex` has no timed acquire, so this is `tryLock` against a
+/// monotonic deadline, yielding between attempts so the thread that holds it
+/// can make progress and drop it. A box with no usable monotonic clock degrades
+/// to a single `tryLock` rather than to an unbounded wait — the entire point of
+/// this path is that it cannot block.
+fn lockWithin(mutex: *std.Thread.Mutex, timeout_ns: u64) bool {
+    if (mutex.tryLock()) return true;
+    var timer = std.time.Timer.start() catch return false;
+    while (timer.read() < timeout_ns) {
+        std.Thread.yield() catch std.Thread.sleep(100 * std.time.ns_per_us);
+        if (mutex.tryLock()) return true;
+    }
+    return false;
+}
+
+/// The body of `sessionSnapshot`, with the renderer mutex already held.
+fn sessionSnapshotLocked(self: *Surface, alloc: Allocator) !?SessionSnapshot {
     // Only agent-backed remote panes re-attach from the manifest.
     const offset = self.io.remoteAppliedOffset() orelse return null;
     // Nothing applied yet ⇒ nothing worth snapshotting. A 0-offset restore would

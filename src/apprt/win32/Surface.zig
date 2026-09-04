@@ -192,6 +192,15 @@ banner_text: ?[:0]u8 = null,
 last_snapshot: ?[]const u8 = null,
 last_snapshot_offset: ?u64 = null,
 
+/// When `last_snapshot` was taken (`std.time.milliTimestamp`), or 0 for never.
+///
+/// The bounded refresh round (T1311) spreads a forced capture across ticks, and
+/// this is how it knows which panes it has already reached: a pane whose screen
+/// was dumped after the round began is current, and re-dumping it would spend
+/// the round's frame on a pane that owes nothing while the pane behind it keeps
+/// waiting.
+last_snapshot_ms: i64 = 0,
+
 /// Read-only badge (T445): the corner card that marks this pane as
 /// read-only. Created lazily the first time the mode is entered — a pane
 /// that never goes read-only never pays for a popup — and kept afterwards,

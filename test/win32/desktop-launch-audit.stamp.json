@@ -1,11 +1,10 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-03T22:04:54-07:00",
-    "commit":  "38192df6c",
+    "generated":  "2026-09-03T23:33:39-07:00",
+    "commit":  "c6e5b376a",
     "uncommitted":  [
-                        "test/win32/chooser-restore-all-remote.ps1",
-                        "test/win32/chooser-resume-remote.ps1"
+                        "test/win32/layout-capture-cost.ps1"
                     ],
     "files":  {
                   "src/cli/ghostty.zig":  "ef54b501298cfda9306cfb958c1094db24ee30f355b25865656b3e2bc713bcd7",
@@ -152,7 +151,7 @@
                   "test/win32/launch-preflight-audit.ps1":  "474a31cc4abb0fc92c75e577bb81e1b5a6e9ff9e6548f2438d6b0fd5eead2178",
                   "test/win32/layout-blob-cross-lineage.ps1":  "87f15d32d375a5262334a59d3e8a0f7f37f8d8647c2000686f532c7df1417324",
                   "test/win32/layout-blobs.ps1":  "d91f5b4afad56f13d8fba4d6f00abf44539b9a5e93afadd26acaec53c5413b75",
-                  "test/win32/layout-capture-cost.ps1":  "c83936ffeb9aa3bbf473771fc8e1902ee5a3b8bf8cf693c02e1854136bc4e73d",
+                  "test/win32/layout-capture-cost.ps1":  "60a2c830f6bac395be0ea78847d0f07466cefca0c8bb9d86385ea27618628e8e",
                   "test/win32/lib/DesktopLaunchAudit.ps1":  "6a520668a22c54f4c5163d5efe9fb3a01bdb8568d60f6cfa5366a1fb2edad86f",
                   "test/win32/lib/TestDesktop.ps1":  "42d47db53b5fb12f34cc8f41403251207858af330a2cf6507f8237c1ed8e972b",
                   "test/win32/local-split-no-command-rerun.ps1":  "ee277b6308cdb172e153fe92d0624732f8b64743418134ce466da5534138fae2",

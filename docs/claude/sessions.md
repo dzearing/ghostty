@@ -203,22 +203,38 @@ tail and the repaint of it), which is the duplication section D of
 arms of that script (a marker planted before the FIRST kill must still be
 readable after the third).
 
-**How fresh that persisted screen is, and why not fresher** (T922 + T412). The
+**How fresh that persisted screen is, and why not fresher** (T922 + T412 +
+T1311). The
 manifest is rewritten by two different kinds of trigger and they no longer cost
 the same. A **topology or frame** change — a tab, a split, a rename, a banner, a
 window drag — writes the file but CARRIES the panes' last screens forward
 (`App.ScreenCapture.reuse`, cached in `Surface.last_snapshot`); a pane with none
 yet still captures fresh, so reuse can never mean "restores blank". Only the
-**T922 refresh tick**, which waits for the panes to go quiet first (2 s poll,
-30 s ceiling), and the **quit / `WM_ENDSESSION` flush** re-dump. The split exists
-because a dump takes each pane's `renderer_state.mutex` and the IO thread holds
-it while feeding output: with eight panes printing, one capture measured **991
-ms on the UI thread**, so every window drag ended in a second of frozen window.
-It is now 0.14 ms. The consequence to know when reading a restored pane: its
-screen is as of the last quiet moment, up to 30 s old for a pane that never goes
-quiet — not as of the last time a window moved. Measured by
-`test/win32/layout-capture-cost.ps1`; the budget lives in
-`src/apprt/win32/layout_cost.zig`.
+**T922 refresh tick** (2 s poll, 30 s ceiling) and the **quit /
+`WM_ENDSESSION` flush** re-dump. The split exists because a dump takes each
+pane's `renderer_state.mutex` and the IO thread holds it while feeding output:
+with eight panes printing, one capture measured **991 ms on the UI thread**, so
+every window drag ended in a second of frozen window. It is now 0.14 ms.
+
+The refresh tick itself has TWO prices, and which one it pays is decided by
+`layout_refresh.decide`. When the panes went quiet it re-dumps everything at the
+idle price (`ScreenCapture.fresh`). When they never went quiet — a long build, an
+agent printing without a pause — the 30 s ceiling fires anyway, and a full dump
+there is the contended price by definition: that was a ~1 s freeze every half
+minute for exactly the user this terminal is for (T1311). So that case runs an
+INCREMENTAL bounded round (`ScreenCapture.fresh_bounded`): it spends half a frame
+re-dumping the panes the round has not reached yet, refuses to queue behind any
+one pane's renderer mutex for more than a couple of milliseconds
+(`Surface.sessionSnapshotTimeout`), carries the rest forward, and finishes on the
+next ticks — a round is over only once a pass defers nobody. Every pane still
+gets a fresh screen; the cost is spread over ticks instead of taken in one
+freeze. Measured: 15 ms worst case, 3.5 ms mean, against 195 ms before.
+
+The consequence to know when reading a restored pane: its screen is as of the
+last quiet moment, up to 30 s old (plus a tick or two of the bounded round) for
+a pane that never goes quiet — not as of the last time a window moved. Measured
+by `test/win32/layout-capture-cost.ps1` (section G is the flooded refresh); the
+budget lives in `src/apprt/win32/layout_cost.zig`.
 
 The agent owns the PTYs, keeps a per-session output ring (2 MB default;
 snapshotted to disk for reboot scrollback), persists session metadata to
