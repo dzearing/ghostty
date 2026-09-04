@@ -40,11 +40,50 @@
 # signtool.exe - the release builds on ubuntu-latest and cross-compiles, so
 # there is no Windows runner to run signtool on.
 #
+# TWO BACKENDS, BECAUSE EV CERTIFICATES ARE NOT FILES. Decision D89
+# (2026-09-04) reversed D87 and chose to buy an EV certificate, and an EV
+# certificate bought today does not arrive as an exportable .pfx: the CA/B
+# Forum rules require the private key to live on a FIPS-140 hardware token or
+# in a cloud HSM, so no issuer will hand one over. A pfx-only pipeline is
+# therefore a pipeline the certificate we are actually buying cannot use. The
+# second backend is PKCS#11 rather than any one issuer's CLI, because PKCS#11
+# is the interface all of them already expose - SafeNet and YubiKey tokens,
+# DigiCert KeyLocker, SSL.com eSigner, Azure Trusted Signing - so the choice
+# of issuer stops being a code change here, and osslsigncode already speaks
+# it, so no new tool joins the release runner. The key never leaves the
+# token in either direction: osslsigncode sends it a hash and gets a
+# signature back.
+#
+# Exactly one backend may be configured. Both at once is a hard error rather
+# than a precedence rule, because "which certificate signed this release" is
+# not a question anybody should have to answer by reading this file.
+#
 # Environment:
-#   WINDOWS_SIGN_PFX_BASE64   base64 of the PKCS#12 (.pfx) certificate.
-#                             Base64 because a GitHub secret is a string and
-#                             a .pfx is binary.
-#   WINDOWS_SIGN_PASSWORD     its password. Optional only if the pfx has none.
+#   WINDOWS_SIGN_PFX_BASE64   PFX BACKEND. base64 of the PKCS#12 (.pfx)
+#                             certificate. Base64 because a GitHub secret is a
+#                             string and a .pfx is binary.
+#   WINDOWS_SIGN_PKCS11_MODULE
+#                             PKCS#11 BACKEND. Path to the issuer's PKCS#11
+#                             library on the runner (opensc-pkcs11.so for a
+#                             token, the issuer's .so for a cloud HSM). Setting
+#                             this selects the backend.
+#   WINDOWS_SIGN_PKCS11_ENGINE
+#                             Path to OpenSSL's pkcs11 engine. Defaults to the
+#                             first of the usual Debian/Ubuntu locations that
+#                             exists, so a stock `libengine-pkcs11-openssl`
+#                             install needs no configuration.
+#   WINDOWS_SIGN_PKCS11_CERT  PKCS#11 URI of the CERTIFICATE on the token,
+#                             e.g. 'pkcs11:object=Ghoztty;type=cert'. Optional
+#                             when the chain is supplied as a file instead.
+#   WINDOWS_SIGN_PKCS11_KEY   PKCS#11 URI of the PRIVATE KEY. Required.
+#   WINDOWS_SIGN_CERT_CHAIN_BASE64
+#                             base64 of a PEM certificate chain, for a token
+#                             that holds only the key. Mutually exclusive with
+#                             WINDOWS_SIGN_PKCS11_CERT; one of the two is
+#                             required, since a signature with no certificate
+#                             attached is not an Authenticode signature.
+#   WINDOWS_SIGN_PASSWORD     The pfx password, or the token/HSM PIN. Optional
+#                             only for a pfx that has none.
 #   WINDOWS_SIGN_TIMESTAMP_URL
 #                             RFC3161 timestamp authority. Defaults to
 #                             DigiCert's. A timestamp is what keeps already
@@ -72,16 +111,28 @@ for f in "$@"; do
 done
 
 PFX_B64="${WINDOWS_SIGN_PFX_BASE64:-}"
+P11_MODULE="${WINDOWS_SIGN_PKCS11_MODULE:-}"
 
-if [[ -z "$PFX_B64" ]]; then
-    echo "==> code signing: NOT CONFIGURED (no \$WINDOWS_SIGN_PFX_BASE64)"
+if [[ -n "$PFX_B64" && -n "$P11_MODULE" ]]; then
+    echo "::error::both signing backends are configured" \
+         "(\$WINDOWS_SIGN_PFX_BASE64 and \$WINDOWS_SIGN_PKCS11_MODULE)." \
+         "Unset one: which certificate signed a release must not depend on a" \
+         "precedence rule buried in sign-artifacts.sh." >&2
+    exit 1
+fi
+
+if [[ -z "$PFX_B64" && -z "$P11_MODULE" ]]; then
+    echo "==> code signing: NOT CONFIGURED (no \$WINDOWS_SIGN_PFX_BASE64," \
+         "no \$WINDOWS_SIGN_PKCS11_MODULE)"
     echo "    These artifacts are UNSIGNED. Windows SmartScreen will show"
     echo "    'Windows protected your PC' with an unknown publisher the first"
-    echo "    time a downloaded copy is run. That is DELIBERATE, not a build"
-    echo "    failure: decision D87 chose to ship unsigned and explain the"
-    echo "    warning instead of buying a certificate. This pipeline stays in"
-    echo "    place so reversing that call is only a matter of adding the two"
-    echo "    secrets (T1203)."
+    echo "    time a downloaded copy is run, and on some machines Defender"
+    echo "    removes the files outright instead of warning about them."
+    echo "    That is not a build failure: a release must never be held"
+    echo "    hostage to a certificate the build cannot obtain for itself."
+    echo "    Decision D89 chose to buy an EV certificate; until it is loaded"
+    echo "    into the repo secrets, releases ship openly unsigned and say so"
+    echo "    (T1246)."
     for f in "$@"; do echo "    unsigned: $f"; done
     exit 0
 fi
@@ -90,12 +141,13 @@ TIMESTAMP_URL="${WINDOWS_SIGN_TIMESTAMP_URL:-http://timestamp.digicert.com}"
 SIGN_NAME="${WINDOWS_SIGN_NAME:-Ghoztty}"
 SIGN_URL="${WINDOWS_SIGN_URL:-https://github.com/dzearing/ghoztty}"
 
-if ! command -v osslsigncode >/dev/null 2>&1; then
-    echo "::error::code signing is configured (\$WINDOWS_SIGN_PFX_BASE64 is set)" \
-         "but osslsigncode is not installed. Install it before building, or" \
-         "unset the secret to publish deliberately unsigned artifacts." >&2
-    exit 1
-fi
+if [[ -n "$PFX_B64" ]]; then BACKEND="pfx"; else BACKEND="pkcs11"; fi
+
+# The configuration is validated BEFORE the toolchain is looked for, so that
+# "your PKCS#11 secrets are wrong" is answerable on any box rather than only
+# on one that already has osslsigncode. That ordering is also what lets
+# sections G17-G21 of test\win32\release-artifacts.ps1 watch every one of
+# these refusals actually fire from this Windows seat.
 
 # The certificate and its password only ever exist as files, mode 600, in a
 # directory that is removed on any exit. Two things this is not: the password
@@ -106,22 +158,115 @@ WORKDIR="$(mktemp -d)"
 cleanup() { rm -rf "$WORKDIR"; }
 trap cleanup EXIT
 
-PFX="$WORKDIR/cert.pfx"
 PASSFILE="$WORKDIR/cert.pass"
-
 umask 077
-if ! printf '%s' "$PFX_B64" | base64 -d > "$PFX" 2>/dev/null; then
-    echo "::error::\$WINDOWS_SIGN_PFX_BASE64 is not valid base64. Re-encode the" \
-         ".pfx with 'base64 -w0 cert.pfx' and update the secret." >&2
-    exit 1
-fi
-if [[ ! -s "$PFX" ]]; then
-    echo "::error::\$WINDOWS_SIGN_PFX_BASE64 decoded to an empty file." >&2
-    exit 1
-fi
 printf '%s' "${WINDOWS_SIGN_PASSWORD:-}" > "$PASSFILE"
 
+# SIGN_ARGS holds the backend-specific half of the osslsigncode invocation.
+# Building it once here rather than branching inside the per-file loop keeps
+# there being exactly ONE place that decides how a Ghoztty artifact is signed.
+SIGN_ARGS=()
+
+if [[ "$BACKEND" == "pfx" ]]; then
+    PFX="$WORKDIR/cert.pfx"
+    if ! printf '%s' "$PFX_B64" | base64 -d > "$PFX" 2>/dev/null; then
+        echo "::error::\$WINDOWS_SIGN_PFX_BASE64 is not valid base64. Re-encode the" \
+             ".pfx with 'base64 -w0 cert.pfx' and update the secret." >&2
+        exit 1
+    fi
+    if [[ ! -s "$PFX" ]]; then
+        echo "::error::\$WINDOWS_SIGN_PFX_BASE64 decoded to an empty file." >&2
+        exit 1
+    fi
+    SIGN_ARGS+=(-pkcs12 "$PFX" -readpass "$PASSFILE")
+else
+    # Everything below is checked BEFORE the first artifact is touched. A
+    # misconfigured token that is only discovered on the third of four files
+    # leaves a payload where some binaries are signed and some are not, which
+    # is the one output shape worse than an openly unsigned release.
+    if [[ ! -f "$P11_MODULE" ]]; then
+        echo "::error::\$WINDOWS_SIGN_PKCS11_MODULE points at '$P11_MODULE'," \
+             "which does not exist. It must be the issuer's PKCS#11 library on" \
+             "this runner (opensc-pkcs11.so for a hardware token, the issuer's" \
+             ".so for a cloud HSM)." >&2
+        exit 1
+    fi
+
+    P11_ENGINE="${WINDOWS_SIGN_PKCS11_ENGINE:-}"
+    if [[ -z "$P11_ENGINE" ]]; then
+        # Stock libengine-pkcs11-openssl, wherever this runner's OpenSSL keeps
+        # its engines. Defaulted rather than required so the common case is no
+        # configuration at all.
+        for candidate in \
+            /usr/lib/x86_64-linux-gnu/engines-3/pkcs11.so \
+            /usr/lib/x86_64-linux-gnu/engines-1.1/pkcs11.so \
+            /usr/lib64/engines-3/pkcs11.so \
+            /usr/lib/engines-3/pkcs11.so; do
+            if [[ -f "$candidate" ]]; then P11_ENGINE="$candidate"; break; fi
+        done
+    fi
+    if [[ -z "$P11_ENGINE" || ! -f "$P11_ENGINE" ]]; then
+        echo "::error::no OpenSSL pkcs11 engine found. Install" \
+             "libengine-pkcs11-openssl on the runner, or set" \
+             "\$WINDOWS_SIGN_PKCS11_ENGINE to the engine's path." >&2
+        exit 1
+    fi
+
+    P11_KEY="${WINDOWS_SIGN_PKCS11_KEY:-}"
+    if [[ -z "$P11_KEY" ]]; then
+        echo "::error::\$WINDOWS_SIGN_PKCS11_KEY is required with the PKCS#11" \
+             "backend. It is the PKCS#11 URI of the private key, e.g." \
+             "'pkcs11:object=Ghoztty;type=private'." >&2
+        exit 1
+    fi
+
+    P11_CERT="${WINDOWS_SIGN_PKCS11_CERT:-}"
+    CHAIN_B64="${WINDOWS_SIGN_CERT_CHAIN_BASE64:-}"
+    if [[ -n "$P11_CERT" && -n "$CHAIN_B64" ]]; then
+        echo "::error::\$WINDOWS_SIGN_PKCS11_CERT and" \
+             "\$WINDOWS_SIGN_CERT_CHAIN_BASE64 are alternatives - the" \
+             "certificate comes either off the token or out of a PEM file," \
+             "not both. Unset one." >&2
+        exit 1
+    fi
+    if [[ -z "$P11_CERT" && -z "$CHAIN_B64" ]]; then
+        echo "::error::the PKCS#11 backend needs the CERTIFICATE as well as the" \
+             "key: set \$WINDOWS_SIGN_PKCS11_CERT (it lives on the token) or" \
+             "\$WINDOWS_SIGN_CERT_CHAIN_BASE64 (a PEM chain). A signature with" \
+             "no certificate attached is not an Authenticode signature." >&2
+        exit 1
+    fi
+
+    SIGN_ARGS+=(-pkcs11engine "$P11_ENGINE" -pkcs11module "$P11_MODULE")
+    if [[ -n "$P11_CERT" ]]; then
+        SIGN_ARGS+=(-pkcs11cert "$P11_CERT")
+    else
+        CHAIN="$WORKDIR/chain.pem"
+        if ! printf '%s' "$CHAIN_B64" | base64 -d > "$CHAIN" 2>/dev/null; then
+            echo "::error::\$WINDOWS_SIGN_CERT_CHAIN_BASE64 is not valid base64." \
+                 "Re-encode the PEM chain with 'base64 -w0 chain.pem'." >&2
+            exit 1
+        fi
+        if [[ ! -s "$CHAIN" ]]; then
+            echo "::error::\$WINDOWS_SIGN_CERT_CHAIN_BASE64 decoded to an empty" \
+                 "file." >&2
+            exit 1
+        fi
+        SIGN_ARGS+=(-certs "$CHAIN")
+    fi
+    # -readpass carries the token PIN for exactly the argv reason above.
+    SIGN_ARGS+=(-key "$P11_KEY" -readpass "$PASSFILE")
+fi
+
+if ! command -v osslsigncode >/dev/null 2>&1; then
+    echo "::error::code signing is configured ($BACKEND backend) but" \
+         "osslsigncode is not installed. Install it before building, or" \
+         "unset the secret to publish deliberately unsigned artifacts." >&2
+    exit 1
+fi
+
 echo "==> code signing $# artifact(s) with the configured certificate"
+echo "    backend: $BACKEND"
 echo "    timestamp authority: $TIMESTAMP_URL"
 
 rc=0
@@ -131,8 +276,7 @@ for f in "$@"; do
     # SHA-256 throughout: SHA-1 Authenticode signatures are no longer trusted
     # by any supported Windows.
     if ! osslsigncode sign \
-            -pkcs12 "$PFX" \
-            -readpass "$PASSFILE" \
+            "${SIGN_ARGS[@]}" \
             -h sha256 \
             -ts "$TIMESTAMP_URL" \
             -n "$SIGN_NAME" \

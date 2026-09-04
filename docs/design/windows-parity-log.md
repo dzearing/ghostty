@@ -21718,3 +21718,60 @@ Filed on the way past: **T1336** (the card has no filter box - Mac pins a
 search field under the header, and it is the one piece of that panel this port
 left out) and **T1337** (next-change dead-ends at a file boundary because
 nothing on this side handles `diffNavOverflow`).
+
+## 2026-09-04 - The signing pipeline can now use the kind of certificate we are actually buying (T1246)
+
+You answered D89: buy an EV certificate, rather than keep shipping unsigned and
+explaining why Defender ate the download. That reverses D87, which is the reason
+T1246 was closed, so the task is open again and this turn built the half of it
+that is not a purchase.
+
+An EV certificate is not a file. The CA/B Forum rules put its private key on a
+FIPS-140 hardware token or in a cloud HSM, so no issuer will hand over an
+exportable `.pfx` - and `dist/windows-installer/sign-artifacts.sh` had exactly
+one backend, `-pkcs12 cert.pfx`. The pipeline T1203 built could not have used
+the certificate D89 chose. Worse, it would not have said so: set the PKCS#11
+half of the configuration on the pre-change script and it printed NOT
+CONFIGURED and shipped an unsigned release, exit 0.
+
+So there are two backends now, and the second is PKCS#11 rather than any one
+issuer's CLI: it is the interface all of them already expose (SafeNet and
+YubiKey tokens, DigiCert KeyLocker, SSL.com eSigner, Azure Trusted Signing), so
+choosing an issuer stops being a code change here, and `osslsigncode` already
+speaks it, so no new tool joins the release runner. The key never moves in
+either direction - the signer sends the token a hash and gets a signature back.
+`release-windows.yml` installs `libengine-pkcs11-openssl` and `opensc`
+unconditionally and carries all four new secret slots unset, for the same reason
+it already installed `osslsigncode` that way: the day the certificate arrives
+must be a secrets change and never a workflow change.
+
+Two refusals matter more than the happy path. Configuring both backends is a
+hard error rather than a precedence rule, because "which certificate signed this
+release" must not be answerable only by reading the script. And every PKCS#11
+misconfiguration - missing module, missing key URI, no certificate at all, both
+certificate forms at once - is refused before the first artifact is touched: a
+token that failed on the third of four binaries would leave a payload where some
+are signed and some are not, which is the one output shape worse than an openly
+unsigned release. The configuration checks therefore run BEFORE the toolchain
+check, which also lets this Windows seat watch all five of them fire.
+
+G8b-G8d and G17-G21 of `test\win32\release-artifacts.ps1` cover it, and each of
+the five refusals was confirmed red against the pre-change script first - four of
+them by exiting 0 and shipping UNSIGNED, which is the silent-success shape this
+repo keeps paying for. The UNSIGNED banner also stopped citing D87's "no
+certificate will be bought" and now names D89 and says the state is temporary.
+
+Floor: all four lanes PASS; `release-artifacts.ps1` ALL PASS (1 skipped, Docker
+down), `website-windows-download.ps1` ALL PASS.
+
+What is left on T1246 cannot be done from this seat: buying the certificate, and
+loading `WINDOWS_SIGN_PKCS11_MODULE`, `WINDOWS_SIGN_PKCS11_KEY`, one of
+`WINDOWS_SIGN_PKCS11_CERT` / `WINDOWS_SIGN_CERT_CHAIN_BASE64`, and the PIN into
+the repo secrets. The task's Summary spells out both.
+
+Filed on the way past: **T1338** - the download page's in-repo mirror goes stale
+after every release, because the release job rewrites the version links on the
+deployed page and nothing writes them back. Its drift gate was three releases
+behind and red for nobody's mistake, which is how the unpublished hand-edit it
+exists to catch would get waved through. Re-synced by hand here; the recurrence
+is the task.

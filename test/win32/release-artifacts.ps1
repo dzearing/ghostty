@@ -1,4 +1,4 @@
-# Every release ships Windows too, and ships BOTH Windows artifacts (T38).
+﻿# Every release ships Windows too, and ships BOTH Windows artifacts (T38).
 #
 # Before this, the Windows terminal was published by hand from this box
 # (scripts\publish-windows-release.ps1) and the macOS app was published by a
@@ -341,9 +341,10 @@ if (-not $builtZip) {
         Assert "B4 portable ZIP console twin is console-subsystem" $false
     }
 
-    # B4b: the READ-ME-FIRST's SmartScreen caveat. Decision D87 chose to ship
-    # unsigned and EXPLAIN the warning, which makes this text a shipped
-    # feature rather than a footnote -- and until now nothing checked it. It
+    # B4b: the READ-ME-FIRST's SmartScreen caveat. Every release ships
+    # unsigned until D89's EV certificate lands in the repo secrets, so
+    # EXPLAINING the warning is a shipped feature rather than a footnote --
+    # and until D87's audit nothing checked it. It
     # still said 'Click "More info" -> "Run anyway"', the wording the website
     # note was corrected away from in T1203 after the user ran the MSI on a
     # clean machine and got Run anyway and Don't run with no More info link at
@@ -702,6 +703,25 @@ Assert "G7 the certificate arrives as an env secret" `
     ($wf -match '(?m)^\s*WINDOWS_SIGN_PFX_BASE64: \$\{\{ secrets\.WINDOWS_SIGN_PFX_BASE64 \}\}')
 Assert "G8 its password arrives the same way" `
     ($wf -match '(?m)^\s*WINDOWS_SIGN_PASSWORD: \$\{\{ secrets\.WINDOWS_SIGN_PASSWORD \}\}')
+# G8b-G8d: the PKCS#11 backend (T1246). D89 chose to buy an EV certificate,
+# and an EV certificate does not arrive as a .pfx -- the CA/B rules put the
+# key on a hardware token or in a cloud HSM, reached through a PKCS#11 module.
+# A pfx-only pipeline is one the certificate being bought cannot use, so the
+# runner carries the pkcs11 toolchain and the secrets on every run, unset,
+# for the same reason osslsigncode is installed unconditionally: the day the
+# certificate lands must be a secrets change and not a workflow change.
+Assert "G8b the runner installs the OpenSSL pkcs11 engine" `
+    ($wf -match 'libengine-pkcs11-openssl')
+foreach ($p11 in @('WINDOWS_SIGN_PKCS11_MODULE', 'WINDOWS_SIGN_PKCS11_KEY',
+                   'WINDOWS_SIGN_PKCS11_CERT', 'WINDOWS_SIGN_CERT_CHAIN_BASE64')) {
+    Assert "G8c $p11 arrives as an env secret" `
+        ($wf -match ('(?m)^\s*' + $p11 + ': \$\{\{ secrets\.' + $p11 + ' \}\}'))
+}
+# The key material never leaves the token: osslsigncode is handed a PKCS#11
+# URI, not an exported key file.
+Assert "G8d the script reaches the key through PKCS#11, not an export" `
+    ($signSh -match '-pkcs11module' -and $signSh -match '-pkcs11engine' -and
+     $signSh -match '-key "\$P11_KEY"')
 Assert "G9 nothing echoes the certificate or its password" `
     (-not ($wf -match 'echo[^\r\n]*WINDOWS_SIGN') -and
      -not ($signSh -match 'echo[^\r\n]*\$(PFX_B64|\{?WINDOWS_SIGN_PASSWORD)'))
@@ -725,6 +745,11 @@ if (-not $bash) {
     Skip 'G14 the unsigned path really exits 0' 'no bash on this box'
     Skip 'G15 a configured-but-unusable certificate really fails' 'no bash on this box'
     Skip 'G16 a missing input is a usage error' 'no bash on this box'
+    Skip 'G17 both backends at once really fails' 'no bash on this box'
+    Skip 'G18 a PKCS#11 module that does not exist really fails' 'no bash on this box'
+    Skip 'G19 a PKCS#11 backend with no key really fails' 'no bash on this box'
+    Skip 'G20 a PKCS#11 backend with no certificate really fails' 'no bash on this box'
+    Skip 'G21 a PKCS#11 backend given both certificate forms really fails' 'no bash on this box'
 } else {
     # Section B's $work is gone by now (it cleans up after itself), so this
     # section owns its own scratch dir.
@@ -765,6 +790,75 @@ if (-not $bash) {
     $noArgCode = $LASTEXITCODE
     Assert "G16 a missing input is a usage error" `
         ($usageCode -eq 2 -and $noArgCode -eq 2)
+
+    # G17-G21: the PKCS#11 backend's refusals (T1246). Every one of these is
+    # a MISCONFIGURATION that must be caught before the first artifact is
+    # touched, because a token that fails on the third of four files leaves a
+    # payload where some binaries are signed and some are not -- the one
+    # output shape worse than an openly unsigned release. So each case
+    # asserts the sample is byte-identical afterwards, not merely that the
+    # exit code was 1. None of them needs a real token: the point is that the
+    # script refuses before it would ever reach one.
+    #
+    # A helper rather than five copies, because the only thing that varies is
+    # the environment: run the script with $Env set, and answer with the exit
+    # code, the output and whether the sample survived untouched.
+    function Invoke-SignEnv {
+        param([string[]] $Env)
+        $prefix = ($Env | ForEach-Object { "export $_;" }) -join ' '
+        $out = & $bash -c "unset WINDOWS_SIGN_PFX_BASE64; $prefix bash '$signUnix' '$sampleUnix' 2>&1"
+        [pscustomobject]@{
+            Code      = $LASTEXITCODE
+            Text      = ($out | Out-String)
+            Untouched = ((Get-FileHash -LiteralPath $sample -Algorithm SHA256).Hash -eq $before)
+        }
+    }
+
+    # A real module path is needed for the cases that are NOT about the module,
+    # or they would fail for the wrong reason and prove nothing. The sample
+    # file itself is a perfectly good stand-in: the script checks that the
+    # path EXISTS, and never loads it before the checks below.
+    $fakeModule = "WINDOWS_SIGN_PKCS11_MODULE='$sampleUnix'"
+    # Same trick for the engine, whose autodetect looks at Linux paths that do
+    # not exist here -- without it G19-G21 would stop at "no pkcs11 engine"
+    # and never reach the refusal each one is about.
+    $fakeEngine = "WINDOWS_SIGN_PKCS11_ENGINE='$sampleUnix'"
+
+    # Both backends configured: a hard error, not a precedence rule. Which
+    # certificate signed a release must not be answerable only by reading
+    # sign-artifacts.sh.
+    $r = Invoke-SignEnv @("WINDOWS_SIGN_PFX_BASE64='Zm9v'", $fakeModule)
+    Assert "G17 both backends at once really fails" `
+        ($r.Code -eq 1 -and $r.Text -match 'both signing backends' -and $r.Untouched)
+
+    # A module path that does not exist. This is the misconfiguration a
+    # secrets edit produces most easily, and the message names the path.
+    $r = Invoke-SignEnv @("WINDOWS_SIGN_PKCS11_MODULE='/nonexistent/pkcs11.so'",
+                          "WINDOWS_SIGN_PKCS11_KEY='pkcs11:object=k;type=private'",
+                          "WINDOWS_SIGN_PKCS11_CERT='pkcs11:object=c;type=cert'")
+    Assert "G18 a PKCS#11 module that does not exist really fails" `
+        ($r.Code -eq 1 -and $r.Text -match '/nonexistent/pkcs11\.so' -and $r.Untouched)
+
+    # No key URI: there is nothing to sign WITH.
+    $r = Invoke-SignEnv @($fakeModule, $fakeEngine, "WINDOWS_SIGN_PKCS11_CERT='pkcs11:object=c;type=cert'",
+                          "WINDOWS_SIGN_PKCS11_KEY=''")
+    Assert "G19 a PKCS#11 backend with no key really fails" `
+        ($r.Code -eq 1 -and $r.Text -match 'WINDOWS_SIGN_PKCS11_KEY' -and $r.Untouched)
+
+    # Key but no certificate. osslsigncode would happily produce a signature
+    # with no certificate attached, and that is not an Authenticode signature
+    # -- it would ship as "signed" and warn exactly as before.
+    $r = Invoke-SignEnv @($fakeModule, $fakeEngine, "WINDOWS_SIGN_PKCS11_KEY='pkcs11:object=k;type=private'",
+                          "WINDOWS_SIGN_PKCS11_CERT=''", "WINDOWS_SIGN_CERT_CHAIN_BASE64=''")
+    Assert "G20 a PKCS#11 backend with no certificate really fails" `
+        ($r.Code -eq 1 -and $r.Text -match 'not an Authenticode signature' -and $r.Untouched)
+
+    # Both certificate forms: the same ambiguity as G17, one level down.
+    $r = Invoke-SignEnv @($fakeModule, $fakeEngine, "WINDOWS_SIGN_PKCS11_KEY='pkcs11:object=k;type=private'",
+                          "WINDOWS_SIGN_PKCS11_CERT='pkcs11:object=c;type=cert'",
+                          "WINDOWS_SIGN_CERT_CHAIN_BASE64='Zm9v'")
+    Assert "G21 a PKCS#11 backend given both certificate forms really fails" `
+        ($r.Code -eq 1 -and $r.Text -match 'are alternatives' -and $r.Untouched)
 
     Remove-Item -LiteralPath $signWork -Recurse -Force -ErrorAction SilentlyContinue
 }

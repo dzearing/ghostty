@@ -219,8 +219,11 @@ if ($dfNote.Success) {
 Assert 'A17f the quarantine caveat reuses the existing download-note class' `
     ($html -match 'class="download-note" id="win-defender-note"')
 
-# D87 chose to ship unsigned deliberately, so 'not code-signed yet' promised
-# something nobody intends to deliver (T1270). The page states it as a fact.
+# 'not code-signed yet' promises the reader a date nobody can name (T1270), so
+# the page states the current state as a fact instead. D89 (2026-09-04) since
+# chose to buy an EV certificate, which does NOT bring the word back: the note
+# is REMOVED the day the certificate signs a release (a T1246 criterion), not
+# softened into a schedule the page cannot keep in the meantime.
 Assert 'A18 the unsigned note is a standing statement, not a promise' `
     ($html -notmatch 'not code-signed yet')
 

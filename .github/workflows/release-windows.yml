@@ -96,8 +96,16 @@ jobs:
       # is a no-op without the certificate secret: a toolchain that is only
       # present on the runs that use it is a toolchain whose absence is
       # discovered by the first release that needs it.
+      # libengine-pkcs11-openssl and opensc are the OTHER half of that same
+      # rule, for the PKCS#11 backend D89's EV certificate needs: an EV key
+      # lives on a token or in a cloud HSM and is reached through a PKCS#11
+      # module, never as a .pfx. Installed unconditionally for the reason
+      # above -- the day the certificate lands, no workflow edit stands
+      # between it and a signed release.
       - name: Install osslsigncode
-        run: sudo apt-get update && sudo apt-get install -y osslsigncode
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y osslsigncode libengine-pkcs11-openssl opensc
 
       - name: Set release variables
         run: |
@@ -145,6 +153,17 @@ jobs:
           # line, and never as an `echo`, so it cannot land in the log.
           WINDOWS_SIGN_PFX_BASE64: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
           WINDOWS_SIGN_PASSWORD: ${{ secrets.WINDOWS_SIGN_PASSWORD }}
+          # The PKCS#11 backend, for the EV certificate D89 chose to buy
+          # (T1246). Same rules as the pair above, and the same reason they
+          # are all listed while all of them are unset: the certificate
+          # arriving must be a secrets change, never a workflow change.
+          # Setting WINDOWS_SIGN_PKCS11_MODULE is what selects this backend;
+          # setting it AND the pfx is a hard error rather than a precedence
+          # rule. The PIN reuses WINDOWS_SIGN_PASSWORD above.
+          WINDOWS_SIGN_PKCS11_MODULE: ${{ secrets.WINDOWS_SIGN_PKCS11_MODULE }}
+          WINDOWS_SIGN_PKCS11_KEY: ${{ secrets.WINDOWS_SIGN_PKCS11_KEY }}
+          WINDOWS_SIGN_PKCS11_CERT: ${{ secrets.WINDOWS_SIGN_PKCS11_CERT }}
+          WINDOWS_SIGN_CERT_CHAIN_BASE64: ${{ secrets.WINDOWS_SIGN_CERT_CHAIN_BASE64 }}
         run: |
           # The same-day rebuild counter: republishing a version on the same
           # date needs a strictly greater MSI ProductVersion or the package
