@@ -875,6 +875,11 @@ pub extern "user32" fn GetSystemMetrics(
 /// left of or above it). The manifest declares PerMonitorV2, so these come back
 /// in physical pixels with no per-monitor scaling applied — which is exactly
 /// what a screen-pixel capture wants (T647).
+/// Non-zero when this process is running in a Remote Desktop session
+/// (T1295). Layered-window blending is not reliably idempotent there, so the
+/// dim overlay resets the pixels under itself before it re-blends.
+pub const SM_REMOTESESSION: i32 = 0x1000;
+
 pub const SM_XVIRTUALSCREEN: i32 = 76;
 pub const SM_YVIRTUALSCREEN: i32 = 77;
 pub const SM_CXVIRTUALSCREEN: i32 = 78;

@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const w32 = @import("win32.zig");
+const dim_math = @import("dim_math.zig");
 
 const log = std.log.scoped(.win32_dim_overlay);
 
@@ -34,6 +35,12 @@ pub const DimOverlay = struct {
     /// applied (show() never runs with alpha 0 — shouldDim requires > 0),
     /// so the first show() always sets the layered attributes.
     alpha: u8 = 0,
+    /// The overlay is on screen at `placement` (T1295). `hide()` clears it,
+    /// so the show after a hide always repositions.
+    shown: bool = false,
+    /// The placement last handed to SetWindowPos. Only meaningful while
+    /// `shown`.
+    placement: dim_math.Placement = .{ .left = 0, .top = 0, .width = 0, .height = 0 },
 
     pub fn create(
         alloc: std.mem.Allocator,
@@ -87,14 +94,19 @@ pub const DimOverlay = struct {
     /// Show the overlay glued over the owner surface at the given fill
     /// color (COLORREF) and alpha. Idempotent — also serves as the
     /// reposition call when the window moves or the layout changes.
-    pub fn show(self: *DimOverlay, color: u32, alpha: u8) void {
-        if (self.brush == null or color != self.color) {
+    ///
+    /// Returns whether it actually touched the window, which is the unit
+    /// test's only handle on "did this re-blend?" (T1295).
+    pub fn show(self: *DimOverlay, color: u32, alpha: u8) bool {
+        const color_changed = self.brush == null or color != self.color;
+        if (color_changed) {
             if (self.brush) |b| _ = w32.DeleteObject(@ptrCast(b));
             self.brush = w32.CreateSolidBrush(color);
             self.color = color;
             _ = w32.InvalidateRect(self.hwnd, null, 1);
         }
-        if (alpha != self.alpha) {
+        const alpha_changed = alpha != self.alpha;
+        if (alpha_changed) {
             _ = w32.SetLayeredWindowAttributes(self.hwnd, 0, alpha, w32.LWA_ALPHA);
             self.alpha = alpha;
         }
@@ -102,23 +114,62 @@ pub const DimOverlay = struct {
         // GetWindowRect on the (child) surface HWND is already in screen
         // coordinates, which is what a popup's SetWindowPos takes.
         var rect: w32.RECT = undefined;
-        if (w32.GetWindowRect(self.owner, &rect) == 0) return;
+        if (w32.GetWindowRect(self.owner, &rect) == 0) return false;
+        const placement: dim_math.Placement = .{
+            .left = rect.left,
+            .top = rect.top,
+            .width = @max(rect.right - rect.left, 1),
+            .height = @max(rect.bottom - rect.top, 1),
+        };
+
+        // T1295: a caller that changed nothing gets nothing. show() rides
+        // every layout, focus, move, activate and config event, and it used
+        // to SetWindowPos(SWP_SHOWWINDOW) unconditionally — free on a
+        // composited desktop, another wash of fill over the same pixels in a
+        // Remote Desktop session, where the layered blend is not reliably
+        // idempotent. See dim_math.needsReposition for the full argument.
+        if (!dim_math.needsReposition(.{
+            .shown = self.shown,
+            .placement_changed = !dim_math.Placement.eql(self.placement, placement),
+            .alpha_changed = alpha_changed,
+            .color_changed = color_changed,
+        })) return false;
+
+        // And when a re-blend IS unavoidable, start it from clean pixels
+        // rather than from the last blend's output: drop the overlay, make
+        // the owner (and, for a viewer pane, WebView2's own child windows)
+        // repaint underneath, then put it back. Remote sessions only — on a
+        // composited desktop this buys nothing and costs a repaint.
+        if (self.shown and w32.GetSystemMetrics(w32.SM_REMOTESESSION) != 0) {
+            _ = w32.ShowWindow(self.hwnd, w32.SW_HIDE);
+            _ = w32.RedrawWindow(
+                self.owner,
+                null,
+                null,
+                w32.RDW_INVALIDATE | w32.RDW_ERASE | w32.RDW_ALLCHILDREN | w32.RDW_UPDATENOW,
+            );
+        }
+
         _ = w32.SetWindowPos(
             self.hwnd,
             null,
-            rect.left,
-            rect.top,
-            @max(rect.right - rect.left, 1),
-            @max(rect.bottom - rect.top, 1),
+            placement.left,
+            placement.top,
+            placement.width,
+            placement.height,
             w32.SWP_NOACTIVATE | w32.SWP_NOZORDER | w32.SWP_SHOWWINDOW,
         );
         // Every reposition re-checks the z-order instead of leaving it to
         // whatever last touched it (T142).
         w32.healOverlayZOrder(self.hwnd, self.owner);
+        self.placement = placement;
+        self.shown = true;
+        return true;
     }
 
     pub fn hide(self: *DimOverlay) void {
         _ = w32.ShowWindow(self.hwnd, w32.SW_HIDE);
+        self.shown = false;
     }
 
     /// The dim wash, into whichever DC this overlay is handed — the paint

@@ -1454,7 +1454,7 @@ pub fn showDimOverlay(self: *ViewerPane, alloc: Allocator, color: u32, alpha: u8
             return;
         };
     }
-    self.dim_overlay.?.show(color, alpha);
+    _ = self.dim_overlay.?.show(color, alpha);
 }
 
 /// Hide this pane's dim overlay if it exists.
@@ -9194,6 +9194,94 @@ test "T380: the dim overlay glues to the host window and follows it" {
 
     // The heal pass runs against a live overlay without complaint (T142).
     pane.healOverlayZOrders();
+}
+
+// T1295: the same overlay, asked the same question twice. A viewer pane over
+// Remote Desktop kept getting darker the longer it sat there, and the only
+// lever the app has over a layered blend that is not idempotent is to stop
+// asking for one it does not need. `show()` reports whether it touched the
+// window, so "did this re-blend?" is answerable without a screen.
+test "T1295: a redundant dim-overlay show does not re-blend" {
+    // A viewer pane over Remote Desktop kept getting darker the longer it sat
+    // there. The app's alpha bookkeeping cannot accumulate (one overlay per
+    // pane, alpha applied only when it changes), so the only lever it has
+    // over a layered blend that is NOT idempotent is to stop asking for one
+    // it does not need: `show()` rides every layout, focus, move, activate
+    // and config event and used to SetWindowPos(SWP_SHOWWINDOW) every time.
+    // It now reports whether it touched the window, which is how "did this
+    // re-blend?" is answerable without a composited screen.
+    const alloc = testing.allocator;
+    const hinstance = w32.GetModuleHandleW(null);
+    _ = registerClass(hinstance);
+    defer _ = w32.UnregisterClassW(CLASS_NAME, hinstance);
+
+    const parent_class = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyDimReblendTestParent");
+    const pc = w32.WNDCLASSEXW{
+        .cbSize = @sizeOf(w32.WNDCLASSEXW),
+        .style = 0,
+        .lpfnWndProc = &w32.DefWindowProcW,
+        .cbClsExtra = 0,
+        .cbWndExtra = 0,
+        .hInstance = hinstance,
+        .hIcon = null,
+        .hCursor = null,
+        .hbrBackground = null,
+        .lpszMenuName = null,
+        .lpszClassName = parent_class,
+        .hIconSm = null,
+    };
+    _ = w32.RegisterClassExW(&pc);
+    defer _ = w32.UnregisterClassW(parent_class, hinstance);
+
+    const parent = w32.CreateWindowExW(
+        0,
+        parent_class,
+        std.unicode.utf8ToUtf16LeStringLiteral("dim reblend test"),
+        w32.WS_OVERLAPPEDWINDOW,
+        0,
+        0,
+        800,
+        600,
+        null,
+        null,
+        hinstance,
+        null,
+    ) orelse return error.Win32Error;
+    defer _ = w32.DestroyWindow(parent);
+
+    var pane: ViewerPane = .{};
+    defer pane.deinit(alloc);
+    try pane.createHostWindow(hinstance, parent, .{ .left = 0, .top = 0, .right = 300, .bottom = 200 });
+    const host = pane.hwnd.?;
+
+    pane.showDimOverlay(alloc, w32.RGB(16, 16, 20), 77);
+    const d = pane.dim_overlay orelse return error.NoOverlay;
+    try testing.expect(d.shown);
+
+    // Every steady-state event - a focus change elsewhere, a WM_MOVE that did
+    // not move this pane, a config reload that changed nothing - lands here
+    // with identical arguments and must do nothing at all.
+    try testing.expect(!d.show(w32.RGB(16, 16, 20), 77));
+    try testing.expect(!d.show(w32.RGB(16, 16, 20), 77));
+    try testing.expect(!d.show(w32.RGB(16, 16, 20), 77));
+
+    // A real change still gets through: the pane moves...
+    _ = w32.MoveWindow(host, 40, 30, 150, 100, 0);
+    try testing.expect(d.show(w32.RGB(16, 16, 20), 77));
+    try testing.expect(!d.show(w32.RGB(16, 16, 20), 77));
+
+    // ...unfocused-split-opacity changes...
+    try testing.expect(d.show(w32.RGB(16, 16, 20), 128));
+    try testing.expect(!d.show(w32.RGB(16, 16, 20), 128));
+
+    // ...unfocused-split-fill changes...
+    try testing.expect(d.show(w32.RGB(32, 0, 0), 128));
+    try testing.expect(!d.show(w32.RGB(32, 0, 0), 128));
+
+    // ...and a hide/show flip (focus out and back) always replaces it.
+    d.hide();
+    try testing.expect(!d.shown);
+    try testing.expect(d.show(w32.RGB(32, 0, 0), 128));
 }
 
 // -------------------------------------------------------------------------

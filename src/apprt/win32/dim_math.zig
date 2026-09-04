@@ -40,6 +40,50 @@ pub fn shouldDim(state: DimState) bool {
         !state.zoomed and !state.hero and !state.focused_pane;
 }
 
+/// A screen-space placement of the overlay, in the units `SetWindowPos`
+/// takes. Kept OS-free so the reposition decision below is testable in every
+/// lane.
+pub const Placement = struct {
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+
+    pub fn eql(a: Placement, b: Placement) bool {
+        return a.left == b.left and a.top == b.top and
+            a.width == b.width and a.height == b.height;
+    }
+};
+
+/// Everything `DimOverlay.show` knows when it is deciding whether to touch
+/// the window at all.
+pub const RepositionState = struct {
+    /// The overlay is currently on screen at `Placement` last applied.
+    shown: bool,
+    /// The owner's rect moved or resized since the last applied placement.
+    placement_changed: bool,
+    /// `SetLayeredWindowAttributes` was just called with a new alpha.
+    alpha_changed: bool,
+    /// The fill brush was just recreated for a new color.
+    color_changed: bool,
+};
+
+/// Whether `show()` must issue a `SetWindowPos`/z-order pass, or can return
+/// having done nothing (T1295).
+///
+/// `show()` is called from every layout, focus, move, activate and config
+/// event, and it USED to reposition unconditionally — a `SetWindowPos` with
+/// `SWP_SHOWWINDOW` on an already-visible layered popup that had not moved.
+/// On a composited desktop that is free and invisible. In a Remote Desktop
+/// session the layered blend is not reliably idempotent, so every redundant
+/// re-blend is another wash of `unfocused-split-fill` over pixels that
+/// already carry one — which is what "the white kept getting dimmer, and
+/// closing the pane fixed it" looks like from the outside.
+pub fn needsReposition(state: RepositionState) bool {
+    return !state.shown or state.placement_changed or
+        state.alpha_changed or state.color_changed;
+}
+
 test "overlayAlpha: opacity 1 disables dimming" {
     try testing.expectEqual(@as(u8, 0), overlayAlpha(1.0));
 }
@@ -124,4 +168,55 @@ test "shouldDim: inactive tab, zoom, and hero suppress dimming" {
     s = base;
     s.hero = true;
     try testing.expect(!shouldDim(s));
+}
+
+test "needsReposition: a steady, already-shown overlay does nothing" {
+    try testing.expect(!needsReposition(.{
+        .shown = true,
+        .placement_changed = false,
+        .alpha_changed = false,
+        .color_changed = false,
+    }));
+}
+
+test "needsReposition: the first show always repositions" {
+    try testing.expect(needsReposition(.{
+        .shown = false,
+        .placement_changed = false,
+        .alpha_changed = false,
+        .color_changed = false,
+    }));
+}
+
+test "needsReposition: any one change is enough" {
+    const base: RepositionState = .{
+        .shown = true,
+        .placement_changed = false,
+        .alpha_changed = false,
+        .color_changed = false,
+    };
+    var s = base;
+    s.placement_changed = true;
+    try testing.expect(needsReposition(s));
+    s = base;
+    s.alpha_changed = true;
+    try testing.expect(needsReposition(s));
+    s = base;
+    s.color_changed = true;
+    try testing.expect(needsReposition(s));
+}
+
+test "Placement.eql: identical placements compare equal" {
+    const a: Placement = .{ .left = 10, .top = 20, .width = 300, .height = 400 };
+    try testing.expect(Placement.eql(a, a));
+}
+
+test "Placement.eql: a move and a resize are both changes" {
+    const a: Placement = .{ .left = 10, .top = 20, .width = 300, .height = 400 };
+    var b = a;
+    b.left = 11;
+    try testing.expect(!Placement.eql(a, b));
+    b = a;
+    b.height = 401;
+    try testing.expect(!Placement.eql(a, b));
 }

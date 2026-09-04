@@ -1236,7 +1236,7 @@ pub fn showDimOverlay(self: *Surface, color: u32, alpha: u8) void {
             return;
         };
     }
-    self.dim_overlay.?.show(color, alpha);
+    _ = self.dim_overlay.?.show(color, alpha);
 }
 
 /// Hide this pane's dim overlay if it exists.

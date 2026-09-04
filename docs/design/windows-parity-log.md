@@ -20968,3 +20968,53 @@ same day, with the ordinary cadence unchanged around it) and M (`-Status`) of
 control scoring 130 failures; and Z8-Z12 of `test\win32\go-loop-guard.ps1` for
 `ok+n`, plain `ok` when the release carries HEAD, an unhonoured request
 degrading the run, and a request filed this minute NOT doing so.
+
+## 2026-09-03 - an unfocused pane stops re-dimming itself over Remote Desktop (T1295)
+
+A user opened an HTML viewer pane over a Remote Desktop connection and watched
+the white get dimmer and dimmer the longer it sat there; closing the pane and
+opening it again fixed it, and then it started fading again.
+
+The first job was to find out whether the app was doing it. Every layered-alpha
+site in `src/apprt/win32` was read - `App.zig`'s `toggle_background_opacity`,
+`Window.zig`'s creation-time `background-opacity`, `BannerOverlay`,
+`Scrollbar`, `ReadonlyBadge`, `KeyStateIndicator` and `DimOverlay` - and none of
+them accumulates: there is one dim overlay per pane for the life of the pane,
+`SetLayeredWindowAttributes` runs only when the alpha actually changes, and
+nothing re-blends on a timer (`updateDimOverlays` rides focus changes,
+`layoutSplits`, `WM_MOVE`, tab switches and config reloads;
+`healOverlayZOrders` rides `WM_ACTIVATE`). So the app's own alpha bookkeeping
+is ruled out by construction, and the compounding is in composition - which is
+why it appears over RDP and not locally.
+
+That leaves the app one lever: how often it asks for a blend it does not
+control. `DimOverlay.show()` used to issue `SetWindowPos(... SWP_SHOWWINDOW)`
+plus a z-order heal on **every** one of those events, even when the pane had
+not moved and neither the alpha nor the fill had changed. On a composited
+desktop that is free and invisible. In an RDP session, where the layered blend
+is not reliably idempotent, each redundant re-blend is another wash of
+`unfocused-split-fill` over pixels that already carry one.
+
+`show()` is now genuinely idempotent: it remembers the placement it last
+applied and returns having touched nothing when placement, alpha, fill and
+visibility are all unchanged. And when a re-blend IS unavoidable *and*
+`GetSystemMetrics(SM_REMOTESESSION)` says the process is remote, the overlay
+drops itself and forces the owner to repaint underneath first - with
+`RDW_ALLCHILDREN`, so WebView2's own Chromium child windows repaint too - and
+the blend starts from clean pixels instead of the previous blend's output.
+Local sessions take neither path.
+
+Confirmation over RDP is what is still owed, and T1295 is parked on it: there is
+no Remote Desktop session on this box, and off the input desktop there is no
+composited screen to photograph, which is exactly why `split-dim-viewer.ps1`
+asserts on the overlay's own `PrintWindow` fill rather than on composited
+pixels. If the fade survives this, the remaining suspect is the composition
+path itself - the Mesa d3d12 fallback renderer (T1251/T1252) under RDP's
+redirection.
+
+Acceptance: `dim_math.needsReposition` / `Placement.eql` unit tests (every
+lane), and `T1295: a redundant dim-overlay show does not re-blend` in
+`ViewerPane.zig` (win32 lane), which drives a real overlay over a real host
+window and asserts that three identical `show()` calls in a row touch nothing
+while a move, an opacity change, a fill change and a hide/show flip each get
+through.
