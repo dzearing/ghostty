@@ -37,6 +37,7 @@ status: "todo"
 commits: []
 seat: "win"
 tags: ["fix"]
+user-report: true
 ---
 
 # T144 — New windows (ctrl+n) open in C:\Windows\System32
@@ -102,6 +103,31 @@ checks that prove it is done (`new` scaffolds it). The turn that lands the
 task ticks each criterion **with how it was verified**. The dashboard's task
 detail view shows the checklist, so "what validation was done" is answerable
 without reading the diff.
+
+## `user-report:` — a task a person asked for (T1315, 2026-09-04)
+
+`user-report: true` says a USER told us about this: a report in the terminal, a
+screenshot, "it did the thing again". It is optional and absent means no, so
+every older file keeps meaning what it always did.
+
+The flag is not a label — it changes what closing the task does. `set-status
+<id> -Status done` on a flagged task runs `scripts\daily-publish.ps1 -Request`
+itself, with the task id and title as the reason, so the fix ships that day
+rather than waiting for the next daily release; the request is recorded in the
+task's own progress log. `validate` then fails **UNSHIPPED USER REPORT** on a
+closed user report whose log has no such receipt.
+
+```powershell
+scripts\parity-tasks.ps1 new -Title "…" -UserReport -Tags fix
+scripts\parity-tasks.ps1 set-priority T123 -Priority P0 -UserReport   # triage recognises one
+```
+
+Why it is structural rather than a habit: T1294 made the same-day publish
+possible and left the *asking* to whoever closed the task. On 2026-09-03 that
+cost the user a second download of the same broken installer and a second
+report of a bug we had already fixed. A closed user report is not done from
+where they are standing until the fix has shipped. Acceptance: section F of
+`test\win32\gate-negatives.ps1`.
 
 ## Seats (T344, 2026-08-02)
 

@@ -183,6 +183,19 @@ $Registry = @(
     [pscustomobject]@{ Label = 'GUARD DUE CHECK SKIPPED'; Kind = 'hatch'; Demo = 'test\win32\guard-due.ps1'
         Marker = 'GUARD DUE CHECK SKIPPED'
     }
+    # T1315. A closed USER REPORT that never asked for the release carrying its
+    # fix. The gate is validate's; PUBLISH REQUESTED is the ordinary path
+    # (set-status files the request itself) and PUBLISH REQUEST FAILED is the
+    # loud version of the silence that made this necessary - both demonstrated
+    # in section F, because a request that quietly fails to be written is
+    # exactly the state the user experiences as "you said you fixed it".
+    [pscustomobject]@{ Label = 'UNSHIPPED USER REPORT'; Kind = 'gate'; Demo = $Self
+        Marker = 'UNSHIPPED USER REPORT'
+    }
+    [pscustomobject]@{ Label = 'PUBLISH REQUEST FAILED'; Kind = 'gate'; Demo = $Self
+        Marker = 'PUBLISH REQUEST FAILED'
+    }
+    [pscustomobject]@{ Label = 'PUBLISH REQUESTED'; Kind = 'status' }
     [pscustomobject]@{ Label = 'PUSH CHECK SKIPPED'; Kind = 'hatch'; Demo = $Self; Marker = 'PUSH CHECK SKIPPED' }
     [pscustomobject]@{ Label = 'CI CHECK SKIPPED'; Kind = 'hatch'; Demo = $Self; Marker = 'CI CHECK SKIPPED' }
     # Informational by design. SPLIT DEP is a legitimate queue state (a task
@@ -638,6 +651,101 @@ try {
         ($rClaim.Text -match 'CI RED') $rClaim.Text
     Check 'E11 ...and still exits 0, because a claim must never wedge the loop' `
         ($rClaim.Code -eq 0) "exit=$($rClaim.Code)"
+
+    # =======================================================================
+    Say ''
+    Say 'F. T1315: closing a task the user reported asks for the release that carries the fix'
+    # =======================================================================
+    #
+    # T1294 made a same-day publish possible and left the ASKING to a turn's
+    # memory. This section measures that it is no longer remembered: the
+    # request is filed by the close itself, it is NOT filed for an ordinary
+    # task, and a close that failed to file one is caught rather than passing
+    # quietly. The last arm is the one that matters - from where the user
+    # sits, a fix nobody published and a fix nobody made are the same thing.
+
+    $fDir = Join-Path $Sandbox 'tasks-userreport'
+    New-Item -ItemType Directory -Force -Path $fDir | Out-Null
+    $fReq = Join-Path $Sandbox 'publish-request'
+    function Invoke-Task { param([string[]]$A) return Invoke-Ps (@('-File', $TaskScript) + $A + @('-TaskDir', $fDir)) }
+
+    Invoke-Task @('new', '-Title', 'the installer dies silently', '-UserReport', '-Tags', 'fix') | Out-Null
+    Invoke-Task @('new', '-Title', 'an ordinary infra chore', '-Tags', 'infra') | Out-Null
+    $fReported = Join-Path $fDir 'T1.md'
+    $fOrdinary = Join-Path $fDir 'T2.md'
+    Check 'F0 new -UserReport records that a user asked for this' `
+        ((Test-Path -LiteralPath $fReported) -and
+        ([System.IO.File]::ReadAllText($fReported) -match '(?m)^user-report:\s*true\s*$')) `
+        'T1.md carries no user-report flag'
+    Check 'F1 ...and an ordinary task does not carry the flag' `
+        ((Test-Path -LiteralPath $fOrdinary) -and
+        ([System.IO.File]::ReadAllText($fOrdinary) -notmatch '(?m)^user-report:')) `
+        'T2.md was flagged as a user report'
+
+    # The arm where it does NOT fire: closing an ordinary task must not mint a
+    # release request, or the one-a-day cadence becomes publish-per-commit.
+    $env:GHOZTTY_PUBLISH_REQUEST_PATH = $fReq
+    try {
+        $rOrd = Invoke-Task @('set-status', 'T2', '-Status', 'done')
+        $ordWrote = Test-Path -LiteralPath $fReq
+        $rRep = Invoke-Task @('set-status', 'T1', '-Status', 'done')
+        $repWrote = Test-Path -LiteralPath $fReq
+        $reqText = if ($repWrote) { [System.IO.File]::ReadAllText($fReq) } else { '' }
+    }
+    finally { Remove-Item Env:GHOZTTY_PUBLISH_REQUEST_PATH -ErrorAction SilentlyContinue }
+
+    Check 'F2 closing an ordinary task files no publish request' `
+        ((-not $ordWrote) -and $rOrd.Text -notmatch 'PUBLISH REQUESTED') "$($rOrd.Text)"
+    Check 'F3 closing a user report scores PUBLISH REQUESTED' `
+        ($rRep.Text -match 'PUBLISH REQUESTED') "$($rRep.Text)"
+    Check 'F4 ...and the request names the task, so the digest can quote it' `
+        ($repWrote -and $reqText -match 'T1' -and $reqText -match 'installer dies') $reqText
+    Check 'F5 ...and the receipt lands in the task progress log' `
+        ([System.IO.File]::ReadAllText($fReported) -match '(?mi)^-.*publish request filed') `
+        'no receipt in T1.md'
+
+    # The gate with teeth. A hand-edited status, a retro-flag, or a request
+    # that could not be written all end here.
+    $gDir = New-CaseDir 'userreport-unshipped'
+    Write-Ascii (Join-Path $gDir 'T20.md') @(
+        '---', 'id: T20', 'title: "a closed report nobody published"', 'deps: []',
+        'status: "done"', 'commits: []', 'seat: "win"', 'user-report: true', '---',
+        '', '# T20 - fixture', '', '## Progress log', '', '- 2026-09-04 00:00: status: todo -> done'
+    )
+    $rGate = Invoke-Validate $gDir
+    Check 'F6 validate FAILS with UNSHIPPED USER REPORT, naming the task' `
+        ($rGate.Code -ne 0 -and $rGate.Text -match 'UNSHIPPED USER REPORT' -and $rGate.Text -match 'T20') `
+        "exit=$($rGate.Code): $($rGate.Text)"
+    # The receipt is what clears it, so a report that WAS published stops
+    # failing without anyone editing the gate.
+    Invoke-Ps @('-File', $TaskScript, 'note', 'T20', '-Text', 'publish request filed: T20 by hand', '-TaskDir', $gDir) | Out-Null
+    $rGate3 = Invoke-Validate $gDir
+    Check 'F7 ...and a recorded publish request clears it' `
+        ($rGate3.Code -eq 0 -and $rGate3.Text -notmatch 'UNSHIPPED USER REPORT') `
+        "exit=$($rGate3.Code): $($rGate3.Text)"
+
+    # A request that cannot be written must be LOUD. The sandbox path is given
+    # a parent that is a FILE, so daily-publish.ps1 cannot create the directory
+    # it needs and answers non-zero - the shape of a request silently lost.
+    $blockFile = Join-Path $Sandbox 'not-a-dir'
+    Write-Ascii $blockFile @('this is a file, not a directory')
+    $env:GHOZTTY_PUBLISH_REQUEST_PATH = (Join-Path $blockFile 'req')
+    try {
+        Invoke-Task @('new', '-Title', 'another user report', '-UserReport') | Out-Null
+        $rFail = Invoke-Task @('set-status', 'T3', '-Status', 'done')
+    }
+    finally { Remove-Item Env:GHOZTTY_PUBLISH_REQUEST_PATH -ErrorAction SilentlyContinue }
+    Check 'F8 a request that cannot be written scores PUBLISH REQUEST FAILED' `
+        ($rFail.Text -match 'PUBLISH REQUEST FAILED') "$($rFail.Text)"
+    Check 'F9 ...and leaves no receipt, so validate refuses the close' `
+        ((Invoke-Validate $fDir).Code -ne 0) 'validate passed a close whose request was lost'
+
+    # Retro-flagging: triage learns a filed task came from a user report.
+    Invoke-Task @('new', '-Title', 'filed before anybody said who asked') | Out-Null
+    $rFlag = Invoke-Task @('set-priority', 'T4', '-Priority', 'P0', '-UserReport')
+    Check 'F10 set-priority -UserReport flags a task triage recognises' `
+        ([System.IO.File]::ReadAllText((Join-Path $fDir 'T4.md')) -match '(?m)^user-report:\s*true\s*$') `
+        "$($rFlag.Text)"
 
     # =======================================================================
     Say ''

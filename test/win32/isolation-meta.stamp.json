@@ -1,10 +1,10 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-09-04T02:23:16-07:00",
-    "commit":  "0ece9740e",
+    "generated":  "2026-09-04T02:44:36-07:00",
+    "commit":  "d1ab9a76e",
     "uncommitted":  [
-                        "test/win32/false-positive-report.ps1"
+                        "test/win32/gate-negatives.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -98,7 +98,7 @@
                   "test/win32/font-inherit.ps1":  "f303affd8f1c72da77f48f09a10b18d0c7c72af845a4602455bf013662d8c257",
                   "test/win32/foreground-audit.ps1":  "d343505dc8ede3b8a22d230eb7621f529f2a106a740301fead22d422b59310e3",
                   "test/win32/fork-identity.ps1":  "2a83e77b4f6fc5127e583e44175dc00a350ef16cacf5b9404c9e6e8fb388ab71",
-                  "test/win32/gate-negatives.ps1":  "2f760aa588f0f18e7a1c26986dde9f8843c48e60c7d37d7abf02ace70528fd6d",
+                  "test/win32/gate-negatives.ps1":  "2b6146771384b3fc9a9d257f8fcc34b7ffdd0b03be7de06d38ab080bf118f2a7",
                   "test/win32/ghoztty-cleanup.ps1":  "81bfcb6cb5b018195e1056d6ce7203f18235763916bcec4cffcdafa811e73f76",
                   "test/win32/go-loop-guard.ps1":  "5d4434f2893c9e1276d15499141a3a549fc4f17ed0f1dd1771986b62f5f8e7ba",
                   "test/win32/go-loop-uptime.ps1":  "a97005d970a564088741646542ffaca3cb9ffe03d2eb30c55b96841607948b82",

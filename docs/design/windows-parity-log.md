@@ -21237,3 +21237,37 @@ Acceptance: `test\win32\false-positive-report.ps1`, 25 assertions ALL PASS,
 negative control 25 FAILURES, registered in `guard-due.ps1` as
 `false-positive-report`. Section E is the demonstration it can decline - no `gh`
 and no `-AssetDir` is exit 4 and no packet, rather than a form full of blanks.
+
+## 2026-09-04 - closing a bug the user reported now asks for the release that carries the fix (T1315)
+
+T1294 made a same-day release possible: a turn records
+`daily-publish.ps1 -Request` and step 6.5 ships it despite the day's watermark.
+What it left behind was a step somebody has to REMEMBER, and the failure mode of
+forgetting is the exact thing it was filed for. On 2026-09-03 the release went
+out at 09:28, the fix for the installer bug the user had reported that morning
+landed at 11:01, and nobody asked - so they downloaded the same broken installer
+and reported the same bug a second time.
+
+So the fact that a USER asked for a task is now data rather than context. A task
+carries `user-report: true` - written by `parity-tasks.ps1 new -UserReport`, or
+added by `set-priority <id> -UserReport` when triage recognises one - and
+`set-status <id> -Status done` on such a task runs the publish request itself,
+with the task id and title as the reason, and writes the receipt into the task's
+own progress log. Closing an ordinary task still files nothing, so the one-a-day
+cadence is untouched and this is not a route to publish-per-commit.
+
+The gate is `validate`: **UNSHIPPED USER REPORT** on a closed user report whose
+log carries no request. In ordinary operation it never fires, because the close
+filed the request; what it catches is a status hand-edited in the file, a
+request write that failed, and a task retro-flagged after it was already closed.
+All three read identically from where the user sits - a fix they were told about
+and cannot install.
+
+Acceptance: section F of `test\win32\gate-negatives.ps1`, eleven new assertions
+(ALL PASS 58, negative control 1 FAILURE), including the arm where it does NOT
+fire and the arm where the request cannot be written and must be loud. The three
+new labels are declared in that file's registry, so the T1133 rule is satisfied
+rather than sidestepped. Floor green: four zig lanes, P1-P3, and the nine
+harnesses `guard-due` named for these files. Filed alongside: T1321 (the
+feedback queue files user reports without the flag) and T1322 (the dashboard
+does not show it).

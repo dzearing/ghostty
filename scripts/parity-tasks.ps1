@@ -48,6 +48,8 @@
   scripts\parity-tasks.ps1 next -Seat mac
   scripts\parity-tasks.ps1 show T144
   scripts\parity-tasks.ps1 new -Title "Fix the thing" -Deps T73,T94 -Tags fix,polish
+  scripts\parity-tasks.ps1 new -Title "The installer dies" -UserReport -Tags fix
+  scripts\parity-tasks.ps1 set-priority T144 -Priority P0 -UserReport
   scripts\parity-tasks.ps1 note T144 -Text "caption_layout re-pinned; next: slab fills"
   scripts\parity-tasks.ps1 set-order T377 -Order 2
   scripts\parity-tasks.ps1 set-order T500 -Order 2.5   # inject without renumbering
@@ -127,6 +129,17 @@ param(
     # is the exact defect T564 fixed. It is also the bulk hatch past T892's
     # un-block gate, and prints that it was used when it takes it.
     [switch]$NoNote,
+
+    # T1315. This task exists because a USER told us about it - a report in
+    # the terminal, a screenshot, "it did the thing again". `new -UserReport`
+    # writes `user-report: true` into the file, `set-priority -UserReport`
+    # adds it to a task triage discovers came from one, and `set-status done`
+    # on such a task files the publish request itself (T1294) so the fix
+    # actually reaches the person who reported it instead of waiting for the
+    # next daily release. The flag is the whole mechanism: without it, "ask
+    # for a release" is a step a turn has to REMEMBER, and the failure mode of
+    # forgetting is the user re-reporting a bug we already fixed.
+    [switch]$UserReport,
 
     # Escape hatch so the acceptance script can drive a fixture directory
     # instead of the real tracker (same idea as GHOSTTY_HOST_DEFAULTS).
@@ -272,6 +285,12 @@ function ConvertFrom-Frontmatter {
         # since T564's follow-ups). `set-status` reads it so an un-block can
         # restate the condition the caller is claiming is satisfied - see T892.
         Unblock      = & $unquote (& $get 'unblock')
+        # T1315. Did a USER report this? A closed user report is not done from
+        # where they are standing until the fix has SHIPPED, so `set-status
+        # done` on one files a publish request and `validate` fails a closed
+        # one that never did. Absent means no, which keeps the field optional
+        # forever and every pre-T1315 file valid.
+        UserReport   = ((& $unquote (& $get 'user-report')) -match '^(?i:true)$')
         Path         = $Path
     }
 }
@@ -895,6 +914,45 @@ switch ($Command) {
             Write-Host ("      journaled: {0}" -f $line)
         }
 
+        # T1315: closing a task the USER reported asks for the release that
+        # carries the fix, here, rather than leaving it as a step a turn has to
+        # remember. T1294 made the same-day publish possible and left the
+        # asking to discipline; on 2026-09-03 that cost the user a second
+        # download of the same broken installer and a second report of a bug
+        # already fixed. A closed user report is not done from where they are
+        # standing until the fix has shipped, so the close and the request are
+        # one act. The receipt goes in the progress log, and `validate` fails a
+        # closed user report that has none - so a request that could not be
+        # written is loud instead of silent.
+        if ($Status -eq 'done' -and $before -and $before.UserReport) {
+            $pubScript = Join-Path $PSScriptRoot 'daily-publish.ps1'
+            $reason = "{0}: {1}" -f $tid, $(if ($before.Title) { $before.Title } else { 'a task the user reported' })
+            # A fixture task dir is somebody testing this script; it must not
+            # write the real box's publish request. GHOZTTY_PUBLISH_REQUEST_PATH
+            # is how the acceptance harness points the write at its own sandbox
+            # and reads it back. Unset in every real run.
+            $reqPath = [string]$env:GHOZTTY_PUBLISH_REQUEST_PATH
+            if ($TaskDirGiven -and -not $reqPath) {
+                Write-Host ("      (fixture task dir: no publish request filed for {0})" -f $tid)
+            }
+            elseif (-not (Test-Path -LiteralPath $pubScript)) {
+                Write-Host ("PUBLISH REQUEST FAILED: {0} is a user report and {1} is missing - ask for the release by hand" -f $tid, $pubScript)
+            }
+            else {
+                $reqArgs = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $pubScript, '-Request', '-Reason', $reason)
+                if ($reqPath) { $reqArgs += @('-RequestPath', $reqPath) }
+                $reqOut = & powershell.exe @reqArgs 2>&1 | Out-String
+                if ($LASTEXITCODE -eq 0) {
+                    Add-ProgressNote -Path $path -SessionId $Session -NoteText ("publish request filed: {0}" -f $reason)
+                    Write-Host ("PUBLISH REQUESTED: {0} - step 6.5's daily-publish run ships this fix today, whatever the day's watermark says" -f $reason)
+                }
+                else {
+                    Write-Host ("PUBLISH REQUEST FAILED: {0} is a user report but the request was not recorded - run: daily-publish.ps1 -Request -Reason `"{1}`"" -f $tid, $reason)
+                    foreach ($line in ($reqOut -split "`r?`n")) { if ($line.Trim()) { Write-Host ("  " + $line.TrimEnd()) } }
+                }
+            }
+        }
+
         # Restate what the parker asked for, at the moment somebody says it is
         # satisfied (T892). The condition is written down precisely so it can be
         # checked, and the one place it was never shown was the command that
@@ -952,7 +1010,26 @@ switch ($Command) {
                 $new = [regex]::Replace($new, '(?m)^(priority:\s*.*)$', "`$1`ntriage-reason: $why", 1)
             }
         }
+        # T1315: re-triage is where somebody realises a task came from a user
+        # report - the report arrives as a sentence in the terminal and the
+        # task gets filed from it minutes later, often by a different hand. The
+        # flag is additive on purpose: this cannot un-set it, because "actually
+        # nobody reported this" is not a thing triage discovers.
+        $flagged = $false
+        if ($UserReport -and $new -notmatch '(?m)^user-report:\s*true\s*$') {
+            if ($new -match '(?m)^user-report:\s*.*$') {
+                $new = [regex]::Replace($new, '(?m)^user-report:\s*.*$', 'user-report: true', 1)
+            }
+            else {
+                $new = [regex]::Replace($new, '(?m)^(priority:\s*.*)$', "`$1`nuser-report: true", 1)
+            }
+            $flagged = $true
+        }
         [System.IO.File]::WriteAllText($path, $new, (New-Object System.Text.UTF8Encoding $false))
+        if ($flagged) {
+            Add-ProgressNote -Path $path -SessionId $Session -NoteText 'user-report: true (closing this task now asks for the release that carries the fix)'
+            Write-Host ("      {0} is a user report: closing it will file a publish request" -f $tid)
+        }
         # Journalled for the same reason `set-status` is (T564): since D55 the
         # priority IS the queue position, so re-prioritising a task moves what
         # the loop does next - and a re-triage that changed the head of the
@@ -1031,6 +1108,12 @@ switch ($Command) {
                     ("seat: " + (ConvertTo-Json $seatValue -Compress))
                     ("priority: " + (ConvertTo-Json $priorityValue -Compress))
                     "tags: $tagsJson"
+                )
+                # Written only when true (T1315): an absent field already means
+                # "not a user report", and stamping `user-report: false` into
+                # every task file would make the one that matters harder to see.
+                if ($UserReport) { $lines += 'user-report: true' }
+                $lines += @(
                     '---'
                     ''
                     "# $tid - $Title"
@@ -1318,6 +1401,22 @@ switch ($Command) {
                 $bodyText = [System.IO.File]::ReadAllText($t.Path, [System.Text.Encoding]::UTF8)
                 if ($bodyText -notmatch '(?m)^## Progress log\s*$') {
                     Write-Host ("NO PROGRESS LOG: {0} is in-progress with no '## Progress log' section (add one: parity-tasks.ps1 note {0} -Text ...)" -f $t.Id); $problems++
+                }
+            }
+            # T1315: a closed USER REPORT that never asked for a release. The
+            # receipt is written by `set-status done` itself, so in ordinary
+            # operation this never fires; what it catches is the three ways the
+            # asking can go missing - a status hand-edited in the file, a
+            # request write that failed, and a task retro-flagged with
+            # `set-priority -UserReport` after it was already closed. All three
+            # end the same way from where the user sits: they reported a bug,
+            # we fixed it, and no build they can install carries the fix.
+            if ($t.UserReport -and $t.Status -eq 'done') {
+                $bodyText = [System.IO.File]::ReadAllText($t.Path, [System.Text.Encoding]::UTF8)
+                if ($bodyText -notmatch '(?mi)^-.*publish request') {
+                    Write-Host ("UNSHIPPED USER REPORT: {0} is a closed user report with no publish request in its progress log - the reporter has no build carrying this fix" -f $t.Id)
+                    Write-Host ("  (ask for it: scripts\daily-publish.ps1 -Request -Reason `"{0}: <what was fixed>`", then: parity-tasks.ps1 note {0} -Text `"publish request filed: ...`")" -f $t.Id)
+                    $problems++
                 }
             }
         }

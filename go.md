@@ -326,6 +326,12 @@ Concretely, in order, with no stops in between:
    glance. When you claim an untagged task, add tags to its frontmatter as
    part of making it readable.
 
+   **And say so when a USER reported it** (T1315): `new -UserReport` writes
+   `user-report: true`, and that flag is what makes closing the task ask for the
+   release that carries the fix — see step 6.5. A task filed from anything the
+   user said (a report in the terminal, a screenshot, "it did it again") gets
+   the flag; `set-priority <id> -UserReport` adds it to one already filed.
+
    `next` picks by **`priority:`** (P0 → P1 → P2 → P3 → untriaged), then
    `order:` within that band, then id (D55; user, 2026-08-12). Priority is what
    the work is WORTH and it decides; `order:` only sequences tasks that are
@@ -735,6 +741,21 @@ Concretely, in order, with no stops in between:
      honoured within three hours degrades `go-loop-health.ps1`. **A task closed
      from a user report is not done from where the user stands until the fix has
      shipped** — the request is how that stops being a thing to remember.
+
+     **And since T1315 you do not have to remember it at all.** A task that came
+     from a user carries `user-report: true` — `parity-tasks.ps1 new -UserReport`
+     writes it, `set-priority <id> -UserReport` adds it when triage recognises
+     one — and `set-status <id> -Status done` on such a task files the request
+     ITSELF, with the task id and title as the reason, and writes the receipt
+     into the task's progress log. `validate` then FAILS on `UNSHIPPED USER
+     REPORT`: a closed user report whose log carries no publish request. In
+     ordinary operation the gate never fires, because the close filed the
+     request; what it catches is a status hand-edited in the file, a request
+     write that failed, and a task retro-flagged after it was already closed —
+     all three of which the user experiences identically, as a fix they were
+     told about and cannot install. Flag it when you file it; the hand-run
+     `-Request` above stays the way to ask for anything else. Acceptance:
+     section F of `test\win32\gate-negatives.ps1`.
 
      **A pushed tag is not yet a release**, so the watermark records `tagged` and
      the next run reconciles it against `gh release view`: `published` if CI
