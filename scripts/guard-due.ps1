@@ -1579,6 +1579,21 @@ $GuardTable = @(
             'test\win32\floor-lane-solo-confirm.ps1'
         )
     },
+    # The compiler-crash retry (T451) is the same shape again: it speaks only
+    # when zig.exe itself has faulted, which is roughly weekly, so a classifier
+    # that has quietly stopped matching is indistinguishable from a month with
+    # no compiler crash in it -- and the failure mode is the expensive one, a
+    # toolchain fault read as broken code. Same coverage rule as the rows around
+    # it: the library and this harness gate, scripts\floor-lane.ps1 does not.
+    [pscustomobject]@{
+        Name   = 'lane-compiler-crash'
+        Script = 'test\win32\floor-lane-compiler-crash.ps1'
+        Stamp  = 'test\win32\floor-lane-compiler-crash.stamp.json'
+        Covers = @(
+            'scripts\lib\CompilerCrash.ps1',
+            'test\win32\floor-lane-compiler-crash.ps1'
+        )
+    },
     # The leaked-test-binary sweep (T837) is measurement first: its whole job is
     # to make a rare leak COUNTABLE, and a detector that has quietly stopped
     # matching reports the same "leaked test binaries: 0" as a clean run. Same

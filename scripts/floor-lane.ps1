@@ -46,6 +46,13 @@
         cache file, not red code -- the entry is deleted (loudly, as
         `CACHE HEAL` lines) and the lane re-run ONCE; the re-run's verdict is
         final. See scripts\lib\CacheHeal.ps1.
+      * It says when the COMPILER crashed, and retries once (T451). `zig.exe`
+        itself takes access violations on this box -- eight in the 32 days to
+        2026-09-04 -- and the lane then dies on a bare `exited with error code
+        5` that reads exactly like broken code. A `COMPILER CRASH` block names
+        the fault, the lane is re-run once, and the re-run is final. A crash in
+        one of OUR test binaries vetoes all of that, because that red is ours.
+        See scripts\lib\CompilerCrash.ps1.
 
 .PARAMETER Lane
     none | win32 | agent | lib | all. Default `all` runs the four zig lanes in
@@ -137,6 +144,10 @@ $ErrorActionPreference = 'Stop'
 # Decodes a crashed child's truncated exit code and reads the Windows crash log
 # (T444). Without it a lane can end on a bare "exited with error code 5".
 . "$PSScriptRoot\lib\CrashDiag.ps1"
+# Decides whether a red lane is red because zig.exe itself crashed (T451). The
+# decode above NAMES the process that died; this is what the wrapper does with
+# the answer, which until T451 was nothing.
+. "$PSScriptRoot\lib\CompilerCrash.ps1"
 # Re-runs a crashed test binary under cdb for a dump and every thread's stack
 # (T450). Zig's own handler dies in a recursive panic, so without this a crash
 # leaves no stack at all -- see scripts/lib/CrashCatch.ps1.
@@ -380,6 +391,11 @@ function Invoke-Lane {
     # The caller's cache-heal check (T494) needs the log of the run that just
     # failed; the return value stays a bare verdict string on purpose.
     $script:LastLaneLog = $log
+    # Likewise the caller's compiler-crash retry (T451): the verdict is computed
+    # here, where the crash log has already been waited on, and the RETRY POLICY
+    # is the caller's. Cleared per run so a previous lane's crash cannot be read
+    # as this one's.
+    $script:LastLaneCompilerCrash = $null
 
     if ($RawCommand) {
         # Self-test: the same watchdog loop over a synthetic command, so the
@@ -538,6 +554,15 @@ function Invoke-Lane {
         # the process that died, so a red lane is never a bare number.
         $null = Write-CrashDiagnostic -Since $started -LogPath $log
 
+        # ...and then ACT on which process it named (T451). Write-CrashDiagnostic
+        # has already polled for the Application Error record, so by here the
+        # window's crashes are readable without waiting again. A crash in zig.exe
+        # is a toolchain fault, and the caller retries the lane once on it; a
+        # crash in one of OURS vetoes that, because relabelling it would erase
+        # the evidence the T443 crash hunt exists to collect.
+        $script:LastLaneCompilerCrash = Get-CompilerCrashVerdict `
+            -Crashes @(Get-ProcessCrashEvent -Since $started) -TestExeNames $TEST_EXE_NAMES
+
         # T444 names the crashed process and its fault offset. That is a
         # suspect, not a stack -- and Zig's segfault handler cannot supply one
         # here, because it dies in a recursive panic while walking the stack.
@@ -547,6 +572,67 @@ function Invoke-Lane {
         if (-not $NoCatch) { Invoke-LaneCrashCatch -Since $started -LaneLog $log }
     }
     return $result
+}
+
+# --------------------------------------------- compiler-crash retry (T451)
+
+<#
+.SYNOPSIS
+Report a lane that died because zig.exe crashed, and re-run it once.
+
+.DESCRIPTION
+The retry POLICY, kept apart from the classifier in lib\CompilerCrash.ps1 so
+the decision can be tested against planted crash records without running a
+lane. It reads the verdict Invoke-Lane left in $script:LastLaneCompilerCrash,
+which is why every caller gets the same behaviour whether it came through the
+lane loop or through -Command.
+
+The budget is one retry per lane per invocation, exactly like the cache heal:
+a compiler that crashes twice over the same code is no longer distinguishable
+from code that does not compile, and a wrapper that retries forever cannot
+report anything.
+
+.OUTPUTS
+@{ Result = <verdict after the policy>; Retried = <bool>; Note = <summary tag> }
+#>
+function Invoke-CompilerCrashPolicy {
+    param(
+        [string]$Name,
+        [string]$Result,
+        [bool]$AlreadyRetried,
+        [Parameter(Mandatory)][scriptblock]$Rerun
+    )
+
+    $out = @{ Result = $Result; Retried = $AlreadyRetried; Note = '' }
+    $cc = $script:LastLaneCompilerCrash
+    if ($Result -ne 'FAIL' -or -not $cc -or -not $cc.IsCompilerCrash) { return $out }
+
+    foreach ($line in @(Format-CompilerCrashReport -Verdict $cc -LaneName $Name -WillRetry (-not $AlreadyRetried))) {
+        Write-Host $line
+    }
+    if ($AlreadyRetried) {
+        $out.Note = ' [compiler crashed again; retry budget spent]'
+        return $out
+    }
+
+    $out.Retried = $true
+    $out.Result = & $Rerun
+    # The re-run has its own verdict, so say whether the toolchain died AGAIN
+    # rather than letting a second identical crash read as a code failure.
+    $again = $script:LastLaneCompilerCrash
+    if ($out.Result -eq 'PASS') {
+        $out.Note = ' [compiler crashed; passed on retry]'
+    }
+    elseif ($again -and $again.IsCompilerCrash) {
+        foreach ($line in @(Format-CompilerCrashReport -Verdict $again -LaneName $Name -WillRetry $false)) {
+            Write-Host $line
+        }
+        $out.Note = ' [compiler crashed twice; retry budget spent]'
+    }
+    else {
+        $out.Note = ' [compiler crashed; still red on retry]'
+    }
+    return $out
 }
 
 # ------------------------------------------------- solo confirm pass (T1170)
@@ -705,8 +791,15 @@ if ($SelfTest) {
 
 if ($Command) {
     $r = Invoke-Lane -Name 'command' -Iteration 1 -RawCommand $Command
+    # -Command gets the same compiler-crash policy the lane loop does (T451):
+    # this mode is how the acceptance test drives a real crashing process
+    # through the wrapper, so a policy that lived only in the loop would be
+    # demonstrated only in the mode nobody can fixture.
+    $policy = Invoke-CompilerCrashPolicy -Name 'command' -Result $r -AlreadyRetried $false `
+        -Rerun { Invoke-Lane -Name 'command' -Iteration 1 -RawCommand $Command }
+    $r = $policy.Result
     Write-Host ""
-    Write-Host "FLOOR SUMMARY: command=$r"
+    Write-Host "FLOOR SUMMARY: command=$r$($policy.Note)"
     switch ($r) {
         'PASS' { exit $EXIT_PASS }
         'STALL' { exit $EXIT_STALL }
@@ -762,8 +855,18 @@ foreach ($l in $lanes) {
     # code, so delete that entry and re-run once. The re-run's verdict is
     # final -- a genuine failure simply fails again and is reported as such.
     $healedThisLane = $false
+    # And at most ONE compiler-crash retry per lane per invocation (T451), for
+    # the same reason and with the same finality: a lane whose zig.exe took an
+    # access violation is not a result, so it is re-run once and the re-run's
+    # verdict stands.
+    $compilerRetriedThisLane = $false
     for ($i = 1; $i -le $Repeat; $i++) {
         $r = Invoke-Lane -Name $l -Iteration $i
+        $policy = Invoke-CompilerCrashPolicy -Name $l -Result $r `
+            -AlreadyRetried $compilerRetriedThisLane -Rerun { Invoke-Lane -Name $l -Iteration $i }
+        $r = $policy.Result
+        $compilerRetriedThisLane = $policy.Retried
+        $note = $policy.Note
         if ($r -eq 'FAIL' -and -not $healedThisLane -and $script:LastLaneLog) {
             $torn = @(Get-TornCacheEntry -LogPath $script:LastLaneLog -RepoPath $Repo -GlobalCacheDir $cacheDir)
             if ($torn.Count -gt 0) {
@@ -782,10 +885,10 @@ foreach ($l in $lanes) {
         # applied to lanes). The verdict is NOT changed by the answer.
         if ($r -eq 'FAIL' -and -not $NoSoloConfirm -and -not $Filter -and $l -ne 'lib') {
             $alone = Invoke-SoloConfirm -Name $l -LogPath $script:LastLaneLog
-            $summary += "$l#${i}=$r [alone: $alone]"
+            $summary += "$l#${i}=$r$note [alone: $alone]"
         }
         else {
-            $summary += "$l#${i}=$r"
+            $summary += "$l#${i}=$r$note"
         }
         switch ($r) {
             'FAIL' { if ($worst -lt $EXIT_FAIL) { $worst = $EXIT_FAIL } }

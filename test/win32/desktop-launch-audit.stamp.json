@@ -1,10 +1,10 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-04T06:43:49-07:00",
-    "commit":  "246e67755",
+    "generated":  "2026-09-04T09:05:12-07:00",
+    "commit":  "4510d0a36",
     "uncommitted":  [
-                        "test/win32/test-binary-soak.ps1"
+                        "test/win32/floor-lane-compiler-crash.ps1"
                     ],
     "files":  {
                   "src/cli/ghostty.zig":  "ef54b501298cfda9306cfb958c1094db24ee30f355b25865656b3e2bc713bcd7",
@@ -93,6 +93,7 @@
                   "test/win32/feedback-user-report.ps1":  "0b85eddc062d701c1cfe16d603156cdc5702e2d6c78fdc5a2bbd70b088f292cc",
                   "test/win32/float-on-top.ps1":  "1d6c2fb69c3f28f0fbbeb99a8d37634b09784ecf0e14f4c5bcc97383fe31e538",
                   "test/win32/floor-lane-cache-heal.ps1":  "d40d1a377c30e9861010bacb09a810fb848ade4cbc54ed38ecc9980d4f13d740",
+                  "test/win32/floor-lane-compiler-crash.ps1":  "34827f1ed2d63df665d72275f13211f6a3f8273c44561b09396ffdc3f7505470",
                   "test/win32/floor-lane-leak-sweep.ps1":  "c339c10d3445889e7107e6158a32c593bad1ce2454b107551561b39e9f1fd24d",
                   "test/win32/floor-lane-solo-confirm.ps1":  "2e7b8705867fd366ef614013d2cdd8e9e213136a4f8e9347ac049215944c0a50",
                   "test/win32/focus-defer.ps1":  "0781efdaa91cf1730f88acaec0143573697a9d4d305e4becdd08eab8774efafd",

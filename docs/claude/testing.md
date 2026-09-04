@@ -82,6 +82,23 @@ a suspicion (a program really can `exit(5)`), so with no crash record behind it
 the block says so rather than asserting. Acceptance:
 `test\win32\crash-diagnostics.ps1`.
 
+**And when the process that died was the COMPILER, the lane says so and retries**
+(T451). `zig.exe` itself takes access violations on this box — eight in the 32
+days to 2026-09-04, four of them at the same module-relative offset inside one
+minute — and the lane then dies on exactly the bare `error code 5` above, which
+reads as broken code. It is not a result: a `COMPILER CRASH` block names the
+fault (and names a repeated fault site when it sees one, which is what separates
+a compiler bug from a sick machine), the lane is re-run **once**, and the
+re-run's verdict is final — the same budget and the same finality as the cache
+heal. The rule that keeps it honest is the veto: a crash in one of OUR test
+binaries in the same window is never relabelled a toolchain fault, because that
+red is the T443 crash hunt's evidence. Classifier in
+`scripts\lib\CompilerCrash.ps1`; acceptance:
+`test\win32\floor-lane-compiler-crash.ps1`, whose end-to-end arm drives a real
+access-violating process named `zig.exe` through the wrapper. The compiler on
+this box is byte-identical to the official `zig-x86_64-windows-0.15.2` release,
+so this is zig 0.15.2 (or the machine), not a corrupted install.
+
 **And a red lane captures a real stack** (T450). Zig's segfault handler dies in
 a recursive panic here, and even when it works it only ever walks the thread
 that faulted — never the one that did the damage. So a crash in one of our test

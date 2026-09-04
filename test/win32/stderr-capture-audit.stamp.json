@@ -1,13 +1,14 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-04T06:43:44-07:00",
-    "commit":  "246e67755",
+    "generated":  "2026-09-04T09:04:56-07:00",
+    "commit":  "4510d0a36",
     "uncommitted":  [
-                        "test/win32/test-binary-soak.ps1"
+                        "docs/claude/testing.md",
+                        "test/win32/floor-lane-compiler-crash.ps1"
                     ],
     "files":  {
-                  "docs/claude/testing.md":  "353e090f48ab5d8f8eee4042ac2689134b9f082800c4a067d625af97eec7f2c7",
+                  "docs/claude/testing.md":  "75066e86f1dcb63299264139b1ca28da1f7025520011e33f7c3139d0d24fc9b1",
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
                   "test/win32/activity-monitor-probe-fail.ps1":  "3ca33b2b1d163db1fe2b2f8d0cb573c0f9d7decd435f61d64bb5906e71dc6aa4",
@@ -93,6 +94,7 @@
                   "test/win32/feedback-user-report.ps1":  "0b85eddc062d701c1cfe16d603156cdc5702e2d6c78fdc5a2bbd70b088f292cc",
                   "test/win32/float-on-top.ps1":  "1d6c2fb69c3f28f0fbbeb99a8d37634b09784ecf0e14f4c5bcc97383fe31e538",
                   "test/win32/floor-lane-cache-heal.ps1":  "d40d1a377c30e9861010bacb09a810fb848ade4cbc54ed38ecc9980d4f13d740",
+                  "test/win32/floor-lane-compiler-crash.ps1":  "34827f1ed2d63df665d72275f13211f6a3f8273c44561b09396ffdc3f7505470",
                   "test/win32/floor-lane-leak-sweep.ps1":  "c339c10d3445889e7107e6158a32c593bad1ce2454b107551561b39e9f1fd24d",
                   "test/win32/floor-lane-solo-confirm.ps1":  "2e7b8705867fd366ef614013d2cdd8e9e213136a4f8e9347ac049215944c0a50",
                   "test/win32/focus-defer.ps1":  "0781efdaa91cf1730f88acaec0143573697a9d4d305e4becdd08eab8774efafd",

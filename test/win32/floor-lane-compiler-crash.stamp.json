@@ -1,0 +1,14 @@
+{
+    "guard":  "lane-compiler-crash",
+    "script":  "test/win32/floor-lane-compiler-crash.ps1",
+    "generated":  "2026-09-04T08:45:20-07:00",
+    "commit":  "4510d0a36",
+    "uncommitted":  [
+                        "scripts/lib/CompilerCrash.ps1",
+                        "test/win32/floor-lane-compiler-crash.ps1"
+                    ],
+    "files":  {
+                  "scripts/lib/CompilerCrash.ps1":  "3c0fd966fdd0fbb9daac57b22868ca7260351b812f6577b3dc43d0fedb83d09c",
+                  "test/win32/floor-lane-compiler-crash.ps1":  "34827f1ed2d63df665d72275f13211f6a3f8273c44561b09396ffdc3f7505470"
+              }
+}
