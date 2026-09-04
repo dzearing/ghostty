@@ -21421,3 +21421,54 @@ duplicate, with what this turn measured - the blob identity of all four copies,
 and the image-viewer prose main added that this branch has not taken - folded
 into T1325 instead. This commit takes `-NoGuardDue` naming `hook-json` for the
 same pre-existing red.
+
+## 2026-09-04 - the vendored skill documents are current again, and main moving now reopens the check (T1325)
+
+The Windows app writes a copy of the `ghoztty` skill - the document an AI agent
+reads to learn how to drive the terminal - into the agent's skill directory, and
+that copy had fallen two days behind the one the Mac app ships. What it was
+missing was the image viewer: main's `fc7e36356` taught the skill that
+`--view=` opens a picture and added the triggers that decide whether the skill
+fires at all on "show me that screenshot". So an agent on Windows would hand you
+a path instead of a picture, for a feature Windows has had since T1183.
+
+Re-vendored all three copies of `skills/ghoztty/SKILL.md` (the mirror, the copy
+the app ships, and the mac bundle resource) byte for byte from `origin/main`.
+`skills/process-feedback/SKILL.md` is a deliberate fork since T1321, so it took
+main's `source.kind` ROW rather than main's file, and the release-request text
+the fork exists for is intact - hook-json's fork assertions are what prove that,
+and all three forks are green.
+
+The half worth having is the second one. `scripts\guard-due.ps1` reopens a
+harness when the files it COVERS change, all of which live in our tree, and
+nothing in our tree changes when `origin/main` advances. So the drift check went
+red the moment main moved and stayed quiet for two days until an unrelated edit
+happened to poke it - the T1099 shape, a verdict that can only ever say "fine".
+A guard row may now also declare `Upstream` paths, read out of `origin/main`,
+whose blob shas go into the stamp beside the covered files' content hashes.
+Blob rather than head sha, deliberately: keying on main's head would reopen the
+guard several times a day over commits that touch nothing we mirror, and a guard
+that is always due is a guard nobody reads. A tree with no `origin/main` answers
+"cannot answer" and contributes no finding, and stamping there carries the
+previous upstream shas forward rather than erasing the key.
+
+Demonstrated rather than asserted: section M of `test\win32\guard-due.ps1`
+builds a fixture repo with a fabricated `refs/remotes/origin/main`, stamps it,
+advances only the upstream side, and watches the guard reopen and name the move
+as `upstream` rather than as our edit - with M3 the negative control (CURRENT
+before the advance) and M9 the no-remote case. `ALL PASS (100 assertions)`;
+`hook-json.ps1` `ALL PASS (43 assertions)` and its guard is CURRENT again.
+
+Not done here, and filed as **T1327**: the Mac wording that arrives with the
+vendored text. Main's prose says trackpad pinch-to-zoom, two-finger pan and
+`Cmd-F`, where Windows does ctrl+wheel, ctrl+plus/minus/0 and double-click. The
+document is Mac-worded throughout, though - `Cmd+R`, `Cmd+Z`, the `Cmd`/`Cmd-Shift`
+banner modifiers, `-lic`, `/bin/zsh`, `--command=zsh` - and the live copy is
+deliberately UNFORKED, which is what makes re-vendoring a copy rather than a
+merge. Forking it for one paragraph would be an inconsistent divergence in a
+file main edits weekly, so the correction is one coherent pass with a mechanism
+question in front of it (fork the file, or a build-time platform substitution
+over the mirror). T1325's fourth criterion is recorded as deferred with that
+reasoning rather than ticked.
+
+Floor: all four lanes PASS, P1/P2/P3 ALL PASS.

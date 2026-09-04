@@ -749,6 +749,159 @@ $rows
     Check 'L5 the shipped coverage table has no unmatched or corrupt path' `
         ((@($out5) -join "`n") -notmatch 'GUARD TABLE FAULT') (@($out5 | Select-String 'FAULT') -join "`n")
 
+    # --- M. the OTHER tree moving reopens the question ----------------------
+    # T1325. Every arm above keys the guard on files in OUR tree, and that is
+    # the whole vocabulary a row had. `hook-json` asserts something else: that
+    # the vendored asset mirror is byte-identical to tip-of-main. Nothing here
+    # changes when main advances, so on 2026-09-02 main rewrote two SKILL.md
+    # files, the mirror was stale from that moment, and the guard stayed CURRENT
+    # for two days until an unrelated edit to a covered file happened to reopen
+    # it. A check that can only go red by accident is the T1099 shape.
+    #
+    # So a row may also name `Upstream` paths, read out of `origin/main`, whose
+    # BLOB shas go in the stamp. Blob rather than head sha: ordinary main churn
+    # stays silent, and a change to a file we actually mirror does not.
+    #
+    # Proved against a synthetic advance of a fixture's own origin/main, never
+    # by waiting for the real main to move.
+    Write-Host "`n-- M. an upstream advance reopens the guard --"
+
+    $UpFixture = Join-Path $env:TEMP ("ghoztty-guard-up-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+    New-Item -ItemType Directory -Force -Path (Join-Path $UpFixture 'scripts') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $UpFixture 'test\win32') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $UpFixture 'vendor') | Out-Null
+    New-Item -ItemType Directory -Force -Path (Join-Path $UpFixture 'source') | Out-Null
+
+    function Set-UpFile([string]$rel, [string]$text) {
+        [System.IO.File]::WriteAllText((Join-Path $UpFixture $rel), ($text -replace "`r`n", "`n"),
+            (New-Object System.Text.UTF8Encoding($false)))
+    }
+    function Invoke-UpGit([string[]]$argList) {
+        # An explicit identity and NO hooks path: this fixture must not inherit
+        # the repo's commit guard, whose whole job is to refuse a commit it did
+        # not arrange.
+        # core.autocrlf=false so `git add` does not warn about line endings, and
+        # try/catch because a native command's stderr is a terminating
+        # NativeCommandError under this harness's ErrorActionPreference - a
+        # warning must not end the run.
+        $a = @('-C', $UpFixture, '-c', 'core.hooksPath=', '-c', 'core.autocrlf=false',
+            '-c', 'user.name=guard-due fixture', '-c', 'user.email=fixture@example.invalid',
+            '-c', 'commit.gpgsign=false') + $argList
+        $code = 1
+        try { & git @a *> $null; $code = $LASTEXITCODE } catch { $code = $LASTEXITCODE }
+        return $code
+    }
+    function Set-UpTable {
+        # The real script, its table spliced out for one row that watches both
+        # a local file and an upstream one.
+        $table = @"
+`$GuardTable = @(
+    [pscustomobject]@{
+        Name     = 'fixture-row'
+        Script   = 'test\win32\fixture-row.ps1'
+        Stamp    = 'test\win32\fixture-row.stamp.json'
+        Covers   = @(
+            'scripts\good-one.ps1',
+            'vendor\mirror.md'
+        )
+        Upstream = @(
+            'source/thing.md'
+        )
+    }
+)
+
+"@
+        $text = $realDue.Substring(0, $tabStart) + $table + $realDue.Substring($tabEnd)
+        [System.IO.File]::WriteAllText((Join-Path $UpFixture 'scripts\guard-due.ps1'), $text,
+            (New-Object System.Text.UTF8Encoding($false)))
+    }
+    function Invoke-UpDue([string]$Action = 'check') {
+        $a = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+            (Join-Path $UpFixture 'scripts\guard-due.ps1'), $Action, '-Repo', $UpFixture)
+        if ($Action -eq 'update') { $a += '-IgnoreRunState' }
+        $out = & powershell.exe @a 2>&1
+        return [pscustomobject]@{ Exit = $LASTEXITCODE; Text = (@($out) -join "`n") }
+    }
+
+    Set-UpFile 'scripts\good-one.ps1' "# fixture`n"
+    Set-UpFile 'source\thing.md' "upstream v1`n"
+    Set-UpFile 'vendor\mirror.md' "upstream v1`n"
+    Set-UpTable
+    Invoke-UpGit @('init', '--initial-branch=main') | Out-Null
+    Invoke-UpGit @('add', '-A') | Out-Null
+    $rcCommit = Invoke-UpGit @('commit', '--no-verify', '-m', 'fixture v1')
+    # `origin/main` fabricated locally: a remote-tracking ref is just a ref, and
+    # nothing in the gate cares how it got there.
+    Invoke-UpGit @('update-ref', 'refs/remotes/origin/main', 'HEAD') | Out-Null
+    $mainSha1 = ''
+    try { $mainSha1 = (& git -C $UpFixture rev-parse --verify --quiet 'origin/main:source/thing.md' 2>$null | Out-String).Trim() } catch { $mainSha1 = '' }
+    Check 'M0 the fixture has a fabricated origin/main naming the watched blob' `
+        ($rcCommit -eq 0 -and $mainSha1) "commit=$rcCommit blob=$mainSha1"
+
+    $r = Invoke-UpDue update
+    Check 'M1 a first stamp records the run' ($r.Text -match 'STAMPED fixture-row') $r.Text
+    $stampPath = Join-Path $UpFixture 'test\win32\fixture-row.stamp.json'
+    $stampText = [System.IO.File]::ReadAllText($stampPath)
+    Check 'M2 the stamp carries the upstream blob sha beside the file hashes' `
+        ($stampText -match 'origin/main:source/thing\.md' -and $stampText -match [regex]::Escape($mainSha1)) $stampText
+
+    # The negative control: nothing has moved on either side.
+    $r = Invoke-UpDue
+    Check 'M3 with main where it was, the guard is CURRENT' `
+        ($r.Exit -eq 0 -and $r.Text -match 'GUARD CURRENT fixture-row') "exit=$($r.Exit): $($r.Text)"
+
+    # The advance. Only the upstream tree moves; every covered file in this tree
+    # is byte-for-byte what it was when the stamp was taken.
+    Set-UpFile 'source\thing.md' "upstream v2 - main said something new`n"
+    Invoke-UpGit @('add', '-A') | Out-Null
+    Invoke-UpGit @('commit', '--no-verify', '-m', 'fixture v2') | Out-Null
+    Invoke-UpGit @('update-ref', 'refs/remotes/origin/main', 'HEAD') | Out-Null
+    # `vendor\mirror.md` - the only covered file this row shares a subject with -
+    # is deliberately left holding the stamped bytes, so the ONLY difference in
+    # the world is main's.
+
+    $r = Invoke-UpDue
+    Check 'M4 main advancing over a watched file reopens the guard' `
+        ($r.Exit -eq 1 -and $r.Text -match 'GUARD DUE fixture-row') "exit=$($r.Exit): $($r.Text)"
+    Check 'M5 and it is named as an upstream move, not as our edit' `
+        ($r.Text -match 'upstream\s+origin/main:source/thing\.md' -and $r.Text -notmatch 'changed\s+vendor/mirror\.md') $r.Text
+
+    Check 'M6 the local files are untouched, so this is the upstream half alone' `
+        ($r.Text -notmatch 'changed\s+scripts/good-one\.ps1') $r.Text
+
+    # Re-vendoring alone does not clear it - only a run of the harness does,
+    # which is the same contract every other arm here measures.
+    Set-UpFile 'vendor\mirror.md' "upstream v2 - main said something new`n"
+    $r = Invoke-UpDue
+    Check 'M7 re-vendoring without running the harness is still DUE' `
+        ($r.Exit -eq 1) "exit=$($r.Exit): $($r.Text)"
+
+    Invoke-UpDue update | Out-Null
+    $r = Invoke-UpDue
+    Check 'M8 a run over the new upstream sha is CURRENT again' `
+        ($r.Exit -eq 0 -and $r.Text -match 'GUARD CURRENT fixture-row') "exit=$($r.Exit): $($r.Text)"
+
+    # A tree that cannot ask the question must not answer it. Deleting the
+    # remote-tracking ref is the fresh-clone / fixture-repo case, and it has to
+    # read as "no upstream finding", never as "everything moved".
+    $stampBefore = [System.IO.File]::ReadAllText($stampPath)
+    Invoke-UpGit @('update-ref', '-d', 'refs/remotes/origin/main') | Out-Null
+    $r = Invoke-UpDue
+    Check 'M9 with no origin/main the upstream half is silent, not red' `
+        ($r.Exit -eq 0 -and $r.Text -notmatch 'upstream\s+origin/main') "exit=$($r.Exit): $($r.Text)"
+    Invoke-UpDue update | Out-Null
+    $stampAfter = [System.IO.File]::ReadAllText($stampPath)
+    Check 'M10 and stamping there carries the upstream shas forward rather than erasing them' `
+        ($stampAfter -match 'origin/main:source/thing\.md') $stampAfter
+
+    # M11: the live table. `hook-json` is the row this section exists for, and
+    # the claim worth holding is that it still declares the watch.
+    $realTableText = $realDue.Substring($tabStart, $tabEnd - $tabStart)
+    Check 'M11 the shipped hook-json row watches main''s copies of the vendored assets' `
+        ($realTableText -match 'macos/Resources/Ghoztty/skills/ghoztty/SKILL\.md' -and
+         $realTableText -match 'macos/Resources/Ghoztty/skills/process-feedback/SKILL\.md' -and
+         $realTableText -match 'macos/Resources/Ghoztty/hooks/ghoztty-banner\.sh') $realTableText
+
     Complete-TestBody  # T1039: the run reached the end of its body
 }
 finally {
@@ -757,7 +910,8 @@ finally {
     if ($ProvFixture) { Remove-Item -LiteralPath $ProvFixture -Recurse -Force -ErrorAction SilentlyContinue }
     if ($CiFixture) { Remove-Item -LiteralPath $CiFixture -Recurse -Force -ErrorAction SilentlyContinue }
     if ($TabFixture) { Remove-Item -LiteralPath $TabFixture -Recurse -Force -ErrorAction SilentlyContinue }
+    if ($UpFixture) { Remove-Item -LiteralPath $UpFixture -Recurse -Force -ErrorAction SilentlyContinue }
 }
 
 Write-Host ''
-Write-TestVerdict -Pass $script:passes -Fail $script:failures -MinPass 54
+Write-TestVerdict -Pass $script:passes -Fail $script:failures -MinPass 66

@@ -1455,6 +1455,19 @@ $GuardTable = @(
             'src\apprt\win32\assets\ghoztty\upstream\skills\*\SKILL.md',
             'test\win32\hook-json.ps1'
         )
+        # And the OTHER side of the drift compare (T1325). Section A asserts the
+        # mirror is byte-identical to tip-of-main, a question whose answer moves
+        # when main moves and never when our tree does - so without these the
+        # guard could only ever go red by accident. It did exactly that: main
+        # rewrote both SKILL.md files on 2026-09-02, the mirror was stale from
+        # that moment, and the check stayed quiet until an unrelated edit to a
+        # covered file happened to reopen it two days later.
+        Upstream = @(
+            'macos/Resources/Ghoztty/hooks/ghoztty-banner.sh',
+            'macos/Resources/Ghoztty/hooks/ghoztty-activity-state.sh',
+            'macos/Resources/Ghoztty/skills/ghoztty/SKILL.md',
+            'macos/Resources/Ghoztty/skills/process-feedback/SKILL.md'
+        )
     },
     # The forgotten-session notification (T534): its policy only ever acts a
     # DAY after a session is orphaned, so a regression is invisible to every
@@ -2751,6 +2764,47 @@ function Get-LiveMap($row) {
     return $map
 }
 
+<#
+  T1325. A row may also watch files that live in ANOTHER tree - `Upstream` is a
+  list of paths inside `origin/main`, and their blob shas go into the stamp
+  beside the covered files' hashes.
+
+  Why a row would want that: `hook-json` asserts that the vendored asset mirror
+  is byte-identical to tip-of-main, and NOTHING in our tree changes when main
+  advances. So the mirror went stale on 2026-09-02, the harness would have said
+  so, and the guard never reopened to ask it - the T1099 shape, a verdict that
+  can only ever say "fine" until something unrelated pokes it. Keying on the
+  upstream BLOB rather than on main's head sha means ordinary main churn is
+  silent and a change to a file we actually mirror is not.
+
+  An answer is only possible where `origin/main` exists; a clone without it (a
+  fixture repo, a fresh worktree with no fetch) gets $null, and $null means
+  "cannot answer", never "changed" - so the gate can no more go red for missing
+  a remote than it can for missing the files it covers.
+#>
+function Get-UpstreamMap($row) {
+    if (-not $row.Upstream) { return $null }
+    # try/catch as well as 2>$null: a tree with no `.git` at all makes git print
+    # a repository-level fatal that --quiet cannot suppress, and under this
+    # script's ErrorActionPreference that is a terminating NativeCommandError
+    # rather than a line on stderr. That tree is precisely the "cannot answer"
+    # case, so it must be a $null, not a throw.
+    $head = ''
+    try { $head = (& git -C $Repo rev-parse --verify --quiet origin/main 2>$null | Out-String).Trim() } catch { $head = '' }
+    if (-not $head) { return $null }
+    $map = [ordered]@{}
+    foreach ($rel in @($row.Upstream)) {
+        $ref = "origin/main:$($rel -replace '\\', '/')"
+        $sha = ''
+        try { $sha = (& git -C $Repo rev-parse --verify --quiet $ref 2>$null | Out-String).Trim() } catch { $sha = '' }
+        # A path main has DELETED is a real finding, not a reason to bail: the
+        # empty string differs from whatever the stamp holds, so it reads as
+        # moved and the harness gets to say what that means.
+        $map[$ref] = $sha
+    }
+    return $map
+}
+
 function Read-Stamp($row) {
     $path = Join-Path $Repo $row.Stamp
     if (-not (Test-Path -LiteralPath $path)) { return $null }
@@ -2764,6 +2818,13 @@ function Get-StampMap($stamp) {
     $map = [ordered]@{}
     if ($null -eq $stamp -or $null -eq $stamp.files) { return $map }
     foreach ($p in $stamp.files.PSObject.Properties) { $map[$p.Name] = [string]$p.Value }
+    return $map
+}
+
+function Get-StampUpstreamMap($stamp) {
+    $map = [ordered]@{}
+    if ($null -eq $stamp -or $null -eq $stamp.upstream) { return $map }
+    foreach ($p in $stamp.upstream.PSObject.Properties) { $map[$p.Name] = [string]$p.Value }
     return $map
 }
 
@@ -2825,8 +2886,27 @@ function Get-GuardState($row) {
         }
     }
 
+    # The upstream half (T1325), reported as its own finding kind so a reader
+    # can tell "somebody edited our copy" from "main edited theirs".
+    $upstreamMoved = $false
+    $liveUp = Get-UpstreamMap $row
+    if ($null -ne $liveUp) {
+        $stampedUp = Get-StampUpstreamMap $stamp
+        foreach ($ref in $liveUp.Keys) {
+            if (-not $stampedUp.Contains($ref) -or $stampedUp[$ref] -ne $liveUp[$ref]) {
+                $findings += [pscustomobject]@{ Kind = 'upstream'; Path = $ref }
+                $upstreamMoved = $true
+            }
+        }
+    }
+
     $kind = if ($findings.Count -gt 0) { 'due' } else { 'current' }
-    $reason = if ($findings.Count -gt 0) { 'covered-files-changed' } else { '' }
+    $reason = ''
+    if ($findings.Count -gt 0) {
+        $reason = if ($upstreamMoved -and $findings.Count -eq @($findings | Where-Object { $_.Kind -eq 'upstream' }).Count) {
+            'upstream-moved'
+        } else { 'covered-files-changed' }
+    }
     return [pscustomobject]@{
         Name = $row.Name; Script = $row.Script; RunArgs = [string]$row.RunArgs; Stamp = $row.Stamp
         Advisory = [bool]$row.Advisory; CiGuard = ($null -ne $row.CiEvidence)
@@ -2861,6 +2941,21 @@ function Write-Stamp($row, $Provenance) {
     if ($same) {
         foreach ($k in $live.Keys) {
             if (-not $existing.Contains($k) -or $existing[$k] -ne $live[$k]) { $same = $false; break }
+        }
+    }
+    # The upstream shas the run just vouched for (T1325). Where `origin/main` is
+    # unreachable the previous stamp's map is carried forward untouched: a box
+    # that cannot ask the question must not answer it by erasing the key, which
+    # would silently retire the guard for everybody who pulls that stamp.
+    $liveUp = Get-UpstreamMap $row
+    $prevUp = Get-StampUpstreamMap $prevStamp
+    if ($null -eq $liveUp) { $liveUp = $prevUp }
+    if ($same) {
+        if ($liveUp.Count -ne $prevUp.Count) { $same = $false }
+        else {
+            foreach ($k in $liveUp.Keys) {
+                if (-not $prevUp.Contains($k) -or $prevUp[$k] -ne $liveUp[$k]) { $same = $false; break }
+            }
         }
     }
     if ($same -and $Provenance) {
@@ -2916,6 +3011,11 @@ function Write-Stamp($row, $Provenance) {
         uncommitted  = $uncommitted
     }
     if ($Provenance) { foreach ($k in $Provenance.Keys) { $doc[$k] = $Provenance[$k] } }
+    if ($liveUp.Count -gt 0) {
+        $up = [ordered]@{}
+        foreach ($k in $liveUp.Keys) { $up[$k] = $liveUp[$k] }
+        $doc['upstream'] = $up
+    }
     $doc['files'] = $files
     $json = ($doc | ConvertTo-Json -Depth 5)
     $path = Join-Path $Repo $row.Stamp

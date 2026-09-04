@@ -1,6 +1,6 @@
 ---
 name: ghoztty
-description: Use when opening terminal windows, creating split pane layouts, opening a rendered markdown/doc/README, a live HTML page, a code file, or a website in a viewer ("side") pane, showing a git diff in a pane (current branch vs main, `git status`, a single commit, or an arbitrary range), listing open windows/panes, renaming window titles, rearranging pane layouts, reading terminal output, sending keystrokes to panes, setting activity state, showing a sticky status banner above a pane, listing persistent terminal sessions, opening a shell on a remote machine, emitting `ghoztty://focus/<target>` links so a generated document can jump to a terminal window or pane, or managing Ghoztty windows via CLI. Ghoztty is a terminal emulator with IPC commands for programmatic window/pane management. Use this skill whenever you need to launch a terminal, create splits, open a file or website in a side/viewer pane (rendered markdown, a live HTML page, syntax-highlighted code, or a webpage), show changes for a branch, commit, or range, query window state, rename windows, rearrange layouts, read pane output, send input to panes, track activity state, post a persistent banner with status/links above a pane, or tear down layouts. When the user says "open X in a side pane", "show the readme/doc beside this", or "preview this markdown", use `+split --view=<path-or-url>`; when they say "show me changes in this branch", "what's on my branch vs main", "show me my git status", or "what changed in <sha>", use `+split --view=git-diff:<revspec>` or `--view=git-status:`.
+description: Use when opening terminal windows, creating split pane layouts, opening a rendered markdown/doc/README, a live HTML page, a code file, an image/screenshot, or a website in a viewer ("side") pane, showing a git diff in a pane (current branch vs main, `git status`, a single commit, or an arbitrary range), listing open windows/panes, renaming window titles, rearranging pane layouts, reading terminal output, sending keystrokes to panes, setting activity state, showing a sticky status banner above a pane, listing persistent terminal sessions, opening a shell on a remote machine, emitting `ghoztty://focus/<target>` links so a generated document can jump to a terminal window or pane, or managing Ghoztty windows via CLI. Ghoztty is a terminal emulator with IPC commands for programmatic window/pane management. Use this skill whenever you need to launch a terminal, create splits, open a file or website in a side/viewer pane (rendered markdown, a live HTML page, syntax-highlighted code, an image, or a webpage), show changes for a branch, commit, or range, query window state, rename windows, rearrange layouts, read pane output, send input to panes, track activity state, post a persistent banner with status/links above a pane, or tear down layouts. When the user says "open X in a side pane", "show the readme/doc beside this", "preview this markdown", or "show me that screenshot/image/diagram", use `+split --view=<path-or-url>`; when they say "show me changes in this branch", "what's on my branch vs main", "show me my git status", or "what changed in <sha>", use `+split --view=git-diff:<revspec>` or `--view=git-status:`.
 ---
 
 # Ghoztty CLI Reference
@@ -77,7 +77,7 @@ ghoztty +new-window [flags]
 | `--target=<name>` | Register window with a name. If it already exists, focuses it instead. |
 | `--working-directory=<path>` | Working directory for the terminal. Relative paths are resolved from CWD. `~` is expanded. If omitted, uses the CWD where `ghoztty` is invoked. |
 | `--command=<cmd>` | Command to run in the terminal. Auto-wrapped in the user's login shell with profile loaded. |
-| `--view=<path-or-url>` | Open a **viewer** pane instead of a terminal: a rendered markdown file, an `.html`/`.htm` file rendered as a **live page**, a syntax-highlighted text/code file, or a website (http/https URL). Relative paths resolve against `--working-directory` (else caller cwd). Mutually exclusive with `--command`/`-e`. |
+| `--view=<path-or-url>` | Open a **viewer** pane instead of a terminal: a rendered markdown file, an `.html`/`.htm` file rendered as a **live page**, a syntax-highlighted text/code file, an **image**, or a website (http/https URL). Relative paths resolve against `--working-directory` (else caller cwd). Mutually exclusive with `--command`/`-e`. |
 | `--shell=<path>` | Shell to use for `--command`/`--split-command`, invoked with `-lic`. Falls back to config `command-shell`, then `$SHELL`, then `/bin/zsh`. |
 | `--env=KEY=VALUE` | Environment variable for the spawned process. Repeatable. |
 | `--no-activate` | Create the window without stealing focus from the current workspace. Useful for automation and background agent windows. |
@@ -104,7 +104,7 @@ ghoztty +split [flags]
 | `--pane=<name-or-id>` | Split adjacent to **this exact pane** — where `--target` anchors at whichever pane its window has focused. Your own pane is now the default, so reach for this to name a *different* pane, or to state the anchor out loud (`--pane="$GHOZTTY_PANE_ID"`). Unlike the implicit default, a `--pane` that names nothing is an error, not a fallback. |
 | `--name=<name>` | Register the new pane with a name. If it already exists, focuses it instead. |
 | `--command=<cmd>` | Command to run in the new pane. Auto-wrapped in the user's login shell with profile loaded. |
-| `--view=<path-or-url>` | Open the new pane as a **viewer** (rendered markdown / live HTML page / highlighted code / website) instead of a terminal. Relative paths resolve against `--working-directory` (else caller cwd). Mutually exclusive with `--command`/`-e`. This is the way to "open a file/README/doc in a side pane". |
+| `--view=<path-or-url>` | Open the new pane as a **viewer** (rendered markdown / live HTML page / highlighted code / image / website) instead of a terminal. Relative paths resolve against `--working-directory` (else caller cwd). Mutually exclusive with `--command`/`-e`. This is the way to "open a file/README/doc/screenshot in a side pane". |
 | `--shell=<path>` | Shell to use for `--command`, invoked with `-lic`. Falls back to config `command-shell`, then `$SHELL`, then `/bin/zsh`. |
 | `--env=KEY=VALUE` | Environment variable for the spawned process. Repeatable. |
 | `--color=<#hex\|random>` | Background color for the new pane. |
@@ -126,9 +126,22 @@ of a terminal. This is the built-in way to honor "open the README in a side pane
   prototype needs no server. Two limits: assets must live under the page's own
   directory (no `../shared/app.css`), and only the HTML file itself is
   watched — `+reload` picks up a changed sibling stylesheet or script.
+- **Images** (`.png`, `.jpg`/`.jpeg`, `.gif`, `.webp`, `.heic`/`.heif`,
+  `.avif`, `.tiff`, `.bmp`, `.ico`/`.icns`, `.svg`) — a real image viewer, not
+  an `<img>` on a page: trackpad pinch-to-zoom, two-finger pan with elastic
+  edges, and double-click (or two-finger double-tap) to toggle **best-fit ⇄
+  100%**. It opens at best-fit, never upscaled past 100%, re-fits when the pane
+  is resized, and live-reloads on save. Animated GIFs animate. **Cmd-F is
+  declined** in an image pane — there is no text to find.
 - **Text / code** files — syntax-highlighted, read-only.
 - **Websites** — any `http(s)://` URL (this is the only mode that uses the
   network; file rendering is fully offline via bundled assets).
+
+Every viewer pane carries the same **navigation bar** — back / forward /
+reload / home and an editable address field — **always visible, in every
+mode**. (It used to hover-peek in markdown and code panes; it no longer does,
+so the pane's content is laid out below it from the first frame and never
+reflows under the pointer.)
 
 It follows the system/app light-dark theme automatically. Viewer panes are
 **view-only** (no editing) and are ordinary leaves in the split tree, so
@@ -148,6 +161,10 @@ ghoztty +split --pane="$GHOZTTY_PANE_ID" --direction=right --split-percent=45 \
 
 # A standalone viewer window for a webpage
 ghoztty +new-window --target=changelog --view=https://example.com/changelog
+
+# A screenshot beside the work (zoomable, not a terminal dump)
+ghoztty +split --pane="$GHOZTTY_PANE_ID" --direction=right --name=shot \
+  --view=temp/feedback/new/2026-08-26-ab12/images/image-1.png
 
 # Editor + live-rendered markdown preview, side by side (two steps)
 ghoztty +new-window --target=notes --command="nvim NOTES.md"
@@ -298,7 +315,7 @@ ghoztty +rearrange --layout='{
 
 ### `ghoztty +reload`
 
-Reload a named **viewer pane** in place — no close/reopen. Website viewers re-fetch the page from origin (bypassing caches); file viewers re-render the file preserving scroll position. Local file viewers already live-reload on save, so this mainly matters for `--view=<url>` panes (e.g. refresh a dev-server preview after a rebuild) — and for an `.html` pane whose sibling CSS/JS changed, which the save-watcher does not see.
+Reload a named **viewer pane** in place — no close/reopen. Website viewers re-fetch the page from origin (bypassing caches); file viewers re-render the file preserving scroll position, and image viewers re-decode it keeping the zoom. Local file viewers already live-reload on save, so this mainly matters for `--view=<url>` panes (e.g. refresh a dev-server preview after a rebuild) — and for an `.html` pane whose sibling CSS/JS changed, which the save-watcher does not see.
 
 ```
 ghoztty +reload --target=<name>
@@ -1011,6 +1028,7 @@ Closing a nonexistent target is a no-op, so teardown scripts are safe even if so
 - **Don't use sequential `+new-window` then `+split`** for the initial layout — use `--split` and `--split-command` on `+new-window` for atomicity.
 - **Don't assume `--working-directory` propagates to `--split-command`** — the split pane must `cd` explicitly if it needs the same directory.
 - **Don't `less`/`cat`/`open` a file to show it in a pane** — that dumps raw text (unrendered markdown) or opens an external app. Use `+split --view=<path>` for a rendered, live-reloading viewer pane.
+- **Don't `open` an image (or hand the user a path) to show them a picture** — `open` launches Preview outside Ghoztty, and a path is not a picture. `+split --view=<image>` puts it in a zoomable pane beside the work. This is the right move for a screenshot you were asked about, a generated chart or diagram, or an image already in the repo.
 - **Don't leave a design doc or mock HTML app preview-less** — when you author Markdown or scaffold an HTML prototype, auto-open it in a right-hand 2/3 viewer (see *Auto-preview conventions*). Markdown and static `.html` files both render live and live-reload on save, so `--view` the file directly. Only a framework app that needs a dev server gets the serve-then-`--view`-the-URL treatment (and a `+reload` after edits).
 - **Don't dump `git diff` into the terminal to show changes** — use `+split --view=git-diff:…` for a navigable diff with a file tree. Reach for the raw command only when you need the text yourself.
 - **Don't read `git-diff:<sha>` as "compare against `<sha>`"** — a bare revision shows that commit's own changes. A comparison is `git-diff:<sha>..HEAD`.
