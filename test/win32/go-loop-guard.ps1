@@ -65,6 +65,9 @@
 #  AA. The health line measures WORK, not keystrokes (T1290): a turn that has
 #      not completed inside -TurnStaleMinutes reddens the verdict however fresh
 #      the pane is, so the watchdog's own nudge can no longer buy health.
+#  BB. The WATCHDOG decides by that same clock (T1319): a held lock whose turn
+#      has not completed is re-entered, and a composer holding unsent text is
+#      read as a stalled turn rather than as activity.
 #
 # Hermetic: every lock/state/tracker file lives under a per-run temp dir, the
 # repo's own temp\go-loop.lock.json is never touched, and only ghoztty
@@ -96,6 +99,10 @@ $execScript = Join-Path $Repo 'scripts\go-loop-exec.ps1'
 # loop-session.ps1's New-LoopSendKeysText - the transport sections M and T use to
 # put a PATH into a pane without an escape layer eating half of it.
 . (Join-Path $Repo 'scripts\go-loop-pane-probe.ps1')
+# Explicitly, not through the probe's conditional load: section BB drives
+# Resolve-LoopStallVerdict directly, and a helper that happens to be in scope
+# because another file needed something else is not a dependency anybody can see.
+. (Join-Path $Repo 'scripts\loop-session.ps1')
 
 New-Item -ItemType Directory -Force $root | Out-Null
 
@@ -1961,6 +1968,145 @@ Assert 'AA8 -Json carries turn_age_minutes and turn_stalled for the dashboard' `
      $aaJson.turn_stalled -eq $false)
 
 Remove-Item -LiteralPath $aaRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+# --- BB. the WATCHDOG decides by the same clock (T1319) --------------------
+#
+# AA above is the observer; this is the actor. On 2026-09-04 they disagreed in
+# the worst direction for two and a half hours: the health line said
+# `DOWN ... turn_age=2h 32m` and the watchdog - the only thing that recovers an
+# unattended loop - said `healthy: ... age=31.51m (by=transcript)` every five
+# minutes, because the transcript's 31 minutes measured the keystrokes that
+# typed `/rc` into the composer and never sent it. A supervisor that reports
+# correctly and never acts is not a supervisor.
+""
+"BB. the watchdog reads the progress clock, not the pane pulse"
+
+# --- the composer classifier (pure) ---
+# A composer box, borders and all. Written from code points so this file stays
+# ASCII (PS 5.1 mojibakes a BOM-less non-ASCII source), which is also what the
+# classifier itself has to survive.
+$bbV = [string][char]0x2502      # box side
+$bbH = ([string][char]0x2500) * 20
+$bbTL = [string][char]0x256D; $bbTR = [string][char]0x256E
+$bbBL = [string][char]0x2570; $bbBR = [string][char]0x256F
+function BBPane([string]$composer) {
+    return (@(
+        '* Read(go.md)',
+        '  ' + ([string][char]0x23BF) + '  Read 240 lines',
+        '',
+        "$bbTL$bbH$bbTR",
+        "$bbV > $composer",
+        "$bbBL$bbH$bbBR",
+        '  ? for shortcuts                              bypass permissions on'
+    ) -join "`r`n")
+}
+Assert 'BB1 an unsent continuation is pending composer text' `
+    ((Get-PaneComposerText -Tail (BBPane '/rc')) -eq '/rc')
+Assert 'BB2 the exact 2026-09-04 text is read back whole' `
+    ((Get-PaneComposerText -Tail (BBPane '/reset-context read go.md and go')) -eq '/reset-context read go.md and go')
+Assert 'BB3 an empty composer is not pending text' ((Get-PaneComposerText -Tail (BBPane '')) -eq '')
+
+# The chrome this box actually renders, measured off the loop's own pane on
+# 2026-09-04 (Claude Code v2.1.251, 98-column pane). It is NOT a box: the
+# composer is a full-width horizontal RULE with the input row under it, and
+# because the rule is exactly the pane width the input row arrives from `+read`
+# as a CONTINUATION of it - one logical line, `<98 rule chars>> text`. That is
+# why the indent rule above survives both chromes: a border flattens to
+# whitespace whichever shape it has, and only the transcript's own `> message`
+# sits at column 0.
+$bbRule = ([string][char]0x2500) * 98
+function BBRulePane([string]$composer, [string]$status) {
+    return (@(
+        '* Read(go.md)',
+        '',
+        "$bbRule> $composer",
+        "$bbRule  $status",
+        '  users/dzearing/windows-amd64 | D:\git\ghoztty',
+        '  ' + ([string][char]0x23F5) + ' bypass permissions on - 6 shells'
+    ) -join "`r`n")
+}
+Assert 'BB3b the rule-style composer this box renders is read the same way' `
+    ((Get-PaneComposerText -Tail (BBRulePane '/rc' 'ctx: 205k/1000k')) -eq '/rc')
+Assert 'BB3c and an empty one is still empty' `
+    ((Get-PaneComposerText -Tail (BBRulePane '' 'ctx: 205k/1000k')) -eq '')
+# The false positive that would have nudged this box forever: the user's custom
+# status line carries a right-aligned `/rc` on EVERY pane, all the time. A
+# "does the pane contain a slash command" check would fire on it once a turn ran
+# long - which is also the likeliest reading of "`/rc` appears in the composer"
+# in the incident report this task was filed from.
+Assert 'BB3d a slash command in the status line is not pending composer text' `
+    ((Get-PaneComposerText -Tail (BBRulePane '' 'ctx: 205k/1000k (21%) | files: 9 changed | v2.1.251                  /rc')) -eq '')
+Assert 'BB4 the TUI placeholder is not pending text' `
+    ((Get-PaneComposerText -Tail (BBPane 'Try "how do I..."')) -eq '')
+# THE false positive that would nudge every working session forever: Claude Code
+# renders a SUBMITTED user message as '> text' at column 0. Only the composer's
+# marker is indented, because a border sits to its left.
+Assert 'BB5 a submitted message in the transcript is not pending text' `
+    ((Get-PaneComposerText -Tail "> read go.md and go`r`n`r`n* Bash(git status)`r`n  done") -eq '')
+Assert 'BB6 an empty pane reads as no composer' ((Get-PaneComposerText -Tail '') -eq '')
+Assert 'BB7 a shell prompt is not a composer' `
+    ((Get-PaneComposerText -Tail "D:\git\ghoztty>") -eq '')
+# Only the bottom of the screen is the composer; scrollback that happens to hold
+# an indented '>' must not resurrect as pending input.
+Assert 'BB8 an indented marker far up the scrollback is out of the window' `
+    ((Get-PaneComposerText -Tail ((@("  > stale text") + (1..20 | ForEach-Object { "line $_" })) -join "`r`n")) -eq '')
+
+# --- the stall verdict (pure) ---
+$bbFresh = Resolve-LoopStallVerdict -TurnAgeMinutes 4 -StaleMinutes 180 -SuspectMinutes 45 -ComposerText ''
+Assert 'BB9 a turn that started minutes ago is not stalled' `
+    (-not $bbFresh.Stalled -and $bbFresh.Clock -eq 'none')
+$bbLong = Resolve-LoopStallVerdict -TurnAgeMinutes 240 -StaleMinutes 180 -SuspectMinutes 45 -ComposerText ''
+Assert 'BB10 no turn inside the limit is stalled, whatever the pane shows' `
+    ($bbLong.Stalled -and $bbLong.Clock -eq 'turn' -and $bbLong.Why -match 'no turn has completed for 240')
+# The arm this task exists for: 2h32m is UNDER the 180m backstop, so the turn
+# clock alone would still have waited another half hour. The composer is what
+# makes the 2026-09-04 shape catchable.
+$bbShape = Resolve-LoopStallVerdict -TurnAgeMinutes 152 -StaleMinutes 180 -SuspectMinutes 45 -ComposerText '/rc'
+Assert 'BB11 the 2026-09-04 shape - fresh pane, unsent text, turn unmoved - is stalled' `
+    ($bbShape.Stalled -and $bbShape.Clock -eq 'composer')
+Assert 'BB12 and the verdict quotes the text it decided on' ($bbShape.Why -match "'/rc'")
+# Positive controls in both directions: the same composer text early in a turn
+# is a user typing, and an empty composer late in one is just a long turn.
+$bbEarly = Resolve-LoopStallVerdict -TurnAgeMinutes 10 -StaleMinutes 180 -SuspectMinutes 45 -ComposerText '/rc'
+Assert 'BB13 unsent text early in a turn is somebody typing, not a stall' (-not $bbEarly.Stalled)
+$bbQuiet = Resolve-LoopStallVerdict -TurnAgeMinutes 152 -StaleMinutes 180 -SuspectMinutes 45 -ComposerText ''
+Assert 'BB14 a long turn with an empty composer is left alone' (-not $bbQuiet.Stalled)
+$bbUnknown = Resolve-LoopStallVerdict -TurnAgeMinutes ([double]::PositiveInfinity) -StaleMinutes 180 -SuspectMinutes 45
+Assert 'BB15 a lock that cannot say when its turn started reads as stalled, not as fine' `
+    ($bbUnknown.Stalled -and $bbUnknown.Why -match 'unknown time')
+
+# --- the watchdog acts on it ---
+Remove-Item $lock, $state -Force -ErrorAction SilentlyContinue
+$bbProc = Start-Sleeper; $sleepers += $bbProc
+Lock-Run @('acquire', '-PaneId', 'PANE-BB', '-ClaudePid', $bbProc.Id) | Out-Null
+# Fresh transcript and fresh heartbeat - this fixture is HELD by every liveness
+# measure there is. Only the turn is old.
+$L = Read-LockFile
+$L.turn_started = (Get-Date).AddMinutes(-200).ToString('o')
+Write-LockFile $L
+Assert 'BB16 the lock still reads held - no liveness signal is stale' `
+    ((Lock-Run @('status', '-PaneId', 'PANE-BB')).Out -match '^held')
+$r = Dog-Run @('-DryRun')
+Assert 'BB17 a held lock whose turn has not completed is re-entered anyway' `
+    ($r.Out -match 'ACTION new-window')
+Assert 'BB18 and the log names the clock it decided on' ($r.Out -match 'STALLED\(by=turn\)')
+Assert 'BB19 and the number, so a wrong call is auditable' `
+    ($r.Out -match 'no turn has completed for 200' -and $r.Out -match 'turn_age=200\.\d+m\(limit=180m\)')
+# Teeth, the AA1b way: the SAME fixture with the turn gate widened out of the
+# way does nothing at all. Without this arm BB17 passes on any unrelated
+# staleness - which is how a gate that cannot fail ships looking like one that can.
+$r = Dog-Run @('-DryRun', '-TurnStaleMinutes', '100000', '-TurnSuspectMinutes', '100000')
+Assert 'BB20 widening the turn gate makes the same fixture healthy again' `
+    ($r.Out -match 'ACTION none' -and $r.Out -match 'healthy:')
+Assert 'BB21 and the healthy line carries both clocks, not just the pulse' `
+    ($r.Out -match 'healthy:.*age=[\d.]+m\(by=\w+\).*turn_age=200\.\d+m')
+# The safe direction: between the suspect bar and the backstop, a composer the
+# watchdog cannot read is never treated as full. "Could not see the pane" must
+# not be the thing that types into it.
+$r = Dog-Run @('-DryRun', '-TurnStaleMinutes', '100000', '-TurnSuspectMinutes', '45')
+Assert 'BB22 an unreadable composer does not count as unsent text' `
+    ($r.Out -match 'ACTION none' -and $r.Out -match 'healthy:')
+Remove-Item $lock, $state -Force -ErrorAction SilentlyContinue
 
 # --- cleanup --------------------------------------------------------------
 Kill-Sleepers

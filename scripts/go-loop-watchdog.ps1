@@ -14,10 +14,21 @@
 #   1. If no open task file remains that this seat could work (status todo/
 #      in-progress/blocked under docs\design\windows-parity-tasks\, minus
 #      seat: mac tasks), do nothing - the loop is finished, not stuck.
-#   2. Read the lock. Healthy (owner alive AND a recent sign of life) -> do
-#      nothing. Since T253 "sign of life" is the newer of the heartbeat and the
-#      session transcript's mtime, so a turn that is working beats it without
-#      anybody remembering to - see scripts\go-loop-lock.ps1.
+#   2. Read the lock. Healthy (owner alive AND a recent sign of life AND a turn
+#      that has completed recently) -> do nothing. Since T253 "sign of life" is
+#      the newer of the heartbeat and the session transcript's mtime, so a turn
+#      that is working beats it without anybody remembering to - see
+#      scripts\go-loop-lock.ps1.
+#
+#      Since T1319 a sign of life is not enough on its own. A signal anything at
+#      all can move - including this watchdog's own nudge, and including the
+#      keystrokes that type a continuation into the composer and never send it -
+#      cannot answer "is the loop WORKING". So the lock's `turn_age_minutes`
+#      (which only a completed turn moves) is read too, and a held lock whose
+#      turn has not completed inside -TurnStaleMinutes is re-entered anyway. A
+#      pane holding UNSENT composer text trips the same wire at the lower
+#      -TurnSuspectMinutes, because that is the exact shape that hid a 2h32m
+#      stall behind a 31-minute transcript on 2026-09-04.
 #   3. Otherwise re-enter, choosing the cheapest action that fits:
 #        a claude is alive IN THE PANE, pane not producing output
 #                              -> send-keys the resume prompt + Enter
@@ -102,6 +113,19 @@ param(
     [int]$PollSeconds = 300,
     [int]$StaleMinutes = 45,
     [int]$RearmMinutes = 20,
+    # The PROGRESS clock, beside the liveness one above (T1319). -StaleMinutes
+    # asks "has anything touched this session lately"; these two ask "has the
+    # loop finished a turn lately", which is the question a supervisor is for.
+    # Defaults match go-loop-health.ps1's -TurnStaleMinutes so the observer and
+    # the actor cannot disagree about what a stalled loop is.
+    #
+    # -TurnSuspectMinutes is the lower bar that a non-empty composer unlocks:
+    # unsent text plus no completed turn is a stalled turn however fresh the
+    # transcript looks. Everything downstream still applies - a pane that is
+    # producing output is never nudged - so these decide when to LOOK, not when
+    # to type.
+    [int]$TurnStaleMinutes = 180,
+    [int]$TurnSuspectMinutes = 45,
     # The still-producing backstop's sample (T253). It was 5 lines over 8s, which
     # is too thin to tell "wedged" from "compiling": a session between phases, or
     # one whose bottom five lines are a static composer box, read as not
@@ -503,10 +527,40 @@ function Invoke-Tick {
     $lock = Get-Lock
     $state = 'free'
     if ($lock -and $lock.state) { $state = $lock.state }
+
+    # The progress clock (T1319). `turn_age_minutes` is the lock's own field -
+    # only a completed turn moves it - and it is null on a lock written before
+    # T1290, which reads as "unknown" rather than as zero.
+    $turnAge = [double]::PositiveInfinity
+    if ($lock -and ($lock.PSObject.Properties.Name -contains 'turn_age_minutes') -and
+        $null -ne $lock.turn_age_minutes) {
+        $turnAge = [double]$lock.turn_age_minutes
+    }
+    $turnText = if ([double]::IsInfinity($turnAge)) { 'unknown' } else { '{0:N1}m' -f $turnAge }
+    # Every decision line carries BOTH clocks and the limit each was measured
+    # against. The 2026-09-04 log said `healthy` thirty times and the number it
+    # believed - 31.51m of transcript age against a 2h32m turn - could only be
+    # reconstructed afterwards by re-deriving it.
+    $clocks = ("age=$($lock.age_minutes)m(by=$($lock.activity_by)) " +
+               "turn_age=$turnText(limit=${TurnStaleMinutes}m)")
+
     if ($state -eq 'held' -and -not $Force) {
-        Log ("healthy: pane=$($lock.pane_id) pid=$($lock.claude_pid) age=$($lock.age_minutes)m" +
-             "(by=$($lock.activity_by)) remaining=$remaining")
-        return 'none'
+        # A composer is only read once the turn clock is already elevated: the
+        # probe costs an IPC round trip per tick, and unsent text in a session
+        # that finished a turn ten minutes ago is a user typing, not a stall.
+        $composer = ''
+        if ($turnAge -gt $TurnSuspectMinutes -and $lock.pane_id) {
+            $composer = Read-PaneComposer -PaneId $lock.pane_id -GhozttyExe $GhozttyExe
+        }
+        $verdict = Resolve-LoopStallVerdict -TurnAgeMinutes $turnAge `
+            -StaleMinutes $TurnStaleMinutes -SuspectMinutes $TurnSuspectMinutes `
+            -ComposerText $composer
+        if (-not $verdict.Stalled) {
+            Log "healthy: pane=$($lock.pane_id) pid=$($lock.claude_pid) $clocks remaining=$remaining"
+            return 'none'
+        }
+        Log ("STALLED(by=$($verdict.Clock)): the lock reads held but $($verdict.Why) - " +
+             "deciding by the turn clock, not the pane pulse ($clocks; T1319)")
     }
     if ($Force) { Log "forced: re-entry requested despite state=$state (caller knows the loop is broken; T439)" }
 
@@ -537,7 +591,7 @@ function Invoke-Tick {
             Log "stale heartbeat but pane $paneId is still producing output; not nudging"
             return 'none'
         }
-        Log "re-entering: nudge live session in pane $paneId (state=$state, occupant=$occupant, remaining=$remaining)"
+        Log "re-entering: nudge live session in pane $paneId (state=$state, occupant=$occupant, $clocks, remaining=$remaining)"
         if ($DryRun) { return 'nudge' }
         # T210: the prompt goes through a file when the exe supports it, never
         # blindly - PowerShell 5.1 does not escape an embedded `"` when it builds

@@ -131,6 +131,81 @@ function Get-PaneOccupant {
     return 'unknown'
 }
 
+# --- the composer (T1319) ---------------------------------------------------
+#
+# A Claude Code composer holding text nobody submitted is not activity, it is a
+# STALLED TURN wearing activity's clothes. On 2026-09-04 turn 86 ended by
+# reporting success with `/rc` typed into the composer and never sent; the
+# keystrokes that typed it refreshed the session transcript, which is exactly
+# the signal the watchdog trusted, so the supervisor logged `healthy` every five
+# minutes for two and a half hours over a loop that was doing nothing.
+#
+# The window is the LAST few lines only, and the marker must be INDENTED. Claude
+# Code renders a submitted user message as `> text` at column 0 in the
+# transcript; the composer's `>` always has a border to its left. Without the
+# indent rule this would report the last message the user ever sent as pending
+# text - on every pane, forever.
+#
+# "A border to its left" holds for both chromes this has been measured against,
+# which is why the rule is written that way rather than around a box glyph.
+# Measured on the loop's own pane 2026-09-04 (Claude Code v2.1.251, 98 columns):
+# the composer is a full-width horizontal RULE with the input row beneath it,
+# and because the rule is exactly the pane width the input row reaches `+read`
+# as a CONTINUATION of it - one logical line, `<98 rule chars>> text`. Every
+# border character is outside \x20-\x7E, so both shapes flatten to leading
+# whitespace here. If a future chrome puts the marker at column 0 for real, this
+# reads as an EMPTY composer: a miss, never a false nudge, and the turn-age
+# backstop still fires. T1320 tracks checking it against a live TUI.
+$script:ComposerWindowLines = 12
+
+# Text the TUI puts in an empty composer itself. It is not pending input and
+# must never be read as any.
+$script:ComposerPlaceholders = @(
+    '^Try\s',
+    '^Ask\s',
+    '^Type\s',
+    '^for shortcuts',
+    '^\?\s'
+)
+
+# The composer's pending text, or '' when it is empty, absent or unreadable.
+# Pure, so the watchdog's decision can be tested without a live TUI.
+function Get-PaneComposerText {
+    param([AllowEmptyString()][string]$Tail)
+
+    if ([string]::IsNullOrWhiteSpace($Tail)) { return '' }
+    # Borders are flattened by RANGE, never matched by glyph: PS 5.1 decodes a
+    # BOM-less UTF-8 script as ANSI, so a literal box character in this source
+    # would not survive (the encoding note at the top of this file).
+    $flat = ($Tail -replace '[^\x20-\x7E\r\n]', ' ')
+    $lines = @($flat -split "`r?`n")
+    if ($lines.Count -gt $script:ComposerWindowLines) {
+        $lines = @($lines | Select-Object -Last $script:ComposerWindowLines)
+    }
+    for ($i = $lines.Count - 1; $i -ge 0; $i--) {
+        if ($lines[$i].TrimEnd() -notmatch '^\s+>\s+(\S.*)$') { continue }
+        $text = $Matches[1].Trim()
+        foreach ($p in $script:ComposerPlaceholders) { if ($text -match $p) { return '' } }
+        return $text
+    }
+    return ''
+}
+
+# Read the pane and return what its composer is holding. Any IPC failure is ''
+# - "could not see the composer" must never be reported as "the composer is
+# full", because that answer nudges a session.
+function Read-PaneComposer {
+    param([string]$PaneId, [string]$GhozttyExe, [int]$Lines = 20)
+
+    if (-not $PaneId) { return '' }
+    $out = ''
+    # T663: the console twin, and `2>$null` rather than `2>&1` - a merged stderr
+    # line becomes part of the text this classifies.
+    try { $out = (& (Resolve-GhozttyCliExe $GhozttyExe) +read "--name=$PaneId" "--lines=$Lines" 2>$null | Out-String) } catch { return '' }
+    if ($LASTEXITCODE -ne 0) { return '' }
+    return (Get-PaneComposerText -Tail $out)
+}
+
 # The backslash escaper that used to live here moved to loop-session.ps1 with
 # T280, next to the transport that decides whether it is needed at all: a path
 # now travels through `+send-keys --keys-file=`, which sends bytes verbatim, and

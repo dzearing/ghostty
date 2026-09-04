@@ -162,6 +162,53 @@ function Resolve-LoopResumeAction {
     return 'relaunch'
 }
 
+# Pure: is the loop STALLED, judged by the clock that only a completed turn can
+# move (T1319)?
+#
+# T1290 gave the health LINE this clock and left the watchdog - the only thing
+# that actually recovers an unattended loop - deciding by transcript age. On
+# 2026-09-04 the two disagreed in the worst direction: the observer was right
+# (`DOWN ... turn_age=2h 32m`) and the actor was wrong (`healthy: ...
+# age=31.51m (by=transcript)`), because the transcript's 31 minutes measured the
+# keystrokes that typed `/rc` into the composer and never sent it.
+#
+# Two arms, because one is not enough:
+#   - $StaleMinutes: no turn has completed in this long, whatever the pane is
+#     doing. This is the backstop and it is deliberately generous - the caller
+#     still has to prove the pane is not producing output before it acts.
+#   - $SuspectMinutes + a non-empty composer: a pane holding text nobody
+#     submitted, with no turn completed since, is a stalled turn and not a
+#     working one. That is what makes the 2026-09-04 shape catchable in tens of
+#     minutes rather than hours - a half-typed command is perfect camouflage
+#     precisely because typing it refreshes the signal the watchdog trusted.
+#
+# Returns @{ Stalled; Clock; Why } - Clock names WHICH arm decided, so a wrong
+# call is readable in the log afterwards instead of being one word, `healthy`.
+function Resolve-LoopStallVerdict {
+    param(
+        [double]$TurnAgeMinutes = 0,
+        [int]$StaleMinutes = 180,
+        [int]$SuspectMinutes = 45,
+        [AllowEmptyString()][string]$ComposerText = ''
+    )
+    $age = if ([double]::IsInfinity($TurnAgeMinutes) -or [double]::IsNaN($TurnAgeMinutes)) {
+        'an unknown time'
+    } else { '{0:N1}m' -f $TurnAgeMinutes }
+
+    if ($TurnAgeMinutes -gt $StaleMinutes) {
+        return @{ Stalled = $true; Clock = 'turn'
+                  Why = "no turn has completed for $age (limit ${StaleMinutes}m)" }
+    }
+    $pending = ($ComposerText -replace '\s+', ' ').Trim()
+    if ($pending.Length -gt 60) { $pending = $pending.Substring(0, 60) + '...' }
+    if ($TurnAgeMinutes -gt $SuspectMinutes -and $pending) {
+        return @{ Stalled = $true; Clock = 'composer'
+                  Why = ("the composer holds unsent text after $age with no completed turn: '" +
+                         $pending + "'") }
+    }
+    return @{ Stalled = $false; Clock = 'none'; Why = '' }
+}
+
 # The prompt to type into a surviving session, derived from the resume command
 # so the two can never disagree: `claude ... --continue "read go.md and go"`
 # resumes with exactly the text a reused session is sent.

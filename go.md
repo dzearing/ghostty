@@ -818,9 +818,18 @@ success leaves the loop dead — that already cost six days (2026-07-21 →
 reason to stop; finishing IS the trigger to reset and take the next one.
 
 Since T139 there IS a supervisor, but do not lean on it: the watchdog
-(`scripts\go-loop-watchdog.ps1`) only notices the step-0 heartbeat going stale,
-and only re-enters after up to ~45 min of dead time. It is the safety net for a
-crash, not a substitute for step 7.
+(`scripts\go-loop-watchdog.ps1`) re-enters only after tens of minutes of dead
+time. It is the safety net for a crash, not a substitute for step 7.
+
+**And it will catch a continuation you typed but never sent** (T1319), which is
+worth knowing precisely so you do not rely on it. Step 7 is not "type the
+reset", it is "submit it": on 2026-09-04 turn 86 ended with `/rc` sitting in the
+composer, and because typing it refreshed the session transcript — the signal
+the watchdog trusted — the supervisor logged `healthy` every five minutes over a
+2h32m stall. The watchdog now decides by the lock's `turn_age` (only a completed
+turn moves it, so a nudge cannot buy health) and reads a pane holding UNSENT
+composer text as a stalled turn rather than as activity. That closes the hole in
+tens of minutes; ending the turn properly closes it in zero.
 
 The supervisor has its own supervision (T440): it stamps a heartbeat on every
 tick, the dashboard shows a "Supervisor is down" line when that stops, and a
@@ -844,6 +853,11 @@ the verdict was keying off. A nudge is a treatment, not evidence. Past
 pane — three stalls running were theorised about from the ledger when
 `ghoztty +read --name=<pane>` had the answer, which that week was
 `API Error: 529 Overloaded`. `-Postmortem` prints that tail for you.
+
+The watchdog reads that same clock as of T1319, on the same default — so the
+thing that REPORTS a stall and the thing that RECOVERS one can no longer
+disagree, which they did for two and a half hours on 2026-09-04 with the
+observer right and the actor wrong.
 
 The one allowed exception: if the reset probe finds this session is not in a
 Ghoztty pane, say so plainly and ask the user to run `/clear`.

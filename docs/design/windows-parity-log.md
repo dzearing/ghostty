@@ -21122,3 +21122,65 @@ Acceptance: all four floor lanes, `ipc-p1/p2/p3`, `layout-capture-cost.ps1`
 assertions - the restore path that reads these screens is unchanged). Filed
 T1319 for the Mac seat: the same core dump-under-the-renderer-mutex runs on
 macOS's capture path and nothing there has ever put a number on it.
+
+## 2026-09-04 - the supervisor now notices a stalled loop instead of a quiet one (T1319)
+
+The loop stopped just before midnight on 2026-09-04 and sat there for two and a
+half hours while the watchdog - the one thing that recovers an unattended loop -
+wrote `healthy` into its log every five minutes. The health line was right the
+whole time (`DOWN ... turn_age=2h 32m`); the watchdog was reading a different
+clock and got a different answer.
+
+T1290 gave the health line a third clock, `turn_age`, because only a completed
+turn moves it: a nudge cannot buy health, and neither can anything else that
+merely touches the session. What that task converted was the REPORTING. The
+DECIDING stayed on transcript age - and on 2026-09-04 the two disagreed in the
+worst possible direction, with the observer right and the actor wrong. Turn 86
+had ended by reporting success with `/rc` typed into the composer and never
+submitted, and the keystrokes that typed it refreshed exactly the signal the
+watchdog trusted. `age=31.51m (by=transcript)`, comfortably inside 45 minutes,
+over a loop that had done nothing for 152.
+
+So the watchdog reads `turn_age_minutes` off the lock now, on the same default
+the health line uses (180 minutes), and a lock that reads `held` by every
+liveness measure there is gets re-entered anyway once its turn has not completed
+inside it. Observer and actor can no longer answer the same question two ways.
+
+The backstop alone would still have waited another half hour on the day, so
+there is a second arm for the shape that actually happened: above 45 minutes,
+**a composer holding text nobody submitted is a stalled turn, not activity**.
+That is the camouflage the incident turned on, and reading it directly is what
+makes the same failure catchable in tens of minutes. The marker has to be
+INDENTED to count - Claude Code renders a submitted user message as `> text` at
+column 0, and matching that would nudge every working session on the box
+forever.
+
+The chrome was measured rather than assumed, and it is not the box this repo
+would have drawn: on this build the composer is a full-width horizontal rule
+with the input row beneath it, reaching `+read` as a continuation of the same
+logical line. Both shapes flatten to leading whitespace, which is what the
+indent rule actually rests on. The measurement also turned up the false positive
+that would have made a naive check useless - the user's custom status line
+right-aligns a literal `/rc` on every pane, all the time, which is very probably
+what "`/rc` appears in the composer" in the incident report was looking at.
+
+Nothing downstream loosened: a pane that is still producing output is never
+nudged, the rearm hold-off still bounds how often a wedged box is touched, and a
+composer the watchdog could not read is never treated as full. And every
+decision line now names the numbers it decided on - `STALLED(by=turn)` /
+`STALLED(by=composer)`, both clocks, both limits, on the healthy line too -
+because the 2026-09-04 log said `healthy` thirty times and the number behind it
+could only be reconstructed after the fact.
+
+The decision came out as two pure functions so it is testable without a live
+TUI: `Resolve-LoopStallVerdict` (`loop-session.ps1`) and `Get-PaneComposerText`
+(`go-loop-pane-probe.ps1`).
+
+Acceptance: `test\win32\go-loop-guard.ps1` section BB, 22 arms - the composer
+reader against a rendered box, the exact 2026-09-04 shape (152m turn plus
+`/rc`), and the watchdog itself acting on a fixture that is `held` by every
+liveness signal with only `turn_started` backdated. BB20 is the teeth: the SAME
+fixture with the turn gate widened out of the way goes back to `ACTION none`, so
+BB17 cannot pass on unrelated staleness. Whole guard ALL PASS, four floor lanes
+green. Filed T1320 - the composer fixture is drawn from what this repo believes
+Claude Code renders, and that chrome has drifted twice before.
