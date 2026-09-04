@@ -1,0 +1,16 @@
+{
+    "guard":  "verify-release-clean",
+    "script":  "test/win32/verify-release-clean.ps1",
+    "generated":  "2026-09-04T01:59:40-07:00",
+    "commit":  "4e4dd54d1",
+    "uncommitted":  [
+                        "scripts/daily-publish.ps1",
+                        "scripts/verify-release-clean.ps1",
+                        "test/win32/verify-release-clean.ps1"
+                    ],
+    "files":  {
+                  "scripts/daily-publish.ps1":  "647c18dab0e05aad7fc5320a76ee0bd5b6610690f4aa5492d847063924a70fe2",
+                  "scripts/verify-release-clean.ps1":  "ee41494c52f72b6d60caf4ee8750f3fc760ab4330481a7a16c4b4f1d8830c39b",
+                  "test/win32/verify-release-clean.ps1":  "756fee5cbd0b8a1ad8d3d01987658087b62efb6dd8327de4cb9aef10d5107dd3"
+              }
+}

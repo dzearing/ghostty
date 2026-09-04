@@ -1275,6 +1275,22 @@ $GuardTable = @(
             'test\win32\release-parity.ps1'
         )
     },
+    # The second-opinion scanner check (T1312): a checker that has only ever
+    # been observed saying "clean" is indistinguishable from one that cannot say
+    # anything else, and this one is not in the P1-P3 floor -- it is an offline
+    # canned-response harness that nothing else would ever run. Its covered set
+    # includes daily-publish.ps1 because section G asserts the readback still
+    # calls it, which is the wiring that makes the question get asked at all.
+    [pscustomobject]@{
+        Name   = 'verify-release-clean'
+        Script = 'test\win32\verify-release-clean.ps1'
+        Stamp  = 'test\win32\verify-release-clean.stamp.json'
+        Covers = @(
+            'scripts\verify-release-clean.ps1',
+            'scripts\daily-publish.ps1',
+            'test\win32\verify-release-clean.ps1'
+        )
+    },
     # `--when-idle`'s busy detection (T46 motion, T517 --busy-marker): a broken
     # idle poll only ever fails inside a detached automation send — the loop
     # types into a mid-turn session and the damage reads as "the agent ignored

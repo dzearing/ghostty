@@ -1,10 +1,10 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-04T01:15:40-07:00",
-    "commit":  "0aa9dc4be",
+    "generated":  "2026-09-04T02:00:30-07:00",
+    "commit":  "4e4dd54d1",
     "uncommitted":  [
-                        "test/win32/go-loop-guard.ps1"
+                        "test/win32/verify-release-clean.ps1"
                     ],
     "files":  {
                   "docs/claude/testing.md":  "353e090f48ab5d8f8eee4042ac2689134b9f082800c4a067d625af97eec7f2c7",
@@ -291,6 +291,7 @@
                   "test/win32/upstream-remote.ps1":  "83328f27ade7ea1a627c898462f14319f6ca2503a25511c41b9b4c5ac9047698",
                   "test/win32/url-scheme.ps1":  "18d667f6dd3cc51627926901654339da82fcdc2c31ffb07cfffdb2dd126c96e2",
                   "test/win32/verdict-exit-audit.ps1":  "02f5dc6471e5790a9609eeb47a5cb4b3810c8d480ec19626b89bc716bb025d8d",
+                  "test/win32/verify-release-clean.ps1":  "756fee5cbd0b8a1ad8d3d01987658087b62efb6dd8327de4cb9aef10d5107dd3",
                   "test/win32/viewer-composer.ps1":  "a6ee294b66489b65bad593890320052fe11c6677643cff68d4596719fb3e292f",
                   "test/win32/viewer-diff.ps1":  "15b282dfeed59d7764b4b427aa85978ec2c0275188d4c2e3c931e415050765a3",
                   "test/win32/viewer-error-card.ps1":  "bc486ca60cf4eaed7e2bb772a8e6dc80818ef04696f86ea7ea054238dacf2f4c",

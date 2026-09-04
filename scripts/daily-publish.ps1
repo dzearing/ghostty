@@ -176,7 +176,11 @@ param(
     [string]$RequestPath = '',
     # Report what shipped and what has landed since, and change nothing. This is
     # what the digest's "what is stranded" line reads.
-    [switch]$Status
+    [switch]$Status,
+    # T1312. Skip the second-opinion scanner readback that runs once, when a
+    # tagged release is confirmed real. It is advisory either way; this is for a
+    # run that must not touch the network beyond gh.
+    [switch]$NoScanCheck
 )
 
 $ErrorActionPreference = 'Continue'
@@ -510,6 +514,29 @@ if ($mark.Result -eq 'tagged' -and $mark.Tag) {
         $mark.Result = 'published'
         Write-Confirmed-Watermark -Path $WatermarkPath -Mark $mark -Result 'published'
         Log "CONFIRMED $($mark.Tag) is published."
+
+        # And ask somebody other than Defender whether it is clean (T1312).
+        # Every malware verdict this project has had came from one engine on one
+        # machine; T1293 turns on whether that was a false positive, and the
+        # answer decides between a website note and pulling the release. Once
+        # per release, here, because this is the one place that knows a release
+        # just became real. ADVISORY: the verdict is logged, never fatal -- a
+        # scanner the box cannot reach must not be able to stall the loop.
+        if (-not $NoScanCheck) {
+            $scan = Join-Path $PSScriptRoot 'verify-release-clean.ps1'
+            # Not -Quiet: the DETECTED branch quotes what came back, and a
+            # verdict with the engines stripped out of it is the one thing that
+            # arm must never log.
+            $scanOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $scan `
+                -Tag $mark.Tag 2>&1
+            switch ($LASTEXITCODE) {
+                0 { Log "SCAN CLEAN: no engine flagged any asset of $($mark.Tag)." }
+                2 { Log "SCAN UNKNOWN: $($mark.Tag) has assets no scanner has ever seen - that is not a clean verdict." }
+                3 { Log "SCAN DETECTED: engines flagged assets of $($mark.Tag). $(($scanOut | Out-String).Trim())" }
+                4 { Log "SCAN NOT ASKED: no second-opinion scanner available (no API key or no network)." }
+                default { Log "SCAN ERROR: the scanner check could not run for $($mark.Tag)." }
+            }
+        }
     } elseif ((Invoke-Probe { gh auth status }) -eq 0) {
         # gh works and still cannot see the release. Give CI an hour before
         # calling it dead: the tag is normally pushed minutes before this runs.
