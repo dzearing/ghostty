@@ -1,10 +1,12 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-09-04T02:44:39-07:00",
-    "commit":  "d1ab9a76e",
+    "generated":  "2026-09-04T03:17:32-07:00",
+    "commit":  "fff9aed0f",
     "uncommitted":  [
-                        "test/win32/gate-negatives.ps1"
+                        "test/win32/lib/TestDesktop.ps1",
+                        "test/win32/rdp-session.ps1",
+                        "test/win32/suite-run.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -185,7 +187,7 @@
                   "test/win32/lib/SkipAudit.ps1":  "1f144bf0f762eebc385656df1fa39d7629363d44164393de241248c4a231eade",
                   "test/win32/lib/StderrCaptureAudit.ps1":  "69d0a25615d35acc06bf6c1471016186163ae1881ae70a12461425546ac4b7d8",
                   "test/win32/lib/TestClient.ps1":  "98b5449096d7103ec31d8eb19b2d0d84985c48fddc88a5871eeb641ec43091f8",
-                  "test/win32/lib/TestDesktop.ps1":  "42d47db53b5fb12f34cc8f41403251207858af330a2cf6507f8237c1ed8e972b",
+                  "test/win32/lib/TestDesktop.ps1":  "e718e941fcef6bcebc7f25194cc6a18bb2123cd3b4a6893d5466d837f1f947bc",
                   "test/win32/lib/TestReachAudit.ps1":  "3b2fb64aee74f3451127f4f9776141f5781dd210a6fdf0019410485664f0a840",
                   "test/win32/lib/TestScore.ps1":  "1bc571121b1b60ce5d9b63a0e1c8ebf23f6da575f8e9f7dab1a410cbc2888acc",
                   "test/win32/lib/ThrowawayProduct.ps1":  "d0754fbb3791ee3d5fec2369a523df0c23ccb6d4738bad21dd37c25cf86c82fd",
@@ -219,7 +221,7 @@
                   "test/win32/profile-latency.ps1":  "ca0e6053bcf6bd4ea2de39f1f8aa6037405765ff41f58a35071eba89b21918b5",
                   "test/win32/pty-holder.ps1":  "ac9811305a50f2a86dca0af16b2725c8414ed78ebe26c84572ca6599326af88e",
                   "test/win32/pty-host.ps1":  "0f55c91a5950ac27a78bf29b90e3ea613948a586da2ca66dba17a5d8aa220333",
-                  "test/win32/rdp-session.ps1":  "9323be4d3b8cf4fb208acbe2858a4abf67010a29925b76f89e876c64737d6ff4",
+                  "test/win32/rdp-session.ps1":  "563a3fc256c9cb7b7164dee5ee28b1292fadb79ec6283fcc05018c02bf627e86",
                   "test/win32/readonly-badge.ps1":  "b35e31283126676ccaafc9253a6816fe4b21dc454a27b1e8eea999316f27c12c",
                   "test/win32/rearrange-session-drop.ps1":  "88994a4062d36266517b4b8fe6de0301ddb204b051e19e6cd94d446fe2128c34",
                   "test/win32/registration-sites.ps1":  "c634ca739f7e0afdff7a0ea269d9f27d300ed7f095b5585ec909b7f76eebaea3",
@@ -264,7 +266,7 @@
                   "test/win32/split-zoom-nav.ps1":  "7ed3a76e0a6abc09573263efa8f7c7d3889ab31d6d8b258040ab7cf5e9882b12",
                   "test/win32/startup-failure.ps1":  "d2ed885900bd7d68765f605a5a94a622df2682d29c6d9fa27a4612b33cce6cb9",
                   "test/win32/stderr-capture-audit.ps1":  "04424b778285df67f2eeed9c8ee354d1446c62a920ab8de56bf8b4475569cf9b",
-                  "test/win32/suite-run.ps1":  "6ea7f7e2c53ccfba0032856db75abadbd984536294bcc86088647d47cba5df79",
+                  "test/win32/suite-run.ps1":  "19e1384d17cd3f258b2e9c5f2339b6b3dba8a04114006a342dae98a89676dbee",
                   "test/win32/tab-color.ps1":  "af75bcd47eeb68cf93ee056b7aa4e14e147314ab8b4adc3a9c0eb27dfb43f967",
                   "test/win32/tab-strip.ps1":  "9217c29eab658913f60ac6af494ef630c882ef913c3bfbf3987d5951f00df027",
                   "test/win32/tab-strip-autohide.ps1":  "53655e95850098c972752b1deee1a16488c6c1abd4b46b6734c7500b896bae50",

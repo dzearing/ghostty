@@ -208,6 +208,7 @@
 # @input-desktop-exception: context-menu-real-input.ps1 -- (T240) the subject IS a real right-click: a script that synthesizes the trigger cannot validate the trigger.
 # @input-desktop-exception: profile-latency.ps1 -- (T53b) injection timing is the measurement, so a posted message would time the wrong path.
 # @input-desktop-exception: test-desktop-spike.ps1 -- (T207) the spike that measured what does and does not work off the input desktop; it has to reach both.
+# @input-desktop-exception: rdp-session.ps1 -- (T1253/T1316) its subject is the desktop being shipped over the wire, and arm G reads the COMPOSITE of a viewer surface with the dim overlay blended onto it; DWM composes only the input desktop.
 #
 # LAUNCHES ON THE USER'S DESKTOP - the second list, and a different question
 # (T1193). The one above asks which scripts CALL an API that only works on the

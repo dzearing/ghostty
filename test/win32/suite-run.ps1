@@ -66,6 +66,13 @@ $ErrorActionPreference = 'Stop'
 # whether this run could reach the user's installed release - cannot arise: the
 # path is under a throwaway %TEMP% fixture, and the sweep under test is given
 # that same fixture as its repo root.
+#
+# foreground-audit: no injection and no screen DC. `SendInput` appears once, in
+# section S's fixture script - a here-string whose whole body is the SKIP line a
+# capability-blocked script would print - and the T276 detector cannot tell a
+# call from a string that spells one. Every process this launches is a copy of
+# cmd.exe under a %TEMP% fixture, so there is nothing here that could take the
+# input desktop even by accident.
 
 . (Join-Path $PSScriptRoot 'lib\TestScore.ps1')
 # Section M asks the same question the runner asks: is a dialog still on screen?

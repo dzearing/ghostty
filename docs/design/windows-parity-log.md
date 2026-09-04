@@ -21271,3 +21271,55 @@ rather than sidestepped. Floor green: four zig lanes, P1-P3, and the nine
 harnesses `guard-due` named for these files. Filed alongside: T1321 (the
 feedback queue files user reports without the flag) and T1322 (the dashboard
 does not show it).
+
+## 2026-09-04 - the remote-desktop run now measures whether a dimmed pane keeps getting darker (T1316)
+
+Someone reported on 2026-09-03 that an HTML viewer pane's white went grey the
+longer it sat there over Remote Desktop, and that closing and reopening the pane
+fixed it for a while. T1295 read every layered-alpha site in `src\apprt\win32`,
+ruled app-side accumulation out by construction, and shipped the app's one
+contribution to a blend it does not own: `DimOverlay.show()` became genuinely
+idempotent, and in a remote session it resets the pixels under itself before an
+unavoidable re-blend. Then it stopped - because the only oracle left was asking
+the reporter to stare at a pane again, which is how a report gets filed twice.
+
+`test\win32\rdp-session.ps1` gains arm G. It opens a white HTML viewer pane in a
+split, posts a click at the terminal so the T74 dim overlay IS the thing being
+looked through, and samples the pane's COMPOSITED screen rectangle every three
+seconds for two minutes - a 16x16 bilinear downscale of the region, averaged as
+Rec. 709 luminance, so a single glyph or an encoder artifact cannot move the
+number. Every reading lands in `test\win32\artifacts\rdp-session.json` beside
+arm E's fps, because a number nobody wrote down has to be re-earned on a machine
+the next reader may not have.
+
+The verdict is a DRIFT BOUND on quarter-means, never an absolute brightness: the
+pane is supposed to look dimmer than the focused one, and how dim depends on
+`unfocused-split-opacity`, the fill and the client's own colour handling. What it
+must never do is keep going. And a steady reading is a RESULT rather than a
+shrug - if the reporter still sees the fade while the server's own desktop reads
+flat, the blend is accumulating in the RDP client or the redirection path, and
+T1295 reopens there rather than in `DimOverlay.zig`.
+
+Two things it refuses to fake. `screen-pixels` from `lib\DesktopCapability.ps1`
+decides whether it samples at all, so `-SelfTest` and `-BackgroundDesktop` - both
+of which land on a desktop DWM never composes - record `measured: false` with the
+reason instead of a column of zeroes that would read like a measurement nobody
+took. And the drift arithmetic is extracted into `Get-LuminanceDrift` so
+`-SelfTest` can exercise it over a flat series and a compounding one (S2/S3)
+plus a live capture probe (S1): without that, the first run inside a real RDP
+session would also be the first execution of the verdict, on the one box where
+nobody can iterate.
+
+`rdp-session.ps1` is now a declared input-desktop exception in
+`lib\TestDesktop.ps1` - its subject is the composite of a viewer surface with a
+layered overlay blended onto it, which is exactly what PrintWindow of either
+window on its own cannot produce.
+
+Self-test: 19 passed, 1 failed - the one failure is A1 (`SM_REMOTESESSION` is
+0), which is the script refusing to be satisfied from the console. Fixed on the
+way past: `suite-run.ps1` had been an undeclared foreground-audit finding since
+T1100, because section S's fixture is a here-string whose whole body is the SKIP
+line a capability-blocked script prints and the T276 detector cannot tell a call
+from a string that spells one; it carries the `# foreground-audit:` marker now
+and that harness is ALL PASS (40) again. Filed: T1323, the exit-code audit's B3
+spot-check naming a line T1285 legitimately deleted.
