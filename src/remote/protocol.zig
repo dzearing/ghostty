@@ -1095,7 +1095,46 @@ pub const Open = struct {
     pinned: bool = false,
 
     pub const EnvPair = struct { key: []const u8, value: []const u8 };
+
+    /// The one env key the agent reads for its OWN purposes rather than merely
+    /// handing to the child: the pane the session belongs to (T552). It is an
+    /// identity, not an environment detail — see `SessionInfo.pane_id` — and it
+    /// is defined HERE, on the wire type, so the spelling the viewer BAKES
+    /// (`apprt.ipc.pane_env`, which aliases this) and the spelling the agent
+    /// LOOKS FOR are the same constant and cannot drift apart. `protocol.zig`
+    /// imports nothing but std, so both sides can reach it.
+    pub const pane_id_env = "GHOZTTY_PANE_ID";
+
+    /// The value of `pane_id_env` in a set of env pairs, or null when absent or
+    /// empty. Case-sensitive: every producer of this var is ours and writes the
+    /// exact spelling above, and a loose match here would let a child's unrelated
+    /// `ghoztty_pane_id` be mistaken for pane identity.
+    pub fn paneIdOf(env: []const EnvPair) ?[]const u8 {
+        for (env) |pair| {
+            if (!std.mem.eql(u8, pair.key, pane_id_env)) continue;
+            return if (pair.value.len == 0) null else pair.value;
+        }
+        return null;
+    }
 };
+
+test "Open.paneIdOf finds the pane id, ignores absent/empty/miscased keys" {
+    const found = [_]Open.EnvPair{
+        .{ .key = "TERM", .value = "xterm-ghostty" },
+        .{ .key = "GHOZTTY_PANE_ID", .value = "PANE-1" },
+    };
+    try testing.expectEqualStrings("PANE-1", Open.paneIdOf(&found).?);
+
+    // Absent, empty, and a near-miss spelling all read as "no pane id" rather
+    // than as a blank one a consumer would have to special-case.
+    const absent = [_]Open.EnvPair{.{ .key = "TERM", .value = "xterm-ghostty" }};
+    try testing.expect(Open.paneIdOf(&absent) == null);
+    const empty = [_]Open.EnvPair{.{ .key = "GHOZTTY_PANE_ID", .value = "" }};
+    try testing.expect(Open.paneIdOf(&empty) == null);
+    const miscased = [_]Open.EnvPair{.{ .key = "ghoztty_pane_id", .value = "PANE-1" }};
+    try testing.expect(Open.paneIdOf(&miscased) == null);
+    try testing.expect(Open.paneIdOf(&.{}) == null);
+}
 
 /// `OPENED` (0x02).
 pub const Opened = struct {
@@ -1465,6 +1504,24 @@ pub const SessionInfo = struct {
     /// Additive/optional (defaults null; older agents omit it, and a reader that
     /// never heard of it simply shows what it showed before).
     fg_cmd: ?[]const u8 = null,
+    /// The id of the PANE this session was opened for — the `$GHOZTTY_PANE_ID`
+    /// the viewer baked into the OPEN's env (and re-sends on RELAUNCH), captured
+    /// by the agent rather than derived. This is the reverse of the join `+list
+    /// --json`'s `session_id` answers (T332): that one goes pane → session while
+    /// the app is up, this one goes session → pane and works with the app CLOSED,
+    /// which is the only state `+sessions` is the sole view for (T552).
+    ///
+    /// It names the pane that OPENED the session, on whatever machine that pane
+    /// lives — for a cross-machine window the pane is on the VIEWING machine and
+    /// the session is here, because the id rides the viewing surface's env
+    /// overrides. That is the join a script wants in both directions, so the
+    /// field is emitted rather than suppressed for remote sessions; a consumer
+    /// that cares which machine a pane is on already knows which agent it dialed.
+    ///
+    /// Additive/optional (defaults null): an older agent omits it, a session
+    /// opened by an app too old to bake the var has none, and a reader that never
+    /// heard of the key ignores it.
+    pane_id: ?[]const u8 = null,
 };
 
 /// `SESSIONS` (0x25). Reply to `LIST_SESSIONS`: the full session roster. An empty

@@ -117,7 +117,13 @@ test "socketPath: falls back to this build's own socket when unset or empty" {
 ///
 /// This is the targeting twin of `socket_env`: that one says which app to talk
 /// to, this one says which pane is asking.
-pub const pane_env = "GHOZTTY_PANE_ID";
+///
+/// Aliased from the agent wire protocol (T552), for the same reason
+/// `pane_flag` is aliased from `ipc/args.zig`: the agent LOOKS FOR this key in
+/// an OPEN's env to record which pane a session belongs to, so the spelling the
+/// app bakes and the spelling the agent reads are now one constant that cannot
+/// drift apart.
+pub const pane_env = @import("../remote/protocol.zig").Open.pane_id_env;
 
 /// The flag `seedCallerPane` adds to carry `$GHOZTTY_PANE_ID` to the app.
 ///

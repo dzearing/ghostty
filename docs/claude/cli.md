@@ -188,6 +188,17 @@ so a script can answer "which pane is this session open in" (and vice versa)
 without app logs. Absent for plain non-persistent panes and viewers. (win32
 server since T332; the Mac server half is T553.)
 
+The join answers in BOTH directions, and the two are not interchangeable:
+`+list --json`'s `session_id` goes pane -> session and needs the app running,
+while `+sessions --json`'s `pane_id` goes session -> pane and dials the agent
+directly, so it is the only one that answers with the app CLOSED (T552). The
+agent records it from the `$GHOZTTY_PANE_ID` the viewer bakes into the OPEN's
+env, and persists it, so a relaunchable tombstone still names its pane after a
+reboot. Null when the app that opened the session was too old to bake the var,
+and absent entirely from an older agent. For a cross-machine window it names a
+pane on the VIEWING machine while the session runs on the agent's — the join a
+script wants in both cases, since it already knows which agent it dialed.
+
 ### `ghoztty +sessions`
 
 List the persistent terminal sessions owned by the local `ghoztty-agent` (the daemon that keeps session-persistence PTYs alive across app restarts). Unlike the other IPC commands, this dials the agent **directly** over its 0600 unix socket (`~/.config/ghoztty/local-agent[-debug]/agent.sock`) — NOT the app's IPC socket — so it works even when the Ghoztty app is not running (as long as the agent is). Requires `session-persistence = on`. On Windows the agent's local transport is instead an owner-only-DACL **named pipe** (`\\.\pipe\ghoztty-agent[-debug]-<user>`); the endpoint is discovered from the agent's `pipe` field in `%LOCALAPPDATA%\ghoztty\local-agent[-debug]\port.json`, and the same-uid guarantee comes from the pipe DACL rather than a peercred check.
@@ -196,7 +207,7 @@ List the persistent terminal sessions owned by the local `ghoztty-agent` (the da
 ghoztty +sessions [--json] [--agent]
 ```
 
-Each row reports the session id, liveness (`alive`; `dead(relaunchable)` for a tombstone that RELAUNCH can still revive — e.g. after a reboot or agent restart; or `dead(<code>)` for a genuinely exited session), whether a viewer is currently `attached`, the activity state (`idle`/`busy`/`needs_input`), the child pid, `pinned` when the session is protected from the agent's idle-TTL reaper (persistent local panes are pinned so they survive the viewer quitting indefinitely; cross-machine sessions are not), the working directory (when known), and the command. `--json` emits one object per session for scripts and agents.
+Each row reports the session id, liveness (`alive`; `dead(relaunchable)` for a tombstone that RELAUNCH can still revive — e.g. after a reboot or agent restart; or `dead(<code>)` for a genuinely exited session), whether a viewer is currently `attached`, the activity state (`idle`/`busy`/`needs_input`), the child pid, `pinned` when the session is protected from the agent's idle-TTL reaper (persistent local panes are pinned so they survive the viewer quitting indefinitely; cross-machine sessions are not), the working directory (when known), and the command. `--json` emits one object per session for scripts and agents — including `pane_id`, the pane the session was opened for, which the human table deliberately omits (a pane id is a UUID nobody reads off a terminal).
 
 ```bash
 ghoztty +sessions

@@ -797,6 +797,13 @@ pub const OwnedSession = struct {
     /// (T545). Null at an idle prompt — and from an older agent that never heard
     /// of the field, which reads the same and is the safe direction.
     fg_cmd: ?[]const u8 = null,
+    /// The pane this session was opened for (owned) — `$GHOZTTY_PANE_ID` as the
+    /// agent recorded it from the OPEN's env (T552). This is the session -> pane
+    /// direction of the join `+list --json`'s `session_id` answers pane -> session,
+    /// and the only one available with the app closed. Null for a session opened
+    /// by an app that never baked the var, and from an older agent that never
+    /// sent the field — which read the same and is the safe direction.
+    pane_id: ?[]const u8 = null,
 };
 
 /// Caller-owned result of a `LIST_SESSIONS` RPC (T10). Every `OwnedSession` + its
@@ -814,6 +821,7 @@ pub const OwnedSessions = struct {
             if (s.cwd) |c| self.alloc.free(@constCast(c));
             if (s.argv) |a| self.alloc.free(@constCast(a));
             if (s.fg_cmd) |f| self.alloc.free(@constCast(f));
+            if (s.pane_id) |p| self.alloc.free(@constCast(p));
         }
         self.alloc.free(self.sessions);
         self.* = undefined;
@@ -1965,6 +1973,7 @@ pub const Connection = struct {
                 if (s.cwd) |c| self.alloc.free(@constCast(c));
                 if (s.argv) |a| self.alloc.free(@constCast(a));
                 if (s.fg_cmd) |f| self.alloc.free(@constCast(f));
+                if (s.pane_id) |p| self.alloc.free(@constCast(p));
             }
             self.alloc.free(out);
         }
@@ -1980,6 +1989,8 @@ pub const Connection = struct {
             const argv: ?[]const u8 = if (s.argv) |a| try self.alloc.dupe(u8, a) else null;
             errdefer if (argv) |a| self.alloc.free(a);
             const fg_cmd: ?[]const u8 = if (s.fg_cmd) |f| try self.alloc.dupe(u8, f) else null;
+            errdefer if (fg_cmd) |f| self.alloc.free(f);
+            const pane_id: ?[]const u8 = if (s.pane_id) |p| try self.alloc.dupe(u8, p) else null;
             out[i] = .{
                 .id = id,
                 .alive = s.alive,
@@ -1997,6 +2008,7 @@ pub const Connection = struct {
                 .unattached_since = s.unattached_since,
                 .holder_backed = s.holder_backed,
                 .fg_cmd = fg_cmd,
+                .pane_id = pane_id,
             };
             filled = i + 1;
         }

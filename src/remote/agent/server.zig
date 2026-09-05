@@ -1089,6 +1089,13 @@ pub const Server = struct {
         // launching process's cwd (`C:\Windows\System32` for a detached script),
         // which is how a relaunched pane came back in the wrong directory.
         if (open.cwd) |c| s.setCwd(c);
+        // Record WHICH PANE this session belongs to (T552). The agent keeps no
+        // other part of a session's env — `protocol.Relaunch` explains why
+        // RELAUNCH has to re-send it — but this one key is identity rather than
+        // environment: it is the only answer to "which pane is this session in?"
+        // once the app is closed and `+list --json`'s `session_id` (T332, the
+        // same join in the other direction) cannot be asked at all.
+        if (protocol.Open.paneIdOf(open.env)) |pane| s.setPaneId(pane);
         // Pin persistent local sessions so the idle-TTL reaper never evicts them
         // while orphaned (§7.1, T11). Set by the local-agent client for panes the
         // viewer's session-layout manifest references; false for cross-machine.
@@ -1721,6 +1728,10 @@ pub const Server = struct {
                 // their sessions can see "this one is running claude" — the only
                 // answer there is for a plain shell pane, whose `argv` is null.
                 .fg_cmd = if (s.fg_cmd) |f| f else null,
+                // T552: the pane this session is bound to — the reverse of the
+                // join `+list --json` answers, and the only direction that works
+                // with the app closed, which is the state `+sessions` exists for.
+                .pane_id = if (s.pane_id) |p| p else null,
             }) catch break;
         }
 
@@ -1865,6 +1876,13 @@ pub const Server = struct {
         const cwd_copy: ?[]u8 = if (s.cwd) |c| (self.alloc.dupe(u8, c) catch null) else null;
         defer if (cwd_copy) |c| self.alloc.free(c);
         const pinned = s.pinned;
+        // Refresh the recorded pane (T552) from the RELAUNCH's env, which is the
+        // viewer's live answer to "which pane am I respawning this into". It
+        // normally repeats what the OPEN recorded, since a pane id survives
+        // restore by design — but a session materialized from a `sessions.json`
+        // written by an agent too old to persist the field has none until now,
+        // and this is the moment the viewer supplies it.
+        if (protocol.Open.paneIdOf(req.env)) |pane| s.setPaneId(pane);
         self.store.mutex.unlock();
 
         // Phase 2: spawn the child OUTSIDE the lock. Synthesize an OPEN from the
@@ -3266,6 +3284,61 @@ test "LIST_SESSIONS→SESSIONS: agent enumerates its sessions on the request cha
         }
     }
     try testing.expect(seen0 and seen1);
+}
+
+test "LIST_SESSIONS→SESSIONS: a session's row names the pane that opened it (T552)" {
+    // The reverse of the join `+list --json`'s `session_id` answers: session ->
+    // pane, which is the only direction available once the app is closed. The
+    // agent keeps no other part of a session's env, so this asserts the ONE key
+    // it lifts out — and asserts that a session opened without it reports null
+    // rather than an empty string, since an older app bakes no pane id at all.
+    const alloc = testing.allocator;
+    var clock: TestClock = .{};
+    var fc0: FakeChild = .{ .alloc = alloc };
+    var fc1: FakeChild = .{ .alloc = alloc };
+    defer fc0.deinit();
+    defer fc1.deinit();
+    var kids = [_]*FakeChild{ &fc0, &fc1 };
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(0x552);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshake();
+    _ = try h.server.waitHandshake();
+
+    // A viewer-opened pane: the surface's env overrides carry its pane id, mixed
+    // in among the other vars the OPEN forwards, so this also proves the lookup
+    // is by key rather than by position.
+    const paned_env = [_]protocol.Open.EnvPair{
+        .{ .key = "GHOZTTY_WINDOW_NAME", .value = "work" },
+        .{ .key = "GHOZTTY_PANE_ID", .value = "PANE-0BAD-CAFE" },
+        .{ .key = "TERM_PROGRAM", .value = "ghostty" },
+    };
+    const paned = try doOpen(&h, .{ .rows = 24, .cols = 80, .env = &paned_env });
+    // An older app (or a non-pane opener): no pane id in the env at all.
+    const anon = try doOpen(&h, .{ .rows = 24, .cols = 80, .env = &.{} });
+
+    const req_ch: u128 = 0x5520;
+    try h.client.sendControlJson(.list_sessions, req_ch, protocol.ListSessions{});
+    const reply = try h.client.waitControl(.sessions);
+    var parsed = try protocol.parseJson(protocol.Sessions, alloc, reply.payload);
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.sessions.len);
+
+    var seen_paned = false;
+    var seen_anon = false;
+    for (parsed.value.sessions) |s| {
+        if (std.mem.eql(u8, s.id, paned.id[0..])) {
+            seen_paned = true;
+            try testing.expectEqualStrings("PANE-0BAD-CAFE", s.pane_id.?);
+        } else if (std.mem.eql(u8, s.id, anon.id[0..])) {
+            seen_anon = true;
+            try testing.expect(s.pane_id == null);
+        }
+    }
+    try testing.expect(seen_paned and seen_anon);
 }
 
 test "LIST_SESSIONS→SESSIONS: empty roster is answered with an empty array" {
@@ -4853,9 +4926,16 @@ test "RELAUNCH: ATTACH to a materialized session is dead+relaunchable; RELAUNCH 
     const alive = s.alive;
     const relaunchable = s.relaunchable;
     const fg_cmd_cleared = s.fg_cmd == null;
+    // ...and the pane the viewer respawned it into was RECORDED (T552). This
+    // record was materialized from a `sessions.json` with no pane id in it — the
+    // shape an agent too old to persist the field leaves behind — so the
+    // RELAUNCH env is the only place the answer could have come from.
+    const pane_id = if (s.pane_id) |p| alloc.dupe(u8, p) catch null else null;
+    defer if (pane_id) |p| alloc.free(p);
     h.server.store.mutex.unlock();
     try testing.expect(alive and !relaunchable);
     try testing.expect(fg_cmd_cleared);
+    try testing.expectEqualStrings("0BAD-CAFE", pane_id.?);
 
     h.server.onChildOutput(channel, "back!");
     const d = try h.client.nextData();

@@ -23,6 +23,13 @@
 #      command must not have had it written into `argv` - that field is what
 #      RELAUNCH re-executes, and overwriting it would make a resumed pane
 #      re-run `ping` in place of the shell.
+#   D: the pane<->session join ROUND-TRIPS (T552). `+list --json`'s leaf carries
+#      `session_id` (pane -> session, T332) and the roster row now carries
+#      `pane_id` (session -> pane), and the two must name each other. Scored
+#      here because this script is the one place both surfaces are already up
+#      over the same live pane, so an agreement failure is the product's and not
+#      the harness's. The human table must NOT print the pane id: it is a UUID,
+#      and the table is read by eye.
 #
 # The sampler runs on the store's slow tick (every ~10s), so every assertion
 # here polls rather than reading once.
@@ -243,6 +250,33 @@ Assert "C the sampled command did not overwrite argv" `
     ($null -ne $running -and $null -eq $running.argv)
 Assert "C the table still distinguishes cmd= from running=" `
     (($text -match 'running=') -and ($text -notmatch 'cmd=\S*ping'))
+
+# ============================================================================
+Say "== D: the pane<->session join round-trips (T552)"
+# ============================================================================
+# The two directions are answered by two different servers over two different
+# transports - `+list` dials the APP, `+sessions` dials the AGENT - so this is
+# the only assertion that can catch them disagreeing. `$paneId` came from
+# `+list --json` at setup; `$running` is the roster row for that same pane.
+$paneRow = $null
+foreach ($r in (Live-Rows (Get-Roster 'join'))) {
+    if ($r.pane_id -eq $paneId) { $paneRow = $r; break }
+}
+Assert "D the roster row names the pane the session is open in (pane_id)" `
+    ($null -ne $paneRow)
+if ($null -ne $paneRow) { Say "    pane_id = $($paneRow.pane_id)" }
+
+# ...and the OTHER direction agrees: the pane's own leaf names that session.
+$joinTree = Get-List 'join'
+$joinLeaf = @(All-Leaves $joinTree | Where-Object { $_.id -eq $paneId })
+Assert "D the pane's +list leaf is bound to a session" `
+    ($joinLeaf.Count -eq 1 -and -not [string]::IsNullOrWhiteSpace($joinLeaf[0].session_id))
+Assert "D the two directions name each other (session_id <-> pane_id)" `
+    ($null -ne $paneRow -and $joinLeaf.Count -eq 1 -and $joinLeaf[0].session_id -eq $paneRow.id)
+
+# The pane id is a UUID; the table is scanned by eye and must stay unchanged.
+Assert "D the human-readable table does not print the pane id" `
+    ($text -notmatch [regex]::Escape($paneId))
 
 # ============================================================================
 Say "== B: back at the prompt, the roster reports nothing"

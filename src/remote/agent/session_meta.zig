@@ -58,6 +58,12 @@ pub const Record = struct {
     /// the restart notice names. Distinct from `argv` (the relaunch input) on
     /// purpose; see `Session.fg_cmd`. Additive: an older agent omits/ignores it.
     fg_cmd: ?[]const u8 = null,
+    /// The pane this session belongs to (`$GHOZTTY_PANE_ID`, T552). Persisted so
+    /// a relaunchable tombstone still names its pane after the agent restarts —
+    /// pane ids are stable across restore, so the recorded id is still the right
+    /// answer on the far side of a reboot, which is exactly the state a script
+    /// has no other way to query. Additive: an older agent omits/ignores it.
+    pane_id: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
     title: ?[]const u8 = null,
     pinned: bool = false,
@@ -182,6 +188,7 @@ test "serialize + parse round-trip preserves records and elides nulls" {
             .id = "0123456789abcdef0123456789abcdef",
             .argv = "/bin/zsh -lic 'sleep 600'",
             .fg_cmd = "claude --continue",
+            .pane_id = "0BAD-CAFE",
             .cwd = "/Users/x/work",
             .title = "work",
             .pinned = true,
@@ -213,6 +220,7 @@ test "serialize + parse round-trip preserves records and elides nulls" {
     try testing.expectEqualStrings("0123456789abcdef0123456789abcdef", a.id);
     try testing.expectEqualStrings("/bin/zsh -lic 'sleep 600'", a.argv.?);
     try testing.expectEqualStrings("claude --continue", a.fg_cmd.?);
+    try testing.expectEqualStrings("0BAD-CAFE", a.pane_id.?); // T552
     try testing.expectEqualStrings("/Users/x/work", a.cwd.?);
     try testing.expectEqualStrings("work", a.title.?);
     try testing.expect(a.pinned);
@@ -222,6 +230,7 @@ test "serialize + parse round-trip preserves records and elides nulls" {
     try testing.expectEqualStrings("ffffffffffffffffffffffffffffffff", b.id);
     try testing.expect(b.argv == null);
     try testing.expect(b.fg_cmd == null);
+    try testing.expect(b.pane_id == null); // elided, not emitted as null (T552)
     try testing.expect(b.cwd == null);
     try testing.expect(b.title == null);
     try testing.expect(!b.pinned);

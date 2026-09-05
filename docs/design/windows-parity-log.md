@@ -22521,3 +22521,62 @@ Validation: all four floor lanes PASS; P1 25 / P2 20 / P3 16 ALL PASS;
 down and back up, with no updater thread and no tray. Nine further guards that
 `main.zig` touches were re-run green. Also filed: T1362, five design notes that
 still tell a reader to run the deploy script this change deleted.
+
+## 2026-09-05 - `+sessions --json` now names the pane each session lives in (T552)
+
+`+list --json` has said which session a pane is showing since T332. The other
+direction had no answer at all, and it is the direction that matters most when
+things have gone wrong: `+sessions` dials the agent directly, so it is the ONLY
+view a script has while the app is closed - and a row that says `attached` while
+refusing to say WHAT it is attached to is a join with one end missing. Every row
+now carries `pane_id`, and the two directions name each other.
+
+**The task's premise was wrong, and the CHECK FIRST prompt is what caught it.**
+T552 was filed on the belief that the agent already keeps each session's spawn
+env for RELAUNCH and could simply read the pane id back out of it. It does not:
+`protocol.Relaunch`'s own doc comment says "the agent's on-disk session record
+keeps only argv-label/cwd", which is precisely why wp3 made the VIEWER re-send
+env on every relaunch. Building the task as written would have meant reading a
+field that does not exist. What is true is narrower and enough: the pane id
+ARRIVES at the agent, in the OPEN's env (the win32 surface bakes
+`GHOZTTY_PANE_ID` into `config.env`, forwarded verbatim) and again in the
+RELAUNCH's. So the agent captures that one key at spawn.
+
+That it is one key and not the env is the design, not a shortcut. The agent
+deliberately does not keep a session's environment - it belongs to the child, and
+a stale copy of it is a liability. A pane id is not an environment detail; it is
+an IDENTITY, the only thing that answers "where is this session?" once the app
+that could be asked is gone. So `Session.pane_id` is captured explicitly and
+persisted beside `fg_cmd`, and because pane ids are stable across restore, a
+relaunchable tombstone loaded on the far side of a reboot still names the right
+pane. A RELAUNCH refreshes it, which is also how a session materialized from a
+`sessions.json` written by an older agent acquires one.
+
+The key is defined ONCE, on the wire type (`protocol.Open.pane_id_env`), and
+`apprt.ipc.pane_env` now aliases it - the same fix `pane_flag` already has for
+the same reason. The spelling the app BAKES and the spelling the agent LOOKS FOR
+are now the same constant and cannot drift apart; `protocol.zig` imports nothing
+but std, so both sides can reach it. `paneIdOf` is case-sensitive on purpose: an
+unrelated `ghoztty_pane_id` in a child's env is not pane identity.
+
+Additive at every hop (`SessionInfo` -> `OwnedSession` -> the CLI row), so an
+older agent omits it and a reader that never heard of the key ignores it. **The
+human table is deliberately unchanged**: a pane id is a 36-character UUID, and
+the tree is scanned by eye. For a cross-machine window the field names a pane on
+the VIEWING machine while the session runs on the agent's - emitted rather than
+suppressed, because that IS the join a script wants and it already knows which
+agent it dialed.
+
+Validation: all four floor lanes PASS; P1 25 / P2 20 / P3 16 ALL PASS.
+`sessions-running-cmd.ps1` gained arm D - the round trip - and ran `ALL PASS
+(16 checks)`: the roster row reported `pane_id = 6AD668C9-...`, the pane's own
+`+list` leaf named that session back, and the human table printed the id nowhere.
+It is the only place both surfaces are up over the same live pane, so a
+disagreement between the two servers can only be caught there; its guard row
+grew `server.zig`, `protocol.zig` and `connection.zig` so an edit anywhere along
+the chain makes the harness due. Twelve further guards the touched files cover
+were re-run green. Also filed: **T1363** - every one of those runs ended by
+printing `CRASHED` for the app its own teardown force-killed, because
+`0xFFFFFFFF` is indistinguishable by value from an exception code, and a green
+run that shouts CRASHED teaches everyone to skim the one block a real crash
+would report itself in.

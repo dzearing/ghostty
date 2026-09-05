@@ -1535,6 +1535,15 @@ $GuardTable = @(
             'src\cli\sessions.zig',
             'src\remote\agent\pty_child.zig',
             'src\remote\agent\pty_holder_child.zig',
+            # T552 added arm D, the pane<->session round trip, so the harness now
+            # also covers the path that carries `pane_id` from the OPEN's env to
+            # the roster row: the agent records it, the wire type declares it and
+            # the client dupes it. An edit anywhere along that chain makes this
+            # script due, which is the point - the two directions of the join are
+            # answered by two different servers and only this run compares them.
+            'src\remote\agent\server.zig',
+            'src\remote\protocol.zig',
+            'src\remote\connection.zig',
             'test\win32\sessions-running-cmd.ps1'
         )
     },

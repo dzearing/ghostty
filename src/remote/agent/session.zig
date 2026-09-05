@@ -648,6 +648,18 @@ pub const Session = struct {
     /// re-run e.g. `claude` in place of the shell.
     fg_cmd: ?[]u8 = null,
 
+    /// The pane this session was opened for — `$GHOZTTY_PANE_ID`, lifted out of
+    /// the OPEN's env pairs at spawn and refreshed from the RELAUNCH's (T552).
+    /// The agent does not otherwise keep a session's env (see `protocol.Relaunch`
+    /// on why RELAUNCH has to carry it), so this one key is captured explicitly
+    /// because it is an IDENTITY rather than an environment detail: it is the
+    /// only thing that answers "which pane is this session in?" once the app is
+    /// closed and `+list` cannot be asked. Persisted beside `fg_cmd` so a
+    /// relaunchable tombstone still names its pane — pane ids are stable across
+    /// restore, so the recorded id is still the right answer after a reboot.
+    /// Null for a session whose viewer never sent the var (an older app).
+    pane_id: ?[]u8 = null,
+
     /// The child's PTY slave path (e.g. `/dev/ttys014`), captured at spawn (OPEN /
     /// RELAUNCH) and surfaced via `OPENED`/`ATTACHED`/`RELAUNCHED` so a viewer pane
     /// can answer `getProcessInfo(.tty_name)` (wp3). Null on Windows (ConPTY has no
@@ -825,6 +837,7 @@ pub const Session = struct {
         if (self.title) |t| self.alloc.free(t);
         if (self.argv) |a| self.alloc.free(a);
         if (self.fg_cmd) |f| self.alloc.free(f);
+        if (self.pane_id) |p| self.alloc.free(p);
         if (self.tty) |t| self.alloc.free(t);
         if (self.holder_pipe) |p| self.alloc.free(p);
         if (self.holder_stamp) |s| self.alloc.free(s);
@@ -922,6 +935,19 @@ pub const Session = struct {
         const copy: ?[]u8 = if (cmd) |c| (self.alloc.dupe(u8, c) catch return) else null;
         if (self.fg_cmd) |f| self.alloc.free(f);
         self.fg_cmd = copy;
+    }
+
+    /// Record the pane this session belongs to (T552). Owns a copy; replaces any
+    /// prior value. Best-effort like `setArgv` — a failed allocation leaves the
+    /// field as it was rather than propagating, since a missing pane id costs a
+    /// script one join and costs the session nothing. An empty value is ignored
+    /// so a viewer that sends `GHOZTTY_PANE_ID=` never records a blank id that a
+    /// consumer would have to special-case separately from absent.
+    pub fn setPaneId(self: *Session, id: []const u8) void {
+        if (id.len == 0) return;
+        const copy = self.alloc.dupe(u8, id) catch return;
+        if (self.pane_id) |p| self.alloc.free(p);
+        self.pane_id = copy;
     }
 
     /// Record the session's working directory — the cwd the child was spawned in
@@ -1171,6 +1197,7 @@ pub const SessionTable = struct {
         s.created_ms = rec.created_ms; // preserve the original creation time
         if (rec.argv) |a| s.setArgv(a); // relaunch command + LIST_SESSIONS label
         if (rec.fg_cmd) |f| s.setFgCmd(f); // what was running — the notice names it (T429)
+        if (rec.pane_id) |p| s.setPaneId(p); // which pane it lives in (T552)
         if (rec.cwd) |c| s.cwd = try self.alloc.dupe(u8, c);
         errdefer if (s.cwd) |c| self.alloc.free(c);
         if (rec.title) |t| s.title = try self.alloc.dupe(u8, t);
@@ -2745,6 +2772,8 @@ fn dupMetaRecord(alloc: Allocator, s: *const Session) Allocator.Error!session_me
     errdefer if (argv) |a| alloc.free(a);
     const fg_cmd: ?[]u8 = if (s.fg_cmd) |f| try alloc.dupe(u8, f) else null;
     errdefer if (fg_cmd) |f| alloc.free(f);
+    const pane_id: ?[]u8 = if (s.pane_id) |p| try alloc.dupe(u8, p) else null;
+    errdefer if (pane_id) |p| alloc.free(p);
     const cwd: ?[]u8 = if (s.cwd) |c| try alloc.dupe(u8, c) else null;
     errdefer if (cwd) |c| alloc.free(c);
     const title: ?[]u8 = if (s.title) |t| try alloc.dupe(u8, t) else null;
@@ -2756,6 +2785,7 @@ fn dupMetaRecord(alloc: Allocator, s: *const Session) Allocator.Error!session_me
         .id = id,
         .argv = argv,
         .fg_cmd = fg_cmd,
+        .pane_id = pane_id,
         .cwd = cwd,
         .title = title,
         .pinned = s.pinned,
@@ -2775,6 +2805,7 @@ fn freeMetaRecord(alloc: Allocator, r: session_meta.Record) void {
     alloc.free(r.id);
     if (r.argv) |a| alloc.free(a);
     if (r.fg_cmd) |f| alloc.free(f);
+    if (r.pane_id) |p| alloc.free(p);
     if (r.cwd) |c| alloc.free(c);
     if (r.title) |t| alloc.free(t);
     if (r.holder_pipe) |p| alloc.free(p);
@@ -3892,6 +3923,39 @@ test "SessionTable.materialize: fg_cmd survives the reboot floor round-trip (T42
     const out = try dupMetaRecord(alloc, s);
     defer freeMetaRecord(alloc, out);
     try testing.expectEqualStrings("claude --continue", out.fg_cmd.?);
+}
+
+test "SessionTable.materialize: pane_id survives the reboot floor round-trip (T552)" {
+    // Pane ids are stable across restore, so a relaunchable tombstone loaded on
+    // the far side of a reboot still names the right pane — which is precisely
+    // the state `+sessions` is the only view for. If the field did not persist,
+    // the answer would exist only while the agent that took the OPEN was alive.
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5520);
+    var table = SessionTable.init(alloc, prng.random());
+    defer table.deinit();
+
+    const rec: session_meta.Record = .{
+        .id = "0123456789abcdef0123456789abcdef",
+        .pane_id = "PANE-0BAD-CAFE",
+        .cwd = "/work",
+    };
+    const s = (try table.materialize(rec, 1024, 100)).?;
+    try testing.expectEqualStrings("PANE-0BAD-CAFE", s.pane_id.?);
+
+    // And the record a persist would write carries it back out.
+    const out = try dupMetaRecord(alloc, s);
+    defer freeMetaRecord(alloc, out);
+    try testing.expectEqualStrings("PANE-0BAD-CAFE", out.pane_id.?);
+
+    // A record with no pane id (an older agent's file) materializes to null, and
+    // `setPaneId` refuses a blank value rather than recording an empty string a
+    // consumer would have to tell apart from absent.
+    const bare = (try table.materialize(.{
+        .id = "fedcba9876543210fedcba9876543210",
+        .pane_id = "",
+    }, 1024, 100)).?;
+    try testing.expect(bare.pane_id == null);
 }
 
 test "SessionStore.reapIdle: a bound session is never reaped regardless of pin" {

@@ -458,6 +458,17 @@ const JsonRow = struct {
     /// verbatim alongside `argv` rather than folded into it: `argv` is what
     /// RELAUNCH re-executes, this is what is running.
     fg_cmd: ?[]const u8,
+    /// The pane this session is bound to (T552) — the reverse of the join
+    /// `+list --json`'s `session_id` answers, and the only direction that works
+    /// with the app CLOSED, which is the state this command is the sole view
+    /// for. Null when the opening app never baked `$GHOZTTY_PANE_ID` or the
+    /// agent predates the field (additive — absent, never an error).
+    ///
+    /// It names the pane that opened the session, on whatever machine that pane
+    /// lives: for a cross-machine window that is the VIEWING machine while the
+    /// session runs here. Emitted rather than suppressed there, because a script
+    /// already knows which agent it dialed and the join is what it wants.
+    pane_id: ?[]const u8,
 };
 
 fn printJson(alloc: Allocator, stdout: *std.Io.Writer, sessions: []const connection.OwnedSession) !void {
@@ -479,6 +490,7 @@ fn printJson(alloc: Allocator, stdout: *std.Io.Writer, sessions: []const connect
             .relaunchable = s.relaunchable,
             .unattached_since = s.unattached_since,
             .fg_cmd = s.fg_cmd,
+            .pane_id = s.pane_id,
         };
     }
     const json = try std.json.Stringify.valueAlloc(alloc, rows, .{ .whitespace = .indent_2 });
@@ -755,4 +767,74 @@ test "printJson carries fg_cmd verbatim beside argv (T545)" {
     try testing.expectEqualStrings("claude --continue", parsed.value[0].fg_cmd.?);
     try testing.expectEqualStrings("pwsh", parsed.value[1].argv.?);
     try testing.expect(parsed.value[1].fg_cmd == null);
+}
+test "printJson carries pane_id, and the human tree stays unchanged (T552)" {
+    // The scripted surface gains the session -> pane join; the human table does
+    // NOT. A pane id is a 36-character UUID that nobody reads off a terminal, and
+    // the tree is scanned by eye — so it stays a `--json` key, and this asserts
+    // BOTH halves, because "the human output is unchanged" is a validation
+    // criterion rather than an accident of where the field was added.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const sessions = [_]connection.OwnedSession{
+        .{
+            .id = "aaaa",
+            .alive = true,
+            .exit_code = null,
+            .attached = true,
+            .activity = "idle",
+            .pid = 10,
+            .title = null,
+            .cwd = null,
+            .argv = null,
+            .created_at = 1,
+            .last_activity = 2,
+            .pinned = false,
+            .relaunchable = false,
+            .pane_id = "0BAD-CAFE",
+        },
+        .{
+            // An older agent, or an app that never baked the var: absent, and
+            // absent must read as null rather than failing the whole render.
+            .id = "bbbb",
+            .alive = true,
+            .exit_code = null,
+            .attached = false,
+            .activity = "idle",
+            .pid = 11,
+            .title = null,
+            .cwd = null,
+            .argv = null,
+            .created_at = 3,
+            .last_activity = 4,
+            .pinned = false,
+            .relaunchable = false,
+            .pane_id = null,
+        },
+    };
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    var arena: ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    try printJson(arena.allocator(), &out.writer, &sessions);
+
+    const parsed = try std.json.parseFromSlice([]struct {
+        id: []const u8,
+        pane_id: ?[]const u8,
+    }, alloc, out.written(), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.len);
+    try testing.expectEqualStrings("0BAD-CAFE", parsed.value[0].pane_id.?);
+    try testing.expect(parsed.value[1].pane_id == null);
+
+    // The tree: both rows render, and the pane id appears nowhere in it.
+    var tree: std.Io.Writer.Allocating = .init(alloc);
+    defer tree.deinit();
+    try printTable(&tree.writer, &sessions);
+    const text = tree.written();
+    try testing.expect(std.mem.indexOf(u8, text, "0BAD-CAFE") == null);
+    try testing.expect(std.mem.indexOf(u8, text, "aaaa") != null);
+    try testing.expect(std.mem.indexOf(u8, text, "bbbb") != null);
 }
