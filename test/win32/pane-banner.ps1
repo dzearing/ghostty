@@ -547,7 +547,7 @@ try {
         # every painted frame after it, in order.
         function Get-AnimFrames {
             $from = $null; $to = $null; $toggles = 0
-            $frames = @(); $paints = @()
+            $frames = @(); $paints = @(); $buffered = @()
             foreach ($l in @(Get-Content $errlog -ErrorAction SilentlyContinue)) {
                 if ($l -match 'banner collapse from=(-?\d+) to=(-?\d+)') {
                     $toggles++
@@ -556,9 +556,15 @@ try {
                     $frames += [int]$Matches[1]
                 } elseif ($l -match 'banner paint h=(-?\d+)') {
                     $paints += [int]$Matches[1]
+                    # T1344: the same line says whether that frame was
+                    # assembled offscreen. -1 is "the build did not say",
+                    # which is a pre-T1344 binary and is a FAILURE below,
+                    # not a skip - the flicker it describes is silent.
+                    if ($l -match 'buffered=(\d+)') { $buffered += [int]$Matches[1] }
+                    else { $buffered += -1 }
                 }
             }
-            return [pscustomobject]@{ From = $from; To = $to; Toggles = $toggles; Frames = $frames; Paints = $paints }
+            return [pscustomobject]@{ From = $from; To = $to; Toggles = $toggles; Frames = $frames; Paints = $paints; Buffered = $buffered }
         }
 
         $animMid = $ovA.Left + [int]($ovA.Width / 2)
@@ -626,6 +632,17 @@ try {
                 "T833 ($dir): the intermediate frames are PAINTED, not just ticked ($($painted.Count) distinct heights on screen)"
             Assert ($a.Paints.Count -gt 0 -and $a.Paints[-1] -eq $a.To) `
                 "T833 ($dir): the card ends up painted at its settled height ($($a.Paints[-1]) = $($a.To)) - no stale card left over"
+
+            # T1344: ...and each of those frames was assembled OFFSCREEN and
+            # put on the window in one blit. This is the direction the user's
+            # "when i expand/contract banners, they flicker" points: a frame
+            # drawn in stages on the window itself lets the compositor show a
+            # bare band of pane background where the card should be, ~11 times
+            # per toggle. `buffered=` is read from the DC the stages were
+            # handed (WindowFromDC), so a 0 here is the real thing, not a flag.
+            $unbuffered = @($a.Buffered | Where-Object { $_ -ne 1 })
+            Assert ($a.Buffered.Count -gt 0 -and $unbuffered.Count -eq 0) `
+                "T1344 ($dir): every animation frame is assembled offscreen ($($a.Buffered.Count) frames, $($unbuffered.Count) drawn straight on the window)"
 
             # ...and once it settles the popup is glued back over the pane at
             # the band the layout reserved, which is what Get-Overlay matches

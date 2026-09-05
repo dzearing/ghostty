@@ -130,6 +130,17 @@ const T149_NEUTERED = false;
 /// exactly the 6f2 "reaches the screen" assertions in the expand direction and
 /// nothing else.
 const T833_NEUTERED = false;
+
+/// Negative control for `pane-banner.ps1`'s T1344 assertions. Flipping it
+/// restores the pre-T1344 direct paint: every stage of a frame — the band
+/// fill, the card backdrop blit, each text run, the collapse fade, the
+/// chevron — lands straight in the window's own DC, and DWM is free to
+/// composite whatever half-drawn state it finds between two of them. That is
+/// the flicker the user reported on expand/collapse, where the card resizes
+/// ~11 times in 180 ms and each of those frames repaints the whole client.
+/// Re-running the script must fail exactly the T1344 assertions (every
+/// `banner paint` line reports `buffered=0`) and nothing else.
+const T1344_NEUTERED = false;
 /// Chevron toggle glyph half-width / height.
 const CHEV_W: f32 = 5.0;
 const CHEV_H: f32 = 3.5;
@@ -198,6 +209,13 @@ pub const BannerOverlay = struct {
     /// thing that can answer "is the card stale?" — during an expand the
     /// window keeps the settled band the whole way, so its size cannot.
     painted_h: i32 = -1,
+
+    /// Did the LAST frame render offscreen (T1344)? Observed from the DC the
+    /// stages were actually handed — `WindowFromDC` names the window for a
+    /// screen DC and nothing for a memory one — so this is a reading rather
+    /// than a copy of the flag that decided it. The unit lane asserts it; the
+    /// same observation is what `banner paint ... buffered=` logs.
+    last_frame_buffered: bool = false,
 
     /// Height the window layout reserved for this strip ABOVE the owner
     /// pane (T101). The layout shrinks/offsets the owner HWND by this and
@@ -1479,10 +1497,45 @@ pub const BannerOverlay = struct {
         };
     }
 
-    /// Paint the band: the glass card backdrop (pane background + shadow +
-    /// card), then the blocks inside the card, then collapse fade +
-    /// chevron. Rebuilds the link hit rects as a side effect.
+    /// Render one frame OFFSCREEN and put it on the target in a single blit
+    /// (T1344). Everything below draws in stages — pane background over the
+    /// whole client, the card backdrop over that, then the content, the fade
+    /// and the chevron — and each stage is a state a compositor can show. At
+    /// rest nobody sees it, but a collapse or an expand repaints the whole
+    /// client ~11 times in 180 ms, which is when the user sees the card flash.
+    ///
+    /// Both entry points come through here — WM_PAINT and WM_PRINTCLIENT — so
+    /// what a capture reads is byte for byte what the screen gets, which is
+    /// the property `WM_PRINTCLIENT draws the card into the caller's DC`
+    /// asserts and T835 depends on.
     fn paint(self: *BannerOverlay, hdc: w32.HDC) void {
+        if (T1344_NEUTERED) {
+            self.paintFrame(hdc);
+            return;
+        }
+        var rect: w32.RECT = undefined;
+        if (w32.GetClientRect(self.hwnd, &rect) == 0) return;
+        const w = @max(rect.right - rect.left, 1);
+        const h = @max(rect.bottom - rect.top, 1);
+
+        // A buffer we cannot make is not a reason to skip the frame: fall
+        // back to the direct paint, which is what every frame did before this.
+        const mem_dc = w32.CreateCompatibleDC(hdc) orelse return self.paintFrame(hdc);
+        defer _ = w32.DeleteDC(mem_dc);
+        const bmp = w32.CreateCompatibleBitmap(hdc, w, h) orelse return self.paintFrame(hdc);
+        defer _ = w32.DeleteObject(bmp);
+        const old_bmp = w32.SelectObject(mem_dc, bmp);
+        defer _ = w32.SelectObject(mem_dc, old_bmp);
+
+        self.paintFrame(mem_dc);
+        _ = w32.BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, w32.SRCCOPY);
+    }
+
+    /// Draw the band into `hdc`: the glass card backdrop (pane background +
+    /// shadow + card), then the blocks inside the card, then collapse fade +
+    /// chevron. Rebuilds the link hit rects as a side effect. Every caller
+    /// but the neutered control hands this a memory DC — see `paint`.
+    fn paintFrame(self: *BannerOverlay, hdc: w32.HDC) void {
         var client: w32.RECT = undefined;
         if (w32.GetClientRect(self.hwnd, &client) == 0) return;
 
@@ -1491,10 +1544,17 @@ pub const BannerOverlay = struct {
         // frame the animation WANTED; this says which frame was drawn, and
         // the two only agreed in the collapse direction before T833.
         self.painted_h = self.paintedCardHeight();
-        log.debug("banner paint h={} cw={} pw={}", .{
+        // `buffered=` is OBSERVED, not restated (T1344): `WindowFromDC`
+        // answers null for a memory DC and the owning window for one handed
+        // out by BeginPaint/GetDC, so a 0 here means this frame's stages
+        // really are landing on the screen one at a time. That is the whole
+        // claim, and it is the thing the negative control flips.
+        self.last_frame_buffered = w32.WindowFromDC(hdc) == null;
+        log.debug("banner paint h={} cw={} pw={} buffered={}", .{
             self.painted_h,
             client.right,
             self.pane_w,
+            @intFromBool(self.last_frame_buffered),
         });
 
         // The band the CARD occupies. The whole client when settled; while
@@ -2590,6 +2650,85 @@ test "banner overlay: WM_PRINTCLIENT draws the card into the caller's DC" {
     }
     try std.testing.expect(painted > count / 4);
     try std.testing.expectEqualSlices(u32, px_a, px_b);
+}
+
+// T1344: a frame is assembled offscreen and reaches the window in one blit.
+//
+// The user's report was "when i expand/contract banners, they flicker". The
+// card is drawn in stages — pane background across the whole client, the card
+// backdrop over that, the content, the collapse fade, the chevron — and before
+// this every one of those stages landed in the window's own DC. At rest that
+// costs nothing, because a settled banner repaints only when something about
+// it changes; a collapse or an expand repaints the whole client on every one
+// of ~11 frames in 180 ms, and each of those frames gave the compositor a
+// window of time in which the card was a bare band of pane background.
+//
+// Asserted from `WindowFromDC`, which is the same observation the
+// `banner paint ... buffered=` oracle logs: it answers the owning window for a
+// DC that BeginPaint or GetDC handed out, and null for a memory DC. So this
+// reads what the paint was actually given rather than restating the flag that
+// decided it, and it goes red the moment a stage is drawn on the screen again.
+test "banner overlay: a frame is assembled offscreen, not on the window" {
+    const hinst = w32.GetModuleHandleW(null) orelse return error.SkipZigTest;
+    registerClassOnce(hinst) catch return error.SkipZigTest;
+
+    const owner = w32.CreateWindowExW(
+        w32.WS_EX_LAYERED | w32.WS_EX_NOACTIVATE | w32.WS_EX_TOOLWINDOW,
+        WINDOW_CLASS_NAME,
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_POPUP,
+        0,
+        300,
+        600,
+        120,
+        null,
+        null,
+        hinst,
+        null,
+    ) orelse return error.SkipZigTest;
+    defer _ = w32.DestroyWindow(owner);
+    _ = w32.SetLayeredWindowAttributes(owner, 0, 0, w32.LWA_ALPHA);
+    _ = w32.ShowWindow(owner, w32.SW_SHOWNOACTIVATE);
+
+    const overlay = BannerOverlay.create(std.testing.allocator, null, owner, hinst) catch
+        return error.SkipZigTest;
+    defer overlay.destroy();
+    _ = w32.SetLayeredWindowAttributes(overlay.hwnd, 0, 0, w32.LWA_ALPHA);
+    overlay.alpha_set = true;
+
+    // Multi-line, so the banner is collapsible and the mid-animation frame
+    // below is a real one rather than a no-op.
+    overlay.setText("# Heading\n\nfirst line of body text\n\nsecond line of body text");
+    overlay.inset = 100;
+    overlay.updatePosition(1.0);
+
+    const wnd_dc = w32.GetDC(overlay.hwnd) orelse return error.SkipZigTest;
+    defer _ = w32.ReleaseDC(overlay.hwnd, wnd_dc);
+
+    // A settled frame drawn onto the window's OWN DC still renders offscreen.
+    overlay.last_frame_buffered = false;
+    overlay.paint(wnd_dc);
+    try std.testing.expect(overlay.last_frame_buffered);
+
+    // And so does a frame mid-collapse, which is the one the user sees flicker:
+    // the band fill runs there, so it is the frame with the most stages.
+    overlay.collapse_anim = .{
+        .from_h = overlay.cardHeight(),
+        .start = std.time.Instant.now() catch return error.SkipZigTest,
+    };
+    defer overlay.stopCollapseAnim();
+    overlay.collapsed = true;
+    overlay.last_frame_buffered = false;
+    overlay.paint(wnd_dc);
+    try std.testing.expect(overlay.last_frame_buffered);
+
+    // The observation is a reading, not a constant. Drive the stage renderer
+    // straight at the window DC — what the neutered control does for every
+    // frame — and it reports the truth about that too, so a green assertion
+    // above means the buffer is really there.
+    overlay.last_frame_buffered = true;
+    overlay.paintFrame(wnd_dc);
+    try std.testing.expect(!overlay.last_frame_buffered);
 }
 
 test "banner overlay: a link's underline is dotted at rest and solid on hover" {

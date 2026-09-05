@@ -589,6 +589,13 @@ pub extern "user32" fn ReleaseDC(
     hDC: HDC,
 ) callconv(.winapi) i32;
 
+/// The window a DC belongs to, or null for a memory DC. This is how a paint
+/// routine can OBSERVE whether it is drawing straight onto the screen or into
+/// an offscreen buffer, rather than restating the flag that decided it (T1344).
+pub extern "user32" fn WindowFromDC(
+    hDC: HDC,
+) callconv(.winapi) ?HWND;
+
 pub extern "user32" fn SetWindowLongPtrW(
     hWnd: HWND,
     nIndex: i32,

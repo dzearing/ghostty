@@ -22077,3 +22077,48 @@ compare against, rather than leaving the comparison as an impression.
 build (the stale-content guarantee the wait exists for), all four floor lanes
 PASS, P1-P3 ALL PASS, and the meta-audits a `test\win32` edit puts on the due
 list all re-ran green.
+
+## 2026-09-04 - T1344: a banner that expands or collapses stops flashing
+
+The second half of the user's report ("when i expand/contract banners, they
+flicker") had a plainer cause than the drag half. `BannerOverlay.paint` drew a
+frame in stages, straight into the window's own DC: pane background across the
+whole client, then the card backdrop blitted over it, then the content, the
+collapse fade and the chevron. Each of those is a state the compositor may
+show, and the widest of them - a bare band of pane background where the card
+should be - sits between the first two. At rest it costs nothing, because a
+settled banner repaints only when something changes; a collapse or an expand
+repaints the whole client on every one of ~11 frames in 180 ms, which is
+exactly the gesture that was reported.
+
+The fix is the one `activity_paint.zig` already uses and names the same reason
+for: assemble the frame in a memory DC, put it on the target in one `BitBlt`.
+Both entry points go through it - WM_PAINT and WM_PRINTCLIENT - so a capture
+still reads byte for byte what the screen gets, which is what T835's unit test
+asserts.
+
+The oracle is a READING, not a restatement of the flag that decided it.
+`WindowFromDC` answers the owning window for a DC that BeginPaint or GetDC
+handed out and null for a memory one, so `banner paint ... buffered=` reports
+what the stages were actually given; `last_frame_buffered` carries the same
+observation into the unit lane. That mattered because the alternative - logging
+the constant - would have been a check that cannot say anything but "fine".
+
+Capture method, since the task asked for it in writing: an in-app frame log
+plus the compile-time negative control, not the interactive desktop. Layered
+popups do not survive `PrintWindow` on the background test desktop, so a
+mid-animation pixel capture was never on the table here. `T1344_NEUTERED = true`
+restores the direct paint and `pane-banner.ps1` reports `7 frames, 7 drawn
+straight on the window` collapsing and `9 frames, 9` expanding - exactly the two
+new assertions red, 130 others still green.
+
+`SWP_NOCOPYBITS` on the resize path was left alone on purpose. It is a
+plausible second source of exposed pixels and its stated justification does not
+survive reading (SetWindowPos blits 1:1 and never stretches), but it is a
+theory this turn could not demonstrate, and the task's own instruction was to
+capture before theorising: **T1348**. The card surface being re-rendered from
+scratch on every animation frame is **T1349**.
+
+`pane-banner.ps1` ALL PASS (132), `banner-resize-repaint.ps1` ALL PASS (15),
+all four floor lanes PASS, P1-P3 ALL PASS, and the eight test-tree audit guards
+a `test\win32` edit puts on the due list re-ran green.
