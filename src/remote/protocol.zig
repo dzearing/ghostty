@@ -1455,6 +1455,16 @@ pub const SessionInfo = struct {
     /// missing field as "not holder-backed" is the safe direction — it can only
     /// ever hold a handoff back, never permit one that would lose a session).
     holder_backed: bool = false,
+    /// The command line of the FOREGROUND program currently running inside the
+    /// session's shell, sampled by the agent (T429) and cleared when the shell
+    /// returns to its prompt. Deliberately SEPARATE from `argv`: `argv` is what
+    /// the session was opened with (and what RELAUNCH re-executes), while this
+    /// is what is running right now — for a plain shell pane `argv` is null and
+    /// this is the only answer to "what is this session doing?" (T545).
+    ///
+    /// Additive/optional (defaults null; older agents omit it, and a reader that
+    /// never heard of it simply shows what it showed before).
+    fg_cmd: ?[]const u8 = null,
 };
 
 /// `SESSIONS` (0x25). Reply to `LIST_SESSIONS`: the full session roster. An empty
@@ -2501,6 +2511,51 @@ test "SessionInfo.holder_backed is additive: absent decodes as legacy" {
     var new = try parseJson(SessionInfo, alloc, "{\"id\":\"a\",\"alive\":true,\"holder_backed\":true}");
     defer new.deinit();
     try testing.expect(new.value.holder_backed);
+}
+
+test "SessionInfo.fg_cmd is additive in both skew directions (T545)" {
+    const alloc = testing.allocator;
+
+    // NEW app ↔ OLD agent: the roster row has no such key. It must parse, and
+    // the field must read as "nothing sampled" — exactly what an idle prompt
+    // reports — so the client renders what it rendered before the field existed.
+    var old = try parseJson(SessionInfo, alloc, "{\"id\":\"a\",\"alive\":true}");
+    defer old.deinit();
+    try testing.expect(old.value.fg_cmd == null);
+
+    // A new agent's row carries it verbatim, alongside (not instead of) `argv`:
+    // the plain-shell case is `argv == null` with a sampled command.
+    var new = try parseJson(
+        SessionInfo,
+        alloc,
+        "{\"id\":\"a\",\"alive\":true,\"fg_cmd\":\"claude --continue\"}",
+    );
+    defer new.deinit();
+    try testing.expectEqualStrings("claude --continue", new.value.fg_cmd.?);
+    try testing.expect(new.value.argv == null);
+
+    // An explicit null (a live session sitting at its prompt) is the same
+    // answer as the absent key, never a parse failure.
+    var idle = try parseJson(SessionInfo, alloc, "{\"id\":\"a\",\"alive\":true,\"fg_cmd\":null}");
+    defer idle.deinit();
+    try testing.expect(idle.value.fg_cmd == null);
+
+    // OLD app ↔ NEW agent: an older client's SessionInfo has no `fg_cmd`
+    // declared, so the unknown key must be ignored rather than rejected. Stand
+    // in for that client with a struct carrying only the fields it knew.
+    const LegacyRow = struct {
+        id: []const u8,
+        alive: bool = true,
+        argv: ?[]const u8 = null,
+    };
+    var legacy = try parseJson(
+        LegacyRow,
+        alloc,
+        "{\"id\":\"a\",\"alive\":true,\"fg_cmd\":\"claude --continue\"}",
+    );
+    defer legacy.deinit();
+    try testing.expectEqualStrings("a", legacy.value.id);
+    try testing.expect(legacy.value.argv == null);
 }
 
 test "negotiate: open_failed capability is the intersection of both HELLOs" {

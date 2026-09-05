@@ -1518,6 +1518,22 @@ $GuardTable = @(
             'test\win32\lib\ChooserCursor.ps1'
         )
     },
+    # What a plain-shell session is RUNNING, in the roster (T545). The sampler
+    # behind it ticks every ~10s and its only other reader is a restart notice,
+    # so a regression here is invisible to every interactive use of the tree —
+    # `+sessions` simply goes back to saying nothing, which is also what it said
+    # before the feature existed.
+    [pscustomobject]@{
+        Name   = 'sessions-running-cmd'
+        Script = 'test\win32\sessions-running-cmd.ps1'
+        Stamp  = 'test\win32\sessions-running-cmd.stamp.json'
+        Covers = @(
+            'src\cli\sessions.zig',
+            'src\remote\agent\pty_child.zig',
+            'src\remote\agent\pty_holder_child.zig',
+            'test\win32\sessions-running-cmd.ps1'
+        )
+    },
     # The activity-state machine (T605): main's own oracle run verbatim under
     # Git Bash against the live win32 hook asset, plus the native-pid arms the
     # oracle cannot see. A hook-script edit that breaks a transition only ever

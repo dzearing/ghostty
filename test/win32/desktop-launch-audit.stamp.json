@@ -1,11 +1,10 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-05T04:33:30-07:00",
-    "commit":  "1c955d9c9",
+    "generated":  "2026-09-05T05:13:55-07:00",
+    "commit":  "82b87b0d2",
     "uncommitted":  [
-                        "test/win32/viewer-close.ps1",
-                        "test/win32/viewer-narrow-pane.ps1"
+                        "test/win32/sessions-running-cmd.ps1"
                     ],
     "files":  {
                   "src/cli/ghostty.zig":  "ef54b501298cfda9306cfb958c1094db24ee30f355b25865656b3e2bc713bcd7",
@@ -223,6 +222,7 @@
                   "test/win32/session-resume-offset.ps1":  "afda54cfd0df1b0163c489618689744e41ac6ad2b24a2e1a506607ad0d5ccb87",
                   "test/win32/sessions-agent-build.ps1":  "4ddcd1913f07dfb9c177312382493b5a0e6f69d126ebec1ce3522c6908299eea",
                   "test/win32/session-snapshot-reattach.ps1":  "6c3c6d9030d67c11058cabac8960d7c3226bc8e6562eddbe10061ebdd8604c99",
+                  "test/win32/sessions-running-cmd.ps1":  "0fbe8e3a08b94d13098847235c9a057242a181d71c4aabacedf8ada3bce02d4c",
                   "test/win32/session-vanished.ps1":  "048fe12b684bc37dc9500ae1838ccd7e15f9ca1a296a7b820bdcf0b7a864c587",
                   "test/win32/share-machine.ps1":  "e73db9d168f63d50d002de3881193d129aacbd47df8015caec17799ff1b79b5b",
                   "test/win32/ship-workflow.ps1":  "8e3a1a7cdc228cd8b9add1b7fc07e95e325f9f346067d119acc8b91ffa9dd818",

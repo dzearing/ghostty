@@ -417,6 +417,12 @@ fn printTable(stdout: *std.Io.Writer, sessions: []const connection.OwnedSession)
         if (s.pinned) try stdout.writeAll("  pinned");
         if (s.cwd) |c| try stdout.print("  cwd={s}", .{c});
         if (s.argv) |a| try stdout.print("  cmd={s}", .{a});
+        // What the shell is running RIGHT NOW, as distinct from what the session
+        // was opened with (T545). For a plain shell pane — the common case —
+        // `argv` is null and this is the only column that says anything about
+        // what the session is doing; both print when both are known, which is
+        // why they are separate labels rather than one `cmd=`.
+        if (s.fg_cmd) |f| try stdout.print("  running={s}", .{f});
         if (s.title) |t| try stdout.print("  title={s}", .{t});
         try stdout.writeAll("\n");
     }
@@ -447,6 +453,11 @@ const JsonRow = struct {
     /// null while attached/dead or from an older agent (additive — T534). This
     /// is the independent oracle the orphan-notification acceptance reads.
     unattached_since: ?i64,
+    /// The foreground command running inside the session's shell right now, or
+    /// null at an idle prompt / from an older agent (additive — T545). Carried
+    /// verbatim alongside `argv` rather than folded into it: `argv` is what
+    /// RELAUNCH re-executes, this is what is running.
+    fg_cmd: ?[]const u8,
 };
 
 fn printJson(alloc: Allocator, stdout: *std.Io.Writer, sessions: []const connection.OwnedSession) !void {
@@ -467,6 +478,7 @@ fn printJson(alloc: Allocator, stdout: *std.Io.Writer, sessions: []const connect
             .pinned = s.pinned,
             .relaunchable = s.relaunchable,
             .unattached_since = s.unattached_since,
+            .fg_cmd = s.fg_cmd,
         };
     }
     const json = try std.json.Stringify.valueAlloc(alloc, rows, .{ .whitespace = .indent_2 });
@@ -545,6 +557,82 @@ test "printTable distinguishes a relaunchable tombstone from a genuinely dead se
     try testing.expect(std.mem.indexOf(u8, row_c, "dead(1)") != null);
 }
 
+test "printTable names what a plain-shell session is running (T545)" {
+    // The case the roster was blank for: a pane nobody opened with `--command`,
+    // so `argv` is null, running something the agent has sampled. Before T545
+    // both rows below printed the same nothing.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const sessions = [_]connection.OwnedSession{
+        .{
+            .id = "aaaa",
+            .alive = true,
+            .exit_code = null,
+            .attached = true,
+            .activity = "busy",
+            .pid = 10,
+            .title = null,
+            .cwd = null,
+            .argv = null,
+            .created_at = 1,
+            .last_activity = 2,
+            .pinned = false,
+            .relaunchable = false,
+            .fg_cmd = "claude --continue",
+        },
+        .{
+            .id = "bbbb",
+            .alive = true,
+            .exit_code = null,
+            .attached = true,
+            .activity = "idle",
+            .pid = 11,
+            .title = null,
+            .cwd = null,
+            .argv = null,
+            .created_at = 3,
+            .last_activity = 4,
+            .pinned = false,
+            .relaunchable = false,
+            .fg_cmd = null,
+        },
+        .{
+            // Opened WITH a command and now running something else: both facts
+            // are true and both are shown, under labels that say which is which.
+            .id = "cccc",
+            .alive = true,
+            .exit_code = null,
+            .attached = true,
+            .activity = "busy",
+            .pid = 12,
+            .title = null,
+            .cwd = null,
+            .argv = "pwsh",
+            .created_at = 5,
+            .last_activity = 6,
+            .pinned = false,
+            .relaunchable = false,
+            .fg_cmd = "zig build test",
+        },
+    };
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+    try printTable(&out.writer, &sessions);
+
+    var lines = std.mem.splitScalar(u8, out.written(), '\n');
+    const row_a = lines.next().?;
+    const row_b = lines.next().?;
+    const row_c = lines.next().?;
+
+    try testing.expect(std.mem.indexOf(u8, row_a, "running=claude --continue") != null);
+    // An idle prompt says nothing rather than an empty column.
+    try testing.expect(std.mem.indexOf(u8, row_b, "running=") == null);
+    try testing.expect(std.mem.indexOf(u8, row_c, "cmd=pwsh") != null);
+    try testing.expect(std.mem.indexOf(u8, row_c, "running=zig build test") != null);
+}
+
 test "printJson emits relaunchable for a reboot-floor tombstone" {
     // A relaunchable tombstone is dead-but-resumable: the row has to carry the
     // flag, because `alive` alone cannot distinguish it from a genuinely-exited
@@ -603,4 +691,68 @@ test "printJson emits relaunchable for a reboot-floor tombstone" {
     try testing.expectEqual(@as(usize, 2), parsed.value.len);
     try testing.expect(parsed.value[0].relaunchable);
     try testing.expect(!parsed.value[1].relaunchable);
+}
+
+test "printJson carries fg_cmd verbatim beside argv (T545)" {
+    // `--json` is the scripted surface, so both facts stay separate keys: a
+    // consumer that wants "what was this opened with" reads `argv`, one that
+    // wants "what is it doing" reads `fg_cmd`, and neither is inferred from the
+    // other. The key is always emitted — null at an idle prompt.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const sessions = [_]connection.OwnedSession{
+        .{
+            .id = "aaaa",
+            .alive = true,
+            .exit_code = null,
+            .attached = true,
+            .activity = "busy",
+            .pid = 10,
+            .title = null,
+            .cwd = null,
+            .argv = null,
+            .created_at = 1,
+            .last_activity = 2,
+            .pinned = false,
+            .relaunchable = false,
+            .fg_cmd = "claude --continue",
+        },
+        .{
+            .id = "bbbb",
+            .alive = true,
+            .exit_code = null,
+            .attached = true,
+            .activity = "idle",
+            .pid = 11,
+            .title = null,
+            .cwd = null,
+            .argv = "pwsh",
+            .created_at = 3,
+            .last_activity = 4,
+            .pinned = false,
+            .relaunchable = false,
+            .fg_cmd = null,
+        },
+    };
+
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    defer out.deinit();
+
+    var arena: ArenaAllocator = .init(alloc);
+    defer arena.deinit();
+    try printJson(arena.allocator(), &out.writer, &sessions);
+
+    const parsed = try std.json.parseFromSlice([]struct {
+        id: []const u8,
+        argv: ?[]const u8,
+        fg_cmd: ?[]const u8,
+    }, alloc, out.written(), .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    try testing.expectEqual(@as(usize, 2), parsed.value.len);
+    try testing.expect(parsed.value[0].argv == null);
+    try testing.expectEqualStrings("claude --continue", parsed.value[0].fg_cmd.?);
+    try testing.expectEqualStrings("pwsh", parsed.value[1].argv.?);
+    try testing.expect(parsed.value[1].fg_cmd == null);
 }

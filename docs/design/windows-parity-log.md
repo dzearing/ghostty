@@ -22406,3 +22406,40 @@ report's own `0xC000041D`.
 
 `test\win32\viewer-narrow-pane.ps1` closes its section F probe window again;
 the comment that had it leave the window open to dodge this crash is gone.
+
+## 2026-09-05 - `+sessions` now says what a plain shell is running (T545)
+
+`ghoztty +sessions` has always had a command column, and for most sessions it
+was empty. It was showing `argv` - what the pane was OPENED with - which only
+exists for a pane started with an explicit `--command`. A pane where the user
+typed their command at the prompt, which is nearly all of them, listed a working
+directory and nothing else, so the roster could not answer the one question you
+ask it: which of these is the one running claude?
+
+The agent has known the answer since T429. `Session.fg_cmd` is sampled off the
+shell's most recent direct child every ~10s and cleared when the shell returns
+to its prompt; its only reader was the restart notice. This puts it in the
+roster: `protocol.SessionInfo.fg_cmd` (additive and optional, like
+`holder_backed` before it - no capability gate), filled by `sendRoster`, owned
+and freed by `connection.OwnedSession`, and printed by `+sessions` as
+`running=<cmd>`.
+
+It is a SECOND column, not a better `cmd=`. `argv` is what `RELAUNCH`
+re-executes, so folding a sampled foreground command into it would bring a
+resumed pane back running `ping` in place of a shell - the reason T429 made them
+separate fields in the first place. The table prints both when both are known,
+under labels that say which is which, and `--json` carries both keys verbatim.
+
+`test\win32\sessions-running-cmd.ps1` is new and scores the CLI's own output
+rather than the agent's `sessions.json`: arm A runs a long `ping` in a
+plain-shell pane and demands `fg_cmd` in `--json` and `running=` in the table,
+arm C demands that the sample did not land in `argv`, and arm B - scored last,
+and only meaningful because A passed - waits for the pane to go back to its
+prompt and demands the roster fall silent again. An empty answer is what a build
+that never sampled would give too, which is why the positive control comes
+first. `-NegativeControl` inverts A and was observed red.
+
+The mac half of this is a null branch: `queryForegroundCommandFn` has a Windows
+arm and a Linux arm and macOS was deferred at T429, so a Mac roster stays blank.
+Filed as T1360 (`seat: mac`). T1359 carries the same value onto the machine
+chooser's session cards, which are the GUI half of this roster.

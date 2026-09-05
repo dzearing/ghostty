@@ -790,6 +790,13 @@ pub const OwnedSession = struct {
     /// Additive/optional — an older agent omits the wire field, which decodes to
     /// false, i.e. "legacy", which can only ever hold an upgrade back.
     holder_backed: bool = false,
+    /// The command line of the foreground program running inside the session's
+    /// shell right now (owned), sampled by the agent and cleared at the prompt
+    /// (T429). Separate from `argv`, which is what the session was OPENED with:
+    /// for a plain shell pane `argv` is null and this is what `+sessions` shows
+    /// (T545). Null at an idle prompt — and from an older agent that never heard
+    /// of the field, which reads the same and is the safe direction.
+    fg_cmd: ?[]const u8 = null,
 };
 
 /// Caller-owned result of a `LIST_SESSIONS` RPC (T10). Every `OwnedSession` + its
@@ -806,6 +813,7 @@ pub const OwnedSessions = struct {
             if (s.title) |t| self.alloc.free(@constCast(t));
             if (s.cwd) |c| self.alloc.free(@constCast(c));
             if (s.argv) |a| self.alloc.free(@constCast(a));
+            if (s.fg_cmd) |f| self.alloc.free(@constCast(f));
         }
         self.alloc.free(self.sessions);
         self.* = undefined;
@@ -1956,6 +1964,7 @@ pub const Connection = struct {
                 if (s.title) |t| self.alloc.free(@constCast(t));
                 if (s.cwd) |c| self.alloc.free(@constCast(c));
                 if (s.argv) |a| self.alloc.free(@constCast(a));
+                if (s.fg_cmd) |f| self.alloc.free(@constCast(f));
             }
             self.alloc.free(out);
         }
@@ -1969,6 +1978,8 @@ pub const Connection = struct {
             const cwd: ?[]const u8 = if (s.cwd) |c| try self.alloc.dupe(u8, c) else null;
             errdefer if (cwd) |c| self.alloc.free(c);
             const argv: ?[]const u8 = if (s.argv) |a| try self.alloc.dupe(u8, a) else null;
+            errdefer if (argv) |a| self.alloc.free(a);
+            const fg_cmd: ?[]const u8 = if (s.fg_cmd) |f| try self.alloc.dupe(u8, f) else null;
             out[i] = .{
                 .id = id,
                 .alive = s.alive,
@@ -1985,6 +1996,7 @@ pub const Connection = struct {
                 .relaunchable = s.relaunchable,
                 .unattached_since = s.unattached_since,
                 .holder_backed = s.holder_backed,
+                .fg_cmd = fg_cmd,
             };
             filled = i + 1;
         }

@@ -1716,6 +1716,11 @@ pub const Server = struct {
                 // dials to re-adopt the session — so there is no second notion
                 // of "holder-backed" that could disagree with adoption.
                 .holder_backed = s.holder_pipe != null,
+                // T545: what the shell is running right now. Already sampled for
+                // the restart notice (T429); the roster is where a user scanning
+                // their sessions can see "this one is running claude" — the only
+                // answer there is for a plain shell pane, whose `argv` is null.
+                .fg_cmd = if (s.fg_cmd) |f| f else null,
             }) catch break;
         }
 

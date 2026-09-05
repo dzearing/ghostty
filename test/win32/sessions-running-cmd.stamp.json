@@ -1,0 +1,16 @@
+{
+    "guard":  "sessions-running-cmd",
+    "script":  "test/win32/sessions-running-cmd.ps1",
+    "generated":  "2026-09-05T05:11:59-07:00",
+    "commit":  "82b87b0d2",
+    "uncommitted":  [
+                        "src/cli/sessions.zig",
+                        "test/win32/sessions-running-cmd.ps1"
+                    ],
+    "files":  {
+                  "src/cli/sessions.zig":  "d9d748c52c062fbead0270383e89db74c5b20e2d5cd4bf087fc2c51c821de7cf",
+                  "src/remote/agent/pty_child.zig":  "2e55ada8aab26cf658019ee02631d8e01f0787fa9192dcbaa8b9166c91192e4f",
+                  "src/remote/agent/pty_holder_child.zig":  "ebbb06e58599341272c6a3bb868bf499062caada88cf8ca42799ffcfbbf082d1",
+                  "test/win32/sessions-running-cmd.ps1":  "0fbe8e3a08b94d13098847235c9a057242a181d71c4aabacedf8ada3bce02d4c"
+              }
+}
