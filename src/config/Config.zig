@@ -7064,6 +7064,20 @@ pub const Keybinds = struct {
                 .{ .performable = true },
             );
 
+            // ctrl+insert copies, the classic Windows chord. The generic
+            // non-darwin block above binds the same action with a plain
+            // put(), and copy_to_clipboard reports false when there is no
+            // selection — so without the flag the chord was swallowed whole
+            // whenever nothing was selected: nothing copied, and the pane
+            // never saw the key either. Performable for the same reason as
+            // ctrl+c above.
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .physical = .insert }, .mods = .{ .ctrl = true } },
+                .{ .copy_to_clipboard = .mixed },
+                .{ .performable = true },
+            );
+
             // Clear screen + scrollback (mac: cmd+k). Performable: on the
             // alternate screen the action reports unconsumed, so ctrl+k
             // falls through to full-screen TUIs; a primary-screen shell
@@ -10927,6 +10941,33 @@ test "default keybinds: windows shift+insert pastes from the standard clipboard"
 
     const leaf = entry.value_ptr.leaf;
     try testing.expectEqual(inputpkg.Binding.Action.paste_from_clipboard, leaf.action);
+    try testing.expect(leaf.flags.performable);
+}
+
+// T522: ctrl+insert is the classic Windows copy chord and must be
+// performable. The generic non-darwin default binds it with a plain put(),
+// and copy_to_clipboard reports false with no selection — so the chord was
+// swallowed whole whenever nothing was selected: nothing copied, and the
+// pane never saw the key either.
+test "default keybinds: windows ctrl+insert copy is performable" {
+    if (comptime builtin.target.os.tag != .windows) return error.SkipZigTest;
+
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var cfg = try Config.default(alloc);
+    defer cfg.deinit();
+
+    const entry = cfg.keybind.set.get(.{
+        .key = .{ .physical = .insert },
+        .mods = .{ .ctrl = true },
+    }) orelse return error.TestExpectedBinding;
+
+    const leaf = entry.value_ptr.leaf;
+    try testing.expectEqual(
+        inputpkg.Binding.Action{ .copy_to_clipboard = .mixed },
+        leaf.action,
+    );
     try testing.expect(leaf.flags.performable);
 }
 

@@ -7,6 +7,13 @@
 # outright - no paste, and the pane never saw the key. The Windows mirror
 # block now re-binds it to paste_from_clipboard, performable.
 #
+# T522 extends it to ctrl+insert (sections G/H), the same defect on the COPY
+# side: the generic non-darwin default binds it with a plain put(), and
+# copy_to_clipboard declines when nothing is selected, so the chord was
+# swallowed whole in that case - nothing copied, and the pane never saw the
+# key. G is the no-selection fall-through; H is the control that a selection
+# still copies.
+#
 # Why this matters: Claude Code (and other TUIs) read images off the system
 # clipboard themselves when they receive ^V. Before T154 the Windows
 # ctrl-mirror block bound ctrl+v with a plain put() and no `performable`
@@ -86,6 +93,16 @@ function Set-TextClipboard([string]$text) {
         } catch { Start-Sleep -Milliseconds 200 }
     }
     return $false
+}
+
+function Get-TextClipboard {
+    for ($t = 0; $t -lt 10; $t++) {
+        try {
+            if (-not [System.Windows.Forms.Clipboard]::ContainsText()) { return '' }
+            return [string][System.Windows.Forms.Clipboard]::GetText()
+        } catch { Start-Sleep -Milliseconds 200 }
+    }
+    return ''
 }
 
 # An IMAGE with NO text format at all - this is the screenshot case that
@@ -314,6 +331,47 @@ if (-not (Start-Probe 'F')) {
     Assert ($code -ne -1) "F: shift+insert with an image-only clipboard reaches the pane instead of being swallowed (probe char=$code)"
     Stop-Probe
 }
+
+# --- G: no selection + ctrl+insert -> reaches the pane (T522) -----------------
+# The classic Windows copy chord. The generic non-darwin default binds it with
+# a plain put(), and copy_to_clipboard declines when there is no selection - so
+# pre-fix the chord was swallowed whole and the probe never printed at all
+# (code=-1). Performable makes it fall through instead.
+Set-TextClipboard 'ZQ_G_UNTOUCHED' | Out-Null
+if (-not (Start-Probe 'G')) {
+    Assert $false 'G: probe became ready'
+} else {
+    $sent = Send-TestKeys -Window $top -Target $surface -Modifiers ctrl -Key insert
+    Assert $sent 'G: ctrl+insert injected'
+    $tail = Wait-Text 'PROBE_G_CHAR=(\d+)' 10
+    $code = if ($tail -match 'PROBE_G_CHAR=(\d+)') { [int]$Matches[1] } else { -1 }
+    Assert ($code -ne -1) "G: ctrl+insert with NO selection reaches the pane instead of being swallowed (probe char=$code)"
+    Assert ((Get-TextClipboard) -eq 'ZQ_G_UNTOUCHED') 'G: a declined ctrl+insert leaves the clipboard alone'
+    Stop-Probe
+}
+
+# --- H: with a selection + ctrl+insert -> still copies (T522) -----------------
+# The other half of performable: when the action CAN perform, the chord is
+# consumed and the selection lands on the clipboard. ctrl+shift+a is
+# select_all, so the copied text contains the token echoed just above it.
+Set-TextClipboard 'ZQ_H_UNTOUCHED' | Out-Null
+& $Exe +send-keys --target=$script:pane 'cls' Enter | Out-Null
+Start-Sleep -Milliseconds 800
+& $Exe +send-keys --target=$script:pane 'echo ZQ_COPY_TOKEN' Enter | Out-Null
+$tail = Wait-Text 'ZQ_COPY_TOKEN' 10
+Assert ($null -ne $tail) 'H: the token is on screen before the copy'
+$sent = Send-TestKeys -Window $top -Target $surface -Modifiers ctrl,shift -Key A
+Assert $sent 'H: ctrl+shift+a (select all) injected'
+Start-Sleep -Milliseconds 600
+$sent = Send-TestKeys -Window $top -Target $surface -Modifiers ctrl -Key insert
+Assert $sent 'H: ctrl+insert injected'
+$copied = ''
+for ($t = 0; $t -lt 25; $t++) {
+    Start-Sleep -Milliseconds 200
+    $copied = Get-TextClipboard
+    if ($copied -match 'ZQ_COPY_TOKEN') { break }
+}
+Assert ($copied -match 'ZQ_COPY_TOKEN') "H: ctrl+insert with a selection copies it to the clipboard (clipboard=$($copied.Length) chars)"
 
 Assert (-not ($app.Process -and $app.Process.HasExited)) 'no crash at end of run'
 
