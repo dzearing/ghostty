@@ -1993,6 +1993,24 @@ $GuardTable = @(
             'test\win32\parity-tasks-seat.ps1'
         )
     },
+    # The decisions CLI (T566), for the same reason as the row above: nothing
+    # in the zig lanes or the P1-P3 floor executes a line of
+    # `scripts\parity-decisions.ps1`, and its failure mode is not a red test
+    # but a decision the USER reads - the one audience that cannot check it
+    # against the code. `scripts\parity-tasks.ps1` is deliberately NOT covered
+    # here even though it carries the relay: the `gate-negatives` row below
+    # already fires on every edit to it, and its DECISION PROBLEMS registry row
+    # points at this harness, so the relay has a guard without a third harness
+    # falling due on every tracker change.
+    [pscustomobject]@{
+        Name   = 'parity-decisions'
+        Script = 'test\win32\parity-decisions.ps1'
+        Stamp  = 'test\win32\parity-decisions.stamp.json'
+        Covers = @(
+            'scripts\parity-decisions.ps1',
+            'test\win32\parity-decisions.ps1'
+        )
+    },
     # The two gates every turn runs, held to the rule that a gate must be
     # SHOWN to fail (T1133). Deliberately overlapping the `go-loop` and
     # `parity-tasks` rows above: those two ask "does this script still work?",

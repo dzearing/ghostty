@@ -1601,6 +1601,31 @@ switch ($Command) {
             }
         }
 
+        # T566: the decisions filed beside these tasks. They had no gate of
+        # their own, so a decision with no task link, a status outside
+        # open/resolved, or an option list with no Pros/Cons was found only when
+        # a human noticed the Activity feed rendering it wrong - and the reader
+        # of that feed is the user we are asking to make the call. Relayed here
+        # rather than left as a hand-run verb because this is the check every
+        # tracker commit already passes through, and a decision is filed in the
+        # same turn as the task it hangs off. Same fixture arrangement as the
+        # two checks above: skipped for -TaskDir runs unless
+        # GHOZTTY_DECISION_DIR points it at a fixture directory.
+        if (-not $TaskDirGiven -or $env:GHOZTTY_DECISION_DIR) {
+            $decScript = Join-Path $PSScriptRoot 'parity-decisions.ps1'
+            if (Test-Path -LiteralPath $decScript) {
+                $decArgs = @('validate', '-Quiet', '-TaskDir', $TaskDir)
+                if ($env:GHOZTTY_DECISION_DIR) { $decArgs += @('-DecisionDir', $env:GHOZTTY_DECISION_DIR) }
+                $decOut = & powershell -NoProfile -ExecutionPolicy Bypass -File $decScript @decArgs 2>&1 | Out-String
+                if ($LASTEXITCODE -ne 0) {
+                    Write-Host "DECISION PROBLEMS: a decision file is malformed and will render wrong in the Activity feed (T566)"
+                    foreach ($line in ($decOut -split "`r?`n")) { if ($line.Trim()) { Write-Host ("  " + $line.TrimEnd()) } }
+                    Write-Host "  (ask it directly: scripts\parity-decisions.ps1 validate)"
+                    $problems++
+                }
+            }
+        }
+
         # T847: stranded work - paths that were already dirty when this turn
         # claimed the loop (snapshotted by go-loop-exec.ps1 claim, which owns
         # the rationale). Failing here is what makes the claim-time report a

@@ -22836,3 +22836,40 @@ demonstrably able to fail. Registered in `scripts\guard-due.ps1` as
 standing harness audits (isolation-meta, launch-preflight, verdict-exit,
 cleanslate, stderr-capture, body-complete, desktop-launch) pass over the new
 script and were re-stamped.
+
+## 2026-09-05 - The decision cards the user reads are checked before they reach the feed (T566)
+
+A decision card is how the loop hands the user a call it made and might have
+made wrong: the dashboard shows the open ones at the top of the Activity feed,
+and answering one folds the answer back into the linked task. Everything about
+that arrangement was unchecked. A card naming a task that does not exist, a
+status outside open/resolved, an option list with no Pros and Cons, a
+recommendation flagged on two options or on none - none of it failed anything.
+The task files beside them have been gated since the day they became files;
+the decisions had nothing, so the first reader who could notice a malformed one
+was the person being asked to decide.
+
+`scripts\parity-decisions.ps1 validate` now applies those rules to the whole
+directory, and `parity-tasks.ps1 validate` - the gate every tracker commit
+already passes through - relays it as `DECISION PROBLEMS`, so this is the
+loop's check rather than a verb somebody remembers. The structural rules
+(frontmatter, id, title, status, kind, created, the task link, option keys and
+labels, an open decision with nothing to choose between, a resolved one whose
+answer names no option it offered) apply to every file. The option-format rules
+from the user's 2026-08-05 directive - Pros AND Cons on every option, exactly
+one "(Recommended)" and it listed first - apply to every decision minted since;
+the thirteen filed before it are reported as `LEGACY OPTIONS` and pass, because
+rewriting a resolved decision to satisfy a rule that postdates it would falsify
+the record. They are still held to the structural rules.
+
+Validation: `test\win32\parity-decisions.ps1` - `ALL PASS (38 assertions)` -
+drives every rule red against its own fixture, proves the grandfather clause in
+both directions, round-trips what `new` and `resolve` write through the gate
+they now have to pass, and drives the RELAY red rather than only the verb; its
+`-NegativeControl` scores exactly one failure. `DECISION PROBLEMS` is declared
+and demonstrated in `test\win32\gate-negatives.ps1` (`ALL PASS (58
+assertions)`), registered in `scripts\guard-due.ps1` as `parity-decisions`, and
+the real directory validates green at 92 of 92. Floor: all four zig lanes PASS,
+`parity-tasks-seat.ps1` ALL PASS, ipc-p1/p2/p3 ALL PASS, and the seven standing
+harness audits pass over the new script. Filed T1376: `new` can still mint a
+decision this validate rejects, so the two ends do not yet agree.

@@ -1,0 +1,14 @@
+{
+    "guard":  "parity-decisions",
+    "script":  "test/win32/parity-decisions.ps1",
+    "generated":  "2026-09-05T14:28:37-07:00",
+    "commit":  "0cc730f7f",
+    "uncommitted":  [
+                        "scripts/parity-decisions.ps1",
+                        "test/win32/parity-decisions.ps1"
+                    ],
+    "files":  {
+                  "scripts/parity-decisions.ps1":  "2475b9be8aa438a4f5b0cbe1f977253e14a669de074547c869246b83b44d5030",
+                  "test/win32/parity-decisions.ps1":  "05039eff3fcb43d262e34894717a2fc200e98d6e165e29a9eb17618ba54bd397"
+              }
+}

@@ -39,11 +39,29 @@
   scripts\parity-decisions.ps1 list -Status open
   scripts\parity-decisions.ps1 show D1
   scripts\parity-decisions.ps1 resolve D1 -Answer 2 -Note "do the full merge"
+
+.EXAMPLE
+  scripts\parity-decisions.ps1 validate
+
+  T566. The task files have had a gate since the day they became files
+  (parity-tasks.ps1 validate, run before every tracker commit); the decisions
+  beside them had none, so a decision with no task link, a status outside
+  open/resolved, an option list with no Pros/Cons or a recommendation flag on
+  none of its options was only ever found by a human noticing the Activity feed
+  rendering it wrong. This applies the same rules to the whole directory, and
+  parity-tasks.ps1 validate relays it, so it runs on the same gate.
+
+  The option-format rules (Pros/Cons on every option, exactly one
+  "(Recommended)" and it listed first) date from the user's 2026-08-05
+  directive. Decisions minted before it are reported as LEGACY OPTIONS and do
+  not fail the run - rewriting a resolved decision to satisfy a rule that did
+  not exist when it was filed would falsify the record. Every decision filed
+  since is held to them.
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('list', 'show', 'new', 'resolve')]
+    [ValidateSet('list', 'show', 'new', 'resolve', 'validate')]
     [string]$Command,
 
     [Parameter(Position = 1)]
@@ -67,6 +85,11 @@ param(
     # The chosen option: its 1-based number, or its key (o1, o2, ...).
     [string]$Answer,
     [string]$Note,
+
+    # `validate` prints only the problem lines, no summary and no ALL PASS.
+    # parity-tasks.ps1's validate relays those lines under its own headline, so
+    # a second verdict line inside them would read as a second gate's answer.
+    [switch]$Quiet,
 
     # Escape hatch so tests can drive a fixture directory.
     [string]$DecisionDir,
@@ -352,5 +375,149 @@ switch ($Command) {
             }
         }
         Write-Host "resolved $($d.Id): $answerLabel"
+    }
+
+    'validate' {
+        # T566. The same job parity-tasks.ps1 validate does for the task files,
+        # for the decisions beside them. A malformed decision has no red test to
+        # find it: it renders wrong in the Activity feed, where the only reader
+        # is the user we are asking to make the call.
+        #
+        # The option-format rules arrived with the user's 2026-08-05 directive,
+        # so a decision minted before it is reported as LEGACY OPTIONS rather
+        # than failed - see the .EXAMPLE above for why we do not rewrite them.
+        $LegacyBefore = '2026-08-06'
+        $problems = 0
+        $legacy = 0
+        $count = 0
+
+        foreach ($f in (Get-ChildItem -LiteralPath $DecisionDir -Filter '*.md' -File -ErrorAction SilentlyContinue |
+                Sort-Object { [int]([regex]::Match($_.Name, '\d+').Value) })) {
+            $name = $f.Name
+            $stem = [System.IO.Path]::GetFileNameWithoutExtension($name)
+            if ($stem -notmatch '^D\d+$') {
+                Write-Host ("ODD FILENAME: {0} is not D<n>.md, so no verb can address it" -f $name)
+                $problems++
+                continue
+            }
+            $count++
+
+            $text = Read-Text $f.FullName
+            $lines = @($text -split "`r?`n")
+            $fmEnd = -1
+            if ($lines.Count -gt 0 -and $lines[0].Trim() -eq '---') {
+                for ($i = 1; $i -lt $lines.Count; $i++) { if ($lines[$i].Trim() -eq '---') { $fmEnd = $i; break } }
+            }
+            if ($fmEnd -lt 0) {
+                Write-Host ("BAD FRONTMATTER: {0} has no --- delimited frontmatter block" -f $name)
+                $problems++
+                continue
+            }
+
+            $d = ConvertFrom-DecisionFile $f.FullName
+
+            # The declared id is read straight out of the frontmatter here, not
+            # from $d: every other verb takes a decision's identity from its
+            # FILENAME (which is what `show D12` resolves and what the dashboard
+            # links), so the parser never looks at the `id:` line - and a file
+            # whose two ids disagree is exactly what that arrangement cannot
+            # notice on its own.
+            $declaredId = ''
+            for ($i = 1; $i -lt $fmEnd; $i++) {
+                if ($lines[$i] -match '^id:\s*(.+)$') { $declaredId = $Matches[1].Trim().Trim('"'); break }
+            }
+            if ($declaredId -ne $stem) {
+                Write-Host ("ID MISMATCH: {0} declares id={1}" -f $name, $(if ($declaredId) { $declaredId } else { '<none>' }))
+                $problems++
+            }
+            if (-not $d.Title) { Write-Host ("NO TITLE: {0}" -f $name); $problems++ }
+            if ($d.Status -ne 'open' -and $d.Status -ne 'resolved') {
+                Write-Host ("ODD STATUS: {0} = '{1}' (want open or resolved)" -f $stem, $d.Status); $problems++
+            }
+            if ($d.Kind -notin @('assumption', 'question', 'blocker')) {
+                Write-Host ("ODD KIND: {0} = '{1}' (want assumption, question or blocker)" -f $stem, $d.Kind); $problems++
+            }
+            if (-not $d.Created) {
+                Write-Host ("NO CREATED: {0} carries no created timestamp" -f $stem); $problems++
+            }
+
+            # The task link is the whole delivery mechanism: resolve folds the
+            # answer into the linked task, so a decision naming none can be
+            # answered and the answer reaches nobody.
+            if (-not $d.Task) {
+                Write-Host ("NO TASK LINK: {0} names no task, so its answer has nowhere to be folded back into" -f $stem)
+                $problems++
+            }
+            elseif (-not (Test-Path -LiteralPath (Join-Path $TaskDir ("$($d.Task).md")))) {
+                Write-Host ("DANGLING TASK: {0} -> {1} (no such task file)" -f $stem, $d.Task); $problems++
+            }
+
+            $opts = @($d.Options)
+            for ($i = 0; $i -lt $opts.Count; $i++) {
+                $want = "o$($i + 1)"
+                if ($opts[$i].key -ne $want) {
+                    Write-Host ("ODD OPTION KEYS: {0} option {1} is keyed '{2}' (want {3}; resolve -Answer takes these)" -f $stem, ($i + 1), $opts[$i].key, $want)
+                    $problems++
+                }
+                if (-not $opts[$i].label) {
+                    Write-Host ("NO OPTION LABEL: {0} option {1} has no label" -f $stem, ($i + 1)); $problems++
+                }
+            }
+            if ($opts.Count -eq 0 -and $d.Status -eq 'open') {
+                Write-Host ("NO OPTIONS: {0} is open with nothing to choose between" -f $stem); $problems++
+            }
+
+            if ($d.Status -eq 'resolved') {
+                if (-not $d.Answer -and -not $d.Note) {
+                    Write-Host ("RESOLVED WITHOUT ANSWER: {0} is resolved but records neither an answer nor a note" -f $stem)
+                    $problems++
+                }
+                if ($d.Answer -and -not @($opts | Where-Object { $_.key -eq $d.Answer })) {
+                    Write-Host ("UNKNOWN ANSWER: {0} answer='{1}' names no option it offers" -f $stem, $d.Answer)
+                    $problems++
+                }
+            }
+
+            # The 2026-08-05 option-format rules.
+            $isLegacy = ($d.Created -and [string]::CompareOrdinal($d.Created, $LegacyBefore) -lt 0)
+            $styleProblems = @()
+            if ($opts.Count -gt 0) {
+                $rec = @($opts | Where-Object { $_.label -match '(?i)\(recommended\)\s*$' })
+                if ($opts.Count -gt 1 -and $rec.Count -ne 1) {
+                    $styleProblems += ("REC COUNT: {0} flags {1} option(s) (Recommended) - want exactly 1 (go.md step 5b)" -f $stem, $rec.Count)
+                }
+                elseif ($rec.Count -eq 1 -and $opts[0].key -ne $rec[0].key) {
+                    $styleProblems += ("REC NOT FIRST: {0} lists the recommended option as {1} - it belongs first" -f $stem, $rec[0].key)
+                }
+                foreach ($o in $opts) {
+                    if (@($o.pros).Count -eq 0) {
+                        $styleProblems += ("NO PROS: {0} option {1} lists no Pros - an option without both is a quiz, not a choice" -f $stem, $o.key)
+                    }
+                    if (@($o.cons).Count -eq 0) {
+                        $styleProblems += ("NO CONS: {0} option {1} lists no Cons - an option without both is a quiz, not a choice" -f $stem, $o.key)
+                    }
+                }
+            }
+            if ($styleProblems.Count -gt 0) {
+                if ($isLegacy) {
+                    Write-Host ("LEGACY OPTIONS: {0} predates the 2026-08-05 option format ({1} issue(s)) - reported, not failed" -f $stem, $styleProblems.Count)
+                    $legacy++
+                } else {
+                    foreach ($line in $styleProblems) { Write-Host $line; $problems++ }
+                }
+            }
+        }
+
+        if (-not $Quiet) {
+            Write-Host ""
+            if ($legacy -gt 0) { Write-Host ("{0} decision(s) predate the option format and were not failed" -f $legacy) }
+            if ($problems -eq 0) {
+                Write-Host ("ALL PASS ({0} decisions)" -f $count)
+            } else {
+                Write-Host ("{0} PROBLEM(S) across {1} decisions" -f $problems, $count)
+            }
+        }
+        if ($problems -gt 0) { exit 1 }
+        exit 0
     }
 }

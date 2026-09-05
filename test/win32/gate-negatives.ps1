@@ -180,6 +180,14 @@ $Registry = @(
     [pscustomobject]@{ Label = 'CONTROL CHARACTERS'; Kind = 'gate'
         Demo = 'test\win32\control-char-scan.ps1'; Marker = 'CONTROL CHARACTERS'
     }
+    # T566. A malformed decision file, relayed from parity-decisions.ps1 under
+    # validate's own headline (same shape as CONTROL CHARACTERS above). Its
+    # demonstration is the decisions harness, whose section E drives THIS relay
+    # red rather than only the underlying verb - a gate that is only shown to
+    # work when called directly is not shown to work where the turn calls it.
+    [pscustomobject]@{ Label = 'DECISION PROBLEMS'; Kind = 'gate'
+        Demo = 'test\win32\parity-decisions.ps1'; Marker = 'DECISION PROBLEMS'
+    }
     [pscustomobject]@{ Label = 'GUARD DUE CHECK SKIPPED'; Kind = 'hatch'; Demo = 'test\win32\guard-due.ps1'
         Marker = 'GUARD DUE CHECK SKIPPED'
     }
