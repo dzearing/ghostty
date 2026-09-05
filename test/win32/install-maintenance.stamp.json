@@ -1,14 +1,15 @@
 {
     "guard":  "install-maintenance",
     "script":  "test/win32/install-maintenance.ps1",
-    "generated":  "2026-09-05T08:49:32-07:00",
-    "commit":  "baa842241",
+    "generated":  "2026-09-05T09:21:31-07:00",
+    "commit":  "2686b4fa5",
     "uncommitted":  [
-                        "dist/windows-installer/build-msi.sh"
+                        "dist/windows-installer/build-msi.sh",
+                        "test/win32/install-maintenance.ps1"
                     ],
     "files":  {
-                  "dist/windows-installer/build-msi.sh":  "26878b1ff8cfb24dbd1417f5cc966eb8898bcf9e03e02d8de7e59271f78de48a",
+                  "dist/windows-installer/build-msi.sh":  "85cde0f993b27a5b3ae50761e52aa4958289214ce4ce589acf17a14d8f8397f3",
                   "src/apprt/win32/install_maintenance.zig":  "9db551f8aea6218156bd88adc93dc5a87a6e544f0568949d9c562db99ac13fba",
-                  "test/win32/install-maintenance.ps1":  "db2c31ab1fd5febe1fa61d2aada2f953a8b027c96b6fca56613b90c1b3b2488b"
+                  "test/win32/install-maintenance.ps1":  "7a22ad681f24a080536f1eb326ba65140331068b6db449e583ebfc85ede7c451"
               }
 }

@@ -127,13 +127,18 @@ $checks = [ordered]@{
         { param($t) $t.msi -match '<CustomAction Id="PrepareInstallDir"' -and
                     $t.msi -match 'ExeCommand="--install-prepare"' }
     'A11 it runs BEFORE InstallValidate, where the holders would be chosen' =
-        { param($t) $t.msi -match '<Custom Action="PrepareInstallDir" Before="InstallValidate">' }
+        { param($t)
+          # An explicit number rather than Before="InstallValidate" since T1367:
+          # wixl orders two customs anchored on the same standard action by hash
+          # iteration, and this one has to follow the Repair/Cancel prompt.
+          $m = ([regex]'<Custom Action="PrepareInstallDir" Sequence="(\d+)"').Match($t.msi)
+          $m.Success -and [int]$m.Groups[1].Value -lt 1400 }
     'A12 it is immediate and ignores its exit code' =
         { param($t)
           $ca = ([regex]'(?s)<CustomAction Id="PrepareInstallDir".*?/>').Match($t.msi)
           $ca.Success -and $ca.Value -match 'Execute="immediate"' -and $ca.Value -match 'Return="ignore"' }
     'A13 it only fires when there is an existing install in the way' =
-        { param($t) $t.msi -match 'Before="InstallValidate">Installed OR OLDERVERSIONFOUND</Custom>' }
+        { param($t) $t.msi -match '<Custom Action="PrepareInstallDir" Sequence="\d+">Installed OR OLDERVERSIONFOUND</Custom>' }
     'A14 the build reads the action back out of the compiled package' =
         { param($t) $t.msi -match 'CustomAction table has no PrepareInstallDir row' }
     'A15 the read-back rejects a deferred or asynchronous prepare step' =
@@ -164,13 +169,13 @@ $mutations = [ordered]@{
     'A10 the MSI carries the prepare custom action' =
         @{ Key = 'msi'; Find = 'ExeCommand="--install-prepare"'; Replace = 'ExeCommand=""' }
     'A11 it runs BEFORE InstallValidate, where the holders would be chosen' =
-        @{ Key = 'msi'; Find = '<Custom Action="PrepareInstallDir" Before="InstallValidate">'
-           Replace = '<Custom Action="PrepareInstallDir" After="InstallValidate">' }
+        @{ Key = 'msi'; Find = '<Custom Action="PrepareInstallDir" Sequence="1040">'
+           Replace = '<Custom Action="PrepareInstallDir" Sequence="1450">' }
     'A12 it is immediate and ignores its exit code' =
         @{ Key = 'msi'; Find = 'Return="ignore"'; Replace = 'Return="check"' }
     'A13 it only fires when there is an existing install in the way' =
-        @{ Key = 'msi'; Find = 'Before="InstallValidate">Installed OR OLDERVERSIONFOUND</Custom>'
-           Replace = 'Before="InstallValidate">1</Custom>' }
+        @{ Key = 'msi'; Find = 'Sequence="1040">Installed OR OLDERVERSIONFOUND</Custom>'
+           Replace = 'Sequence="1040">1</Custom>' }
     'A14 the build reads the action back out of the compiled package' =
         @{ Key = 'msi'; Find = 'CustomAction table has no PrepareInstallDir row'; Replace = 'warning only' }
     'A15 the read-back rejects a deferred or asynchronous prepare step' =

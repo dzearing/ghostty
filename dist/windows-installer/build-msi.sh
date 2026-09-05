@@ -652,18 +652,39 @@ template = """<?xml version="1.0" encoding="utf-8"?>
 
     <InstallExecuteSequence>
       <RemoveExistingProducts After="InstallValidate"/>
-      <Custom Action="SetPrepareInstallDirCmd" Before="PrepareInstallDir"/>
-      <Custom Action="PrepareInstallDir" Before="InstallValidate">Installed OR OLDERVERSIONFOUND</Custom>
-      <Custom Action="SetRepairMode" Before="CostFinalize">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
-      <!-- Before CostFinalize, not After="SetRepairMode": wixl resolves an
-           After that names a CUSTOM action by appending to the end of the
-           sequence, so this landed at 6605 - long past the 1000 where feature
-           states are decided - and the build's own check caught it. Both arms
-           anchor on the standard action instead; they set independent
-           properties, so their order relative to each other does not matter. -->
-      <Custom Action="SetRepairModeFlags" Before="CostFinalize">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
-      <Custom Action="SetMaintenancePromptCmd" After="CostFinalize">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
-      <Custom Action="MaintenancePrompt" After="SetMaintenancePromptCmd">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
+      <!-- T1367: every immediate action in this band carries an explicit
+           Sequence number, and none of them anchors on another CUSTOM action.
+
+           Why, from wixl's own sequencer (msitools tools/wixl): Before="X"
+           records "X depends on me" and After="X" records "I depend on X",
+           then the table is topologically sorted and an unnumbered action is
+           given the running counter + 1 at the point it is emitted. Only
+           actions with NO incoming dependency are used as entry points for
+           that sort, and the custom ones are visited last - so an action
+           reachable only through an After= is emitted after the final standard
+           action and lands past InstallFinalize at 6600. That is the 6605
+           T1364 saw for SetRepairModeFlags, and it was equally true of the
+           Repair/Cancel question next door: asked once the install had already
+           run, with a Cancel that had nothing left to cancel.
+
+           Anchoring on a standard action with Before= happens to avoid it, but
+           it says nothing about the order of two customs that anchor on the
+           SAME standard action - that falls out of hash iteration order. The
+           prompt has to be asked before PrepareInstallDir renames
+           ghoztty-agent.exe aside, or a Cancel leaves the existing install
+           without one. So the numbers are written down rather than derived.
+
+           The band is CostFinalize (1000, where INSTALLDIR finally resolves)
+           to InstallValidate (1400, where the Restart Manager picks the
+           processes to shut down and the first bytes get committed to). The
+           two arming rows sit just below CostFinalize because that is where
+           feature states are decided. -->
+      <Custom Action="SetRepairMode" Sequence="990">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
+      <Custom Action="SetRepairModeFlags" Sequence="991">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
+      <Custom Action="SetMaintenancePromptCmd" Sequence="1010">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
+      <Custom Action="MaintenancePrompt" Sequence="1020">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
+      <Custom Action="SetPrepareInstallDirCmd" Sequence="1030"/>
+      <Custom Action="PrepareInstallDir" Sequence="1040">Installed OR OLDERVERSIONFOUND</Custom>
       <Custom Action="SetLaunchAppCmd" Before="LaunchApp"/>
       <Custom Action="LaunchApp" After="InstallFinalize">NOT Installed AND NOT OLDERVERSIONFOUND AND UILevel &gt; 3 AND LAUNCHAPP = "1"</Custom>
       <Custom Action="SetRestartAppCmd" Before="RestartApp"/>
@@ -1038,7 +1059,7 @@ for action, prop, value in (
             errs.append(f"{action} value is {ca[action][3]!r}, expected {value!r}")
 
 for action in ("MaintenancePrompt", "SetMaintenancePromptCmd", "SetRepairMode",
-               "SetRepairModeFlags", "CostFinalize"):
+               "SetRepairModeFlags", "CostFinalize", "InstallValidate"):
     if action not in seq:
         errs.append(f"InstallExecuteSequence has no {action} row")
 if not errs:
@@ -1047,12 +1068,27 @@ if not errs:
     n_arm_flags = int(seq["SetRepairModeFlags"][2])
     n_ask = int(seq["MaintenancePrompt"][2])
     n_ask_set = int(seq["SetMaintenancePromptCmd"][2])
+    n_validate = int(seq["InstallValidate"][2])
     if n_arm >= n_cost or n_arm_flags >= n_cost:
         errs.append(f"REINSTALL is armed at {n_arm}/{n_arm_flags}, not before CostFinalize at {n_cost} - feature states are decided there, so Repair would do nothing")
     if n_ask <= n_cost:
         errs.append(f"MaintenancePrompt is sequenced at {n_ask}, before CostFinalize at {n_cost} - INSTALLDIR does not resolve until then, so there would be no exe to run")
+    # T1367: the upper bound, which is the half that was missing. "after
+    # CostFinalize" is satisfied by the END of the table, which is exactly
+    # where wixl put this action when it anchored on another custom one - so
+    # the question was asked once everything had been written and Cancel
+    # cancelled nothing.
+    if n_ask >= n_validate:
+        errs.append(f"MaintenancePrompt is sequenced at {n_ask}, at or after InstallValidate at {n_validate} - the question would be asked after the install had already run, so Cancel would have nothing left to cancel")
     if n_ask_set >= n_ask:
         errs.append(f"SetMaintenancePromptCmd is sequenced at {n_ask_set}, not before MaintenancePrompt at {n_ask}")
+    # And ahead of the prepare step (T1207), which renames ghoztty-agent.exe
+    # aside: a Cancel answered after that has already left the existing install
+    # without an agent image.
+    if "PrepareInstallDir" in seq:
+        n_prep = int(seq["PrepareInstallDir"][2])
+        if n_ask >= n_prep:
+            errs.append(f"MaintenancePrompt is sequenced at {n_ask}, not before PrepareInstallDir at {n_prep} - that step renames ghoztty-agent.exe aside, so a Cancel would leave the existing install without one")
     # The gate. UILevel is the one that keeps the in-app updater's /qb-! install
     # from stopping on a modal dialog nobody is there to answer.
     for action in ("MaintenancePrompt", "SetMaintenancePromptCmd", "SetRepairMode", "SetRepairModeFlags"):
@@ -1083,14 +1119,17 @@ if errs:
     for e in errs:
         print(f"error: {e}", file=sys.stderr)
     sys.exit(1)
-print("already-installed ok: REINSTALL armed before CostFinalize, MaintenancePrompt (immediate, check) after it")
+print("already-installed ok: REINSTALL armed before CostFinalize, MaintenancePrompt (immediate, check) between it and InstallValidate")
 # The resolved numbers, said out loud (T1367): what wixl DID with each anchor is
 # the evidence, and reading them back only from an assertion means the numbers
 # nobody asserted on are invisible.
-print("  sequence: CostFinalize={} SetRepairMode={} SetRepairModeFlags={} SetMaintenancePromptCmd={} MaintenancePrompt={} InstallValidate={} InstallFinalize={}".format(
+print("  sequence: CostFinalize={} SetRepairMode={} SetRepairModeFlags={} SetMaintenancePromptCmd={} MaintenancePrompt={} SetPrepareInstallDirCmd={} PrepareInstallDir={} InstallValidate={} RemoveExistingProducts={} InstallFinalize={}".format(
     seq["CostFinalize"][2], seq["SetRepairMode"][2], seq["SetRepairModeFlags"][2],
     seq["SetMaintenancePromptCmd"][2], seq["MaintenancePrompt"][2],
+    seq["SetPrepareInstallDirCmd"][2] if "SetPrepareInstallDirCmd" in seq else "?",
+    seq["PrepareInstallDir"][2] if "PrepareInstallDir" in seq else "?",
     seq["InstallValidate"][2] if "InstallValidate" in seq else "?",
+    seq["RemoveExistingProducts"][2] if "RemoveExistingProducts" in seq else "?",
     seq["InstallFinalize"][2] if "InstallFinalize" in seq else "?"))
 print("version bands ok: older / same / newer are three different answers")
 PYEOF

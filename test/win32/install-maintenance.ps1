@@ -26,8 +26,9 @@
 #
 #   A  the shipped shape: the flag, the two exit codes, the relabelled buttons,
 #      the early-exit hook in main, the lane wiring, the MSI's four custom
-#      actions with their conditions and their positions either side of
-#      CostFinalize, and the Upgrade table's three separate version bands (so
+#      actions with their conditions and their hand-written sequence numbers -
+#      the band between CostFinalize and InstallValidate, ahead of the prepare
+#      step - and the Upgrade table's three separate version bands (so
 #      "you already have this" is never announced as "a newer version").
 #   E  the build-time read-back can say no: the verifier that ships inside
 #      build-msi.sh is extracted and fed each broken CustomAction /
@@ -108,6 +109,19 @@ foreach ($k in $paths.Keys) {
 # -TeethCheck can feed it the mutation it exists to catch.
 # ---------------------------------------------------------------------------
 
+# The hand-written sequence numbers of the maintenance band, read out of the wxs
+# (T1367). They are written down rather than derived from anchors because wixl
+# resolves an After= that names a CUSTOM action by appending to the END of
+# InstallExecuteSequence, which is how the Repair/Cancel question came to be
+# asked after the install had already run.
+function MaintSequence($msi) {
+    $n = @{}
+    foreach ($m in ([regex]'<Custom Action="([A-Za-z]+)" Sequence="(\d+)"').Matches($msi)) {
+        $n[$m.Groups[1].Value] = [int]$m.Groups[2].Value
+    }
+    return $n
+}
+
 $checks = [ordered]@{
     'A1 the prompt is spelled as an argv flag, the way its neighbour is' =
         { param($t) $t.maint -match 'pub const flag = "--install-maintenance";' }
@@ -139,11 +153,25 @@ $checks = [ordered]@{
           $ca = ([regex]'(?s)<CustomAction Id="MaintenancePrompt".*?/>').Match($t.msi)
           $ca.Success -and $ca.Value -match 'Execute="immediate"' -and $ca.Value -match 'Return="check"' }
     'A13 Repair is pre-armed BEFORE CostFinalize, where feature states are decided' =
-        { param($t) $t.msi -match '<CustomAction Id="SetRepairMode" Property="REINSTALL" Value="ALL"/>' -and
-                    $t.msi -match '<Custom Action="SetRepairMode" Before="CostFinalize">' }
-    'A14 the question is asked AFTER it, where INSTALLDIR finally resolves' =
-        { param($t) $t.msi -match '<Custom Action="SetMaintenancePromptCmd" After="CostFinalize">' -and
-                    $t.msi -match '<Custom Action="MaintenancePrompt" After="SetMaintenancePromptCmd">' }
+        { param($t)
+          $n = MaintSequence $t.msi
+          ($t.msi -match '<CustomAction Id="SetRepairMode" Property="REINSTALL" Value="ALL"/>') -and
+          $n['SetRepairMode'] -gt 0 -and $n['SetRepairMode'] -lt 1000 -and
+          $n['SetRepairModeFlags'] -gt 0 -and $n['SetRepairModeFlags'] -lt 1000 }
+    'A14 the question is asked after INSTALLDIR resolves and before anything is written (T1367)' =
+        { param($t)
+          $n = MaintSequence $t.msi
+          $n['SetMaintenancePromptCmd'] -gt 1000 -and
+          $n['MaintenancePrompt'] -gt $n['SetMaintenancePromptCmd'] -and
+          $n['MaintenancePrompt'] -lt $n['PrepareInstallDir'] -and
+          $n['PrepareInstallDir'] -lt 1400 }
+    'A14b no action in that band anchors on another CUSTOM action (T1367)' =
+        { param($t)
+          # wixl appends an After= that names a custom action to the end of the
+          # table - past InstallFinalize - so the whole band is numbered by hand.
+          $band = 'SetRepairMode|SetRepairModeFlags|SetMaintenancePromptCmd|MaintenancePrompt|SetPrepareInstallDirCmd|PrepareInstallDir'
+          $rows = ([regex]"(?m)^\s*<Custom Action=`"($band)`"([^>]*)>").Matches($t.msi)
+          ($rows.Count -eq 6) -and -not ($rows | Where-Object { $_.Groups[2].Value -notmatch 'Sequence="\d+"' }) }
     'A15 a silent or updater-driven install never sees the dialog' =
         { param($t)
           $rows = ([regex]'(?m)^\s*<Custom Action="(MaintenancePrompt|SetMaintenancePromptCmd|SetRepairMode|SetRepairModeFlags)"[^>]*>(.*?)</Custom>').Matches($t.msi)
@@ -199,17 +227,20 @@ $mutations = [ordered]@{
         @{ Key = 'msi'; Find = "                  Execute=`"immediate`"`n                  Return=`"check`"/>"
            Replace = "                  Execute=`"immediate`"`n                  Return=`"ignore`"/>" }
     'A13 Repair is pre-armed BEFORE CostFinalize, where feature states are decided' =
-        @{ Key = 'msi'; Find = '<Custom Action="SetRepairMode" Before="CostFinalize">'
-           Replace = '<Custom Action="SetRepairMode" After="CostFinalize">' }
-    'A14 the question is asked AFTER it, where INSTALLDIR finally resolves' =
-        @{ Key = 'msi'; Find = '<Custom Action="SetMaintenancePromptCmd" After="CostFinalize">'
-           Replace = '<Custom Action="SetMaintenancePromptCmd" Before="CostFinalize">' }
+        @{ Key = 'msi'; Find = '<Custom Action="SetRepairMode" Sequence="990">'
+           Replace = '<Custom Action="SetRepairMode" Sequence="1200">' }
+    'A14 the question is asked after INSTALLDIR resolves and before anything is written (T1367)' =
+        @{ Key = 'msi'; Find = '<Custom Action="MaintenancePrompt" Sequence="1020">'
+           Replace = '<Custom Action="MaintenancePrompt" Sequence="1050">' }
+    'A14b no action in that band anchors on another CUSTOM action (T1367)' =
+        @{ Key = 'msi'; Find = '<Custom Action="MaintenancePrompt" Sequence="1020">'
+           Replace = '<Custom Action="MaintenancePrompt" After="SetMaintenancePromptCmd">' }
     'A15 a silent or updater-driven install never sees the dialog' =
-        @{ Key = 'msi'; Find = '<Custom Action="MaintenancePrompt" After="SetMaintenancePromptCmd">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>'
-           Replace = '<Custom Action="MaintenancePrompt" After="SetMaintenancePromptCmd">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE</Custom>' }
+        @{ Key = 'msi'; Find = '<Custom Action="MaintenancePrompt" Sequence="1020">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>'
+           Replace = '<Custom Action="MaintenancePrompt" Sequence="1020">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE</Custom>' }
     'A16 uninstall, patching and being replaced by a newer package are excluded' =
-        @{ Key = 'msi'; Find = '<Custom Action="SetRepairMode" Before="CostFinalize">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>'
-           Replace = '<Custom Action="SetRepairMode" Before="CostFinalize">Installed AND UILevel &gt; 3</Custom>' }
+        @{ Key = 'msi'; Find = '<Custom Action="SetRepairMode" Sequence="990">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>'
+           Replace = '<Custom Action="SetRepairMode" Sequence="990">Installed AND UILevel &gt; 3</Custom>' }
     'A17 the same version is its own band, detected separately from a newer one' =
         @{ Key = 'msi'; Find = 'Property="SAMEVERSIONFOUND"/>'; Replace = 'Property="NEWERVERSIONFOUND"/>' }
     'A18 and the newer band no longer swallows the equal version' =
@@ -300,20 +331,22 @@ if (-not $py) {
                 "SetMaintenancePromptCmd${t}51${t}MAINTENANCEPROMPTCMD${t}[INSTALLDIR]ghoztty.exe",
                 "MaintenancePrompt${t}50${t}MAINTENANCEPROMPTCMD${t}--install-maintenance --installed-version=[ARPDISPLAYVERSION]"
             ) -join "`r`n"
+            # CostFinalize sits at 1000 in the standard sequence and
+            # InstallValidate at 1400; the arming rows are below the first and
+            # the whole question sits between them, ahead of the prepare step,
+            # so every ordering check has something real to compare (T1367).
             $goodSeq = @(
                 "Action${t}Condition${t}Sequence",
                 "s72${t}S255${t}I2",
                 "InstallExecuteSequence${t}Action",
-                "SetRepairMode${t}$cond${t}1000",
-                "SetRepairModeFlags${t}$cond${t}1001",
+                "SetRepairMode${t}$cond${t}990",
+                "SetRepairModeFlags${t}$cond${t}991",
                 "CostFinalize${t}${t}1000",
-                "SetMaintenancePromptCmd${t}$cond${t}1396",
-                "MaintenancePrompt${t}$cond${t}1397"
+                "SetMaintenancePromptCmd${t}$cond${t}1010",
+                "MaintenancePrompt${t}$cond${t}1020",
+                "PrepareInstallDir${t}Installed OR OLDERVERSIONFOUND${t}1040",
+                "InstallValidate${t}${t}1400"
             ) -join "`r`n"
-            # CostFinalize sits at 1000 in the standard sequence; the arming
-            # rows are given lower numbers below so the ordering check is real.
-            $goodSeq = $goodSeq.Replace("SetRepairMode${t}$cond${t}1000", "SetRepairMode${t}$cond${t}998")
-            $goodSeq = $goodSeq.Replace("SetRepairModeFlags${t}$cond${t}1001", "SetRepairModeFlags${t}$cond${t}999")
             $goodUp = @(
                 "UpgradeCode${t}VersionMin${t}VersionMax${t}Language${t}Attributes${t}Remove${t}ActionProperty",
                 "s38${t}S20${t}S20${t}S255${t}i4${t}S255${t}s72",
@@ -347,9 +380,9 @@ if (-not $py) {
             Assert 'E6 an unconditional prompt - one a silent install would hit - is rejected' `
                 ((RunVerifier $goodCa ($goodSeq -replace [regex]::Escape($cond), '1') $goodUp) -ne 0)
             Assert 'E7 a prompt sequenced BEFORE CostFinalize, with no INSTALLDIR yet, is rejected' `
-                ((RunVerifier $goodCa ($goodSeq -replace "MaintenancePrompt${t}$([regex]::Escape($cond))${t}1397", "MaintenancePrompt${t}$cond${t}900") $goodUp) -ne 0)
+                ((RunVerifier $goodCa ($goodSeq -replace "MaintenancePrompt${t}$([regex]::Escape($cond))${t}1020", "MaintenancePrompt${t}$cond${t}900") $goodUp) -ne 0)
             Assert 'E8 REINSTALL armed AFTER CostFinalize, where Repair would do nothing, is rejected' `
-                ((RunVerifier $goodCa ($goodSeq -replace "SetRepairMode${t}$([regex]::Escape($cond))${t}998", "SetRepairMode${t}$cond${t}1200") $goodUp) -ne 0)
+                ((RunVerifier $goodCa ($goodSeq -replace "SetRepairMode${t}$([regex]::Escape($cond))${t}990", "SetRepairMode${t}$cond${t}1200") $goodUp) -ne 0)
             Assert 'E9 an MSI that never arms REINSTALL at all is rejected' `
                 ((RunVerifier (DropRow $goodCa 'SetRepairMode') (DropRow $goodSeq 'SetRepairMode') $goodUp) -ne 0)
             Assert 'E10 a prompt with no command property set is rejected' `
@@ -358,6 +391,18 @@ if (-not $py) {
                 ((RunVerifier $goodCa $goodSeq (DropRow $goodUp '\{GUID\}\t26\.9\.301\t26\.9\.301')) -ne 0)
             Assert 'E12 a NEWERVERSIONFOUND that swallows the equal version is rejected' `
                 ((RunVerifier $goodCa $goodSeq ($goodUp -replace "26\.9\.301${t}${t}${t}2${t}", "26.9.301${t}${t}${t}258${t}")) -ne 0)
+            # T1367. 6605 is not a number anybody chose: it is where wixl puts an
+            # action whose only anchor is an After= naming another custom action,
+            # which is past InstallFinalize. The old check said "after
+            # CostFinalize" and the end of the table satisfies that, so the
+            # question was asked once the install had run and Cancel cancelled
+            # nothing. These three are the shapes that hole let through.
+            Assert 'E13 a prompt appended past InstallValidate - asked after the install ran - is rejected' `
+                ((RunVerifier $goodCa ($goodSeq -replace "MaintenancePrompt${t}$([regex]::Escape($cond))${t}1020", "MaintenancePrompt${t}$cond${t}6605") $goodUp) -ne 0)
+            Assert 'E14 a prompt asked AFTER the prepare step has renamed the agent aside is rejected' `
+                ((RunVerifier $goodCa ($goodSeq -replace "MaintenancePrompt${t}$([regex]::Escape($cond))${t}1020", "MaintenancePrompt${t}$cond${t}1300") $goodUp) -ne 0)
+            Assert 'E15 a sequence table with no InstallValidate to measure against is rejected' `
+                ((RunVerifier $goodCa (DropRow $goodSeq 'InstallValidate') $goodUp) -ne 0)
         } finally {
             Remove-Item -LiteralPath $tmpE -Recurse -Force -ErrorAction SilentlyContinue
         }
