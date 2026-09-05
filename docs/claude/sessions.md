@@ -264,20 +264,18 @@ From there:
   (the process keeps running on its own machine; only the viewer is local). A
   session already open in one of your panes is focused instead of attached
   twice.
-- **Relaunch one** — the same key on a **dead-but-relaunchable** row (T466).
-  Those rows are listed because their recorded command and cwd are worth seeing,
-  and since T466 they are also actionable: Return opens a window the same way,
-  over the same ATTACH, and `termio.Remote` applies **`session-relaunch`** on
-  finding the target dead — by default `restore`, a fresh shell in the recorded
-  cwd with a notice naming the command it did **not** re-run (T230), after which
-  the tombstone is retired. It is the same thing launch-time restore does with a
-  tombstone leaf; only the verb differs, and the row says which it is: the exit
-  label plus a **`can relaunch`** badge. Before T466 Return answered "it can't be
-  resumed", so the roster listed offers it would not honour. `rowAction`
-  (`chooser_sessions.zig`) is the one place that names the verb, and the
-  invariant it keeps is **listed ⇔ actionable**: `isConnectable` decides what is
-  listed, and every listed row acts. Mac still refuses the relaunch
-  (`MachineChooserView.swift:167-168`) and owes the same change (T1339).
+- **What the list MEANS** — only sessions whose program is still running (D91,
+  the user's own words: *"the list represents the processes still alive"*). A
+  tombstone is not a row, relaunchable or not, so a reboot does not fill the
+  chooser with finished work (T1364). `isConnectable` (`chooser_sessions.zig`)
+  is the one predicate, `rowAction` names the one verb, and the invariant they
+  keep is **listed ⇔ actionable**: every row the roster shows has something to
+  attach to. T466 briefly shipped the other reading — a dead row with a
+  `can relaunch` badge that respawned the recorded command — and D91 reversed
+  it; Mac never had it and owes nothing here (T1339). Reviving a tombstone is
+  still what **launch-time restore** does with a saved layout leaf, which is a
+  different path with a different contract: the user asked for those panes
+  back.
 - **Restore All** — rebuilds the machine's *whole* window/tab/split topology
   here, every pane attached to its still-running session. The button appears
   only when the selected machine has **two or more live sessions**: with one

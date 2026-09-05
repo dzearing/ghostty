@@ -123,10 +123,11 @@ function Get-Sessions {
     return @($j)
 }
 
-# The rows the roster renders, in agent order (alive or relaunchable) - the
-# keyboard cursor's index space, derived from the agent's own reply.
+# The rows the roster renders, in agent order: the live sessions (T1364 - a
+# tombstone is not a row) - the keyboard cursor's index space, derived from the
+# agent's own reply.
 function Get-RenderedSessions {
-    return @(Get-Sessions | Where-Object { $_.alive -or $_.relaunchable })
+    return @(Get-Sessions | Where-Object { $_.alive })
 }
 
 function Launch-Gui($errlog, [string[]]$extra) {

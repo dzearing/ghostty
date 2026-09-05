@@ -655,7 +655,13 @@ template = """<?xml version="1.0" encoding="utf-8"?>
       <Custom Action="SetPrepareInstallDirCmd" Before="PrepareInstallDir"/>
       <Custom Action="PrepareInstallDir" Before="InstallValidate">Installed OR OLDERVERSIONFOUND</Custom>
       <Custom Action="SetRepairMode" Before="CostFinalize">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
-      <Custom Action="SetRepairModeFlags" After="SetRepairMode">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
+      <!-- Before CostFinalize, not After="SetRepairMode": wixl resolves an
+           After that names a CUSTOM action by appending to the end of the
+           sequence, so this landed at 6605 - long past the 1000 where feature
+           states are decided - and the build's own check caught it. Both arms
+           anchor on the standard action instead; they set independent
+           properties, so their order relative to each other does not matter. -->
+      <Custom Action="SetRepairModeFlags" Before="CostFinalize">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
       <Custom Action="SetMaintenancePromptCmd" After="CostFinalize">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
       <Custom Action="MaintenancePrompt" After="SetMaintenancePromptCmd">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
       <Custom Action="SetLaunchAppCmd" Before="LaunchApp"/>
@@ -1078,6 +1084,14 @@ if errs:
         print(f"error: {e}", file=sys.stderr)
     sys.exit(1)
 print("already-installed ok: REINSTALL armed before CostFinalize, MaintenancePrompt (immediate, check) after it")
+# The resolved numbers, said out loud (T1367): what wixl DID with each anchor is
+# the evidence, and reading them back only from an assertion means the numbers
+# nobody asserted on are invisible.
+print("  sequence: CostFinalize={} SetRepairMode={} SetRepairModeFlags={} SetMaintenancePromptCmd={} MaintenancePrompt={} InstallValidate={} InstallFinalize={}".format(
+    seq["CostFinalize"][2], seq["SetRepairMode"][2], seq["SetRepairModeFlags"][2],
+    seq["SetMaintenancePromptCmd"][2], seq["MaintenancePrompt"][2],
+    seq["InstallValidate"][2] if "InstallValidate" in seq else "?",
+    seq["InstallFinalize"][2] if "InstallFinalize" in seq else "?"))
 print("version bands ok: older / same / newer are three different answers")
 PYEOF
 

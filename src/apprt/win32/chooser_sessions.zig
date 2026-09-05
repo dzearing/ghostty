@@ -51,19 +51,25 @@ pub const Session = struct {
     argv: ?[]const u8 = null,
 };
 
-/// A session worth showing: still alive (attachable) or a relaunchable
-/// tombstone (revivable via RELAUNCH). A dead, non-relaunchable tombstone is an
-/// unreconnectable dead end — filtered out as a client-side backstop to the
-/// agent's own reap, exactly as Mac's `isConnectable`
-/// (`SessionBrowserProbe.swift:56`) intends.
+/// A session worth showing: one whose program is STILL RUNNING. The user's
+/// answer to D91 (2026-09-05) is the whole rule — *"the list represents the
+/// processes still alive. If we don't have a ghoztty window for something still
+/// running in the agent, we should list it, otherwise if it's a dead process and
+/// not working we don't."* — so a tombstone is not a row at all, relaunchable or
+/// not (T1364).
 ///
-/// The Mac comment and the Mac behavior disagree today because its C API omits
-/// `relaunchable` (T322), which collapses the test to `alive` and hides the
-/// resumable tombstones the term exists to keep. Windows takes the field at its
-/// word: the divergence is deliberate, and it is the side that matches what
-/// both comments say the rule is.
+/// T466 shipped the opposite reading: a dead-but-relaunchable tombstone stayed
+/// listed with a `can relaunch` badge. That made the list GROW with finished
+/// work — a reboot turns every session into a tombstone at once — and buried the
+/// rows the chooser exists for. The dead end is now filtered here, which is also
+/// where Mac's `isConnectable` (`SessionBrowserProbe.swift:56`) already lands
+/// via its `alive`-only C view (T322): the two platforms agree by behavior.
+///
+/// This says nothing about launch-time RESTORE, which legitimately revives a
+/// tombstone leaf from a saved layout: that is a different path with a different
+/// contract (the user asked for those panes back), and it is untouched.
 pub fn isConnectable(s: Session) bool {
-    return s.alive or s.relaunchable;
+    return hasLiveChild(s);
 }
 
 /// The last component of a path, for the cwd rung of the label ladder. Handles
@@ -194,13 +200,13 @@ pub fn orphaned(s: Session, open_locally: bool, local_target: bool) bool {
 ///   says the row is `orphaned` (T520) — a live local session nothing shows.
 ///   Deliberately no `pinned` badge: every persistent local session is pinned,
 ///   so it is noise, not signal.
-/// - Last, `can relaunch` on a dead-but-relaunchable tombstone (T466). The exit
-///   label alone reads as a dead end, and the row is not one: Return revives the
-///   recorded command. This is the one badge that names an AFFORDANCE rather
-///   than a state, and it earns that because without it the roster's only
-///   actionable-looking rows are the live ones.
 ///
-/// Returns the filled prefix of `out` (which needs room for 3).
+/// The dead arm is a BACKSTOP as of T1364, not a state the user meets:
+/// `isConnectable` keeps exited sessions out of the list entirely, so nothing
+/// wearing an exit label is offered. T466's `can relaunch` badge is gone with
+/// the affordance it named.
+///
+/// Returns the filled prefix of `out` (which needs room for 2).
 pub fn badges(out: []Badge, exit_buf: []u8, s: Session, open_locally: bool, orphan: bool) []const Badge {
     var n: usize = 0;
     if (s.alive) {
@@ -230,18 +236,8 @@ pub fn badges(out: []Badge, exit_buf: []u8, s: Session, open_locally: bool, orph
         n += 1;
     }
 
-    if (rowAction(s) == .relaunch and n < out.len) {
-        out[n] = .{ .text = relaunch_text, .tone = .good };
-        n += 1;
-    }
     return out[0..n];
 }
-
-/// The T466 affordance's wording, shared with the roster's log oracle so the
-/// badge and the sentence about it cannot drift apart — the same arrangement
-/// `orphan_text` has, and for the same reason: the rows are owner-drawn, so a
-/// log line is the only thing an acceptance script can read the mark back from.
-pub const relaunch_text = "can relaunch";
 
 /// The T520 mark's wording, shared with the roster's log oracle so the badge
 /// and the sentence about it cannot drift apart.
@@ -355,39 +351,34 @@ pub fn transitionFor(
 // ---------------------------------------------------------------------
 
 /// Whether a row has a LIVE child to ATTACH to — the same-PID re-attach that
-/// gap-fills scrollback and leaves the running program running. Deliberately
-/// NOT `isConnectable`: a *relaunchable* tombstone is listable and (since T466)
-/// actionable, but there is no process behind it, so anything counting live
-/// sessions — "Restore All"'s two-session floor above all — must not count it.
-/// `rowAction` is what says which VERB a row offers.
+/// gap-fills scrollback and leaves the running program running.
+///
+/// Since T1364 this is also what `isConnectable` asks, because the two questions
+/// turned out to be the same one: a row is listed exactly when there is a
+/// process behind it. The names are kept apart because they are asked for
+/// different reasons — "should this be a row" and "is there something to
+/// attach to", the latter being "Restore All"'s two-session floor.
 pub fn hasLiveChild(s: Session) bool {
     return s.alive;
 }
 
-/// What pressing Return on a roster row does (T466). The roster lists two kinds
-/// of row and until then only one of them did anything:
+/// What pressing Return on a roster row does:
 ///
 /// - `.resume_session` — a live session: open a pane ATTACHed to its running
-///   child, which is the T320 path.
-/// - `.relaunch` — a dead-but-relaunchable tombstone: revive the recorded
-///   command. Mechanically this is still an ATTACH — the agent materializes the
-///   session from disk, and `termio.Remote` applies `session-relaunch` on
-///   finding the target dead (`restore` by default: a fresh shell in the
-///   recorded cwd with a notice naming the command, which is the same thing
-///   launch-time restore does with a tombstone leaf) — but it is a different
-///   VERB to the user, so the roster names it differently.
-/// - `.none` — a genuinely exited child. `isConnectable` already keeps such a
-///   row out of the list; this is the backstop for one that got in anyway.
+///   child, which is the T320 path. Every LISTED row is this one.
+/// - `.none` — a session whose program has exited. `isConnectable` keeps such a
+///   row out of the list (T1364); this is the backstop for one that got in
+///   anyway, and it is why nothing downstream has to re-derive the rule.
 ///
-/// Before T466 the tombstone case answered "That session has exited - it can't
-/// be resumed.", so the roster carried rows that looked like offers and were
-/// not — the defect the task was filed for. Mac still refuses it
-/// (`MachineChooserView.swift:167-168`) and owes the same change.
-pub const RowAction = enum { none, resume_session, relaunch };
+/// T466's third arm, `.relaunch` — reviving a tombstone's recorded command from
+/// the roster — is gone with the rows that offered it: per D91 a finished
+/// session is not listed, so there is nothing to press Return on. Launch-time
+/// restore still revives a tombstone leaf from a saved layout; that is a
+/// different path and it did not go through here.
+pub const RowAction = enum { none, resume_session };
 
 pub fn rowAction(s: Session) RowAction {
-    if (s.alive) return .resume_session;
-    if (s.relaunchable) return .relaunch;
+    if (hasLiveChild(s)) return .resume_session;
     return .none;
 }
 
@@ -405,10 +396,8 @@ pub fn rowAction(s: Session) RowAction {
 /// (`WindowTarget.resumeSession`) and the reason `MachineChooser.zig` does not
 /// grow an attach path.
 pub const Resume = union(enum) {
-    /// Nothing to open: a genuinely exited row, or no machine selected. Since
-    /// T466 a dead-but-relaunchable row is NOT this case — it resolves to the
-    /// same transport arm a live row does, and `rowAction` is what tells the
-    /// two apart for anything that has to name the verb.
+    /// Nothing to open: a row whose program has exited (relaunchable or not,
+    /// since T1364), or no machine selected.
     none,
     /// A session of THIS box's `ghoztty-agent`, by id.
     local: []const u8,
@@ -438,12 +427,12 @@ pub fn resumeTarget(target: Target, s: Session) Resume {
 /// button for the first button's job.
 pub const restore_all_min_alive: usize = 2;
 
-/// How many of `sessions` are ALIVE — the datum the rule is taken of. This is
-/// `hasLiveChild`, deliberately, and NOT `isConnectable`: a relaunchable
-/// tombstone is worth LISTING — and since T466 it can be RELAUNCHED from the
-/// roster — but it has no live child to attach, so a machine holding two
-/// tombstones would otherwise offer a Restore All that rebuilds two fresh
-/// shells and calls it a restore. Same distinction T320 drew one level down.
+/// How many of `sessions` are ALIVE — the datum the rule is taken of. Asked
+/// through `hasLiveChild`, which since T1364 is also what decides whether a
+/// session is a row at all: a machine's Restore All is offered exactly when two
+/// of the rows it can show have a process behind them. It is still asked as
+/// "live child" rather than "listed" because THIS is the question — a restore
+/// rebuilt out of dead sessions would be two fresh shells and a lie.
 pub fn aliveCount(sessions: []const Session) usize {
     var n: usize = 0;
     for (sessions) |s| {
@@ -777,12 +766,17 @@ fn contrast(a: Rgb, b: Rgb) f64 {
     return color_math.wcagContrastRatio(color_math.wcagLuminance(a), color_math.wcagLuminance(b));
 }
 
-test "isConnectable keeps alive sessions and relaunchable tombstones" {
+test "isConnectable lists LIVE sessions only - a tombstone is not a row (D91/T1364)" {
     try testing.expect(isConnectable(.{ .alive = true }));
-    try testing.expect(isConnectable(.{ .alive = false, .relaunchable = true }));
     // A genuinely exited child: an unreconnectable dead end.
     try testing.expect(!isConnectable(.{ .alive = false, .exit_code = 1 }));
     try testing.expect(!isConnectable(.{}));
+    // And the case T466 got wrong: a dead-but-relaunchable tombstone is just as
+    // finished as any other dead session. The user's rule is about the PROCESS,
+    // not about whether a command could be typed again — "if it's a dead process
+    // and not working we don't [list it]".
+    try testing.expect(!isConnectable(.{ .alive = false, .relaunchable = true }));
+    try testing.expect(!isConnectable(.{ .alive = false, .relaunchable = true, .exit_code = 0 }));
 }
 
 test "baseName handles both separators, trailing separators and roots" {
@@ -1177,59 +1171,56 @@ test "the count label agrees with the roster it counts" {
 // Resume + the keyboard sub-cursor (T320)
 // ---------------------------------------------------------------------
 
-test "hasLiveChild is alive only - a relaunchable tombstone has no process behind it" {
+test "hasLiveChild is alive only, and it is what listing now asks" {
     try testing.expect(hasLiveChild(.{ .alive = true }));
-    // Listable (isConnectable) and actionable (rowAction), but there is nothing
-    // running: reviving it is RELAUNCH, and it never counts as a live session.
     const tombstone: Session = .{ .alive = false, .relaunchable = true };
-    try testing.expect(isConnectable(tombstone));
     try testing.expect(!hasLiveChild(tombstone));
     try testing.expect(!hasLiveChild(.{ .alive = false, .exit_code = 1 }));
+    // T1364 collapsed the two questions into one answer: nothing without a live
+    // child is listed, so "listed" and "attachable" can no longer disagree.
+    for ([_]Session{ .{ .alive = true }, tombstone, .{ .alive = false, .exit_code = 1 }, .{} }) |s| {
+        try testing.expectEqual(hasLiveChild(s), isConnectable(s));
+    }
 }
 
-test "rowAction: every LISTED row acts, and it says which verb (T466)" {
+test "rowAction: every LISTED row resumes, and nothing else acts (T1364)" {
     try testing.expectEqual(RowAction.resume_session, rowAction(.{ .alive = true }));
+    // The T466 arm is gone: a tombstone is neither listed nor actionable, which
+    // is the same sentence now rather than two rules that could drift.
     const tombstone: Session = .{ .alive = false, .relaunchable = true };
-    try testing.expectEqual(RowAction.relaunch, rowAction(tombstone));
-    // A genuinely exited child: no verb — and `isConnectable` keeps it out of
-    // the roster in the first place, which is what makes "every listed row
-    // acts" true rather than merely intended.
+    try testing.expectEqual(RowAction.none, rowAction(tombstone));
     const dead: Session = .{ .alive = false, .exit_code = 1 };
     try testing.expectEqual(RowAction.none, rowAction(dead));
-    try testing.expect(!isConnectable(dead));
-    // The invariant the task exists to establish, stated over the whole domain:
-    // listed <=> actionable.
+    // The invariant, stated over the whole domain: listed <=> actionable.
     for ([_]Session{ .{ .alive = true }, tombstone, dead, .{} }) |s| {
         try testing.expectEqual(isConnectable(s), rowAction(s) != .none);
     }
-    // Alive wins over a stale `relaunchable` flag: a live session is ATTACHed,
-    // never respawned.
+    // Alive wins over a stale `relaunchable` flag: a live session is ATTACHed.
     try testing.expectEqual(
         RowAction.resume_session,
         rowAction(.{ .alive = true, .relaunchable = true }),
     );
 }
 
-test "a relaunchable tombstone wears the affordance badge, a dead one does not" {
+test "no row wears an affordance badge - the tombstone rows are gone (T1364)" {
     var out: [3]Badge = undefined;
     var exit_buf: [32]u8 = undefined;
 
+    // The dead arm is a backstop only, and it says just the exit label: the
+    // `can relaunch` badge went out with the offer it named.
     const tomb = badges(&out, &exit_buf, .{ .alive = false, .relaunchable = true, .exit_code = 0 }, false, false);
-    try testing.expectEqual(@as(usize, 2), tomb.len);
+    try testing.expectEqual(@as(usize, 1), tomb.len);
     try testing.expectEqualStrings("exited (0)", tomb[0].text);
-    try testing.expectEqualStrings(relaunch_text, tomb[1].text);
 
-    // A live row is unchanged: no affordance badge, because Return has always
-    // worked on it and a mark that is on every row says nothing.
+    // A live row: no badge at all when it is idle and nothing holds it.
     const live = badges(&out, &exit_buf, .{ .alive = true }, false, false);
     try testing.expectEqual(@as(usize, 0), live.len);
 
-    // The badge run stays honest at its widest: exited + open + can relaunch.
-    const open_tomb = badges(&out, &exit_buf, .{ .alive = false, .relaunchable = true }, true, false);
-    try testing.expectEqual(@as(usize, 3), open_tomb.len);
-    try testing.expectEqualStrings("exited", open_tomb[0].text);
-    try testing.expectEqualStrings("open", open_tomb[1].text);
-    try testing.expectEqualStrings(relaunch_text, open_tomb[2].text);
+    // The badge run at its widest is now two: state + openness.
+    const busy_open = badges(&out, &exit_buf, .{ .alive = true, .activity = "busy" }, true, false);
+    try testing.expectEqual(@as(usize, 2), busy_open.len);
+    try testing.expectEqualStrings("busy", busy_open[0].text);
+    try testing.expectEqualStrings("open", busy_open[1].text);
 }
 
 test "resumeTarget names the machine the roster is pointed at" {
@@ -1245,18 +1236,18 @@ test "resumeTarget names the machine the roster is pointed at" {
         },
         else => return error.TestUnexpectedResult,
     }
-    // A relaunchable tombstone resolves to the SAME arm (T466): the transport is
-    // identical, and it is `rowAction` that names the verb. Before this it
-    // resolved to `.none`, which is what left the row listed and inert.
-    switch (resumeTarget(.local, .{ .id = "abc", .relaunchable = true })) {
-        .local => |id| try testing.expectEqualStrings("abc", id),
-        else => return error.TestUnexpectedResult,
-    }
-    switch (resumeTarget(.{ .remote = "dev-a" }, .{ .id = "abc", .relaunchable = true })) {
-        .remote => |r| try testing.expectEqualStrings("abc", r.session),
-        else => return error.TestUnexpectedResult,
-    }
-    // A genuinely exited row still resolves to nothing, and that guard lives
+    // A relaunchable tombstone resolves to NOTHING again (T1364): it is not a
+    // row, so there is nothing to open on either transport. T466 pointed it at
+    // the live arms; that is the behavior D91 reversed.
+    try testing.expectEqual(
+        Resume.none,
+        resumeTarget(.local, .{ .id = "abc", .relaunchable = true }),
+    );
+    try testing.expectEqual(
+        Resume.none,
+        resumeTarget(.{ .remote = "dev-a" }, .{ .id = "abc", .relaunchable = true }),
+    );
+    // A genuinely exited row resolves to nothing, and that guard lives
     // HERE so no caller can forget it.
     try testing.expectEqual(Resume.none, resumeTarget(.local, .{ .id = "abc", .exit_code = 1 }));
     // No machine selected, and a row with no id, resolve to nothing rather than
@@ -1276,8 +1267,8 @@ test "restoreAllAvailable: two ALIVE sessions, and tombstones do not count" {
     try testing.expect(!restoreAllAvailable(aliveCount(&.{alive})));
     try testing.expect(restoreAllAvailable(aliveCount(&.{ alive, alive2 })));
 
-    // Two relaunchable tombstones LOOK like two rows (both are rendered) and
-    // must still not offer it: there is nothing to attach to.
+    // Two relaunchable tombstones are not rows at all since T1364, and the
+    // count they feed must agree: nothing to list, nothing to attach to.
     try testing.expectEqual(@as(usize, 0), aliveCount(&.{ tombstone, tombstone }));
     try testing.expect(!restoreAllAvailable(aliveCount(&.{ tombstone, tombstone })));
 
@@ -1296,6 +1287,9 @@ test "the cursor's index space is the RENDERED list, with a dead row planted mid
     const raw = [_]Session{
         .{ .id = "one", .alive = true },
         .{ .id = "gone", .alive = false, .exit_code = 1 },
+        // Since T1364 a relaunchable tombstone is filtered by the same rule, so
+        // the walk skips it too — the shape a reboot produces en masse.
+        .{ .id = "tomb", .alive = false, .relaunchable = true },
         .{ .id = "two", .alive = true },
     };
     var rendered: [raw.len]Session = undefined;

@@ -1695,9 +1695,9 @@ pub fn onSessions(app: *App, res: *SessionRoster.Result) void {
             // after a resume or a pane close re-states the mark's count.
             if (chooser.roster.state == .loaded) {
                 chooser.roster.logOrphans(app);
-                // The T466 oracle rides the same adoption: how many rows offer
-                // RELAUNCH rather than Resume.
-                chooser.roster.logRelaunchable(app);
+                // The T1364 oracle rides the same adoption: how many rows the
+                // roster is showing, and how many finished sessions it hid.
+                chooser.roster.logListed(app);
             }
             chooser.refreshSessions();
             // The session count in the identity subtitle lives in the band
@@ -3113,14 +3113,12 @@ fn copyResumeName(
 /// window whose pane ATTACHes to that session — the local agent's, or a relay
 /// machine's over its own transport.
 ///
-/// Since T466 that covers the roster's OTHER kind of row too: a
-/// dead-but-relaunchable tombstone RELAUNCHES, which is the same ATTACH over the
-/// same transport (`termio.Remote` applies `session-relaunch` on finding the
-/// target dead — by default a fresh shell in the recorded cwd with a notice
-/// naming the command), and is exactly what launch-time restore already does
-/// with a tombstone leaf. Only the verb differs, so only the logging does.
-/// Before it, Return on such a row said "it can't be resumed" and the roster
-/// listed offers it could not honour.
+/// Every row the roster shows is such a session as of T1364: the list is "what
+/// is still running that you have no window on" (D91), so there is one verb and
+/// no dead rows to refuse. T466's second kind of row — a dead-but-relaunchable
+/// tombstone that RELAUNCHED on Return — is gone with the listing rule that
+/// produced it; launch-time restore still revives a tombstone leaf from a saved
+/// layout, which is a different path the user actually asked for.
 ///
 /// The chooser produces a target and closes; the attach itself belongs to `App`
 /// (Mac keeps the same separation via `WindowTarget.resumeSession`, and
@@ -3140,19 +3138,20 @@ fn resumeRow(self: *MachineChooser, row: SessionRoster.VisibleRow) void {
         if (self.focusOpenSession(row.session.id)) return;
     }
 
-    // The VERB, for the log oracle the acceptance script reads: the transport
-    // arms below cannot tell a relaunch from a resume, and the user can.
+    // The VERB, for the log oracle the acceptance script reads. Since T1364
+    // there is only one, and that is the point: every row the roster shows is a
+    // running session, so Return always means "attach to this".
     switch (chooser_sessions.rowAction(row.session)) {
         .none => {},
         .resume_session => log.info("chooser roster: resuming session id={s}", .{row.session.id}),
-        .relaunch => log.info("chooser roster: relaunching session id={s}", .{row.session.id}),
     }
 
     switch (target) {
         .none => {
-            // A genuinely exited row. `isConnectable` keeps these out of the
-            // roster, so this is a backstop rather than a path the user meets —
-            // a relaunchable tombstone takes the arms below (T466).
+            // A session whose program has exited. `isConnectable` keeps these
+            // out of the roster (T1364), so this is a backstop for a row that
+            // died between the fetch and the keystroke rather than a path the
+            // user meets by walking the list.
             self.setHint("That session has exited - there's nothing left to open.");
         },
         .local => |sid| {

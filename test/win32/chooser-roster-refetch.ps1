@@ -101,11 +101,12 @@ function Get-Sessions {
     return @($j)
 }
 
-# The rows the roster actually RENDERS, in agent order: the connectable ones
-# (alive, or a relaunchable tombstone). The cursor's index space is this list,
-# so it is derived from the agent's own reply rather than assumed.
+# The rows the roster actually RENDERS, in agent order: the sessions whose
+# program is still running (T1364 - a tombstone is not a row). The cursor's
+# index space is this list, so it is derived from the agent's own reply rather
+# than assumed.
 function Get-RenderedSessions {
-    return @(Get-Sessions | Where-Object { $_.alive -or $_.relaunchable })
+    return @(Get-Sessions | Where-Object { $_.alive })
 }
 
 function Launch-Gui($errlog) {

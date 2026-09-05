@@ -107,7 +107,7 @@ function Get-Sessions {
 }
 
 function Get-RenderedSessions {
-    return @(Get-Sessions | Where-Object { $_.alive -or $_.relaunchable })
+    return @(Get-Sessions | Where-Object { $_.alive })
 }
 
 function Launch-Gui($errlog, [string[]]$extra) {

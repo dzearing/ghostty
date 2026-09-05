@@ -670,9 +670,10 @@ pub const VisibleRow = struct {
     orphan: bool = false,
 };
 
-/// The rows worth rendering, in agent order: connectable (alive OR a
-/// relaunchable tombstone), minus anything the user just killed. Fills the
-/// caller's buffer and returns its filled prefix.
+/// The rows worth rendering, in agent order: the sessions whose program is
+/// still running (T1364 — a tombstone is not a row, relaunchable or not), minus
+/// anything the user just killed. Fills the caller's buffer and returns its
+/// filled prefix.
 pub fn visible(self: *const SessionRoster, app: *App, out: []VisibleRow) []const VisibleRow {
     const roster = self.owned orelse return out[0..0];
     var n: usize = 0;
@@ -758,9 +759,8 @@ pub fn aliveCount(self: *const SessionRoster) usize {
     for (roster.sessions) |s| {
         if (self.isKilled(s.id)) continue;
         // One predicate for "is there a live child here", shared with the
-        // Restore All floor — a tombstone is listed, and since T466 it can be
-        // relaunched from the roster, but it is not ALIVE and a topology
-        // rebuilt out of tombstones is not a restore.
+        // Restore All floor. Since T1364 it is also what decides the rows, so
+        // this count and the rendered list can no longer disagree.
         if (chooser_sessions.hasLiveChild(.{ .id = s.id, .alive = s.alive })) n += 1;
     }
     return n;
@@ -781,20 +781,28 @@ pub fn logOrphans(self: *const SessionRoster, app: *App) void {
     log.info("chooser roster: {d} session(s) not in any window", .{n});
 }
 
-/// Say the T466 affordance out loud, once per adopted roster: how many rows are
-/// dead-but-relaunchable, and therefore carry the `can relaunch` badge and act
-/// on Return. Same reasoning as `logOrphans` — the rows are owner-drawn, so
-/// there is no HWND to read a badge back from — with one difference: this one is
-/// NOT local-only, because a relay machine's roster carries tombstones too and
-/// Return relaunches them over that machine's own transport. Said even at zero,
-/// so a script can assert the mark's ABSENCE as strongly as its presence.
-pub fn logRelaunchable(self: *const SessionRoster, app: *App) void {
+/// Say what the roster is LISTING out loud, once per adopted roster: how many
+/// rows it renders, and how many of the machine's sessions it left out because
+/// their program has exited. Same reasoning as `logOrphans` — the rows are
+/// owner-drawn, so there is no HWND to read the list back from — and NOT
+/// local-only, because a relay machine's roster carries tombstones too.
+///
+/// This replaces T466's `can relaunch` oracle with the ABSENCE oracle T1364
+/// needs: `hidden` is the count of finished sessions the agent reported and the
+/// user is deliberately not offered, so a script can hold the agent's own
+/// `+sessions --json` against it and prove the filter fired rather than that the
+/// fixture happened to be empty.
+pub fn logListed(self: *const SessionRoster, app: *App) void {
     var rows: [max_rows]VisibleRow = undefined;
-    var n: usize = 0;
-    for (self.visible(app, &rows)) |r| {
-        if (chooser_sessions.rowAction(r.session) == .relaunch) n += 1;
+    const listed = self.visible(app, &rows).len;
+    var hidden: usize = 0;
+    if (self.owned) |roster| {
+        for (roster.sessions) |s| {
+            if (self.isKilled(s.id)) continue;
+            if (!chooser_sessions.isConnectable(.{ .id = s.id, .alive = s.alive })) hidden += 1;
+        }
     }
-    log.info("chooser roster: {d} session(s) can relaunch", .{n});
+    log.info("chooser roster: listing {d} session(s), {d} exited hidden", .{ listed, hidden });
 }
 
 /// The title of an OPEN pane bound to `id`, or null. Also the answer to "is
@@ -1200,8 +1208,9 @@ fn paintRow(
     const old_label = if (ctx.label_font) |f| w32.SelectObject(hdc, f) else null;
     _ = w32.SetTextColor(hdc, rgb(chrome_theme.textOn(card_bg)));
 
-    // Room for 3 (T466): liveness, openness, and the tombstone's `can relaunch`.
-    var badge_buf: [3]chooser_sessions.Badge = undefined;
+    // Room for 2 (T1364): liveness and openness. The third slot was T466's
+    // `can relaunch`, which went out with the dead rows that wore it.
+    var badge_buf: [2]chooser_sessions.Badge = undefined;
     var exit_buf: [32]u8 = undefined;
     const run = chooser_sessions.badges(&badge_buf, &exit_buf, row.session, row.open_locally, row.orphan);
 

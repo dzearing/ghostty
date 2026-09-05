@@ -1,10 +1,13 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-05T07:45:19-07:00",
-    "commit":  "187d3b61f",
+    "generated":  "2026-09-05T08:39:00-07:00",
+    "commit":  "baa842241",
     "uncommitted":  [
-                        "test/win32/install-restart.ps1"
+                        "test/win32/chooser-orphan-badge.ps1",
+                        "test/win32/chooser-resume.ps1",
+                        "test/win32/chooser-roster-refetch.ps1",
+                        "test/win32/orphan-notify.ps1"
                     ],
     "files":  {
                   "docs/claude/testing.md":  "c67089bfa8dbe5ee19cfdcabbdd52945d88e392dddd90d90b6ad1dbac0592b8e",
@@ -47,13 +50,13 @@
                   "test/win32/chooser-link-hover.ps1":  "9de29beaeb0ae0194f458a30bc0bb10e570decc4610dc3784f9e21629ed1e6d5",
                   "test/win32/chooser-menu.ps1":  "39bf0ac434cc2eb9b69f2d1a569be9be09502e2787cdc3d814516958366c9c5b",
                   "test/win32/chooser-open-chord.ps1":  "fbf6f3281efd358cdd41d49c2bf630e95b559861f0776ea3eb93167adeb7c028",
-                  "test/win32/chooser-orphan-badge.ps1":  "b2595e279cf5fbba2431bafb3e310bb78c3c0d9d67ff5a669eae33ae4b18ba64",
+                  "test/win32/chooser-orphan-badge.ps1":  "e007a37b50e7093d73a532033f3b282c134748e9ea47d06bb38b7f6b52bf43dc",
                   "test/win32/chooser-restore-all.ps1":  "ced0ad850d422bf42cd4040a41863b5a1a1158d57a2937e485ff60468d716ceb",
                   "test/win32/chooser-restore-all-adopt.ps1":  "d05f84d8d6e52dcd0996ccbe3992b584cb5ba20969b41f3f21943a47361b2241",
                   "test/win32/chooser-restore-all-remote.ps1":  "a2addfc7741bd91fd9e685414f7638da78908ab5d94534b80b09fecce383916a",
-                  "test/win32/chooser-resume.ps1":  "c2c2de32646d9680282b35fcd8e9064cf5575444c2391a01fb71367a0932a38a",
+                  "test/win32/chooser-resume.ps1":  "399481f261c7e5a1761ba7f60e3b27f0333dfcc1e866b519144c3437c9074080",
                   "test/win32/chooser-resume-remote.ps1":  "53d6417f7b8334aaf2bce8e5e83051697c96cc160eb0a51cf0febcb0d582830a",
-                  "test/win32/chooser-roster-refetch.ps1":  "34bbe1abdec86abedc09684df617d9e4f54c72d68609159e012049c94efd2579",
+                  "test/win32/chooser-roster-refetch.ps1":  "bad4f2ce9924598420d0cff81430db6fb7afc9a220bbaa1f53f8abd98f4faa14",
                   "test/win32/chooser-selection.ps1":  "8810962da8559557b577daba7bbbcd43eb6c3ac8ce3771beec06c5553b7b9bc7",
                   "test/win32/chooser-session-cpu.ps1":  "91c3195e8a940e442ab166a2af770267375605b16b169fd649af969fe162238a",
                   "test/win32/chooser-sessions.ps1":  "7f21f3537696c70144241327120c7099004f2d1f66947be3d4ed7d296cb3bbd8",
@@ -207,7 +210,7 @@
                   "test/win32/new-window-cwd.ps1":  "0c35d0adaf39cdd7fa733c5e2912f1cb4dce1f7c12f05ed63b90a851acd5c440",
                   "test/win32/notification-click-focus.ps1":  "7382c18defc188e5036e2549119e6611615af455dbd696ceec2fe7eacb39040a",
                   "test/win32/one-installer.ps1":  "e8f2855cab4c267362f75fe7d78b810375ebc6fd253a31ab70c43579b3cea76e",
-                  "test/win32/orphan-notify.ps1":  "200452e245fcaca1b85e2ee96a2a226b93e71ac607d1f30f41a1c623458149de",
+                  "test/win32/orphan-notify.ps1":  "b84c26f50537993e099e9ab406c27077b8f1cbc96ae1fe8d84ea94e9cfeb9eac",
                   "test/win32/overlay-zorder.ps1":  "48f8bcc2f312e6031dede6f4c19fa50a961804fdbe81de80b2ed27247f92c6aa",
                   "test/win32/palette-close-crash.ps1":  "e6046113e0de2c089224b358bac4ef12ed298e86983c3bf68bd48588a34c964d",
                   "test/win32/palette-jump.ps1":  "1745b9a557417e11bdfceaf4db1997de31bc457f7f9919664fa01b592f5b6ac7",

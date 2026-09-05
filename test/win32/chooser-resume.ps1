@@ -24,25 +24,23 @@
 #      closes, and - the independent oracle - `ghoztty +sessions --json`, which
 #      dials the agent directly and never goes through the app, flips that
 #      session's `attached` from false to true.
-#   4. a relaunchable TOMBSTONE row RELAUNCHES (T466). Until then it was listed
-#      and inert - Return answered "it can't be resumed" - so the roster carried
-#      rows that looked like offers and were not. Now Return on one opens a
-#      window the same way a live row does (the transport is the same ATTACH;
-#      `termio.Remote` applies `session-relaunch` on finding the target dead),
-#      the app names the VERB in the log, and the agent - dialled directly -
-#      shows the tombstone RETIRED and a fresh live session in its place, which
-#      is what the default `restore` policy does.
+#   4. a session whose program has EXITED is not offered at all (D91/T1364).
+#      The user's rule is that the list means "what is still running that you
+#      have no window on", so a tombstone - relaunchable or not - is simply not
+#      a row. T466 read D91's question the other way and listed such rows with a
+#      "can relaunch" badge, which made the list grow with finished work every
+#      time the box rebooted. The fixture kills the agent to produce tombstones,
+#      then asserts their ABSENCE two ways: the roster's own oracle line
+#      ("chooser roster: listing N session(s), M exited hidden"), cross-checked
+#      against `+sessions --json`, and a keyboard walk over the whole rendered
+#      list that never lands on one. The agent keeps the tombstones, because
+#      launch-time restore still revives them from a saved layout.
 #
-#      Its badge is asserted too, through the roster's own oracle line
-#      ("chooser roster: N session(s) can relaunch"), cross-checked against
-#      `+sessions --json`: the rows are owner-drawn, so a log line is the only
-#      thing a script can read a badge back from.
-#
-# POSITIVE CONTROL for (4): section 5 reopens the chooser and acts on a LIVE
-# row with the same keys. Section 4's own assertions are positive (an attach
-# that must HAPPEN), so a keystroke that never arrived fails them outright -
-# but the control stays, because it is what distinguishes "relaunch works" from
-# "any Return in this dialog opens something" (the T240 lesson).
+# POSITIVE CONTROL for (4): section 4 reopens the chooser and acts on a LIVE
+# row with the same keys. Section 3's headline assertion is an ABSENCE, which a
+# dialog that ignored every keystroke would also satisfy - so the control is
+# what separates "the tombstones are gone" from "nothing in here works at all"
+# (the T240 lesson).
 #
 # T248: the repo's agent AND its app are killed at setup and the agent's state
 # is dropped, so the fixture is built fresh instead of measuring the previous
@@ -131,12 +129,12 @@ function Get-Sessions {
     return @($j)
 }
 
-# The rows the roster actually RENDERS, in agent order: the connectable ones
-# (alive, or a relaunchable tombstone). The keyboard cursor's index space is
-# this list - which is the property under test, so it is derived here from the
-# agent's own reply rather than assumed.
+# The rows the roster actually RENDERS, in agent order: the sessions whose
+# program is still running (T1364 - a tombstone is not a row). The keyboard
+# cursor's index space is this list - which is the property under test, so it is
+# derived here from the agent's own reply rather than assumed.
 function Get-RenderedSessions {
-    return @(Get-Sessions | Where-Object { $_.alive -or $_.relaunchable })
+    return @(Get-Sessions | Where-Object { $_.alive })
 }
 
 function Launch-Gui($errlog, [string[]]$extra) {
@@ -319,26 +317,30 @@ try {
     $wasAttached = @($before | Where-Object { $_.id -eq $resumedId -and $_.attached }).Count
     Assert ($wasAttached -eq 0) 'and it was NOT attached a moment before (the resume is what bound it)'
 
-    # --- A relaunchable tombstone RELAUNCHES (T466) -------------------------
+    # --- A finished session is NOT listed (D91/T1364) -----------------------
     Write-Host ''
-    Write-Host '3. a relaunchable tombstone is listed AND relaunches on Return'
+    Write-Host '3. a session whose program has exited is not offered at all'
     # Killing the agent turns every live child into a tombstone; the respawned
-    # agent rematerializes them from sessions.json as relaunchable rows.
-    # GHOZTTY_RESTORE_SKIP is still set, deliberately: without it this relaunch
-    # would adopt the agent's layout blobs and RELAUNCH the tombstones as fresh
-    # shells (T89g), leaving no dead row for this section to refuse.
+    # agent rematerializes them from sessions.json as relaunchable rows - the
+    # exact shape a reboot produces, and the one T466 used to LIST with a
+    # "can relaunch" badge. Per D91 those rows are over and the chooser must not
+    # carry them. GHOZTTY_RESTORE_SKIP is still set, deliberately: without it
+    # this relaunch would adopt the agent's layout blobs and RELAUNCH the
+    # tombstones as fresh shells (T89g), leaving no dead row for this section to
+    # find. The new app's own panes supply the live rows.
     Stop-RepoProcesses @('ghoztty', 'ghoztty-agent')
     Remove-LayoutManifest
     $g = Launch-Gui $errlog3 @('--session-persistence=true')
     if (-not $g) { Write-Host 'SETUP FAIL: GUI died on second relaunch'; exit 1 }
     Start-Sleep -Seconds 2
 
+    $all = @(Get-Sessions)
+    $deadIds = @($all | Where-Object { -not $_.alive } | ForEach-Object { $_.id })
     $rows = @(Get-RenderedSessions)
-    $deadIds = @($rows | Where-Object { -not $_.alive } | ForEach-Object { $_.id })
-    $liveIds = @($rows | Where-Object { $_.alive } | ForEach-Object { $_.id })
-    Assert ($deadIds.Count -ge 1) "a tombstone row is rendered ($($deadIds.Count) of $($rows.Count))"
-    Assert ($liveIds.Count -ge 1) "a live row is rendered too ($($liveIds.Count))"
-    if ($deadIds.Count -lt 1 -or $liveIds.Count -lt 1) { Write-Host 'SETUP FAIL: need one dead and one live row'; exit 1 }
+    $liveIds = @($rows | ForEach-Object { $_.id })
+    Assert ($deadIds.Count -ge 1) "the agent is holding tombstones ($($deadIds.Count) of $($all.Count))"
+    Assert ($liveIds.Count -ge 1) "and a live session too ($($liveIds.Count))"
+    if ($deadIds.Count -lt 1 -or $liveIds.Count -lt 1) { Write-Host 'SETUP FAIL: need one dead and one live session'; exit 1 }
 
     $chooser = Open-Chooser $g
     Assert ($chooser -ne [IntPtr]::Zero) 'the chooser reopens'
@@ -346,64 +348,49 @@ try {
     $filter = ConvertTo-TestHwnd (Get-ChooserFilterField -Chooser $chooser)
     Wait-LogLine $errlog3 'chooser roster: loaded (\d+) session' 8000 | Out-Null
 
-    # The BADGE oracle. The rows are owner-drawn, so the mark is said out loud
-    # once per adopted roster (SessionRoster.logRelaunchable) and cross-checked
-    # here against `+sessions --json`, which dials the agent directly and never
-    # goes through the app. Read the LAST such line: the roster is adopted on
-    # every fetch, so earlier opens left their own counts in this log.
-    $markLines = @(Select-String -Path $errlog3 -Pattern 'chooser roster: (\d+) session\(s\) can relaunch')
-    $marked = if ($markLines.Count -gt 0) { [int]$markLines[-1].Matches[0].Groups[1].Value } else { -1 }
-    Assert ($marked -eq $deadIds.Count) `
-        "the roster marks exactly the tombstones as relaunchable (said $marked, agent says $($deadIds.Count))"
+    # The ABSENCE oracle, and the reason it is one: the rows are owner-drawn, so
+    # the roster says out loud what it LISTED and what it HID
+    # (SessionRoster.logListed), and that is cross-checked here against
+    # `ghoztty +sessions --json`, which dials the agent directly and never goes
+    # through the app. An empty fixture cannot pass it - the agent must report
+    # the tombstones for `hidden` to match. This replaces T466's "N session(s)
+    # can relaunch" oracle rather than deleting it: the same mark, asserted
+    # absent. Read the LAST such line: the roster is adopted on every fetch, so
+    # earlier opens left their own counts in this log.
+    $markLines = @(Select-String -Path $errlog3 -Pattern 'chooser roster: listing (\d+) session\(s\), (\d+) exited hidden')
+    $listed = if ($markLines.Count -gt 0) { [int]$markLines[-1].Matches[0].Groups[1].Value } else { -1 }
+    $hidden = if ($markLines.Count -gt 0) { [int]$markLines[-1].Matches[0].Groups[2].Value } else { -1 }
+    Assert ($hidden -eq $deadIds.Count) `
+        "the roster hides exactly the finished sessions (hid $hidden, agent says $($deadIds.Count))"
+    Assert ($listed -eq $liveIds.Count) `
+        "and lists exactly the live ones (listed $listed, agent says $($liveIds.Count))"
 
-    # Walk to a dead row, reading each landing from the cursor log (the
-    # displayed order is T602-sorted, so no index is assumed).
+    # And the cursor cannot reach one: the keyboard walk over the whole rendered
+    # list never lands on a tombstone id, so there is no row to press Return on
+    # even for someone who tries. The walk is bounded by the rendered count,
+    # which is what the roster claims to be showing.
     $deadLanded = Walk-CursorToId $chooser $filter $errlog3 $deadIds $rows.Count
-    Assert ($null -ne $deadLanded) "the cursor walk lands on a tombstone row ($deadLanded)"
-    if ($null -eq $deadLanded) { Write-Host 'SETUP FAIL: cursor never reached a tombstone row'; exit 1 }
-    Start-Sleep -Milliseconds 400
-    $attachesBefore = Count-LogLines $errlog3 'resume session: attaching'
-    $relaunchesBefore = Count-LogLines $errlog3 'chooser roster: relaunching session id='
-    Send-ChooserKey $chooser $filter 'Return' | Out-Null
-    $waited = 0
-    while ($waited -lt 8000 -and (Count-LogLines $errlog3 'resume session: attaching') -le $attachesBefore) {
-        Start-Sleep -Milliseconds 200
-        $waited += 200
-    }
+    Assert ($null -eq $deadLanded) `
+        "no cursor landing names a finished session (landed on '$deadLanded')"
 
-    Assert ((Count-LogLines $errlog3 'resume session: attaching') -gt $attachesBefore) `
-        'Return on a tombstone opens a window ATTACHed to that session'
-    Assert ((Count-LogLines $errlog3 'chooser roster: relaunching session id=') -gt $relaunchesBefore) `
-        'and the app names the verb RELAUNCH, not resume'
-    Assert ((Count-LogLines $errlog3 "chooser roster: relaunching session id=$deadLanded") -ge 1) `
-        'naming the row the cursor was actually on'
-    Start-Sleep -Seconds 2
-    Assert (-not (Test-TestWindowExists -Window $chooser)) `
-        'and the chooser dismissed itself onto the relaunched window'
+    # Nothing was opened, so this chooser is still up: dismiss it for the
+    # control below, which opens its own.
+    Send-ChooserKey $chooser $filter 'Escape' | Out-Null
+    Start-Sleep -Milliseconds 600
+    Assert (-not (Test-TestWindowExists -Window $chooser)) 'the chooser closes on Escape'
 
-    # The INDEPENDENT oracle, the agent dialled directly again: the default
-    # `restore` policy opens a fresh session in the dead one's recorded cwd and
-    # RETIRES the tombstone (termio/Remote.zig), so that id leaves the agent's
-    # roster and there is one more live session than before.
-    $liveBefore = $liveIds.Count
-    $settled = 0
-    while ($settled -lt 10000) {
-        if (@(Get-Sessions | Where-Object { $_.id -eq $deadLanded }).Count -eq 0) { break }
-        Start-Sleep -Milliseconds 250
-        $settled += 250
-    }
-    $after3 = @(Get-Sessions)
-    $liveAfter = @($after3 | Where-Object { $_.alive }).Count
-    Assert (@($after3 | Where-Object { $_.id -eq $deadLanded }).Count -eq 0) `
-        'the agent has retired the tombstone it relaunched'
-    Assert ($liveAfter -gt $liveBefore) `
-        "and holds one more LIVE session than before ($liveAfter vs $liveBefore)"
+    # The agent's own roster is unchanged by any of it: refusing to LIST a
+    # tombstone must not retire it, because launch-time restore still revives
+    # those leaves from a saved layout (a different path, D91 untouched).
+    $stillDead = @(Get-Sessions | Where-Object { -not $_.alive } | ForEach-Object { $_.id })
+    Assert ($stillDead.Count -ge $deadIds.Count) `
+        "the agent still holds its tombstones for launch-time restore ($($stillDead.Count))"
 
     # POSITIVE CONTROL: the same keys, a LIVE row, in a freshly reopened
-    # chooser (section 3's Return dismissed the last one). Section 3's
-    # assertions are positive, so a keystroke that never arrived fails them
-    # outright - this control says the dialog distinguishes the two kinds of row
-    # rather than opening something on any Return.
+    # chooser (section 3 dismissed the last one with Escape). Section 3's
+    # headline assertion is an ABSENCE - no tombstone row, no cursor landing on
+    # one - and a dialog that swallowed every keystroke would satisfy it too, so
+    # this control is what says the keys reach the roster at all.
     #
     # A session already open here is FOCUSED rather than attached a second time
     # - the agent rebinds a session to its newest ATTACH, so resuming one twice
