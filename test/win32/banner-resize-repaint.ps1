@@ -33,6 +33,11 @@
 #      after a whole-window resize: the banner popup exactly covers the band
 #      above its pane (same left, same right, its bottom on the pane's top).
 #      A gap in that arithmetic IS a parent-owned region nothing paints.
+#   C. The same invariant holds during a HERO divider drag (T1324). Hero mode
+#      runs its own drag handler, which reached `layoutHero` directly and so
+#      skipped the pane-chrome pass every other layout path gets for free from
+#      `layoutSplits`. The banner kept its pre-drag geometry for the length of
+#      the drag and healed on button-up, so the sampling has to be MID-drag.
 # The "repaint landed in the same pass, not one WM_PAINT later" half is a unit
 # test - `banner overlay: a size-changing updatePosition repaints in the same
 # pass` in BannerOverlay.zig, run at 1.0/1.25/1.5/2.0.
@@ -221,6 +226,84 @@ try {
     }
     Assert ($winViolations.Count -eq 0) ('band tiles the pane across whole-window resizes' +
         $(if ($winViolations.Count) { ' -- ' + (($winViolations | Select-Object -First 4) -join '; ') } else { '' }))
+
+    # ---- C. hero mode: the banner must track the HERO divider drag -------
+    # T1324. Hero mode has its OWN divider (hero pane on the left, thumbnail
+    # carousel on the right) and its own drag handler, `heroUpdateDividerDrag`,
+    # which called `layoutHero` DIRECTLY to get the 80ms leaf-resize throttle.
+    # Every other layout path reaches the pane chrome through `layoutSplits`'s
+    # trailing `updateDimOverlays`; that one did not, so the hero pane narrowed
+    # under the drag while its banner kept the pre-drag geometry and left stale
+    # strip pixels behind. `heroEndDividerDrag` then ran a full `layoutSplits`,
+    # which is why the artifacts healed the instant the button came up and the
+    # bug only ever existed DURING the drag - so this samples mid-drag, before
+    # the button-up, which is the only place it is observable.
+    [void](Set-TestWindowPos -Window ([IntPtr]$top) -X 40 -Y 40 -Width 1200 -Height 820)
+    Start-Sleep -Milliseconds 400
+    # The chord goes at the bannered LEAF, not the top-level window: hero is a
+    # surface binding, and the pane that has focus when it fires becomes the
+    # hero - which is also what puts the banner's owner on screen.
+    [void](Send-TestKeys -Window ([IntPtr]$top) -Target ([IntPtr]$owner.Hwnd) `
+        -Modifiers @('ctrl', 'shift') -Key 'space')
+    Start-Sleep -Milliseconds 1200
+
+    $heroPanes = @(Get-TestChildWindows -Window ([IntPtr]$top) -Class 'GhozttyTerminal' |
+        Where-Object Visible)
+    Assert ($heroPanes.Count -eq 1) "hero mode: exactly one visible pane (saw $($heroPanes.Count))"
+    if ($heroPanes.Count -eq 1) {
+        $hero = $heroPanes[0]
+        $hb = Get-Banner $appPid
+        # The banner hides itself when its owner pane is not visible, so a
+        # banner that is present at all here belongs to the hero.
+        Assert (($null -ne $hb) -and ($hb.Visible)) 'hero mode: the bannered pane is the hero and its strip is showing'
+        if ($hb -and $hb.Visible) {
+            $v = Get-TilingViolations $hb $hero 'hero-settled'
+            Assert ($v.Count -eq 0) ('band tiles the hero pane before the hero drag' +
+                $(if ($v.Count) { ' -- ' + ($v -join '; ') } else { '' }))
+
+            # Press in the hero divider band and walk LEFT (the user's case:
+            # the hero narrows, so the band rewraps taller and both edges of
+            # the banner have to move). Each step sleeps past the 80ms leaf
+            # throttle so the sample sees a settled leaf rather than a frame
+            # the app has not laid out yet.
+            $heroViolations = @()
+            $midY = [int](($hero.Top + $hero.Bottom) / 2)
+            $divX = $hero.Right + 3
+            [void](Send-TestMouse -Window ([IntPtr]$top) -Target ([IntPtr]$top) `
+                -X $divX -Y $midY -Action down)
+            Start-Sleep -Milliseconds 150
+            for ($i = 1; $i -le 8; $i++) {
+                $nx = $divX - ($i * 25)
+                [void](Send-TestMouse -Window ([IntPtr]$top) -Target ([IntPtr]$top) `
+                    -X $nx -Y $midY -Action move)
+                Start-Sleep -Milliseconds 200
+                $bb = Get-Banner $appPid
+                $pp = @(Get-TestChildWindows -Window ([IntPtr]$top) -Class 'GhozttyTerminal' |
+                    Where-Object Visible)
+                if ($bb -and $pp.Count -eq 1) {
+                    $heroViolations += Get-TilingViolations $bb $pp[0] "herodrag-$i"
+                }
+            }
+            [void](Send-TestMouse -Window ([IntPtr]$top) -Target ([IntPtr]$top) `
+                -X ($divX - 200) -Y $midY -Action up)
+            Start-Sleep -Milliseconds 500
+
+            $heroOk = ($heroViolations.Count -eq 0)
+            if ($NegativeControl) { $heroOk = -not $heroOk }
+            Assert $heroOk ('band tiles the hero pane at every step of a hero divider drag' +
+                $(if ($heroViolations.Count) { ' -- ' + (($heroViolations | Select-Object -First 4) -join '; ') } else { '' }))
+
+            # And the hero actually narrowed - otherwise the loop above proved
+            # nothing, because a divider that never moved cannot desynchronise
+            # anything from it.
+            $after = @(Get-TestChildWindows -Window ([IntPtr]$top) -Class 'GhozttyTerminal' |
+                Where-Object Visible)
+            if ($after.Count -eq 1) {
+                Assert ($after[0].Width -le ($hero.Width - 100)) `
+                    "hero drag actually moved the divider (was $($hero.Width), now $($after[0].Width))"
+            }
+        }
+    }
 
     Assert (-not (Test-TestDesktopLeak -ProcessId $appPid)) 'GUI never became visible on the interactive desktop'
 }

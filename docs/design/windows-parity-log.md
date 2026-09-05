@@ -21978,3 +21978,47 @@ relationship with, so the material is prepared and the posting waits for them -
 PASS, P1-P3 ALL PASS, and the seven meta-audits that a new `test\win32` script
 puts on the due list (isolation-meta, launch-preflight, verdict-exit,
 cleanslate, stderr-capture, body-complete, desktop-launch) all re-ran green.
+
+## 2026-09-04 - A banner keeps up with the hero divider while you drag it (T1324)
+
+The user reported four things in one sentence about the Windows build feeling
+unpolished next to the Mac one. This is the one that was a bug rather than a
+performance question: with a sticky banner showing, dragging the divider
+between the hero pane and the thumbnail carousel left the banner exactly where
+it was. The pane narrowed under the mouse, the strip above it kept its old
+width, and the pixels it no longer covered stayed on screen as leftovers.
+Letting go put everything right, so the mess only ever existed mid-drag.
+
+The task file's own diagnosis was wrong in a useful way. It said the live
+layout does not reposition the banner; it does - `layoutSplits` ends with a
+`defer updateDimOverlays()`, and that call finishes by re-gluing every piece of
+per-pane chrome: the banner strip, the dim overlay over unfocused panes, the
+read-only badge, the key-state pill. Every ordinary layout path gets that for
+free. The exception is `heroUpdateDividerDrag`, which calls `layoutHero`
+DIRECTLY so it can throttle the leaf resize to 80 ms, and in taking the
+shortcut skipped the chrome pass entirely. `heroEndDividerDrag` then runs a
+full `layoutSplits`, which is exactly why the artifacts healed on button-up.
+The fix is that one call from the throttled branch; `layoutHero` now says in
+its doc comment that a caller reaching it directly owes it.
+
+The oracle is section C of `test\win32\banner-resize-repaint.ps1`, which
+extends the tiling invariant that script already had (the banner popup exactly
+covers the band above its pane) into hero mode and samples it MID-drag, before
+the button-up that used to hide the defect. It was shown to score red rather
+than assumed to: with the fix commented out and the app rebuilt, the banner's
+right edge stayed frozen at 927 while the pane walked 901 -> 826.
+
+T1324 is split here rather than closed, because the hero artifact was one
+quarter of the report. The rest is **T1343** (the divider drag is slow and
+steppy - the per-surface frame wait in `Surface.setSize`, and the measurement
+work the other two depend on), **T1344** (banners flicker as they expand and
+collapse) and **T1345** (the layered-popup fan-out behind the general
+heaviness, deliberately behind T1343 because only numbers can say whether that
+redesign is worth doing). Each needs its own evidence and its own oracle, and
+none of them should be guessed at - which is what T1324 was filed to stop.
+
+`banner-resize-repaint.ps1` ALL PASS (15 assertions), `hero-mode.ps1` ALL PASS
+(72), `pane-banner.ps1` ALL PASS (130). All four floor lanes PASS, P1-P3 ALL
+PASS, and the eight meta-audits a `test\win32` edit puts on the due list
+(printclient, isolation-meta, launch-preflight, verdict-exit, cleanslate,
+stderr-capture, test-reach, desktop-launch) all re-ran green.

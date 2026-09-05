@@ -2751,6 +2751,18 @@ fn heroUpdateDividerDrag(self: *Window, x: i32) void {
     if (now - self.hero_drag_resize_ms >= HERO_DRAG_RESIZE_MS) {
         self.hero_drag_resize_ms = now;
         self.layoutHero(rect);
+        // T1324: `layoutHero` moves the leaves and nothing else. Every piece of
+        // per-pane chrome — the sticky banner strip, the dim overlay, the
+        // read-only badge, the key-state pill — is a separate layered popup that
+        // only `updateDimOverlays` re-glues, and on every OTHER layout path that
+        // call rides `layoutSplits`'s trailing `defer`. This path calls
+        // `layoutHero` DIRECTLY (to get the 80 ms throttle), so it skipped it:
+        // the hero pane narrowed under the drag while its banner kept the
+        // pre-drag width and left its old strip pixels behind, which is exactly
+        // the "the banner doesn't resize and I get artifacts" the user reported.
+        // The final `layoutSplits` in `heroEndDividerDrag` is why it looked
+        // correct the moment the button came up.
+        self.updateDimOverlays();
     }
     // Repaint the whole content region: the divider/carousel boundary
     // moves every tick even between throttled leaf resizes.
@@ -2829,6 +2841,11 @@ fn heroOnSnapReady(self: *Window, leaf_hwnd_int: usize) void {
 /// needs no grid reflow (the Mac keeps all strip slots hero-sized for
 /// exactly this reason). The carousel column itself has no child HWNDs;
 /// it is owner-painted by HeroCarousel.
+///
+/// Moves LEAVES ONLY. The per-pane layered chrome (banner strip, dim overlay,
+/// read-only badge, key-state pill) is re-glued by `updateDimOverlays`, which
+/// `layoutSplits` runs on the way out — so a caller that reaches this function
+/// directly, bypassing `layoutSplits`, owes that call itself (T1324).
 fn layoutHero(self: *Window, rect: w32.RECT) void {
     // A re-layout mid-animation (window resize, tab ops) invalidates the
     // animation's captured geometry — finish instantly and lay out the
