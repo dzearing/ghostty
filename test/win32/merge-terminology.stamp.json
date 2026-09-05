@@ -1,8 +1,8 @@
 {
     "guard":  "merge-terminology",
     "script":  "test/win32/merge-terminology.ps1",
-    "generated":  "2026-09-04T17:41:50-07:00",
-    "commit":  "3636936bc",
+    "generated":  "2026-09-04T23:01:25-07:00",
+    "commit":  "9a3bf90ae",
     "uncommitted":  [
                         "go.md"
                     ],
@@ -10,7 +10,7 @@
                   "CLAUDE.md":  "ed2bd546b1fb102c9ed719093fb0bfa3b52c407acae184ef2880e1b7aba027d7",
                   "docs/design/windows-parity-ship-workflow.md":  "f7289e5a320ad543ee36ece4ddef741e958f78ba942eed49547f9db26784e0c6",
                   "docs/design/windows-parity-upstream-pull-plan.md":  "ce7efdbe6eb4cec9529fce4a4656cf17f0b13db5f35c5738524ed86ccee56002",
-                  "go.md":  "243566bc6fc51377589017c6e14537b5f43bb0a8d7c8f5d7fe7c1af335f2d2f0",
+                  "go.md":  "f536522cb5a46af59304c33fff7d5d6fc62a73b9bf0f8cc275aababf3c5d1481",
                   "scripts/ship-readiness.ps1":  "1fcab42cac628cae5852b0d1bd93b266c0d9809b015ff996362f02c5895c84f7",
                   "test/win32/merge-terminology.ps1":  "c6e28d4f5dac63e423b492c7e854a11ae24e754ddf56587a8dd6cbeeb5efa6eb"
               }

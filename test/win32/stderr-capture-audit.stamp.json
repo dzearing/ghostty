@@ -1,10 +1,10 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-04T22:08:16-07:00",
-    "commit":  "980a149a3",
+    "generated":  "2026-09-04T23:01:18-07:00",
+    "commit":  "9a3bf90ae",
     "uncommitted":  [
-                        "test/win32/drag-perf.ps1"
+                        "test/win32/parity-tasks-seat.ps1"
                     ],
     "files":  {
                   "docs/claude/testing.md":  "75066e86f1dcb63299264139b1ca28da1f7025520011e33f7c3139d0d24fc9b1",
@@ -215,7 +215,7 @@
                   "test/win32/pane-id.ps1":  "0c722d4f0cb52d3567b2d070362fa2cf825aafc952a81b1bcf01768203181161",
                   "test/win32/pane-ingest-lag.ps1":  "a5c9ffcbdeae28c26b54d98d09586137bcba9be70691c2b2634c781b3fdf9768",
                   "test/win32/parity-sweep.ps1":  "2251497104f8df5a8b1146441bd2b5e3ebb38a495c7d7fe16a9f64a05c801044",
-                  "test/win32/parity-tasks-seat.ps1":  "8bfb0266e93149059dc1675dca291f2fa60e46187204c3e1ee611c516235fe0b",
+                  "test/win32/parity-tasks-seat.ps1":  "93f60db34af8e611ca4d288d93d8bf5ee612d981ff99ce835e4cde7f80ad6205",
                   "test/win32/parity-tasks-split-deps.ps1":  "0e1a57bd7a925ee877b450d538bfbc4fc97c25eb4542be246dc7b2a403e7546d",
                   "test/win32/path-selfheal.ps1":  "e37347a9c7c11b2b85bcb7fca1fb80a13fe5984a401f9cadcd81ee245d41781f",
                   "test/win32/persistence-flag.ps1":  "5c9e111014296ec7d652199dfa837b4c597b4eea1c868e33fb233812039c198b",
