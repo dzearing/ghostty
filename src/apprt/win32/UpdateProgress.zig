@@ -37,8 +37,12 @@ const UpdateProgress = @This();
 
 const std = @import("std");
 const w32 = @import("win32.zig");
+const App = @import("App.zig");
 const model = @import("update_progress.zig");
 const type_ramp = @import("type_ramp.zig");
+const brush_cache = @import("brush_cache.zig");
+const panel_theme = @import("panel_theme.zig");
+const system_colors = @import("system_colors.zig");
 
 const log = std.log.scoped(.win32_update_progress);
 
@@ -55,25 +59,28 @@ const TIMER_ID: usize = 1;
 /// mostly the failure case's dwell time.
 const LINGER_MS: i64 = 2_500;
 
-// The ConfirmDialog dark palette — this panel is the same surface as the
-// dialog that launched it, so the colors are not re-invented here.
-const COLOR_BG = w32.RGB(32, 32, 32);
-const COLOR_TEXT = w32.RGB(230, 230, 230);
-const COLOR_TEXT_SECONDARY = w32.RGB(160, 160, 160);
-/// The bar's unfilled track: one notch darker than the surface, the same
-/// relationship the dialog's text field has to it.
-const COLOR_TRACK = w32.RGB(58, 58, 58);
-/// The filled run — the accent blue the tab strip and command palette use for
-/// the active thing.
-const COLOR_FILL = w32.RGB(76, 160, 235);
-/// A stalled or failed run desaturates rather than turning red: nothing is
-/// broken yet, and the sentence under the bar carries the meaning.
-const COLOR_FILL_STALLED = w32.RGB(120, 120, 120);
+/// The panel's palette (T563). It was six literals copied from the confirm
+/// dialog's dark one, so this window opened black on a light system theme —
+/// and it is the window a user stares at for the length of a download.
+///
+/// The roles map onto `panel_theme` rather than onto new numbers: the track is
+/// a `well` (a recessed trough, which is what a progress track is), the run is
+/// the user's `accent` floored against the surface, and a stalled run is the
+/// `secondary` ramp — desaturated, still legible, and still not red, because
+/// nothing is broken yet.
+fn pal(self: *const UpdateProgress) panel_theme.Panel {
+    return system_colors.panelFor(self.app);
+}
 
+/// Keyed on the color it was made for: a GDI brush is immutable, so a theme
+/// flip has to mean a new object rather than a handle stuck on the old palette.
 var class_registered: bool = false;
-var bg_brush: ?w32.HBRUSH = null;
+var bg_brush: brush_cache.CachedBrush = .{};
 
 alloc: std.mem.Allocator,
+/// The app whose theme this panel paints from — it is an app window, not a
+/// standalone one, so it follows the same `window-theme` its terminal does.
+app: *App,
 hwnd: w32.HWND,
 shared: *model.Shared,
 /// Title line, e.g. "Downloading Ghoztty 1.36.0" (UTF-16, owned).
@@ -167,6 +174,7 @@ fn px(v: f32, scale: f32) i32 {
 /// before this panel existed.
 pub fn create(
     alloc: std.mem.Allocator,
+    app: *App,
     hinstance: ?w32.HINSTANCE,
     owner: ?w32.HWND,
     scale: f32,
@@ -248,6 +256,7 @@ pub fn create(
 
     self.* = .{
         .alloc = alloc,
+        .app = app,
         .hwnd = undefined,
         .shared = shared,
         .title = title,
@@ -275,13 +284,8 @@ pub fn create(
     self.hwnd = hwnd;
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
 
-    const dark_mode: u32 = 1;
-    _ = w32.DwmSetWindowAttribute(
-        hwnd,
-        w32.DWMWA_USE_IMMERSIVE_DARK_MODE,
-        @ptrCast(&dark_mode),
-        @sizeOf(u32),
-    );
+    // The caption follows the same surface the body does (T563).
+    system_colors.applyPanelChrome(hwnd, self.pal());
 
     // SW_SHOWNA: the panel reports, it does not steal the caret from the
     // terminal the user is still typing in.
@@ -381,7 +385,8 @@ fn paint(self: *UpdateProgress, hdc: w32.HDC, client: w32.RECT) void {
     const prev_bmp = w32.SelectObject(mem_dc, bmp);
     defer _ = w32.SelectObject(mem_dc, prev_bmp);
 
-    if (bg_brush) |b| _ = w32.FillRect(mem_dc, &client, b);
+    const p = self.pal();
+    if (bg_brush.get(system_colors.cr(p.bg))) |b| _ = w32.FillRect(mem_dc, &client, b);
 
     const snap = self.shared.snapshot();
     const now = std.time.milliTimestamp();
@@ -398,7 +403,7 @@ fn paint(self: *UpdateProgress, hdc: w32.HDC, client: w32.RECT) void {
     if (self.fonts.body) |f| {
         const prev = w32.SelectObject(mem_dc, f);
         defer _ = w32.SelectObject(mem_dc, prev);
-        _ = w32.SetTextColor(mem_dc, COLOR_TEXT);
+        _ = w32.SetTextColor(mem_dc, system_colors.cr(p.text));
         var r = l.title;
         _ = w32.DrawTextW(
             mem_dc,
@@ -411,13 +416,13 @@ fn paint(self: *UpdateProgress, hdc: w32.HDC, client: w32.RECT) void {
 
     // Track, then the run over it.
     const track_w = l.track.right - l.track.left;
-    if (w32.CreateSolidBrush(COLOR_TRACK)) |tb| {
+    if (w32.CreateSolidBrush(system_colors.cr(p.well))) |tb| {
         defer _ = w32.DeleteObject(tb);
         _ = w32.FillRect(mem_dc, &l.track, tb);
     }
     const stalled = snap.outcome == .running and idle >= model.stall_after_ms;
-    const fill_color = if (stalled or snap.outcome == .failed) COLOR_FILL_STALLED else COLOR_FILL;
-    if (w32.CreateSolidBrush(fill_color)) |fb| {
+    const fill_color = if (stalled or snap.outcome == .failed) p.secondary else p.accent;
+    if (w32.CreateSolidBrush(system_colors.cr(fill_color))) |fb| {
         defer _ = w32.DeleteObject(fb);
         var run = l.track;
         if (snap.outcome == .ok) {
@@ -440,7 +445,7 @@ fn paint(self: *UpdateProgress, hdc: w32.HDC, client: w32.RECT) void {
     if (self.fonts.caption) |f| {
         const prev = w32.SelectObject(mem_dc, f);
         defer _ = w32.SelectObject(mem_dc, prev);
-        _ = w32.SetTextColor(mem_dc, COLOR_TEXT_SECONDARY);
+        _ = w32.SetTextColor(mem_dc, system_colors.cr(p.secondary));
         var status_buf: [192]u8 = undefined;
         const status = model.statusLine(&status_buf, snap, idle);
         var w_buf: [256]u16 = undefined;
@@ -464,7 +469,6 @@ fn utf16z(alloc: std.mem.Allocator, s: []const u8) ![:0]u16 {
 
 fn registerClass(hinstance: ?w32.HINSTANCE) ?void {
     if (class_registered) return;
-    bg_brush = w32.CreateSolidBrush(COLOR_BG);
     const wc = w32.WNDCLASSEXW{
         .cbSize = @sizeOf(w32.WNDCLASSEXW),
         .style = 0,
@@ -474,7 +478,9 @@ fn registerClass(hinstance: ?w32.HINSTANCE) ?void {
         .hInstance = hinstance,
         .hIcon = null,
         .hCursor = w32.LoadCursorW(null, w32.IDC_ARROW),
-        .hbrBackground = bg_brush,
+        // Null: `paint` fills the whole client from the live palette, and a
+        // class brush would be frozen at registration time anyway (T563).
+        .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = CLASS_NAME,
         .hIconSm = null,

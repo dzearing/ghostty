@@ -448,13 +448,8 @@ pub fn open(window: *Window) void {
     };
     self.hwnd = hwnd;
 
-    const dark_mode: u32 = 1;
-    _ = w32.DwmSetWindowAttribute(
-        hwnd,
-        w32.DWMWA_USE_IMMERSIVE_DARK_MODE,
-        @ptrCast(&dark_mode),
-        @sizeOf(u32),
-    );
+    // The caption follows the same surface the body does (T563).
+    system_colors.applyPanelChrome(hwnd, self.pal());
 
     // Account row (T141, recomposed in T311): the status/email text, the
     // signed-out state's bordered button, and the signed-in state's link.

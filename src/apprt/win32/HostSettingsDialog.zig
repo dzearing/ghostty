@@ -28,21 +28,25 @@ const host_defaults = @import("host_defaults.zig");
 const type_ramp = @import("type_ramp.zig");
 const w32 = @import("win32.zig");
 const utf16_text = @import("utf16_text.zig");
+const brush_cache = @import("brush_cache.zig");
+const panel_theme = @import("panel_theme.zig");
+const system_colors = @import("system_colors.zig");
 
 const log = std.log.scoped(.win32);
 
 const CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyHostSettings");
 
-/// Dialog colors — the shared dark dialog palette (ConfirmDialog / RenameDialog
-/// / the machine chooser).
-const COLOR_BG = w32.RGB(32, 32, 32);
-const COLOR_FIELD_BG = w32.RGB(30, 30, 30);
-const COLOR_TEXT = w32.RGB(230, 230, 230);
-const COLOR_LABEL = w32.RGB(200, 200, 200);
+/// The dialog's palette, derived from the surface `window-theme` puts the app
+/// on and the accent the user picked (T563), the way the panels have been
+/// since T308. It was four dark literals, so this dialog opened black on a
+/// light system theme.
+fn pal(self: *const HostSettingsDialog) panel_theme.Panel {
+    return system_colors.panelFor(self.app);
+}
 
 var class_registered: bool = false;
-var bg_brush: ?w32.HBRUSH = null;
-var field_brush: ?w32.HBRUSH = null;
+var bg_brush: brush_cache.CachedBrush = .{};
+var field_brush: brush_cache.CachedBrush = .{};
 
 /// The informative line above the fields, matching Mac's `informativeText`
 /// word for word — it is the only place the "values are REMOTE-native" rule is
@@ -67,6 +71,7 @@ const CANCEL_LABEL = std.unicode.utf8ToUtf16LeStringLiteral("Cancel");
 const IDOK: u16 = 1;
 const IDCANCEL: u16 = 2;
 
+app: *App,
 hwnd: w32.HWND,
 body: ?w32.HWND = null,
 wd_label: ?w32.HWND = null,
@@ -317,6 +322,7 @@ pub fn prompt(
     // The dialog lives on this stack frame: `prompt` does not return until the
     // nested loop is done, so nothing needs to be allocated.
     var self: HostSettingsDialog = .{
+        .app = app,
         .hwnd = undefined,
         .wd_edit = undefined,
         .shell_combo = undefined,
@@ -340,13 +346,8 @@ pub fn prompt(
     ) orelse return null;
     self.hwnd = hwnd;
 
-    const dark_mode: u32 = 1;
-    _ = w32.DwmSetWindowAttribute(
-        hwnd,
-        w32.DWMWA_USE_IMMERSIVE_DARK_MODE,
-        @ptrCast(&dark_mode),
-        @sizeOf(u32),
-    );
+    // The caption follows the same surface the body does (T563).
+    system_colors.applyPanelChrome(hwnd, self.pal());
 
     self.body = createStatic(app, hwnd, BODY_TEXT, l.body, 0);
     self.wd_label = createStatic(app, hwnd, WD_LABEL, l.wd_label, w32.SS_RIGHT);
@@ -681,8 +682,9 @@ fn handleKey(self: *HostSettingsDialog, vk: u16) bool {
 
 fn registerClass(app: *App) ?void {
     if (class_registered) return;
-    bg_brush = w32.CreateSolidBrush(COLOR_BG);
-    field_brush = w32.CreateSolidBrush(COLOR_FIELD_BG);
+    // Warm the palette memo so the first paint does not resolve on the
+    // critical path; the brushes are created on demand, keyed on their color.
+    _ = system_colors.panelFor(app);
     const wc = w32.WNDCLASSEXW{
         .cbSize = @sizeOf(w32.WNDCLASSEXW),
         .style = 0,
@@ -692,7 +694,10 @@ fn registerClass(app: *App) ?void {
         .hInstance = app.hinstance,
         .hIcon = null,
         .hCursor = w32.LoadCursorW(null, w32.IDC_ARROW),
-        .hbrBackground = bg_brush,
+        // Null, erased from the live palette in `WM_ERASEBKGND` instead
+        // (T563) - a class brush is captured once per process, so it cannot
+        // follow a theme flip.
+        .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = CLASS_NAME,
         .hIconSm = null,
@@ -740,31 +745,54 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
             }
             return 0;
         },
+        // The class carries no background brush (it would be frozen at
+        // registration time), so the dialog surface is erased here from the
+        // live palette instead.
+        w32.WM_ERASEBKGND => {
+            const hdc: w32.HDC = @ptrFromInt(wparam);
+            var er: w32.RECT = undefined;
+            if (w32.GetClientRect(hwnd, &er) == 0) return 0;
+            if (bg_brush.get(system_colors.cr(self.pal().bg))) |b| _ = w32.FillRect(hdc, &er, b);
+            return 1;
+        },
+        // A light/dark flip or an accent change reaches TOP-LEVEL windows, and
+        // this dialog is one. Repaint it AND its children: a control colors
+        // itself from a `WM_CTLCOLOR*` reply, which is only sent when it
+        // repaints (T307).
+        w32.WM_SETTINGCHANGE, w32.WM_DWMCOLORIZATIONCOLORCHANGED => {
+            if (msg != w32.WM_SETTINGCHANGE or system_colors.isColorSettingChange(lparam)) {
+                system_colors.repaintForColorChange(hwnd);
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         // Fields (and the combo's inner edit / its drop-down list) are fields,
         // not dialog surface: without this they render as white boxes.
         w32.WM_CTLCOLOREDIT, w32.WM_CTLCOLORLISTBOX => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc, COLOR_TEXT);
-            _ = w32.SetBkColor(hdc, COLOR_FIELD_BG);
-            if (field_brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
+            const p = self.pal();
+            _ = w32.SetTextColor(hdc, system_colors.cr(p.text));
+            _ = w32.SetBkColor(hdc, system_colors.cr(p.field));
+            if (field_brush.get(system_colors.cr(p.field))) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_CTLCOLORSTATIC => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
+            const p = self.pal();
             // Labels are secondary text; the body paragraph reads as primary.
             const ctl: ?w32.HWND = @ptrFromInt(@as(usize, @bitCast(lparam)));
             const is_label = (self.wd_label != null and ctl == self.wd_label) or
                 (self.shell_label != null and ctl == self.shell_label);
-            _ = w32.SetTextColor(hdc, if (is_label) COLOR_LABEL else COLOR_TEXT);
-            _ = w32.SetBkColor(hdc, COLOR_BG);
-            if (bg_brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
+            _ = w32.SetTextColor(hdc, system_colors.cr(if (is_label) p.label else p.text));
+            _ = w32.SetBkColor(hdc, system_colors.cr(p.bg));
+            if (bg_brush.get(system_colors.cr(p.bg))) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_CTLCOLORBTN => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc, COLOR_TEXT);
-            _ = w32.SetBkColor(hdc, COLOR_BG);
-            if (bg_brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
+            const p = self.pal();
+            _ = w32.SetTextColor(hdc, system_colors.cr(p.text));
+            _ = w32.SetBkColor(hdc, system_colors.cr(p.bg));
+            if (bg_brush.get(system_colors.cr(p.bg))) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),

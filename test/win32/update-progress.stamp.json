@@ -1,16 +1,15 @@
 {
     "guard":  "update-progress",
     "script":  "test/win32/update-progress.ps1",
-    "generated":  "2026-09-01T21:17:55-07:00",
-    "commit":  "d26d0f59b",
+    "generated":  "2026-09-05T13:21:27-07:00",
+    "commit":  "8154e59a0",
     "uncommitted":  [
-                        "src/apprt/win32/update_install.zig",
-                        "test/win32/update-progress.ps1"
+                        "src/apprt/win32/UpdateProgress.zig"
                     ],
     "files":  {
                   "src/apprt/win32/update_install.zig":  "d46a6f766a57b16d799f7e21dce6f06a5c4de5e1cdd3853afe2a2d23dea2e153",
                   "src/apprt/win32/update_progress.zig":  "a090e739bf82ae630fa588b22362156891207a83bd3dfde3f41ae13b09a61b3b",
-                  "src/apprt/win32/UpdateProgress.zig":  "13aacc529a801083a8baed1ce899eefc3c2d7e2c5b3530926dbd319ba7bdfbbe",
+                  "src/apprt/win32/UpdateProgress.zig":  "206bb573d91ef28ad2300624102f1fafafead120541afbf46cfae3d499f3c598",
                   "test/win32/update-progress.ps1":  "3107586eba654bf2021e46c47be937e37e59a66aee947129ddc5729a9405783d"
               }
 }

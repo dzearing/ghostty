@@ -23,6 +23,9 @@ const App = @import("App.zig");
 const w32 = @import("win32.zig");
 const type_ramp = @import("type_ramp.zig");
 const utf16_text = @import("utf16_text.zig");
+const brush_cache = @import("brush_cache.zig");
+const panel_theme = @import("panel_theme.zig");
+const system_colors = @import("system_colors.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -77,23 +80,30 @@ pub const Check = struct {
 /// Checkbox row capacity (two agent runtimes today; room to grow).
 pub const max_checks = 4;
 
-/// Dialog colors — the RenameDialog dark palette (matches the command
-/// palette and the tab bar's dark styling).
-const COLOR_BG = w32.RGB(32, 32, 32);
-const COLOR_TEXT = w32.RGB(230, 230, 230);
-/// The note's secondary text — the same gray the About box uses for its
-/// de-emphasized statics on this dark dialog surface.
-const COLOR_TEXT_SECONDARY = w32.RGB(160, 160, 160);
-/// The prompt field's fill — the same field color the chooser and the rename
-/// dialog use, one notch darker than the dialog surface.
-const COLOR_FIELD_BG = w32.RGB(30, 30, 30);
+/// The dialog's palette (T563), derived from the surface `window-theme` puts
+/// the app on and the accent the user picked — the derivation the panels got
+/// in T308. It was four literals described as "the RenameDialog dark palette",
+/// which is a fine description of a dialog that can only ever be dark and a
+/// defect on a light system theme.
+///
+/// `app` is optional because this dialog has an app-less path: the
+/// startup-failure box (T1177) runs before there is an `App`, and the
+/// standalone updater has none at all. With no configured `window-theme` and
+/// no configured background to derive from, the honest surface is the OS apps
+/// theme — which is what any other app-less Windows dialog follows.
+fn pal(self: *const ConfirmDialog) panel_theme.Panel {
+    return if (self.app) |a| system_colors.panelFor(a) else system_colors.panelSystem();
+}
 
-/// Class-lifetime brushes, created at class registration and never freed
-/// (they live for the process, like the other dialog classes).
+/// Keyed on the color they were made for: a GDI brush is immutable, so a theme
+/// flip has to mean a new object rather than a handle stuck on the old palette.
 var class_registered: bool = false;
-var bg_brush: ?w32.HBRUSH = null;
-var field_brush: ?w32.HBRUSH = null;
+var bg_brush: brush_cache.CachedBrush = .{};
+var field_brush: brush_cache.CachedBrush = .{};
 
+/// The app whose theme this dialog paints from, or null on the app-less
+/// paths (`showStandalone`, and the updater's own process).
+app: ?*App,
 hwnd: w32.HWND,
 static: ?w32.HWND,
 /// The optional secondary note (`Options.note`), colored separately in
@@ -274,7 +284,7 @@ pub fn show(
     refocus: ?w32.HWND,
     opts: Options,
 ) Result {
-    return run(app.hinstance, owner, scale, refocus, opts, null);
+    return run(app, app.hinstance, owner, scale, refocus, opts, null);
 }
 
 /// The same dialog with NO App behind it — the startup-failure path (T1177),
@@ -285,7 +295,7 @@ pub fn show(
 /// other class registration in this app uses.
 pub fn showStandalone(owner: ?w32.HWND, scale: f32, opts: Options) Result {
     const hinstance = w32.GetModuleHandleW(null);
-    return run(hinstance, owner, scale, null, opts, null);
+    return run(null, hinstance, owner, scale, null, opts, null);
 }
 
 /// Show a dialog carrying a text field (`opts.input` MUST be set) and return
@@ -304,7 +314,7 @@ pub fn prompt(
 ) ?[]const u8 {
     std.debug.assert(opts.input != null);
     var out: Output = .{ .buf = buf };
-    if (run(app.hinstance, owner, scale, refocus, opts, &out) != .ok) return null;
+    if (run(app, app.hinstance, owner, scale, refocus, opts, &out) != .ok) return null;
     return buf[0..out.len];
 }
 
@@ -316,6 +326,7 @@ const Output = struct {
 };
 
 fn run(
+    app: ?*App,
     hinstance: ?w32.HINSTANCE,
     owner: ?w32.HWND,
     scale: f32,
@@ -486,6 +497,7 @@ fn run(
     // The dialog lives entirely on this stack frame — show() does not
     // return until the nested loop finishes, so no allocation is needed.
     var self: ConfirmDialog = .{
+        .app = app,
         .hwnd = undefined,
         .static = null,
         .ok_btn = undefined,
@@ -518,14 +530,8 @@ fn run(
     ) orelse return fallback(owner, opts);
     self.hwnd = hwnd;
 
-    // Dark title bar, matching the terminal windows.
-    const dark_mode: u32 = 1;
-    _ = w32.DwmSetWindowAttribute(
-        hwnd,
-        w32.DWMWA_USE_IMMERSIVE_DARK_MODE,
-        @ptrCast(&dark_mode),
-        @sizeOf(u32),
-    );
+    // The caption follows the same surface the body does (T563).
+    system_colors.applyPanelChrome(hwnd, self.pal());
 
     // Message text.
     self.static = w32.CreateWindowExW(
@@ -892,8 +898,6 @@ fn handleKey(self: *ConfirmDialog, vk: u16) bool {
 
 fn registerClass(hinstance: ?w32.HINSTANCE) ?void {
     if (class_registered) return;
-    bg_brush = w32.CreateSolidBrush(COLOR_BG);
-    field_brush = w32.CreateSolidBrush(COLOR_FIELD_BG);
     const wc = w32.WNDCLASSEXW{
         .cbSize = @sizeOf(w32.WNDCLASSEXW),
         .style = 0,
@@ -903,7 +907,10 @@ fn registerClass(hinstance: ?w32.HINSTANCE) ?void {
         .hInstance = hinstance,
         .hIcon = null,
         .hCursor = w32.LoadCursorW(null, w32.IDC_ARROW),
-        .hbrBackground = bg_brush,
+        // Null, erased from the live palette in `WM_ERASEBKGND` instead
+        // (T563) - a class brush is captured once per process, so it cannot
+        // follow a theme flip.
+        .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = CLASS_NAME,
         .hIconSm = null,
@@ -972,27 +979,49 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
             }
             return 0;
         },
+        // The class carries no background brush (it would be frozen at
+        // registration time), so the dialog surface is erased here from the
+        // live palette instead.
+        w32.WM_ERASEBKGND => {
+            const hdc: w32.HDC = @ptrFromInt(wparam);
+            var er: w32.RECT = undefined;
+            if (w32.GetClientRect(hwnd, &er) == 0) return 0;
+            if (bg_brush.get(system_colors.cr(self.pal().bg))) |b| _ = w32.FillRect(hdc, &er, b);
+            return 1;
+        },
+        // A light/dark flip or an accent change reaches TOP-LEVEL windows, and
+        // this dialog is one. Repaint it AND its children: a control colors
+        // itself from a `WM_CTLCOLOR*` reply, which is only sent when it
+        // repaints (T307).
+        w32.WM_SETTINGCHANGE, w32.WM_DWMCOLORIZATIONCOLORCHANGED => {
+            if (msg != w32.WM_SETTINGCHANGE or system_colors.isColorSettingChange(lparam)) {
+                system_colors.repaintForColorChange(hwnd);
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         // The prompt field is a field, not dialog surface — without this it
         // renders as a white box in an otherwise dark dialog.
         w32.WM_CTLCOLOREDIT => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc, COLOR_TEXT);
-            _ = w32.SetBkColor(hdc, COLOR_FIELD_BG);
-            if (field_brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
+            const p = self.pal();
+            _ = w32.SetTextColor(hdc, system_colors.cr(p.text));
+            _ = w32.SetBkColor(hdc, system_colors.cr(p.field));
+            if (field_brush.get(system_colors.cr(p.field))) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_CTLCOLORSTATIC, w32.WM_CTLCOLORBTN => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
+            const p = self.pal();
             // lparam names the control: the note reads in the secondary
-            // gray, everything else in the message color.
+            // ramp, everything else in the message color.
             const ctl: ?w32.HWND = @ptrFromInt(@as(usize, @bitCast(lparam)));
-            const color: u32 = if (self.note_static != null and ctl == self.note_static)
-                COLOR_TEXT_SECONDARY
+            const color = if (self.note_static != null and ctl == self.note_static)
+                p.secondary
             else
-                COLOR_TEXT;
-            _ = w32.SetTextColor(hdc, color);
-            _ = w32.SetBkColor(hdc, COLOR_BG);
-            if (bg_brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
+                p.text;
+            _ = w32.SetTextColor(hdc, system_colors.cr(color));
+            _ = w32.SetBkColor(hdc, system_colors.cr(p.bg));
+            if (bg_brush.get(system_colors.cr(p.bg))) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),

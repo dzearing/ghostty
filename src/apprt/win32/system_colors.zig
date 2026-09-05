@@ -5,6 +5,7 @@
 const std = @import("std");
 const w32 = @import("win32.zig");
 const chrome_theme = @import("chrome_theme.zig");
+const color_math = @import("color_math.zig");
 const panel_theme = @import("panel_theme.zig");
 
 const Rgb = chrome_theme.Rgb;
@@ -181,6 +182,65 @@ pub fn panelPalette(theme: anytype, terminal_bg: Rgb) panel_theme.Panel {
     panel_cache = panel_theme.resolve(base, acc);
     panel_key = .{ .base = base, .accent = acc };
     return panel_cache;
+}
+
+/// The panel palette for an APP: its `window-theme` and its terminal
+/// background, which is what every panel and dialog in the app paints from
+/// (T563).
+///
+/// `app` is `anytype` so this stays where the other live theme reads are
+/// without importing `App.zig` back into it — a dependency that would be a
+/// cycle, since `App` reaches this file through the dialogs. Every caller
+/// passes `*App`.
+///
+/// Before T563 each panel wrote this two-line resolve out for itself; there
+/// are now nine surfaces that need it (five small dialogs, the agent
+/// integrations list, the update window, the command palette and the search
+/// bar), and nine copies of a theme read is how two of them end up asking
+/// different questions.
+pub fn panelFor(app: anytype) panel_theme.Panel {
+    const bg = app.config.background;
+    return panelPalette(
+        app.config.@"window-theme",
+        .{ .r = bg.r, .g = bg.g, .b = bg.b },
+    );
+}
+
+/// The `window-theme` values `chrome_theme.chromeBase` switches on, for the
+/// callers that have no app config to read one from.
+const SystemTheme = enum { auto, system, light, dark, ghostty };
+
+/// The panel palette for a surface with NO app behind it: the standalone
+/// update window and the startup-failure dialog, which run before (or without)
+/// an `App` and therefore have no `window-theme` and no configured background
+/// to derive from. `system` is the honest answer there — follow the OS apps
+/// theme, which is what any app-less Windows dialog does.
+pub fn panelSystem() panel_theme.Panel {
+    return panelPalette(SystemTheme.system, .{ .r = 0, .g = 0, .b = 0 });
+}
+
+/// Put a top-level panel's DWM chrome on the same side of light/dark as the
+/// surface it paints (T563).
+///
+/// Every dialog and panel used to set this attribute to a literal 1, which is
+/// how a light-themed dialog ended up under a black title bar: the body
+/// followed the theme and the caption did not. `Window.applyChromeTheme` has
+/// derived it since T304; this is the same decision for the windows that are
+/// not the main one, read off the palette they already resolved so the two
+/// cannot disagree.
+pub fn applyPanelChrome(hwnd: w32.HWND, p: panel_theme.Panel) void {
+    const dark: u32 = if (color_math.isLight(p.bg)) 0 else 1;
+    _ = w32.DwmSetWindowAttribute(
+        hwnd,
+        w32.DWMWA_USE_IMMERSIVE_DARK_MODE,
+        @ptrCast(&dark),
+        @sizeOf(u32),
+    );
+}
+
+/// A `panel_theme` color as the COLORREF every GDI call wants.
+pub fn cr(c: panel_theme.Rgb) u32 {
+    return w32.RGB(c.r, c.g, c.b);
 }
 
 test "panelPalette: memoized on its inputs, and it follows them" {

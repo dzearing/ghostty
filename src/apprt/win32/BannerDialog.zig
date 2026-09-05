@@ -23,6 +23,9 @@ const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
 const type_ramp = @import("type_ramp.zig");
 const utf16_text = @import("utf16_text.zig");
+const brush_cache = @import("brush_cache.zig");
+const panel_theme = @import("panel_theme.zig");
+const system_colors = @import("system_colors.zig");
 
 const log = std.log.scoped(.win32);
 
@@ -41,15 +44,18 @@ ok_btn: w32.HWND,
 cancel_btn: w32.HWND,
 font: ?*anyopaque = null,
 
-/// Dialog colors (dark chrome, same palette as RenameDialog).
-const COLOR_BG = w32.RGB(32, 32, 32);
-const COLOR_EDIT_BG = w32.RGB(30, 30, 30);
-const COLOR_TEXT = w32.RGB(230, 230, 230);
-const COLOR_LABEL = w32.RGB(200, 200, 200);
+/// The dialog's palette, from the same derivation the rename dialog and the
+/// panels use (T563). Four hardcoded dark literals before that, which is a
+/// dialog that opens black on a light system theme.
+fn pal(self: *const BannerDialog) panel_theme.Panel {
+    return system_colors.panelFor(self.window.app);
+}
 
+/// Keyed on the color they were made for: a GDI brush is immutable, so a theme
+/// flip means a new object rather than a handle stuck on the old palette.
 var class_registered: bool = false;
-var bg_brush: ?w32.HBRUSH = null;
-var edit_brush: ?w32.HBRUSH = null;
+var bg_brush: brush_cache.CachedBrush = .{};
+var edit_brush: brush_cache.CachedBrush = .{};
 
 /// Dialog layout in physical pixels from the owner's DPI scale. Pure —
 /// unit tested below. Mirrors RenameDialog.layout but with a multi-line
@@ -177,13 +183,8 @@ pub fn open(surface: *Surface) void {
         return;
     };
 
-    const dark_mode: u32 = 1;
-    _ = w32.DwmSetWindowAttribute(
-        hwnd,
-        w32.DWMWA_USE_IMMERSIVE_DARK_MODE,
-        @ptrCast(&dark_mode),
-        @sizeOf(u32),
-    );
+    // The caption follows the same surface the body does (T563).
+    system_colors.applyPanelChrome(hwnd, system_colors.panelFor(window.app));
 
     const label = w32.CreateWindowExW(
         0,
@@ -349,8 +350,9 @@ pub fn open(surface: *Surface) void {
 
 fn registerClass(app: *App) ?void {
     if (class_registered) return;
-    bg_brush = w32.CreateSolidBrush(COLOR_BG);
-    edit_brush = w32.CreateSolidBrush(COLOR_EDIT_BG);
+    // Warm the palette memo so the first paint does not resolve on the
+    // critical path; the brushes are created on demand, keyed on their color.
+    _ = system_colors.panelFor(app);
     const wc = w32.WNDCLASSEXW{
         .cbSize = @sizeOf(w32.WNDCLASSEXW),
         .style = 0,
@@ -360,7 +362,10 @@ fn registerClass(app: *App) ?void {
         .hInstance = app.hinstance,
         .hIcon = null,
         .hCursor = w32.LoadCursorW(null, w32.IDC_ARROW),
-        .hbrBackground = bg_brush,
+        // Null, erased from the live palette in `WM_ERASEBKGND` instead
+        // (T563) - a class brush is captured once per process and cannot
+        // follow a theme flip.
+        .hbrBackground = null,
         .lpszMenuName = null,
         .lpszClassName = CLASS_NAME,
         .hIconSm = null,
@@ -409,18 +414,37 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
             }
             return 0;
         },
+        // The class carries no background brush, so the surface is erased
+        // here from the live palette.
+        w32.WM_ERASEBKGND => {
+            const hdc: w32.HDC = @ptrFromInt(wparam);
+            var er: w32.RECT = undefined;
+            if (w32.GetClientRect(hwnd, &er) == 0) return 0;
+            if (bg_brush.get(system_colors.cr(self.pal().bg))) |b| _ = w32.FillRect(hdc, &er, b);
+            return 1;
+        },
+        // A theme or accent change while the editor is open: repaint it and
+        // its children, which is what re-derives every color here.
+        w32.WM_SETTINGCHANGE, w32.WM_DWMCOLORIZATIONCOLORCHANGED => {
+            if (msg != w32.WM_SETTINGCHANGE or system_colors.isColorSettingChange(lparam)) {
+                system_colors.repaintForColorChange(hwnd);
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
         w32.WM_CTLCOLOREDIT => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc, COLOR_TEXT);
-            _ = w32.SetBkColor(hdc, COLOR_EDIT_BG);
-            if (edit_brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
+            const p = self.pal();
+            _ = w32.SetTextColor(hdc, system_colors.cr(p.text));
+            _ = w32.SetBkColor(hdc, system_colors.cr(p.field));
+            if (edit_brush.get(system_colors.cr(p.field))) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         w32.WM_CTLCOLORSTATIC, w32.WM_CTLCOLORBTN => {
             const hdc: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc, COLOR_LABEL);
-            _ = w32.SetBkColor(hdc, COLOR_BG);
-            if (bg_brush) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
+            const p = self.pal();
+            _ = w32.SetTextColor(hdc, system_colors.cr(p.label));
+            _ = w32.SetBkColor(hdc, system_colors.cr(p.bg));
+            if (bg_brush.get(system_colors.cr(p.bg))) |b| return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(b))));
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
         else => return w32.DefWindowProcW(hwnd, msg, wparam, lparam),

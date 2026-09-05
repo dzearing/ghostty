@@ -715,13 +715,8 @@ fn openInner(window: *Window, src: Source, borrow: ?*remote_connection.Connectio
     };
     self.hwnd = hwnd;
 
-    const dark_mode: u32 = 1;
-    _ = w32.DwmSetWindowAttribute(
-        hwnd,
-        w32.DWMWA_USE_IMMERSIVE_DARK_MODE,
-        @ptrCast(&dark_mode),
-        @sizeOf(u32),
-    );
+    // The caption follows the same surface the body does (T563).
+    system_colors.applyPanelChrome(hwnd, self.pal());
 
     const l = self.layout();
 

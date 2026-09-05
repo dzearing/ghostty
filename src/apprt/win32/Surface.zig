@@ -45,6 +45,9 @@ const menu_label = @import("menu_label.zig");
 const pane_id_mod = @import("pane_id.zig");
 const palette_jump = @import("palette_jump.zig");
 const tab_tooltip = @import("tab_tooltip.zig");
+const brush_cache = @import("brush_cache.zig");
+const panel_theme = @import("panel_theme.zig");
+const system_colors = @import("system_colors.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const ProcessTree = @import("ProcessTree.zig");
 const provenance = @import("provenance.zig");
@@ -324,8 +327,6 @@ palette_font: ?*anyopaque = null,
 /// in paintPalette. Cached so we don't allocate a new HFONT on every
 /// keystroke-driven repaint.
 palette_paint_font: ?*anyopaque = null,
-/// Cached brush for palette background (reused in WM_CTLCOLOREDIT).
-palette_brush: ?w32.HBRUSH = null,
 /// Whether the command palette is currently visible.
 palette_active: bool = false,
 /// Currently selected item in the filtered palette list.
@@ -1076,10 +1077,6 @@ pub fn deinit(self: *Surface) void {
     if (self.palette_font) |f| {
         _ = w32.DeleteObject(f);
         self.palette_font = null;
-    }
-    if (self.palette_brush) |b| {
-        _ = w32.DeleteObject(b);
-        self.palette_brush = null;
     }
     if (self.palette_paint_font) |f| {
         _ = w32.DeleteObject(f);
@@ -2236,14 +2233,10 @@ fn ensureSearchBar(self: *Surface) void {
         null,
     ) orelse return;
 
-    // Apply dark theme
-    const dark_mode: u32 = 1;
-    _ = w32.DwmSetWindowAttribute(
-        popup,
-        w32.DWMWA_USE_IMMERSIVE_DARK_MODE,
-        @ptrCast(&dark_mode),
-        @sizeOf(u32),
-    );
+    // The popup's frame follows the same surface its body paints from
+    // (T563) - it was pinned dark, so a light theme got a black hairline
+    // border around a light bar.
+    system_colors.applyPanelChrome(popup, self.panelPalette());
     _ = w32.SetWindowTheme(
         popup,
         std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"),
@@ -2612,14 +2605,10 @@ fn ensureCommandPalette(self: *Surface) void {
         null,
     ) orelse return;
 
-    // Apply dark theme
-    const dark_mode: u32 = 1;
-    _ = w32.DwmSetWindowAttribute(
-        popup,
-        w32.DWMWA_USE_IMMERSIVE_DARK_MODE,
-        @ptrCast(&dark_mode),
-        @sizeOf(u32),
-    );
+    // The popup's frame follows the same surface its body paints from
+    // (T563) - it was pinned dark, so a light theme got a black hairline
+    // border around a light bar.
+    system_colors.applyPanelChrome(popup, self.panelPalette());
     _ = w32.SetWindowTheme(
         popup,
         std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"),
@@ -2665,9 +2654,6 @@ fn ensureCommandPalette(self: *Surface) void {
     if (self.palette_font) |f| {
         _ = w32.SendMessageW(edit, w32.WM_SETFONT, @intFromPtr(f), 1);
     }
-
-    // Create cached brush for WM_CTLCOLOREDIT (avoids leak on every repaint)
-    self.palette_brush = w32.CreateSolidBrush(w32.RGB(30, 30, 30));
 
     // Set placeholder text via EM_SETCUEBANNER
     const placeholder = std.unicode.utf8ToUtf16LeStringLiteral("Type a command...");
@@ -3055,22 +3041,45 @@ pub fn showAboutDialog(self: *Surface) void {
     );
 }
 
+/// The palette the command palette and the search bar paint from (T563).
+///
+/// They are panels — a surface floating over the terminal with text and rows
+/// on it — and until T563 they were the last hardcoded-dark ones: `RGB(30,30,30)`
+/// behind the palette, `RGB(60,60,80)` under its selected row, two greys for
+/// its text. On a light theme that put a black popup over a white window, on
+/// the surface a user opens most.
+pub fn panelPalette(self: *const Surface) panel_theme.Panel {
+    return system_colors.panelFor(self.app);
+}
+
+/// The palette popup's surface fill, keyed on its color so a theme flip
+/// replaces the object rather than repainting through a stale one. Process
+/// lifetime and GUI-thread only, like every other `CachedBrush` here.
+var palette_bg_brush: brush_cache.CachedBrush = .{};
+
 /// Paint the command palette list area.
 pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
     var ps: w32.PAINTSTRUCT = undefined;
     const hdc = w32.BeginPaint(hwnd, &ps) orelse return;
     defer _ = w32.EndPaint(hwnd, &ps);
+    self.paintPaletteInto(hdc, hwnd);
+}
 
+/// The same chrome into a caller's DC, so a pixel probe can photograph the
+/// palette synchronously (T940's contract, extended to this popup by T563).
+/// Without it `PrintWindow` with no flags draws nothing here and the palette
+/// is the one surface in this task that cannot be measured at all.
+pub fn paintPaletteInto(self: *Surface, hdc: w32.HDC, hwnd: w32.HWND) void {
     var client_rect: w32.RECT = undefined;
     if (w32.GetClientRect(hwnd, &client_rect) == 0) return;
 
-    // Fill background. Reuse the cached brush set up by setCommandPaletteActive
-    // — falling back to a one-shot brush only if it's somehow missing.
-    if (self.palette_brush) |b| {
+    // The popup surface is the panel background. The brush is keyed on that
+    // color rather than made once with the popup (T563): the popup outlives
+    // its first open, so a brush created at construction time would still be
+    // painting the palette the theme had then.
+    const p = self.panelPalette();
+    if (palette_bg_brush.get(system_colors.cr(p.bg))) |b| {
         _ = w32.FillRect(hdc, &client_rect, b);
-    } else if (w32.CreateSolidBrush(w32.RGB(30, 30, 30))) |b| {
-        _ = w32.FillRect(hdc, &client_rect, b);
-        _ = w32.DeleteObject(b);
     }
 
     // Reuse a cached 14pt font; create on first paint and keep it for
@@ -3125,7 +3134,7 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
 
         // Draw selection highlight
         if (i == self.palette_selected) {
-            if (w32.CreateSolidBrush(w32.RGB(60, 60, 80))) |sel_brush| {
+            if (w32.CreateSolidBrush(system_colors.cr(p.select))) |sel_brush| {
                 const sel_rect = w32.RECT{
                     .left = 0,
                     .top = y,
@@ -3141,7 +3150,9 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
         const text_pad: i32 = @intFromFloat(@round(12.0 * s));
         const text_top_pad: i32 = @intFromFloat(@round(4.0 * s));
         const kb_area: i32 = @intFromFloat(@round(160.0 * s));
-        _ = w32.SetTextColor(hdc, w32.RGB(220, 220, 220));
+        const row_text = if (i == self.palette_selected) p.text_on_select else p.text;
+        const row_dim = if (i == self.palette_selected) p.secondary_on_select else p.secondary;
+        _ = w32.SetTextColor(hdc, system_colors.cr(row_text));
         var name_rect = w32.RECT{
             .left = text_pad,
             .top = y + text_top_pad,
@@ -3180,7 +3191,7 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
                 .bottom = y + item_height,
             };
             if (sub_rect.left < sub_rect.right) {
-                _ = w32.SetTextColor(hdc, w32.RGB(140, 140, 140));
+                _ = w32.SetTextColor(hdc, system_colors.cr(row_dim));
                 var wsub_buf: [tab_tooltip.max_len]u16 = undefined;
                 const wsub_len = std.unicode.utf8ToUtf16Le(&wsub_buf, sub) catch 0;
                 _ = w32.DrawTextW(
@@ -3190,14 +3201,14 @@ pub fn paintPalette(self: *Surface, hwnd: w32.HWND) void {
                     &sub_rect,
                     0x0022, // DT_RIGHT | DT_SINGLELINE
                 );
-                _ = w32.SetTextColor(hdc, w32.RGB(220, 220, 220));
+                _ = w32.SetTextColor(hdc, system_colors.cr(row_text));
             }
         }
 
         // Draw keybinding hint on the right
         const trigger = if (entry_action) |a| self.app.config.keybind.set.getTrigger(a) else null;
         if (trigger) |t| {
-            _ = w32.SetTextColor(hdc, w32.RGB(140, 140, 140));
+            _ = w32.SetTextColor(hdc, system_colors.cr(row_dim));
             var kb_buf: [64]u8 = undefined;
             const kb_len = formatTrigger(t, &kb_buf);
             var wkb_buf: [64]u16 = undefined;

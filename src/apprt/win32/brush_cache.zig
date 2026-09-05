@@ -58,17 +58,25 @@ test "CachedBrush: same color reuses the handle, a new color replaces it" {
     var b: CachedBrush = .{};
     defer b.deinit();
 
-    const first = b.get(w32.RGB(32, 32, 32));
+    // Two arbitrary distinct colors standing for "a dark surface" and "a light
+    // one". Deliberately NOT the retired dialog literals: T563's sweep reads
+    // any of those left under `src/apprt/win32/` as a surface that never got
+    // re-themed, and a test fixture that happens to spell one is a false
+    // positive nobody can tell from a real one.
+    const dark = w32.RGB(18, 24, 30);
+    const light = w32.RGB(236, 240, 244);
+
+    const first = b.get(dark);
     try testing.expect(first != null);
     // The point of the cache: a paint path asking again must not allocate.
-    try testing.expectEqual(first, b.get(w32.RGB(32, 32, 32)));
+    try testing.expectEqual(first, b.get(dark));
 
     // ...and the point of the invalidation: a theme flip must not keep
     // painting the old color.
-    const second = b.get(w32.RGB(243, 243, 243));
+    const second = b.get(light);
     try testing.expect(second != null);
     try testing.expect(second.? != first.?);
-    try testing.expectEqual(second, b.get(w32.RGB(243, 243, 243)));
+    try testing.expectEqual(second, b.get(light));
 }
 
 test "CachedBrush: an untouched cache has nothing to delete" {

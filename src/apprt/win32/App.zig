@@ -27,6 +27,8 @@ const RestoreAllRelay = @import("RestoreAllRelay.zig");
 const ActivityMonitor = @import("ActivityMonitor.zig");
 const RelayAccountRow = @import("RelayAccountRow.zig");
 const ShareMachineRow = @import("ShareMachineRow.zig");
+const brush_cache = @import("brush_cache.zig");
+const system_colors = @import("system_colors.zig");
 const RenameDialog = @import("RenameDialog.zig");
 const BannerDialog = @import("BannerDialog.zig");
 const QuickTerminal = @import("QuickTerminal.zig");
@@ -291,6 +293,13 @@ pub const WINDOW_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyWin
 
 /// Window class for terminal surfaces (OpenGL via WGL, needs CS_OWNDC).
 pub const TERMINAL_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyTerminal");
+
+/// The search bar's and the command palette's surface and field fills, keyed
+/// on the color they were made for so a theme flip replaces the GDI object
+/// instead of painting through a stale one (T563). Process lifetime, GUI
+/// thread only - the same contract every other `CachedBrush` here has.
+var popup_bg_brush: brush_cache.CachedBrush = .{};
+var popup_field_brush: brush_cache.CachedBrush = .{};
 
 /// Window class for the message-only HWND (WM_APP_WAKEUP, WM_TIMER).
 pub const MSG_CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyMsg");
@@ -8290,6 +8299,7 @@ fn offerUpdate(self: *App) bool {
     // balloon is still there to say something happened.
     if (UpdateProgress.create(
         alloc,
+        self,
         self.hinstance,
         if (owner) |win| win.hwnd else null,
         if (owner) |win| win.scale else 1.0,
@@ -9185,6 +9195,19 @@ fn surfaceWndProc(
             return 1;
         },
 
+        // The palette popup into a caller's DC (T563). The terminal surface
+        // itself is deliberately NOT printable - it is a GL surface and
+        // `PrintWindow` returns a flat fill for it, which is the capture limit
+        // T214 wrote down - but the palette is ordinary GDI and answering here
+        // is what lets a probe photograph it synchronously.
+        w32.WM_PRINTCLIENT => {
+            if (is_palette_popup and wparam != 0) {
+                surface.paintPaletteInto(@ptrFromInt(wparam), hwnd);
+                return 0;
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+
         w32.WM_PAINT => {
             if (is_palette_popup) {
                 surface.paintPalette(hwnd);
@@ -9461,28 +9484,28 @@ fn surfaceWndProc(
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
+        // The palette's and the search bar's edit fields. Both were hardcoded
+        // dark (`RGB(30,30,30)` / `RGB(45,45,45)` under a fixed light text);
+        // they take the panel palette's field now, so they follow the theme
+        // the window does (T563).
         w32.WM_CTLCOLOREDIT => {
-            // Dark mode colors for search/palette edit controls
             const hdc_edit: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc_edit, w32.RGB(220, 220, 220));
-            _ = w32.SetBkColor(hdc_edit, if (is_palette_popup) w32.RGB(30, 30, 30) else w32.RGB(45, 45, 45));
-            if (is_palette_popup) {
-                if (surface.palette_brush) |brush| {
-                    return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(brush))));
-                }
-            }
-            if (surface.app.bg_brush) |brush| {
+            const p = surface.panelPalette();
+            _ = w32.SetTextColor(hdc_edit, system_colors.cr(p.text));
+            _ = w32.SetBkColor(hdc_edit, system_colors.cr(p.field));
+            if (popup_field_brush.get(system_colors.cr(p.field))) |brush| {
                 return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(brush))));
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
         },
 
+        // The search bar's match-count label ("3/17"), on the bar's surface.
         w32.WM_CTLCOLORSTATIC => {
-            // Dark mode colors for the search match-count label.
             const hdc_static: w32.HDC = @ptrFromInt(wparam);
-            _ = w32.SetTextColor(hdc_static, w32.RGB(160, 160, 160));
-            _ = w32.SetBkColor(hdc_static, w32.RGB(45, 45, 45));
-            if (surface.app.bg_brush) |brush| {
+            const p = surface.panelPalette();
+            _ = w32.SetTextColor(hdc_static, system_colors.cr(p.secondary));
+            _ = w32.SetBkColor(hdc_static, system_colors.cr(p.bg));
+            if (popup_bg_brush.get(system_colors.cr(p.bg))) |brush| {
                 return @bitCast(@intFromPtr(@as(*const anyopaque, @ptrCast(brush))));
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);

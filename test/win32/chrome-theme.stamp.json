@@ -1,16 +1,16 @@
 {
     "guard":  "chrome-theme",
     "script":  "test/win32/chrome-theme.ps1",
-    "generated":  "2026-09-04T11:45:10-07:00",
-    "commit":  "bb610d3c7",
+    "generated":  "2026-09-05T12:58:39-07:00",
+    "commit":  "8154e59a0",
     "uncommitted":  [
-                        "src/apprt/win32/chrome_theme.zig"
+                        "test/win32/chrome-theme.ps1"
                     ],
     "files":  {
                   "src/apprt/win32/chrome_theme.zig":  "f371f9852b1ef7afb754589edd3b34083a7cf8293796b88431f1ef3fd6a7bd11",
                   "src/apprt/win32/color_math.zig":  "144ee567f70e4bffa1fb09b174d8685dfd316da3aa519cfa414d6edef8ebddce",
                   "src/apprt/win32/panel_theme.zig":  "caf0cd7e30f705d17e3590985e3fa51a7a3a32f90b619fd38e51b932a6c7a134",
-                  "test/win32/chrome-theme.ps1":  "974dba3d7868d2308cc89e071ae83e987a945c9dde0d36da0ff8c4a24c2c5cf2",
+                  "test/win32/chrome-theme.ps1":  "8ec354d4c90141ab27e7f88855b149cd5828ad771c7ccf02585eb94769c6ec25",
                   "test/win32/lib/ColorMath.ps1":  "a825f6793a37181cb68b840042fa4403b08a60de696e36e677bb3d3cdda16e04"
               }
 }

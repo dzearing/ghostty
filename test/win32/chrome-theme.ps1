@@ -283,6 +283,21 @@ function Open-Panel([IntPtr]$top, [IntPtr]$pane) {
     return (Wait-TestWindow -ProcessId $script:app.Pid -Class 'GhozttyActivityMonitor' -TimeoutMs 8000)
 }
 
+# Open the command palette and return the POPUP itself (T563), which is what
+# the palette case measures. `Invoke-Palette` above opens the same popup and
+# then types into it; this stops one step earlier.
+function Open-Palette([IntPtr]$top, [IntPtr]$pane) {
+    foreach ($try in 1..3) {
+        if (-not (Send-TestKeys -Window $top -Target $pane -Modifiers ctrl, shift -Key P)) { continue }
+        $popup = Wait-TestWindow -ProcessId $script:app.Pid -Class 'GhozttyTerminal' -TimeoutMs 5000
+        if ($popup -ne [IntPtr]::Zero) {
+            Start-Sleep -Milliseconds 500
+            return $popup
+        }
+    }
+    return [IntPtr]::Zero
+}
+
 function Close-Panel([IntPtr]$panel) {
     $edit = Find-TestWindowEx -Parent $panel -Class 'EDIT'
     if ($edit -ne [IntPtr]::Zero) { Send-TestControlKey -Control $edit -Key Escape | Out-Null }
@@ -299,6 +314,48 @@ function Close-Panel([IntPtr]$panel) {
 # unrunnable from its first line - fixed while validating T307.)
 $isDebugBuild = Test-GhozttyIsolatedBuildMode (Get-GhozttyBuildMode -Exe $exe)
 Write-Host ("build under test: " + $(if ($isDebugBuild) { 'marks itself (Debug/ReleaseSafe)' } else { 'release, unmarked' }))
+
+# ===========================================================================
+# E. NO SURFACE STILL WRITES ITS OWN DARK PALETTE (T563)
+# ===========================================================================
+#
+# D measures the surfaces it can open. This asks the question D cannot: is
+# there a surface nobody re-themed? The two panels T308 fixed left seven more
+# holding the identical literals - "the RenameDialog dark palette" - and the
+# only reason that went unnoticed for a month is that no check could see a
+# dialog it did not know to open.
+#
+# So the retired constants themselves are the oracle: after T563 no file under
+# `src\apprt\win32\` may spell one, except `panel_theme.zig`, whose doc
+# comments record what each derived color replaced. A new dialog that copies
+# the old palette fails here on the day it is written, which is the point -
+# this is the cheap half of the guard, and it runs before the GUI does.
+$RETIRED = @(
+    @{ Rgb = 'RGB(32, 32, 32)'; Role = 'the dialog surface' },
+    @{ Rgb = 'RGB(230, 230, 230)'; Role = 'its primary text' },
+    @{ Rgb = 'RGB(30, 30, 30)'; Role = 'its field fill' },
+    @{ Rgb = 'RGB(45, 45, 45)'; Role = "the search bar's field" },
+    @{ Rgb = 'RGB(200, 200, 200)'; Role = 'its label ramp' }
+)
+$src = Join-Path $repo 'src\apprt\win32'
+foreach ($lit in $RETIRED) {
+    $hits = @(Get-ChildItem -Path $src -Filter '*.zig' -File |
+        Where-Object { $_.Name -ne 'panel_theme.zig' } |
+        Select-String -SimpleMatch -Pattern $lit.Rgb |
+        Where-Object { $_.Line -notmatch '^\s*(//|///)' })
+    $where = ($hits | ForEach-Object { "$($_.Filename):$($_.LineNumber)" }) -join ', '
+    Assert ($hits.Count -eq 0) `
+        ("E no file still hardcodes $($lit.Rgb) - $($lit.Role)" +
+         $(if ($hits.Count) { " (found in $where)" } else { '' }))
+}
+
+# The negative control for E: the literals are real strings that this scan
+# would find, so a scan that reports zero because it is looking in the wrong
+# place cannot pass silently. `panel_theme.zig` is excluded above precisely
+# BECAUSE it still names them - which makes it the one file that proves the
+# search works.
+$control = @(Select-String -Path (Join-Path $src 'panel_theme.zig') -SimpleMatch -Pattern 'RGB(32,32,32)')
+Assert ($control.Count -gt 0) 'E the sweep can find a literal at all (panel_theme.zig still names the retired ones)'
 
 Kill-RepoInstances
 Start-TestForegroundWatch
@@ -558,26 +615,67 @@ try {
         $g = Start-Gui @("--background=$hex")
         if (-not $g) { Write-Host "SETUP FAIL: GUI did not come up on $hex for section D"; exit 1 }
         try {
+            # T563 grows this list past the two panels T308 fixed: the small
+            # dialogs and the COMMAND PALETTE - the surface a user opens most -
+            # held the same literals one size down, so on a light theme they
+            # opened black on top of a light window. They are measured exactly
+            # the same way, which is the point of adding them here rather than
+            # writing a second harness (the T257 rule).
+            #
+            # `Palette = $true` is the one case that is not opened FROM the
+            # palette: it IS the palette. It is a WS_POPUP of the terminal
+            # class, so it is found as the popup `Invoke-Palette` already
+            # waited for rather than by a class of its own.
             foreach ($panel in @(
                     @{ Label = 'activity'; Filter = 'ACTIVITY MONITOR'; Class = 'GhozttyActivityMonitor' },
-                    @{ Label = 'chooser'; Filter = 'NEW REMOTE WINDOW'; Class = 'GhozttyMachineChooser' })) {
+                    @{ Label = 'chooser'; Filter = 'NEW REMOTE WINDOW'; Class = 'GhozttyMachineChooser' },
+                    @{ Label = 'palette'; Palette = $true },
+                    @{ Label = 'rename'; Filter = 'CHANGE WINDOW TITLE'; Class = 'GhozttyRenameDialog' },
+                    @{ Label = 'banner'; Filter = 'SET PANE BANNER'; Class = 'GhozttyBannerDialog'; BodyTop = 0.72 },
+                    @{ Label = 'about'; Filter = 'ABOUT GHOZTTY'; Class = 'GhozttyConfirmDialog'; CloseMsg = $true })) {
 
-                if (-not (Invoke-Palette $g.Top $g.Pane $panel.Filter)) {
-                    Assert $false "D/$($case.Name)/$($panel.Label) the command palette accepted the opener"
-                    continue
+                $h = [IntPtr]::Zero
+                if ($panel.Palette) {
+                    $h = Open-Palette $g.Top $g.Pane
+                    Assert ($h -ne [IntPtr]::Zero) "D/$($case.Name)/$($panel.Label) the command palette opened"
+                    if ($h -eq [IntPtr]::Zero) { continue }
+                } else {
+                    if (-not (Invoke-Palette $g.Top $g.Pane $panel.Filter)) {
+                        Assert $false "D/$($case.Name)/$($panel.Label) the command palette accepted the opener"
+                        continue
+                    }
+                    $h = Wait-TestWindow -ProcessId $g.Pid -Class $panel.Class -TimeoutMs 8000
                 }
-                $h = Wait-TestWindow -ProcessId $g.Pid -Class $panel.Class -TimeoutMs 8000
                 Assert ($h -ne [IntPtr]::Zero) "D/$($case.Name)/$($panel.Label) the panel opened"
                 if ($h -eq [IntPtr]::Zero) { continue }
 
-                $shot = Get-TestWindowPixels -Window $h -Sync
+                # The palette popup shares the terminal's window CLASS, which
+                # is what `Get-TestWindowPixels` keys its refusal on (T214).
+                # That refusal is about the GL surface: `PrintWindow` returns a
+                # flat fill for it off the input desktop. The palette is
+                # ordinary GDI and answers `WM_PRINTCLIENT` as of T563, so
+                # `-Sync` here is a real synchronous paint rather than the
+                # capture that passes against nothing - and the assertions
+                # below would catch it if it were not (a flat fill has one
+                # distinct color and no text ramp in it).
+                $shot = Get-TestWindowPixels -Window $h -Sync -AllowTerminalSurface:([bool]$panel.Palette)
                 try {
                     # The panel BODY: below the caption the frame draws (which
                     # is DWM's, not ours) and inside the border, so neither can
                     # contribute a pixel to the fill or to the extremes.
+                    #
+                    # `BodyTop` moves that top edge for a surface whose FIELD
+                    # is the biggest thing on it (T563): the banner editor is a
+                    # five-line edit box occupying the middle two thirds, so
+                    # the mode of the default box is `panel.field` - which is
+                    # derived from the surface and therefore neither wrong nor
+                    # the thing this assertion is about. Measuring the strip
+                    # below the edit asks the same question of actual panel
+                    # surface.
+                    $bodyTop = if ($panel.BodyTop) { [double]$panel.BodyTop } else { 0.30 }
                     $x0 = $shot.Left + 8
                     $x1 = $shot.Left + $shot.Width - 8
-                    $y0 = $shot.Top + [int]($shot.Height * 0.30)
+                    $y0 = $shot.Top + [int]($shot.Height * $bodyTop)
                     $y1 = $shot.Top + $shot.Height - 8
                     $body = Measure-Box $shot $x0 $y0 $x1 $y1 3
                     Assert ($null -ne $body) "D/$($case.Name)/$($panel.Label) the panel body captured"
@@ -613,9 +711,17 @@ try {
                     Close-TestWindowPixels -Shot $shot
                 }
 
-                # Escape closes both panels (each puts focus in its own EDIT).
-                $edit = Find-TestWindowEx -Parent $h -Class 'EDIT'
-                if ($edit -ne [IntPtr]::Zero) { Send-TestControlKey -Control $edit -Key Escape | Out-Null }
+                # Escape closes anything with an EDIT to take it (both panels,
+                # the palette, the two prompt dialogs). The About box has no
+                # field - its focus is on a button, and its keys are read by a
+                # nested modal loop - so it gets WM_CLOSE, which it handles as
+                # the OK its single button would have sent.
+                if ($panel.CloseMsg) {
+                    Send-TestRawMessage -Window $h -Message 0x0010 -WParam 0 -LParam 0 | Out-Null
+                } else {
+                    $edit = Find-TestWindowEx -Parent $h -Class 'EDIT'
+                    if ($edit -ne [IntPtr]::Zero) { Send-TestControlKey -Control $edit -Key Escape | Out-Null }
+                }
                 Start-Sleep -Milliseconds 700
             }
         } finally {
