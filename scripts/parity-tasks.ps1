@@ -460,10 +460,33 @@ function Get-SplitChildren {
     return @($ids)
 }
 
+# A dependency on a `skipped(duplicate -> X)` / `skipped(obsolete -> X)` /
+# `skipped(superseded by X)` parent is really a dependency on X (T518). The
+# work did not evaporate when the card was closed: it MOVED to the task the
+# skip names, exactly as a split's work moves to its children, and a dependent
+# that was waiting for it is still waiting. Before this, closing a card as a
+# duplicate released everything downstream of it the moment the redirect was
+# written - while the task that actually owed the work sat open.
+#
+# Unlike a split, a redirect has exactly ONE target, and the rest of the status
+# is prose that routinely names OTHER ids ("duplicate of T1189, which already
+# tracks the guard; T1063 and T1187 are two more of the same"). Harvesting every
+# token the way Get-SplitChildren does would block on those bystanders, so only
+# the FIRST id is taken - which is the redirect target in all 74 such statuses
+# in the tracker today, whatever the phrasing ("of", "->", "by", ":").
+function Get-RedirectTarget {
+    param([string]$StatusValue)
+    if ($StatusValue -notmatch '^skipped\(\s*(dup(licate)?|obsolete|supersede[ds])\b') { return @() }
+    $m = [regex]::Match($StatusValue, '\b[Tt]\d+[a-z]?\d*\b')
+    if (-not $m.Success) { return @() }     # "skipped(obsolete)" with no target: genuinely ended
+    return @('T' + $m.Value.Substring(1))
+}
+
 # The still-open leaves a dependency resolves to; empty means satisfied. A
 # todo/in-progress/blocked dep is its own open leaf; done is satisfied; skipped
-# resolves through its split children, recursively (a split of a split is
-# normal: T89f -> T89f1/T89f2). Unknown ids are ignored - same rule as `next`
+# resolves through its split children or its redirect target, recursively (a
+# split of a split is normal: T89f -> T89f1/T89f2, and so is a duplicate of a
+# duplicate). Unknown ids are ignored - same rule as `next`
 # has always applied to a dep with no file - and the visited set makes a
 # malformed cycle terminate instead of recursing forever.
 function Get-OpenDeps {
@@ -475,6 +498,9 @@ function Get-OpenDeps {
     if (-not (Test-Done $status)) { return @($DepId) }
     $open = @()
     foreach ($c in (Get-SplitChildren $status)) {
+        $open += @(Get-OpenDeps -DepId $c -ById $ById -Visited $Visited)
+    }
+    foreach ($c in (Get-RedirectTarget $status)) {
         $open += @(Get-OpenDeps -DepId $c -ById $ById -Visited $Visited)
     }
     return $open
@@ -1426,13 +1452,22 @@ switch ($Command) {
                 elseif ($t.Status -match '^(todo|in-progress)') {
                     # A dep satisfied only on paper - a skipped(split) parent
                     # whose children are still open - is the misroute T382
-                    # exists to end. Said out loud, but informational: a task
-                    # waiting on a split is a legitimate queue state, not a
-                    # broken file, so it must not fail the tracker.
+                    # exists to end, and a skipped(duplicate/obsolete -> X)
+                    # parent whose X is still open is the same misroute by
+                    # another name (T518). Named apart so the line says which
+                    # mechanism is holding the dependent. Said out loud, but
+                    # informational both ways: waiting on a split or on a
+                    # redirect target is a legitimate queue state, not a broken
+                    # file, so it must not fail the tracker.
                     if ((Test-Done $byId[$d].Status)) {
                         $open = @(Get-OpenDeps -DepId $d -ById $byId -Visited @{})
                         if ($open.Count -gt 0) {
-                            Write-Host ("SPLIT DEP: {0} -> {1} resolves through a split with open children: {2} (next will not offer {0} until they are done)" -f $t.Id, $d, ($open -join ', '))
+                            if (@(Get-SplitChildren $byId[$d].Status).Count -gt 0) {
+                                Write-Host ("SPLIT DEP: {0} -> {1} resolves through a split with open children: {2} (next will not offer {0} until they are done)" -f $t.Id, $d, ($open -join ', '))
+                            }
+                            else {
+                                Write-Host ("REDIRECT DEP: {0} -> {1} resolves through a duplicate/obsolete redirect that is still open: {2} (next will not offer {0} until it is done)" -f $t.Id, $d, ($open -join ', '))
+                            }
                         }
                     }
                 }

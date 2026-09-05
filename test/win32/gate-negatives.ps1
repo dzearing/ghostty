@@ -202,6 +202,7 @@ $Registry = @(
     # waiting on a split parent), STRANDED WORK ACKNOWLEDGED is the ack path
     # succeeding, and the rest belong to other verbs entirely.
     [pscustomobject]@{ Label = 'SPLIT DEP'; Kind = 'status' }
+    [pscustomobject]@{ Label = 'REDIRECT DEP'; Kind = 'status' }
     [pscustomobject]@{ Label = 'STRANDED WORK ACKNOWLEDGED'; Kind = 'status' }
     [pscustomobject]@{ Label = 'ALL PASS'; Kind = 'status' }
     [pscustomobject]@{ Label = 'NEXT'; Kind = 'status' }

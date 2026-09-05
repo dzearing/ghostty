@@ -1,10 +1,11 @@
 {
     "guard":  "cleanslate",
     "script":  "test/win32/cleanslate-audit.ps1",
-    "generated":  "2026-09-04T23:58:29-07:00",
-    "commit":  "9ea5835a4",
+    "generated":  "2026-09-05T00:28:41-07:00",
+    "commit":  "12392b8d2",
     "uncommitted":  [
-                        "test/win32/agent-shell-integration.ps1"
+                        "test/win32/gate-negatives.ps1",
+                        "test/win32/parity-tasks-split-deps.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -102,7 +103,7 @@
                   "test/win32/font-inherit.ps1":  "f303affd8f1c72da77f48f09a10b18d0c7c72af845a4602455bf013662d8c257",
                   "test/win32/foreground-audit.ps1":  "d343505dc8ede3b8a22d230eb7621f529f2a106a740301fead22d422b59310e3",
                   "test/win32/fork-identity.ps1":  "2a83e77b4f6fc5127e583e44175dc00a350ef16cacf5b9404c9e6e8fb388ab71",
-                  "test/win32/gate-negatives.ps1":  "2b6146771384b3fc9a9d257f8fcc34b7ffdd0b03be7de06d38ab080bf118f2a7",
+                  "test/win32/gate-negatives.ps1":  "b5d43e05d2d0487009d77be1155040f79ad4286fb4a79ea5cd53d7ba6af096a5",
                   "test/win32/ghoztty-cleanup.ps1":  "81bfcb6cb5b018195e1056d6ce7203f18235763916bcec4cffcdafa811e73f76",
                   "test/win32/go-loop-guard.ps1":  "d30b555f4bac3465d59e55b16f993e7d4b93213ec65e58a722695fe9ac1db029",
                   "test/win32/go-loop-uptime.ps1":  "a97005d970a564088741646542ffaca3cb9ffe03d2eb30c55b96841607948b82",
@@ -215,7 +216,7 @@
                   "test/win32/pane-ingest-lag.ps1":  "a5c9ffcbdeae28c26b54d98d09586137bcba9be70691c2b2634c781b3fdf9768",
                   "test/win32/parity-sweep.ps1":  "2251497104f8df5a8b1146441bd2b5e3ebb38a495c7d7fe16a9f64a05c801044",
                   "test/win32/parity-tasks-seat.ps1":  "93f60db34af8e611ca4d288d93d8bf5ee612d981ff99ce835e4cde7f80ad6205",
-                  "test/win32/parity-tasks-split-deps.ps1":  "0e1a57bd7a925ee877b450d538bfbc4fc97c25eb4542be246dc7b2a403e7546d",
+                  "test/win32/parity-tasks-split-deps.ps1":  "4cae00c40c97f85c7a4b6871ff32a8276cb752fe7c6c8a5120844dd614e71a78",
                   "test/win32/path-selfheal.ps1":  "e37347a9c7c11b2b85bcb7fca1fb80a13fe5984a401f9cadcd81ee245d41781f",
                   "test/win32/persistence-flag.ps1":  "5c9e111014296ec7d652199dfa837b4c597b4eea1c868e33fb233812039c198b",
                   "test/win32/printclient-audit.ps1":  "876bc3a0a69619bc34e41ba6ed41897107a314628c858d371da3559050087c1b",

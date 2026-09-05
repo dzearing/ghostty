@@ -17,12 +17,15 @@
 #   C. The status formats found in the real tracker all parse: the JSON-escaped
 #      arrow ("-\u003e"), "split into A + B", slash separators, prose after each
 #      id, and the T10b-T10d letter-range shorthand (en dash).
-#   D. A NON-split skip (duplicate, obsolete) still satisfies, exactly as
-#      before - that work genuinely ended.
+#   D. A REDIRECT skip (duplicate/obsolete/superseded -> X) resolves through X
+#      the same way (T518) - the work moved there, it did not end. Only the
+#      FIRST id is the target, so bystanders named in the status prose never
+#      block; chains resolve through; a skip with no target still satisfies.
 #   E. A malformed cycle terminates instead of recursing forever.
 #   F. `validate` prints an informational SPLIT DEP line for a live task whose
-#      dep resolves through an open split, and still exits 0 (a task waiting on
-#      a split is a legitimate queue state, not a broken file).
+#      dep resolves through an open split, a REDIRECT DEP line when it resolves
+#      through an open redirect target, and still exits 0 either way (a task
+#      waiting on one is a legitimate queue state, not a broken file).
 #   G. The real tracker still validates.
 #
 # Hermetic: sections A-F run against a fixture task dir under $env:TEMP via
@@ -168,20 +171,58 @@ $r = Task-Run @('next')
 Assert 'a letter range expands: the unnamed middle child blocks' ($r.Out -match 'NEXT: T10c\b' -and $r.Out -notmatch 'NEXT: T4\b')
 Assert 'the blocked report names the middle child' ($r.Out -match 'T4\(needs T1\[open: T10c\]\)')
 
-# --- D. non-split skips still satisfy ----------------------------------------
+# --- D. redirect skips resolve through their target ---------------------------
 ""
-'D. duplicate/obsolete skips still satisfy'
+'D. duplicate/obsolete/superseded skips resolve through their target'
 Reset-Fixture
-New-FixtureTask -Id 'T1' -Status 'skipped(duplicate -> T3)'
-New-FixtureTask -Id 'T2' -Status 'skipped(obsolete -> T3 - covered there)'
-New-FixtureTask -Id 'T3'                       # open, but NOT a split child
+# The dependent (T3) carries a LOWER id than the redirect target (T5) - the
+# real-world shape, and what puts T3 in the blocked report, which only lists
+# todos scanned before the winner.
+New-FixtureTask -Id 'T1' -Status 'skipped(duplicate -> T5)'
+New-FixtureTask -Id 'T2' -Status 'skipped(obsolete -> T5 - covered there)'
+New-FixtureTask -Id 'T3' -Deps '["T1","T2"]'
+New-FixtureTask -Id 'T5'                       # the redirect target, still open
+$r = Task-Run @('next')
+Assert 'next offers the redirect target, not the dependent' ($r.Out -match 'NEXT: T5\b')
+Assert 'the blocked report names the open target behind BOTH redirects' `
+    ($r.Out -match 'T3\(needs T1\[open: T5\],T2\[open: T5\]\)')
+
+& powershell -NoProfile -File $taskScript set-status T5 -Status done -TaskDir $fixture | Out-Null
+$r = Task-Run @('next')
+Assert 'with the target done, the dependent is offered' ($r.Out -match 'NEXT: T3\b')
+
+# D2. Only the FIRST id is the target. Real statuses name bystanders in prose
+# ("duplicate of T1189, which already tracks the guard; T1063 and T1187 are two
+# more of the same") - harvesting them the way a split does would block the
+# dependent on tasks the redirect never pointed at.
+Reset-Fixture
+New-FixtureTask -Id 'T1' -Status 'skipped(duplicate of T2, which already tracks the guard; T3 and T9 are two more of the same)'
+New-FixtureTask -Id 'T2' -Status 'done'
+New-FixtureTask -Id 'T3'                       # bystander, open - must NOT block
+New-FixtureTask -Id 'T4' -Deps '["T1"]'
+New-FixtureTask -Id 'T9'                       # bystander, open - must NOT block
+& powershell -NoProfile -File $taskScript set-status T3 -Status blocked -TaskDir $fixture | Out-Null
+& powershell -NoProfile -File $taskScript set-status T9 -Status blocked -TaskDir $fixture | Out-Null
+$r = Task-Run @('next')
+Assert 'ids named only in prose after the target do not block' ($r.Out -match 'NEXT: T4\b')
+
+# D3. "superseded by X" is the same redirect in a third phrasing, and a
+# redirect chain (dup -> dup -> open) resolves all the way through.
+Reset-Fixture
+New-FixtureTask -Id 'T1' -Status 'skipped(superseded by T2; verified on box)'
+New-FixtureTask -Id 'T2' -Status 'skipped(duplicate of T5)'
+New-FixtureTask -Id 'T3' -Deps '["T1"]'
+New-FixtureTask -Id 'T5'                       # the real owner, still open
+$r = Task-Run @('next')
+Assert 'a redirect chain resolves to the open task at its end' ($r.Out -match 'T3\(needs T1\[open: T5\]\)')
+
+# D4. A skip with NO target genuinely ended: nothing to resolve through.
+Reset-Fixture
+New-FixtureTask -Id 'T1' -Status 'skipped(obsolete)'
+New-FixtureTask -Id 'T2' -Status 'skipped(stale: untouched for 30+ days)'
 New-FixtureTask -Id 'T4' -Deps '["T1","T2"]'
 $r = Task-Run @('next')
-# T3 has a lower id, so it heads the queue either way; prove T4 is not blocked
-# by claiming T3 out of the way and asking again.
-& powershell -NoProfile -File $taskScript set-status T3 -Status blocked -TaskDir $fixture | Out-Null
-$r = Task-Run @('next')
-Assert 'a non-split skip satisfies even with its target open' ($r.Out -match 'NEXT: T4\b')
+Assert 'a targetless skip still satisfies' ($r.Out -match 'NEXT: T4\b')
 
 # --- E. a malformed cycle terminates ------------------------------------------
 ""
@@ -210,6 +251,17 @@ Assert 'validate still exits 0 (informational, not a problem)' ($r.Code -eq 0 -a
 & powershell -NoProfile -File $taskScript set-status T4 -Status done -TaskDir $fixture | Out-Null
 $r = Task-Run @('validate')
 Assert 'a done dependent draws no SPLIT DEP line' ($r.Out -notmatch 'SPLIT DEP:')
+
+# A redirect gets its own label, so the line says which mechanism holds the
+# dependent rather than calling every paper-satisfied dep a split.
+Reset-Fixture
+New-FixtureTask -Id 'T1' -Status 'skipped(duplicate -> T3)'
+New-FixtureTask -Id 'T3'
+New-FixtureTask -Id 'T4' -Deps '["T1"]'
+$r = Task-Run @('validate')
+Assert 'validate names the redirect, its target, and calls it a redirect' `
+    ($r.Out -match 'REDIRECT DEP: T4 -> T1 .*still open: T3' -and $r.Out -notmatch 'SPLIT DEP:')
+Assert 'a redirect dep is informational too (validate exits 0)' ($r.Code -eq 0 -and $r.Out -match 'ALL PASS')
 
 # --- G. the real tracker ------------------------------------------------------
 ""
