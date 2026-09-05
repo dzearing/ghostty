@@ -1,10 +1,10 @@
 {
     "guard":  "cleanslate",
     "script":  "test/win32/cleanslate-audit.ps1",
-    "generated":  "2026-09-05T12:59:10-07:00",
-    "commit":  "8154e59a0",
+    "generated":  "2026-09-05T13:52:57-07:00",
+    "commit":  "2e47b1037",
     "uncommitted":  [
-                        "test/win32/chrome-theme.ps1"
+                        "test/win32/dashboard-dom.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "3052e775963769cbf212fc36b08a73d7d23743b7250f4474cb15823305328eaa",
@@ -84,6 +84,7 @@
                   "test/win32/crash-stacks.ps1":  "a0c6fa51f11530a9915fcb8477517a6757b48ced7a9aff89aaf5c1313c33e710",
                   "test/win32/daily-publish.ps1":  "9a9c9c698f7eedc50927536a038397281e4c4471d56c4f2e9fffbf8fe61c7512",
                   "test/win32/dark-menus.ps1":  "ab97be43af44188040463ebf9c6ab7b4a96139a623445aeb145eec3e4c9f906f",
+                  "test/win32/dashboard-dom.ps1":  "caf3d91216082f17b0e12c5ae88c56e360ef62b715197429abc4db037be40a69",
                   "test/win32/deliver-windows-build.ps1":  "e3bd97324b317cc164f69a9bb78514e21ef94be11c773186cbfe1f7e4ffab17d",
                   "test/win32/desktop-launch-audit.ps1":  "df0f8241a82fb625a5309378e3d96de7951876f8d2c394564e3f3326d8889a53",
                   "test/win32/divergence-inventory.ps1":  "829edd00d4ed65595adf6d9a837414af1f212b18f4cbfff9f4ce4568e43b7c09",

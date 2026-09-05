@@ -1,0 +1,18 @@
+{
+    "guard":  "dashboard-dom",
+    "script":  "test/win32/dashboard-dom.ps1",
+    "generated":  "2026-09-05T13:51:13-07:00",
+    "commit":  "2e47b1037",
+    "uncommitted":  [
+                        "test/win32/dashboard-dom.ps1",
+                        "test/win32/lib/dashboard-dom-selftest.js",
+                        "test/win32/lib/dashboard-stub-server.js"
+                    ],
+    "files":  {
+                  "scripts/task-dashboard.js":  "f42c190f9640b27c49a9db124fc5ba32b721452b96042d0be01212717bc68d5f",
+                  "scripts/task-dashboard.page.html":  "239a50ca16a7b9ab370a02f873a5ae8f22110b8419b44dcb066cdb61c35a07e9",
+                  "test/win32/dashboard-dom.ps1":  "caf3d91216082f17b0e12c5ae88c56e360ef62b715197429abc4db037be40a69",
+                  "test/win32/lib/dashboard-dom-selftest.js":  "f09c3bd6e90ada5438ce2165da700a40a72aa8a34445bde3193b289c47f2f3aa",
+                  "test/win32/lib/dashboard-stub-server.js":  "927f2dd9a58164e5ac2c7634ccef5387436c7febcbca7e5ffd99c2b703aada49"
+              }
+}

@@ -649,6 +649,36 @@ powershell -NoProfile -File scripts\suite-run.ps1 confirm -Resume <run>  # an ol
 Acceptance: section P of `test\win32\suite-run.ps1` (a fixture script that is red
 once and green after, one that is red however often it runs).
 
+**A web page is tested by CLICKING it, against a stub, with the driver injected**
+(T565). The tracker dashboard is the one HTML surface here, and until now its 74k
+of inline JS was covered only by "does the script parse" plus the HTTP surface
+underneath it: a control that rendered fine and did nothing was found by a human
+clicking it. `test\win32\dashboard-dom.ps1` is the shape to copy for any page:
+
+- **Drive the real page in a real browser.** Headless Edge with
+  `--virtual-time-budget=<ms> --dump-dom`, and the verdict written into the DOM
+  where the dump can read it. No mock DOM: the subject is the page as shipped.
+- **Serve it from a STUB, never the live server.** The buttons that matter here
+  POST to `/api/status` and `/api/resolve`, which rewrite real task files, and
+  the live payload has no guaranteed blocked task, armed watch, stale row or open
+  decision to click. `test\win32\lib\dashboard-stub-server.js` serves the real
+  page bytes plus a payload captured from the REAL builder
+  (`node scripts\task-dashboard.js --once`) with those shapes injected, and it
+  RECORDS posts instead of performing them. Capturing the payload rather than
+  hand-writing one is what stops the fixture drifting from the shape the page
+  actually receives.
+- **Judge a click by the request it sent.** The stub hands its recording back
+  over `/api/_posted`, and the harness asserts the ids, statuses and answer keys
+  from PowerShell — the half of the evidence the page cannot fake by rendering
+  convincingly.
+- **Inject the driver; never edit the page to be testable.** The stub appends one
+  `<script src="/selftest-dom.js">` at serve time, so a green run is evidence
+  about the shipped file rather than about test code living inside it.
+- **Ship the demonstration that it can fail.** `-NegativeControl` serves the page
+  with the two-step unblock guard disarmed and requires the run to go red; it
+  fails on exactly the arming checks, which is what makes those checks worth
+  having.
+
 **A window under test is identified by the NAME the test gave it, never by "the
 one that was not there a moment ago"** (T1103). `viewer-popup.ps1` snapshotted
 the set of windows to ignore AFTER the page under test had already had the chance

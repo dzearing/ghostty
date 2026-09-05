@@ -2047,6 +2047,24 @@ $GuardTable = @(
             'test\win32\task-dashboard.ps1'
         )
     },
+    # The dashboard's DOM level (T565): the page's 74k of inline JS, driven in a
+    # real browser. The HTTP harness above proves the script PARSES; only this
+    # one proves a button still does what it says. It shares the page and the
+    # server with that guard on purpose - either harness going stale over a
+    # dashboard edit is worth saying out loud, and they answer different
+    # questions about the same file.
+    [pscustomobject]@{
+        Name   = 'dashboard-dom'
+        Script = 'test\win32\dashboard-dom.ps1'
+        Stamp  = 'test\win32\dashboard-dom.stamp.json'
+        Covers = @(
+            'scripts\task-dashboard.page.html',
+            'scripts\task-dashboard.js',
+            'test\win32\dashboard-dom.ps1',
+            'test\win32\lib\dashboard-stub-server.js',
+            'test\win32\lib\dashboard-dom-selftest.js'
+        )
+    },
     # The acceptance-suite runner (T361). It is the one tool whose subject is
     # the other 241 scripts, so a regression in it does not fail loudly - it
     # mis-scores a sweep, and a wall of green is exactly what nobody re-reads.

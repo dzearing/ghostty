@@ -22798,3 +22798,41 @@ Validation: 5 consecutive `ALL PASS (159 assertions)` runs, the script's own
 go red - building the app with `if (false) self.clearError();` turns J into
 `FAIL J clicking the glyph DISMISSES the banner` (7 FAILURE(S)); that patch was
 reverted and the tree rebuilt. All four floor lanes PASS and P1-P3 ALL PASS.
+
+## 2026-09-05 - The dashboard's buttons are tested by clicking them now (T565)
+
+The tracker dashboard was the one surface here whose behavior nobody measured.
+Its server has an end-to-end harness, and its page was checked to the depth of
+"the inline script parses" - which is exactly as much as a blank page passes.
+Everything behind the buttons, all 74k of it, was found working by a human
+clicking it and finding it working. The two-step Mark unblocked button T564 added
+is the sharpest case: its whole point is that the FIRST click does not act, and
+nothing but a click could have told you whether it still didn't.
+
+`test\win32\dashboard-dom.ps1` drives the real page in headless Edge and asserts
+what the clicks did: the shell renders and reports no error, the two-step unblock
+arms and only then acts, an armed watch gets the other control, a stale row
+resets, a decision resolves with the option clicked and refuses to resolve with
+neither an option nor a note, the table filters, the task dialog opens and closes,
+and the data and digest views draw without throwing.
+
+Three choices are what make it evidence rather than decoration. It serves the
+page from a STUB, because the buttons under test POST to `/api/status`, which
+rewrites real task files, and because the live payload has no guaranteed blocked
+task, armed watch, stale row or open decision to click - the stub serves the real
+page bytes plus a payload captured from the real builder (`--once`) with those
+four shapes injected, and records posts instead of performing them. It judges
+each click by the REQUEST that reached the recorder, read back over
+`/api/_posted` and matched by id, status and answer key, not by what the page
+says about itself afterwards. And the driver is INJECTED at serve time as one
+extra `<script>` tag, so `scripts\task-dashboard.page.html` is byte-for-byte
+unchanged and a green run is evidence about the shipped file.
+
+Validation: `ALL PASS (40 assertions)`, and `-NegativeControl` - which serves the
+page with the two-step guard disarmed - scores the run red on exactly the arming
+checks (C6/C7/C8) plus the request-count assertions, so those checks are
+demonstrably able to fail. Registered in `scripts\guard-due.ps1` as
+`dashboard-dom` over the page, the server and its own three files. The seven
+standing harness audits (isolation-meta, launch-preflight, verdict-exit,
+cleanslate, stderr-capture, body-complete, desktop-launch) pass over the new
+script and were re-stamped.
