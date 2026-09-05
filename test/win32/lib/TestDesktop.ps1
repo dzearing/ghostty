@@ -2052,6 +2052,14 @@ $script:GhozttyTestDesktopPids = @()
 # an empty set - an assertion that passes because it checked nothing.
 # Read it with Get-TestLaunchedPids.
 $script:GhozttyTestDesktopAllPids = @()
+# T527: one record per launch - { Pid, Exe, Name, StdErr, StartedAt, Process,
+# Killed, Reported }. This is what turns "the app died" into a diagnosis: the
+# Process object keeps a handle open so Windows still has the exit code after
+# the process is gone, and `Killed` remembers which corpses are OURS so the
+# teardown report does not present a deliberate Stop-Process as a mystery.
+$script:GhozttyTestDesktopLaunches = @()
+
+. (Join-Path $PSScriptRoot 'GuiPostmortem.ps1')
 
 # T43: measure the chrome the USER gets, not the chrome a dev build wears.
 #
@@ -2124,6 +2132,8 @@ function New-TestDesktop {
     $script:GhozttyTestDesktop = $td
     $script:GhozttyTestDesktopPids = @()
     $script:GhozttyTestDesktopAllPids = @()
+    $script:GhozttyTestDesktopLaunches = @()
+    Clear-LastGuiPostmortem
     if ($interactiveMode) {
         Write-Host "NOTE  test desktop DISABLED (-Interactive): running on the interactive desktop, this WILL steal focus"
     }
@@ -2211,7 +2221,81 @@ function Start-OnTestDesktop {
     $script:GhozttyTestDesktopAllPids += $procId
     $p = $null
     try { $p = [System.Diagnostics.Process]::GetProcessById($procId) } catch { }
+    # T527: touch .Handle so the object CACHES a real process handle. Without
+    # one, Windows recycles the exit code the moment the process is reaped and
+    # `.ExitCode` throws - which is why every "GUI died" report this harness has
+    # ever printed could say that it died and never why. This is the same trap
+    # that made Start-Process's ExitCode read empty (see the box notes); the fix
+    # is to hold the handle from the start rather than to go looking later.
+    if ($p) { try { $null = $p.Handle } catch { } }
+    $script:GhozttyTestDesktopLaunches += [pscustomobject]@{
+        Pid       = $procId
+        Exe       = $Exe
+        Name      = (Split-Path -Leaf $Exe)
+        StdErr    = $StdErr
+        StartedAt = (Get-Date)
+        Process   = $p
+        Killed    = $false
+        Reported  = $false
+    }
     return [pscustomobject]@{ Pid = $procId; Process = $p }
+}
+
+# Every launch this run made, dead ones included. Records survive
+# Remove-TestDesktop so a postmortem can still be asked for afterwards.
+function Get-TestLaunchRecords {
+    return @($script:GhozttyTestDesktopLaunches)
+}
+
+<#
+Diagnose one launched process by pid and print the block (T527).
+
+For the SETUP FAIL branch every GUI script already has: instead of
+
+    if ($app.Process.HasExited) { Write-Host 'SETUP FAIL: GUI died'; exit 1 }
+
+say WHY it died on the way out. Returns the report object, or $null when the
+pid was never launched through this harness.
+#>
+function Write-TestGuiPostmortem {
+    param([Parameter(Mandatory = $true)][int]$ProcessId, [int]$WaitSeconds = 20)
+
+    $rec = @($script:GhozttyTestDesktopLaunches | Where-Object { $_.Pid -eq $ProcessId })
+    if ($rec.Count -eq 0) { return $null }
+    $r = $rec[-1]
+    $report = Get-GuiPostmortem -ProcessId $r.Pid -Name $r.Name -Process $r.Process `
+        -StdErr $r.StdErr -Since $r.StartedAt -WaitSeconds $WaitSeconds
+    Write-GuiPostmortem -Report $report
+    $r.Reported = $true
+    return $report
+}
+
+<#
+Report every launch that died on its own (T527).
+
+Called from Remove-TestDesktop before it kills anything, so a script that gave
+up ten sections ago still leaves the diagnosis in its log. Deliberate kills are
+skipped - `Killed` is set by the teardown as it goes - and so is a clean exit
+0, which is what a CLI helper's child looks like. What is left is exactly the
+population this exists for: a process that was supposed to still be running.
+#>
+function Write-TestDesktopPostmortems {
+    param([int]$WaitSeconds = 8)
+
+    $n = 0
+    foreach ($r in $script:GhozttyTestDesktopLaunches) {
+        if ($r.Killed -or $r.Reported) { continue }
+        $gone = $false
+        try { $gone = -not (Get-Process -Id $r.Pid -ErrorAction Stop) } catch { $gone = $true }
+        if (-not $gone) { continue }
+        $report = Get-GuiPostmortem -ProcessId $r.Pid -Name $r.Name -Process $r.Process `
+            -StdErr $r.StdErr -Since $r.StartedAt -WaitSeconds $WaitSeconds
+        $r.Reported = $true
+        if ($null -ne $report.ExitCode -and $report.ExitCode -eq 0) { continue }
+        Write-GuiPostmortem -Report $report
+        $n++
+    }
+    return $n
 }
 
 <#
@@ -3803,8 +3887,15 @@ function Remove-TestDesktop {
     Restore-TestWindowTopmost | Out-Null
     $td = $Desktop
     if (-not $td) { $td = $script:GhozttyTestDesktop }
+    # T527: read the corpses BEFORE making more of them. Anything already gone
+    # at this point died on its own, which is the event that used to leave
+    # nothing behind but a wall of asserts failing for the wrong reason.
+    try { Write-TestDesktopPostmortems | Out-Null } catch { }
     if (-not $KeepProcesses) {
         foreach ($procId in $script:GhozttyTestDesktopPids) {
+            foreach ($r in $script:GhozttyTestDesktopLaunches) {
+                if ($r.Pid -eq $procId) { $r.Killed = $true }
+            }
             Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue
         }
         Start-Sleep -Milliseconds 400

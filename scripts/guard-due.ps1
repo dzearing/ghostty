@@ -1725,6 +1725,24 @@ $GuardTable = @(
             'test\win32\crash-stacks.ps1'
         )
     },
+    # T527: the GUI postmortem is the third crash row, and it covers the case
+    # neither of the two above can - a death nobody was watching for, in a run
+    # whose subject was something else entirely. Like them it is only ever
+    # exercised on a bad day, so a quietly broken diagnosis is indistinguishable
+    # from a run in which nothing died. lib\TestDesktop.ps1 is deliberately NOT
+    # in Covers: it is the harness every GUI script edits for its own reasons,
+    # and gating all of those on this one script is exactly the noise T783 warns
+    # about. What IS covered is the postmortem library and its own acceptance.
+    [pscustomobject]@{
+        Name   = 'gui-postmortem'
+        Script = 'test\win32\gui-postmortem.ps1'
+        Stamp  = 'test\win32\gui-postmortem.stamp.json'
+        Covers = @(
+            'test\win32\lib\GuiPostmortem.ps1',
+            'scripts\lib\CrashDiag.ps1',
+            'test\win32\gui-postmortem.ps1'
+        )
+    },
     # The banner is the one piece of chrome the user reads all day, and its
     # regressions are HORIZONTAL - a column that stops halfway is invisible to
     # every height oracle in the suite, so only pane-banner.ps1's pixel probes

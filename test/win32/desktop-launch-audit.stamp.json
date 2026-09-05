@@ -1,10 +1,11 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-05T01:26:41-07:00",
-    "commit":  "58660564f",
+    "generated":  "2026-09-05T02:06:31-07:00",
+    "commit":  "eb24f19ed",
     "uncommitted":  [
-                        "test/win32/clipboard-paste.ps1"
+                        "test/win32/gui-postmortem.ps1",
+                        "test/win32/lib/TestDesktop.ps1"
                     ],
     "files":  {
                   "src/cli/ghostty.zig":  "ef54b501298cfda9306cfb958c1094db24ee30f355b25865656b3e2bc713bcd7",
@@ -109,6 +110,7 @@
                   "test/win32/go-loop-uptime.ps1":  "a97005d970a564088741646542ffaca3cb9ffe03d2eb30c55b96841607948b82",
                   "test/win32/guard-due.ps1":  "306e120c7282b5c4c50c75ac9d7a30a8db84e94e92745cc79caa6ea4eb437d01",
                   "test/win32/gui-launch-command.ps1":  "92343e0db67fea906f08a1a8ef37ec38c4bd2ca90b859269451d543e33ec6202",
+                  "test/win32/gui-postmortem.ps1":  "bd3a16f1ac67d46c914a30582a69d391f923701ea29e90820472f0fec662ef7d",
                   "test/win32/harness-exitcode-audit.ps1":  "9568a9718f2cfba7d2bc2b8f9813a74ba8767a062a20dea8f236fc56fa3ee4e5",
                   "test/win32/harness-process-leak.ps1":  "c62a0f43277632a1bd8506273912a0f73b13ed311d3f84e6a3763b425a9d14a9",
                   "test/win32/hero-mode.ps1":  "bc202bf5cc920c3949969f8dc8576092bc6ac692ea10718257827b3e04fd7a83",
@@ -158,7 +160,7 @@
                   "test/win32/layout-blobs.ps1":  "d91f5b4afad56f13d8fba4d6f00abf44539b9a5e93afadd26acaec53c5413b75",
                   "test/win32/layout-capture-cost.ps1":  "60a2c830f6bac395be0ea78847d0f07466cefca0c8bb9d86385ea27618628e8e",
                   "test/win32/lib/DesktopLaunchAudit.ps1":  "6a520668a22c54f4c5163d5efe9fb3a01bdb8568d60f6cfa5366a1fb2edad86f",
-                  "test/win32/lib/TestDesktop.ps1":  "e718e941fcef6bcebc7f25194cc6a18bb2123cd3b4a6893d5466d837f1f947bc",
+                  "test/win32/lib/TestDesktop.ps1":  "27a0aefd00a14f8859b1d721a07a9cbaf12fe40c296d8511f77463c3abaf9a9f",
                   "test/win32/local-split-no-command-rerun.ps1":  "ee277b6308cdb172e153fe92d0624732f8b64743418134ce466da5534138fae2",
                   "test/win32/log-append.ps1":  "959f1a2a1a0d7d0ef3fa7aba7ed59c240d2d0cace3de6317dbb530eecd747423",
                   "test/win32/machine-chooser.ps1":  "c69e331b19e83e300b5f0c22860220ea1d2de144d587db1ee4ae4e797ce6b79e",

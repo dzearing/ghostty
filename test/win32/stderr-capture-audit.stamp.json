@@ -1,10 +1,12 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-05T01:26:35-07:00",
-    "commit":  "58660564f",
+    "generated":  "2026-09-05T02:05:37-07:00",
+    "commit":  "eb24f19ed",
     "uncommitted":  [
-                        "test/win32/clipboard-paste.ps1"
+                        "test/win32/gui-postmortem.ps1",
+                        "test/win32/lib/GuiPostmortem.ps1",
+                        "test/win32/lib/TestDesktop.ps1"
                     ],
     "files":  {
                   "docs/claude/testing.md":  "75066e86f1dcb63299264139b1ca28da1f7025520011e33f7c3139d0d24fc9b1",
@@ -109,6 +111,7 @@
                   "test/win32/go-loop-uptime.ps1":  "a97005d970a564088741646542ffaca3cb9ffe03d2eb30c55b96841607948b82",
                   "test/win32/guard-due.ps1":  "306e120c7282b5c4c50c75ac9d7a30a8db84e94e92745cc79caa6ea4eb437d01",
                   "test/win32/gui-launch-command.ps1":  "92343e0db67fea906f08a1a8ef37ec38c4bd2ca90b859269451d543e33ec6202",
+                  "test/win32/gui-postmortem.ps1":  "bd3a16f1ac67d46c914a30582a69d391f923701ea29e90820472f0fec662ef7d",
                   "test/win32/harness-exitcode-audit.ps1":  "9568a9718f2cfba7d2bc2b8f9813a74ba8767a062a20dea8f236fc56fa3ee4e5",
                   "test/win32/harness-process-leak.ps1":  "c62a0f43277632a1bd8506273912a0f73b13ed311d3f84e6a3763b425a9d14a9",
                   "test/win32/hero-mode.ps1":  "bc202bf5cc920c3949969f8dc8576092bc6ac692ea10718257827b3e04fd7a83",
@@ -177,6 +180,7 @@
                   "test/win32/lib/FakeRelay.ps1":  "e30d00b4c6d6d58bbdc23d82fa76b586a84143111b8d00bcd5a7777736088075",
                   "test/win32/lib/FloorFixture.ps1":  "d2becd0816d1623fc18be994609fcbc22a6fd165fd19656c50f67abe86538155",
                   "test/win32/lib/ForegroundAudit.ps1":  "7b5deda440053a6ce0b0e8fa4047a3febd432bdbabd4b65a09e5425f81dc9e3c",
+                  "test/win32/lib/GuiPostmortem.ps1":  "b2aaea0dd2e850ba4958c2a2e1a7179df9a27ec824790b934e2a036c0b0c4c2f",
                   "test/win32/lib/HarnessLeak.ps1":  "98c3df24fc6b37702f3b7c8ac80a8f5fffff94a7ed390f99f5b1146306274438",
                   "test/win32/lib/HoverCapture.ps1":  "ce62c60da9068be953b9c4bece7b10afda478af42ebc0942ab90e7a634b285a0",
                   "test/win32/lib/Isolation.ps1":  "93b2efed0772d8debdd7ccbda2ca5b51d63bee517d2a1fd1fe6b33da89024464",
@@ -190,7 +194,7 @@
                   "test/win32/lib/SkipAudit.ps1":  "1f144bf0f762eebc385656df1fa39d7629363d44164393de241248c4a231eade",
                   "test/win32/lib/StderrCaptureAudit.ps1":  "69d0a25615d35acc06bf6c1471016186163ae1881ae70a12461425546ac4b7d8",
                   "test/win32/lib/TestClient.ps1":  "98b5449096d7103ec31d8eb19b2d0d84985c48fddc88a5871eeb641ec43091f8",
-                  "test/win32/lib/TestDesktop.ps1":  "e718e941fcef6bcebc7f25194cc6a18bb2123cd3b4a6893d5466d837f1f947bc",
+                  "test/win32/lib/TestDesktop.ps1":  "27a0aefd00a14f8859b1d721a07a9cbaf12fe40c296d8511f77463c3abaf9a9f",
                   "test/win32/lib/TestReachAudit.ps1":  "3b2fb64aee74f3451127f4f9776141f5781dd210a6fdf0019410485664f0a840",
                   "test/win32/lib/TestScore.ps1":  "1bc571121b1b60ce5d9b63a0e1c8ebf23f6da575f8e9f7dab1a410cbc2888acc",
                   "test/win32/lib/ThrowawayProduct.ps1":  "d0754fbb3791ee3d5fec2369a523df0c23ccb6d4738bad21dd37c25cf86c82fd",
