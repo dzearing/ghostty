@@ -22315,3 +22315,54 @@ so it passed against the HARNESS's prompt while the pane's was never read.
 Filed while here: T1352, `shell-integration` still cannot be forced to either
 Windows shell - the config enum knows nothing of `cmd` or `powershell` even
 though `setup()`'s force path handles both.
+
+## 2026-09-05 - The contents card slides in, and its header is glass (T543)
+
+The viewer's table-of-contents card had two things Mac's has and this one did
+not. In a narrow pane the compact card appeared and vanished instantly on
+toggle, where Mac parks it off the leading edge and animates it in. And its
+pinned CONTENTS header was a solid strip, where Mac's is translucent glass the
+rows travel under. Both are polish, and both are the difference between a card
+that matches and a card that merely works.
+
+The slide is ONE number. `slide` is where the card is - 0 parked off the pane's
+left edge, 1 fully in - and `slide_want` is where the toggle says it should end
+up; a 15ms timer walks the first toward the second through an ease-out cubic.
+That shape is why the fast double-toggle needs nothing special: reversing
+changes which end the number is walking to, and the card carries on from where
+it actually is, so there is no end-of-animation state to re-read and get wrong
+(Mac re-reads its own for exactly this reason). A change of LAYOUT snaps rather
+than sliding - the pane crossing the gutter/compact threshold is not a toggle,
+and a card sliding out from under a window somebody is dragging narrower reads
+as a glitch. The curve is pure, in `viewer_toc_layout.zig`, and asserted in the
+`none` lane without a window.
+
+One thing the animation must not do is leave the card's window outside its
+pane. A parked card is hidden, and a hidden window still has a rect that
+`viewer-narrow-pane.ps1` counts, so the off-edge position exists only while the
+timer is running; the moment the card settles it is moved back to its resting
+origin. That was found by the harness rather than by reading, which is the
+whole point of the containment sweep.
+
+The header is translucent by re-compositing the card's own backdrop over the
+rows at alpha 217, after the rows have been allowed to paint under it (they
+used to be clipped at the band's edge, so there was nothing behind it to see).
+GDI has no live blur; a reduced-alpha composite reads as glass without one. It
+also restores the card's specular top edge, which the opaque band had quietly
+been painting out ever since T160.
+
+Proving that on a background desktop needed one new fact from the app: the
+band's height is a font metric at the current scale, not a DIP constant a
+script could restate, so the card now logs its box once per change
+(`viewer toc card pane=.. header=.. card=WxH margin=..`). Section F of
+`test\win32\viewer-narrow-pane.ps1` reads that, wheels a 60-heading list under
+the header, and compares the band's own pixels: 263 change where an opaque band
+changes none, with the list strip below as the positive control and
+`-NegativeControl` inverting the claim.
+
+Filed while validating: T1356, closing a window that holds a viewer pane
+crashes the app (the WebView2 `Close()` pumps messages and the window's
+dim-overlay sweep then walks the pane being freed) - section F leaves its probe
+window open to avoid inheriting it. And T1357, section E's widest-band capture
+is taken before the nav strip has settled, which reds the run about half the
+time on a build where nothing is wrong.

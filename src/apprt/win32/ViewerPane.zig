@@ -6464,6 +6464,26 @@ test "host floor: a real controller on a real window, on this box" {
         try testing.expect(pane.toc_open);
         try testing.expect(shownByStyle(toc_panel.hwnd));
 
+        // A FAST double-toggle lands in the state the last toggle asked for
+        // (T543). The slide is one number walking toward its target, so
+        // reversing mid-flight resumes from where the card actually is —
+        // there is no end-of-animation state left to read back and get wrong.
+        try testing.expect(toc_panel.sliding());
+        pane.toggleTOCPanel(); // shut, mid-slide...
+        try testing.expect(!pane.toc_open);
+        pane.toggleTOCPanel(); // ...and open again, still mid-slide
+        try testing.expect(pane.toc_open);
+        var flip_timer = try std.time.Timer.start();
+        while (flip_timer.read() < 5 * std.time.ns_per_s and toc_panel.sliding()) {
+            while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+                _ = w32.TranslateMessage(&msg);
+                _ = w32.DispatchMessageW(&msg);
+            }
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
+        try testing.expect(!toc_panel.sliding());
+        try testing.expect(shownByStyle(toc_panel.hwnd));
+
         // Clicking a row scrolls the page to that heading and PINS it: the
         // page posts the pinned id back as an `active` message, which is what
         // moves the native selection — and using the overlay dismisses it.
@@ -6471,6 +6491,19 @@ test "host floor: a real controller on a real window, on this box" {
         defer alloc.free(target_id);
         pane.tocRowClicked(target_id);
         try testing.expect(!pane.toc_open);
+        // The overlay leaves by SLIDING out (T543), so it is still on screen
+        // for the length of the animation and hidden at the end of it. Waiting
+        // it out is the assertion that a toggle lands in its final state.
+        try testing.expect(toc_panel.sliding());
+        var slide_timer = try std.time.Timer.start();
+        while (slide_timer.read() < 5 * std.time.ns_per_s and toc_panel.sliding()) {
+            while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+                _ = w32.TranslateMessage(&msg);
+                _ = w32.DispatchMessageW(&msg);
+            }
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
+        try testing.expect(!toc_panel.sliding());
         try testing.expect(!shownByStyle(toc_panel.hwnd));
         var click_timer = try std.time.Timer.start();
         while (click_timer.read() < 30 * std.time.ns_per_s) {

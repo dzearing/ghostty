@@ -50,6 +50,13 @@ const log = std.log.scoped(.viewer_toc);
 
 pub const CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyViewerTOC");
 
+/// The compact overlay's slide timer (T543) and its frame interval. 15ms is a
+/// hair under a 60Hz frame, so a frame is never skipped waiting for the next
+/// tick; the step is time-based, so a slower tick shortens the animation
+/// rather than stretching it.
+const SLIDE_TIMER_ID: usize = 1;
+const SLIDE_TICK_MS: u32 = 15;
+
 /// The document page's own background, kept in step with viewer.css (and with
 /// Mac's `SidePanelCard.documentBackground`) so the card's opaque composite is
 /// the same color as the page it sits on: white in light, GitHub's `#0d1117`
@@ -131,6 +138,34 @@ measured_scale: f32 = 0,
 /// Resize drag state: the card width (DIP) when the drag started, and the
 /// mouse x (client px) it started at. Null when not dragging.
 drag: ?struct { start_dip: f32, start_x: i32 } = null,
+
+/// Compact-overlay slide (T543). `slide` is where the card IS — 0 parked off
+/// the pane's left edge, 1 fully in — and `slide_want` is where the toggle
+/// says it should end up; a timer walks the first toward the second. Storing
+/// the position rather than an animation start/end is what makes a fast
+/// double-toggle correct for free: reversing changes the target, and the card
+/// carries on from wherever it had got to.
+slide: f32 = 1.0,
+slide_want: f32 = 1.0,
+slide_timer: bool = false,
+slide_last_ms: i64 = 0,
+/// The window geometry the slide moves over, from the last placement: the
+/// resting (fully-in) origin and the window size.
+slide_x: i32 = 0,
+slide_y: i32 = 0,
+slide_w: i32 = 1,
+slide_h: i32 = 1,
+/// The presentation the last placement chose. A change of MODE snaps — the
+/// pane growing past the gutter threshold is a layout switch, not a toggle,
+/// and a card sliding out from under a window someone is dragging narrower
+/// reads as a glitch rather than as an animation.
+last_mode: toc.Mode = .hidden,
+
+/// The card box last reported by `logCardMetrics`, so the line is emitted once
+/// per change rather than once per bounds sync.
+logged_header: i32 = -1,
+logged_card_w: i32 = -1,
+logged_card_h: i32 = -1,
 
 scale: f32 = 1.0,
 row_font: ?*anyopaque = null,
@@ -231,6 +266,7 @@ pub fn create(
 }
 
 pub fn destroy(self: *ViewerTOCPanel) void {
+    self.stopSlide();
     // Clear the back-pointer FIRST: DestroyWindow delivers messages
     // synchronously and they must not find a half-dead object.
     _ = w32.SetWindowLongPtrW(self.hwnd, w32.GWLP_USERDATA, 0);
@@ -603,8 +639,7 @@ pub fn place(
     const pane_w_dip = @as(f32, @floatFromInt(content_w)) / scale;
     const which = toc.mode(pane_w_dip, self.rows.items.len);
     if (which == .hidden) {
-        self.layout = .{ .which = .hidden };
-        _ = w32.ShowWindow(self.hwnd, w32.SW_HIDE);
+        self.hide();
         return .{ .which = .hidden, .card_w_dip = 0 };
     }
 
@@ -634,12 +669,20 @@ pub fn place(
     // the overflow the old scroll compensated for).
     self.clampScroll();
 
+    // Geometry the compact slide moves over (T543): the card's RESTING
+    // origin, which is where it sits at every point of the animation except
+    // while one is in flight.
+    self.slide_x = l.window.left;
+    self.slide_y = content_top + l.window.top;
+    self.slide_w = @max(l.window.width(), 1);
+    self.slide_h = @max(l.window.height(), 1);
+
     _ = w32.MoveWindow(
         self.hwnd,
-        l.window.left,
-        content_top + l.window.top,
-        @max(l.window.width(), 1),
-        @max(l.window.height(), 1),
+        self.windowX(),
+        self.slide_y,
+        self.slide_w,
+        self.slide_h,
         1,
     );
 
@@ -664,27 +707,157 @@ pub fn place(
         _ = w32.SetWindowRgn(self.hwnd, null, 1);
     }
 
-    if (visible) {
-        // Above the WebView2 sibling: the card floats over the document.
-        _ = w32.SetWindowPos(
-            self.hwnd,
-            null, // HWND_TOP
-            0,
-            0,
-            0,
-            0,
-            w32.SWP_NOMOVE | w32.SWP_NOSIZE | w32.SWP_NOACTIVATE | w32.SWP_SHOWWINDOW,
-        );
-    } else {
-        _ = w32.ShowWindow(self.hwnd, w32.SW_HIDE);
-    }
+    // The gutter card is part of the layout and the compact card is an
+    // overlay, so only the second one animates — and only when the TOGGLE
+    // moved, not when the pane crossed the threshold between the two.
+    const animate = which == .compact and self.last_mode == .compact;
+    self.last_mode = which;
+    self.setVisible(visible, animate);
     _ = w32.InvalidateRect(self.hwnd, null, 0);
+    self.logCardMetrics();
 
     return .{ .which = which, .card_w_dip = l.card_w_dip };
 }
 
+/// Report the card's measured box, once per CHANGE of it.
+///
+/// The pinned header's height is a font metric resolved at this scale, not a
+/// DIP constant a script could restate — so an acceptance script that wants to
+/// look at the header band (T543's translucency check) has no way to find it
+/// except to be told. `place` runs on every bounds sync, so a line per call
+/// would be noise; a line per change is the same rule `logPanelLayout` follows
+/// one level up.
+fn logCardMetrics(self: *ViewerTOCPanel) void {
+    const header_h = toc.headerHeight(self.caption_line_h, self.scale);
+    const w = self.layout.card.width();
+    const h = self.layout.card.height();
+    if (header_h == self.logged_header and w == self.logged_card_w and
+        h == self.logged_card_h) return;
+    self.logged_header = header_h;
+    self.logged_card_w = w;
+    self.logged_card_h = h;
+    log.info("viewer toc card pane={s} header={d} card={d}x{d} margin={d}", .{
+        self.pane.paneId(),
+        header_h,
+        w,
+        h,
+        self.px(toc.margin_dip),
+    });
+}
+
+/// Raise the card above the WebView2 sibling and show it: the card floats
+/// over the document.
+fn showAbove(self: *ViewerTOCPanel) void {
+    _ = w32.SetWindowPos(
+        self.hwnd,
+        null, // HWND_TOP
+        0,
+        0,
+        0,
+        0,
+        w32.SWP_NOMOVE | w32.SWP_NOSIZE | w32.SWP_NOACTIVATE | w32.SWP_SHOWWINDOW,
+    );
+}
+
+/// Drive the card toward `visible`, sliding when `animate` says the change is
+/// a toggle and snapping when it is not.
+fn setVisible(self: *ViewerTOCPanel, visible: bool, animate: bool) void {
+    self.slide_want = if (visible) 1.0 else 0.0;
+    if (!animate) {
+        self.slide = self.slide_want;
+        self.stopSlide();
+    } else if (self.slide != self.slide_want) {
+        // The timer is armed BEFORE the first frame is placed: the parked
+        // position is a thing that exists only while one is running.
+        self.startSlide();
+    }
+    self.moveToSlide();
+    // A card sliding OUT is still on screen — that is the animation — and one
+    // sliding IN has to be shown before it can be seen doing it.
+    if (visible or self.slide_timer) {
+        self.showAbove();
+    } else {
+        _ = w32.ShowWindow(self.hwnd, w32.SW_HIDE);
+    }
+}
+
+/// Where the window sits right now: off the pane's left edge only while a
+/// slide is actually running, and at its resting origin the rest of the time.
+///
+/// A PARKED card is hidden, and a hidden window still has a rect — leaving it
+/// out beyond the pane's left edge would make this the one piece of viewer
+/// chrome whose bounds escape the pane it belongs to, which
+/// `test/win32/viewer-narrow-pane.ps1` checks on every painted window.
+fn windowX(self: *const ViewerTOCPanel) i32 {
+    if (!self.slide_timer) return self.slide_x;
+    return toc.slideX(self.slide, self.slide_x, self.slide_w);
+}
+
+/// Put the window where `windowX` says, without touching its size, z-order or
+/// visibility.
+fn moveToSlide(self: *ViewerTOCPanel) void {
+    _ = w32.SetWindowPos(
+        self.hwnd,
+        null,
+        self.windowX(),
+        self.slide_y,
+        0,
+        0,
+        w32.SWP_NOSIZE | w32.SWP_NOZORDER | w32.SWP_NOACTIVATE,
+    );
+}
+
+fn startSlide(self: *ViewerTOCPanel) void {
+    self.slide_last_ms = std.time.milliTimestamp();
+    if (self.slide_timer) return;
+    if (w32.SetTimer(self.hwnd, SLIDE_TIMER_ID, SLIDE_TICK_MS, null) != 0) {
+        self.slide_timer = true;
+        return;
+    }
+    // No timer to be had: land on the final state rather than freeze the card
+    // halfway across the pane.
+    log.warn("viewer TOC slide timer unavailable; snapping to final state", .{});
+    self.slide = self.slide_want;
+    self.settleSlide();
+}
+
+fn stopSlide(self: *ViewerTOCPanel) void {
+    if (!self.slide_timer) return;
+    _ = w32.KillTimer(self.hwnd, SLIDE_TIMER_ID);
+    self.slide_timer = false;
+}
+
+/// One animation frame. Returns having either advanced the card or settled it.
+fn tickSlide(self: *ViewerTOCPanel) void {
+    const now = std.time.milliTimestamp();
+    const dt: f32 = @floatFromInt(now - self.slide_last_ms);
+    self.slide_last_ms = now;
+    self.slide = toc.slideStep(self.slide, self.slide_want, dt);
+    self.moveToSlide();
+    if (self.slide == self.slide_want) self.settleSlide();
+}
+
+/// The card reached the end of its travel: stop the timer, and hide the
+/// window if that end was the parked one.
+fn settleSlide(self: *ViewerTOCPanel) void {
+    self.stopSlide();
+    // Back to the resting rect, which for a card that just parked means the
+    // hidden window is inside its pane again.
+    self.moveToSlide();
+    if (self.slide_want == 0) _ = w32.ShowWindow(self.hwnd, w32.SW_HIDE);
+}
+
+/// Whether the card is mid-slide — the state the pane's own tests wait out.
+pub fn sliding(self: *const ViewerTOCPanel) bool {
+    return self.slide_timer;
+}
+
 pub fn hide(self: *ViewerTOCPanel) void {
     self.layout = .{ .which = .hidden };
+    self.last_mode = .hidden;
+    self.stopSlide();
+    self.slide = 0;
+    self.slide_want = 0;
     _ = w32.ShowWindow(self.hwnd, w32.SW_HIDE);
 }
 
@@ -908,7 +1081,11 @@ fn paint(self: *ViewerTOCPanel, hdc: w32.HDC, width: i32, height: i32) void {
         const inner_saved = w32.SaveDC(hdc);
         defer _ = w32.RestoreDC(hdc, inner_saved);
         const list_top = l.card.top + header_h;
-        _ = w32.IntersectClipRect(hdc, l.card.left, list_top, l.card.right, l.card.bottom);
+        // Clipped to the CARD, not to the list: a row scrolling up leaves the
+        // viewport by passing under the translucent header rather than by
+        // being cut off at its edge (T543), which is what there is to see
+        // through it.
+        _ = w32.IntersectClipRect(hdc, l.card.left, l.card.top, l.card.right, l.card.bottom);
 
         const fill_inset = self.px(toc.fill_inset_dip);
         const origin_y = list_top + fill_inset - self.scroll;
@@ -920,7 +1097,7 @@ fn paint(self: *ViewerTOCPanel, hdc: w32.HDC, width: i32, height: i32) void {
         if (self.row_font) |f| _ = w32.SelectObject(hdc, @ptrCast(f));
         for (self.rows.items, 0..) |row, i| {
             const top = origin_y + row.y;
-            if (top + row.h < list_top) continue;
+            if (top + row.h < l.card.top) continue;
             if (top > l.card.bottom) break;
 
             // A section header is a label, not a target: it never fills, so
@@ -1007,20 +1184,55 @@ fn paint(self: *ViewerTOCPanel, hdc: w32.HDC, width: i32, height: i32) void {
         }
     }
 
-    // The pinned header, over the rows: an opaque band of the card's own fill
-    // with the "CONTENTS" caption at the label inset (a sidebar header lines
-    // up with the row text, not the fill).
+    // The pinned header, over the rows, with the "CONTENTS" caption at the
+    // label inset (a sidebar header lines up with the row text, not the fill).
+    //
+    // Translucent (T543): Mac's `SidePanelHeader` sits on `glassBackdrop()`,
+    // so a row scrolling beneath it stays a recognizable shape. GDI has no
+    // live blur, and the approximation is to composite the card's OWN backdrop
+    // back over the band at just under opaque — the rows read through as a
+    // ghost, and the band keeps the card's specular top edge, which the
+    // opaque fill this replaces used to paint out.
     {
-        const fill_ref = w32.RGB(self.card_fill.r, self.card_fill.g, self.card_fill.b);
-        if (w32.CreateSolidBrush(fill_ref)) |brush| {
-            defer _ = w32.DeleteObject(@ptrCast(brush));
-            var hr = w32.RECT{
-                .left = l.card.left,
-                .top = l.card.top,
-                .right = l.card.right,
-                .bottom = l.card.top + header_h,
+        var hr = w32.RECT{
+            .left = l.card.left,
+            .top = l.card.top,
+            .right = l.card.right,
+            .bottom = l.card.top + header_h,
+        };
+        var composited = false;
+        if (self.card_dc) |mem| {
+            const blend = w32.BLENDFUNCTION{
+                .SourceConstantAlpha = toc.header_alpha,
+                // The backdrop DIB is 0x00RRGGBB — its alpha byte is not a
+                // channel, so blend with the constant alpha alone.
+                .AlphaFormat = 0,
             };
-            _ = w32.FillRect(hdc, &hr, brush);
+            composited = w32.AlphaBlend(
+                hdc,
+                hr.left,
+                hr.top,
+                hr.right - hr.left,
+                header_h,
+                mem,
+                // The band DIB holds the card inset by one margin, so the
+                // card's own origin sits at (margin, margin) in it — the same
+                // mapping the backdrop blit above uses.
+                margin,
+                margin,
+                hr.right - hr.left,
+                header_h,
+                blend,
+            ) != 0;
+        }
+        if (!composited) {
+            // No DIB (or a blend the driver refused): an opaque band still
+            // reads as a pinned header.
+            const fill_ref = w32.RGB(self.card_fill.r, self.card_fill.g, self.card_fill.b);
+            if (w32.CreateSolidBrush(fill_ref)) |brush| {
+                defer _ = w32.DeleteObject(@ptrCast(brush));
+                _ = w32.FillRect(hdc, &hr, brush);
+            }
         }
         if (self.header_font) |f| _ = w32.SelectObject(hdc, @ptrCast(f));
         _ = w32.SetTextColor(hdc, self.secondary_ref);
@@ -1273,6 +1485,15 @@ fn wndProc(
 
     switch (msg) {
         w32.WM_ERASEBKGND => return 1,
+
+        // The compact overlay's slide (T543).
+        w32.WM_TIMER => {
+            if (wparam == SLIDE_TIMER_ID) {
+                self.tickSlide();
+                return 0;
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
 
         w32.WM_PAINT => {
             var ps: w32.PAINTSTRUCT = undefined;

@@ -38,9 +38,14 @@
 #
 #   powershell -NoProfile -File test\win32\viewer-narrow-pane.ps1
 #
-# -NegativeControl inverts the narrow-pane containment assertion and MUST fail
-# with exactly THREE failures - one per width in section B - so a run that
-# scores anything else is measuring something other than the containment.
+# SECTION F measures the TOC card's pinned header (T543): it is translucent,
+# so scrolling the list under it CHANGES its pixels, where the opaque band it
+# replaced never did.
+#
+# -NegativeControl inverts the narrow-pane containment assertion and section
+# F's header claim, and MUST fail with exactly FOUR failures - one per width in
+# section B, plus the header - so a run that scores anything else is measuring
+# something other than what those assertions name.
 param([string]$ExePath, [switch]$NegativeControl, [switch]$Interactive)
 
 . (Join-Path $PSScriptRoot 'lib\CleanSlate.ps1')
@@ -496,6 +501,189 @@ try {
         Write-Host "      band captures written to $env:TEMP\ghoztty-vnp-band-*.png"
     }
     Remove-Item $htmlFile -ErrorAction SilentlyContinue
+
+    # -----------------------------------------------------------------------
+    # F. T543 - the card's pinned header is TRANSLUCENT, so a row scrolling
+    #    under it stays a recognizable shape.
+    #
+    # Mac's `SidePanelHeader` sits on `glassBackdrop()` and the list blurs
+    # through it. GDI has no live blur, so the win32 header re-composites the
+    # card's own backdrop over the rows at just under opaque - and what tells
+    # that apart from the opaque band it replaces is that SCROLLING CHANGES
+    # THE HEADER'S PIXELS. An opaque header is byte-identical however far the
+    # list has moved beneath it, which makes this section its own negative
+    # control: same capture, same rows, same comparison.
+    #
+    # Only the band's own top rows are compared, above the caption's glyphs,
+    # so "CONTENTS" is not what is being measured. The rows well BELOW the
+    # band are compared too, as the positive control that the wheel scrolled
+    # anything at all - without it a card that ignored the wheel would score
+    # this green by never changing either strip.
+    # -----------------------------------------------------------------------
+    $mdFile = Join-Path $env:TEMP "ghoztty-vnp-toc-$PID.md"
+    $mdLines = @('# Translucent header probe', '')
+    foreach ($i in 1..60) {
+        $mdLines += "## Section $i"
+        $mdLines += "Body text for section $i, long enough to be a paragraph."
+        $mdLines += ''
+    }
+    Set-Content -Path $mdFile -Encoding utf8 -Value ($mdLines -join [Environment]::NewLine)
+
+    Invoke-Verb @('+new-window', '--target=vnf') | Out-Null
+    if (-not (Wait-Win 'vnf')) {
+        Assert $false 'F: a window for the header probe'
+    } else {
+        $r = Invoke-Verb @('+split', '--target=vnf', "--view=$mdFile", '--name=vf')
+        Assert ($r.Code -eq 0) 'F: +split --view=<60-heading markdown> succeeded'
+        Start-Sleep -Seconds 5
+
+        # The card has to be in the GUTTER layout to be measured without a
+        # cursor: that is the one presentation where it is on screen with no
+        # toggle. The threshold is 720 DIP of PANE, so the window is stretched
+        # and the viewer given most of it.
+        $wf = Wait-Win 'vnf'
+        $probeWin = [IntPtr]::Zero
+        foreach ($t in @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyWindow')) {
+            if ([IntPtr]$t.Hwnd -eq $top) { continue }
+            if (@(Get-TestChildWindows -Window ([IntPtr]$t.Hwnd) -Class 'GhozttyViewer').Count -ge 1) {
+                $probeWin = [IntPtr]$t.Hwnd
+            }
+        }
+        if ($probeWin -ne [IntPtr]::Zero) {
+            $wantW = [int][Math]::Round(1100 * $scale)
+            [void](Set-TestWindowPos -Window $probeWin -X 0 -Y 0 -Width $wantW -Height 900)
+            Start-Sleep -Milliseconds 800
+        }
+        if ($wf) {
+            $leavesF = @(Get-Leaves $wf.tabs[0].splits)
+            $termF = @($leavesF | Where-Object { $_.type -ne 'viewer' })
+            $viewF = @($leavesF | Where-Object { $_.type -eq 'viewer' })
+            if ($termF.Count -eq 1 -and $viewF.Count -eq 1) {
+                $layoutF = '{"direction":"horizontal","ratio":15,"left":{"pane":"' +
+                    $termF[0].name + '"},"right":{"pane":"' + $viewF[0].name + '"}}'
+                [void](Invoke-Verb @('+rearrange', '--target=vnf',
+                    ('--layout=' + ($layoutF -replace '"', '\"'))))
+                Start-Sleep -Milliseconds 1500
+            }
+        }
+
+        # The probe window's TOC card.
+        $tocH = [IntPtr]::Zero
+        $probeTop = [IntPtr]::Zero
+        $tocRect = $null
+        $cardH = 0
+        foreach ($t in @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyWindow')) {
+            if ([IntPtr]$t.Hwnd -eq $top) { continue }
+            foreach ($vh in @(Get-TestChildWindows -Window ([IntPtr]$t.Hwnd) -Class 'GhozttyViewer')) {
+                foreach ($c in @(Get-TestChildWindows -Window ([IntPtr]$vh.Hwnd) -Class 'GhozttyViewerTOC')) {
+                    $cr = Get-Rect ([IntPtr]$c.Hwnd)
+                    if ((Rect-Width $cr) -gt 0 -and ($cr.bottom - $cr.top) -gt 0) {
+                        $tocH = [IntPtr]$c.Hwnd
+                        $probeTop = [IntPtr]$t.Hwnd
+                        $tocRect = $cr
+                        $cardH = $cr.bottom - $cr.top
+                    }
+                }
+            }
+        }
+        Assert ($tocH -ne [IntPtr]::Zero) 'F: the probe document built a contents card to measure'
+
+        # Where the band IS, from the app rather than from a DIP constant: the
+        # header's height is a FONT metric at this scale, so a script cannot
+        # restate it, and the card reports its box on stderr for exactly this
+        # (`viewer toc card ... header=<px> ... margin=<px>`).
+        $marginPx = [int][Math]::Round(12 * $scale)
+        $headerPx = 0
+        foreach ($line in @(Get-Content $errlog -ErrorAction SilentlyContinue)) {
+            $m = [regex]::Match($line, 'viewer toc card pane=\S+ header=(\d+) card=\d+x\d+ margin=(\d+)')
+            if ($m.Success) {
+                $headerPx = [int]$m.Groups[1].Value
+                $marginPx = [int]$m.Groups[2].Value
+            }
+        }
+        Assert ($headerPx -gt 0) "F: the card reported its header band ($headerPx px)"
+
+        if ($tocH -ne [IntPtr]::Zero -and $headerPx -gt 0) {
+            # The band, and ONLY the band: the card sits one margin inside the
+            # gutter window, so it runs from `margin` to `margin + header`.
+            # Two pixels are dropped at each end - the top one is the card's
+            # antialiased rim, the bottom one is the seam a row's first lit
+            # pixel can straddle - so nothing outside the header can be what
+            # this measures.
+            $bandTop = $marginPx + 2
+            $bandBot = $marginPx + $headerPx - 2
+
+            function Get-TocStrips([IntPtr]$h) {
+                $shot = $null
+                # No -AllowUniform: a blank bitmap (which is what a card that
+                # is not on screen gives back) must fail the capture rather
+                # than pass every comparison below by being equal to itself.
+                try { $shot = Get-TestWindowPixels -Window $h -Sync } catch { $shot = $null }
+                if ($null -eq $shot) { return $null }
+                try {
+                    $band = New-Object System.Collections.Generic.List[int]
+                    $rows = New-Object System.Collections.Generic.List[int]
+                    $w = [Math]::Min($shot.Width, 200)
+                    for ($y = $bandTop; $y -lt [Math]::Min($bandBot, $shot.Height); $y++) {
+                        for ($x = 0; $x -lt $w; $x++) { $band.Add($shot.Bitmap.GetPixel($x, $y).ToArgb()) }
+                    }
+                    $y0 = [Math]::Min($marginPx * 6, [Math]::Max($shot.Height - 8, 0))
+                    for ($y = $y0; $y -lt [Math]::Min($y0 + 6, $shot.Height); $y++) {
+                        for ($x = 0; $x -lt $w; $x++) { $rows.Add($shot.Bitmap.GetPixel($x, $y).ToArgb()) }
+                    }
+                    return [pscustomobject]@{ Band = $band.ToArray(); Rows = $rows.ToArray() }
+                } finally { if ($shot.Bitmap) { $shot.Bitmap.Dispose() } }
+            }
+
+            function Measure-StripDiff($a, $b) {
+                if ($null -eq $a -or $null -eq $b -or $a.Count -ne $b.Count) { return -1 }
+                $n = 0
+                for ($i = 0; $i -lt $a.Count; $i++) { if ($a[$i] -ne $b[$i]) { $n++ } }
+                return $n
+            }
+
+            $before = Get-TocStrips $tocH
+            Assert ($null -ne $before) 'F: the contents card paints under WM_PRINTCLIENT'
+            if ($null -ne $before) {
+                # Wheel the list down, addressed straight at the card's own
+                # window: the panel handles WM_MOUSEWHEEL itself, so this needs
+                # no cursor and no foreground. It goes through Send-TestMouse
+                # because a message has to be posted from a thread ON THE TEST
+                # DESKTOP to arrive at all.
+                $wx = [int](($tocRect.left + $tocRect.right) / 2)
+                $wy = [int](($tocRect.top + $tocRect.bottom) / 2)
+                for ($i = 0; $i -lt 8; $i++) {
+                    [void](Send-TestMouse -Window $probeTop -Target $tocH -X $wx -Y $wy `
+                        -Action wheel -Delta -120)
+                    Start-Sleep -Milliseconds 60
+                }
+                Start-Sleep -Milliseconds 600
+                $after = Get-TocStrips $tocH
+
+                $rowsMoved = Measure-StripDiff $before.Rows $after.Rows
+                $bandMoved = Measure-StripDiff $before.Band $after.Band
+                Write-Host ("      card ${cardH}px tall; the wheel changed $rowsMoved list pixels " +
+                    "and $bandMoved header-band pixels")
+                Assert ($rowsMoved -gt 0) `
+                    "F: the wheel scrolled the list under the header ($rowsMoved list pixels changed)"
+                $bandOk = ($bandMoved -gt 0)
+                if ($NegativeControl) {
+                    Write-Host 'NEGATIVE CONTROL: asserting the header is OPAQUE - this run MUST fail'
+                    Assert (-not $bandOk) 'F: the pinned header is opaque (negative control)'
+                } else {
+                    Assert $bandOk `
+                        ("F: rows read THROUGH the pinned header - scrolling changed $bandMoved " +
+                         'of its pixels (an opaque band changes none)')
+                }
+            }
+        }
+        # The probe window is left open on purpose: closing a window that owns
+        # a viewer pane crashes the app on this build (T1356 - the WebView2
+        # Close pumps messages, and the window's dim-overlay sweep then walks
+        # the pane it is in the middle of freeing). The desktop teardown below
+        # takes it down either way; a probe must not carry an unrelated defect.
+    }
+    Remove-Item $mdFile -ErrorAction SilentlyContinue
 
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'the GUI survived the whole run'
 } finally {

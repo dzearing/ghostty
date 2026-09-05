@@ -301,6 +301,54 @@ pub fn headerHeight(caption_line_h: i32, scale: f32) i32 {
     return caption_line_h + 2 * px(header_pad_v_dip, scale);
 }
 
+/// The compact overlay's slide (T543), and the pinned header's translucency.
+///
+/// Mac parks the compact card off the leading edge and animates a Core
+/// Animation transform on toggle (`ViewerView.applySidePanelState`, 0.26s);
+/// GDI has no such thing, so the card's window is stepped across by a timer
+/// and the curve lives here, where it is asserted without a window.
+///
+/// The state is ONE number, `t` in 0 (parked off the left edge) through 1
+/// (fully in), walking toward whatever the toggle currently wants. That is
+/// what makes a fast double-toggle land correctly without re-reading anything
+/// at the end of the animation: reversing simply changes which end `t` is
+/// walking to, from wherever the card actually is.
+pub const slide_ms: f32 = 150.0;
+
+/// Alpha the pinned header composites its backdrop back at, 0-255. Mac's
+/// `SidePanelHeader` sits on `glassBackdrop()` and the rows blur through it;
+/// GDI has no live blur, so the header re-composites the card's own backdrop
+/// at just under opaque, which reads as translucency without one. Low enough
+/// that a row scrolling under keeps a recognizable shape, high enough that
+/// the caption over it never competes with the text passing beneath.
+pub const header_alpha: u8 = 217;
+
+/// Ease-out cubic. Monotonic and fixed at both ends, so it is safe to apply
+/// to a `t` that can reverse mid-flight.
+pub fn slideEase(t: f32) f32 {
+    const c = std.math.clamp(t, 0, 1);
+    const inv = 1 - c;
+    return 1 - inv * inv * inv;
+}
+
+/// Step `t` toward `want` for one frame of `dt_ms`, landing exactly on the
+/// target rather than approaching it (a slide that never quite arrives leaves
+/// a card one pixel off its resting place forever).
+pub fn slideStep(t: f32, want: f32, dt_ms: f32) f32 {
+    const d = @max(dt_ms, 0) / slide_ms;
+    if (want > t) return @min(want, t + d);
+    return @max(want, t - d);
+}
+
+/// Where the compact card's window sits for one point of the slide:
+/// `resting_x` when fully in, entirely off the content's left edge when fully
+/// out.
+pub fn slideX(t: f32, resting_x: i32, card_w: i32) i32 {
+    const out: f32 = @floatFromInt(-card_w);
+    const in: f32 = @floatFromInt(resting_x);
+    return @intFromFloat(@round(out + (in - out) * slideEase(t)));
+}
+
 /// One row's height from its wrapped line count.
 pub fn rowHeight(lines: i32, line_h: i32, scale: f32) i32 {
     return lines * line_h + 2 * px(row_v_pad_dip, scale);
@@ -585,6 +633,67 @@ test "row metrics: label inset, indent steps, and heights at every scale" {
             w,
         );
         try testing.expectEqual(@as(i32, 1), rowTextWidth(4, 3, scale));
+    }
+}
+
+test "T543 slide: the curve is fixed at both ends and never goes backwards" {
+    try testing.expectEqual(@as(f32, 0), slideEase(0));
+    try testing.expectEqual(@as(f32, 1), slideEase(1));
+    // Clamped, so a step that overshoots cannot throw the card past its rest.
+    try testing.expectEqual(@as(f32, 0), slideEase(-0.5));
+    try testing.expectEqual(@as(f32, 1), slideEase(2));
+    var prev: f32 = -1;
+    var i: u32 = 0;
+    while (i <= 20) : (i += 1) {
+        const e = slideEase(@as(f32, @floatFromInt(i)) / 20.0);
+        try testing.expect(e >= prev);
+        prev = e;
+    }
+    // Ease-OUT: most of the distance is covered in the first half.
+    try testing.expect(slideEase(0.5) > 0.5);
+}
+
+test "T543 slide: a step lands exactly on the target, from either side" {
+    // Opening: one full duration's worth of frames arrives, and stops there.
+    try testing.expectEqual(@as(f32, 1), slideStep(0, 1, slide_ms));
+    try testing.expectEqual(@as(f32, 1), slideStep(0.9, 1, slide_ms));
+    // Closing walks the same number back down and stops at 0.
+    try testing.expectEqual(@as(f32, 0), slideStep(0.2, 0, slide_ms));
+    // A frame is a fraction of the distance, in the right direction.
+    try testing.expect(slideStep(0, 1, slide_ms / 2) > 0);
+    try testing.expect(slideStep(0.5, 1, 15) > 0.5);
+    try testing.expect(slideStep(0.5, 0, 15) < 0.5);
+    // A stalled frame (a clock that went backwards) moves nothing.
+    try testing.expectEqual(@as(f32, 0.5), slideStep(0.5, 1, -10));
+}
+
+test "T543 slide: a toggle mid-flight reverses from where the card is" {
+    // Half open, then the user toggles shut: the card walks back from 0.5
+    // rather than restarting at 1, and reaches the parked position in less
+    // than a full duration.
+    var t: f32 = slideStep(0, 1, slide_ms / 2);
+    try testing.expect(t > 0 and t < 1);
+    const from = t;
+    t = slideStep(t, 0, slide_ms / 4);
+    try testing.expect(t < from);
+    try testing.expectEqual(@as(f32, 0), slideStep(t, 0, slide_ms));
+}
+
+test "T543 slide: fully out clears the content edge, fully in is the rest" {
+    const resting: i32 = 12;
+    const card_w: i32 = 260;
+    try testing.expectEqual(resting, slideX(1, resting, card_w));
+    // Parked: the card's right edge is at the content's left edge, so no
+    // pixel of it is on screen.
+    try testing.expectEqual(-card_w, slideX(0, resting, card_w));
+    // Mid-flight it is somewhere between, and monotonic in t.
+    var prev: i32 = slideX(0, resting, card_w);
+    var i: u32 = 1;
+    while (i <= 20) : (i += 1) {
+        const x = slideX(@as(f32, @floatFromInt(i)) / 20.0, resting, card_w);
+        try testing.expect(x >= prev);
+        try testing.expect(x <= resting);
+        prev = x;
     }
 }
 
