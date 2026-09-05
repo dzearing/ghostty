@@ -95,10 +95,19 @@ zig build -Dapp-runtime=win32 -Doptimize=Debug      # -> zig-out\bin\ghoztty.exe
   from that moment `+new-window` opens windows in the user's terminal, the
   path-filtered kills match nothing, and the acceptance suite reports passes
   about a binary nobody here built. A private `GHOZTTY_PIPE_SUFFIX` does not fix
-  it: the agent pipe has no env override. `test\win32\lib\BuildMode.ps1` now
-  refuses such a run before anything is launched (acceptance:
-  `test\win32\build-mode-guard.ps1`); `GHOZTTY_TEST_ALLOW_RELEASE=1` is the
-  opt-in for a script whose subject really is the release build.
+  it **on its own** — it moves the APP endpoint and nothing else, so the panes
+  such a run opens still land on the agent holding the user's live sessions
+  (that partial state is what T1158 actually was). Isolating a release-lineage
+  run takes **all three knobs**: `GHOZTTY_PIPE_SUFFIX` for the app endpoint,
+  `GHOZTTY_AGENT_INSTANCE` for the agent's pipe, state dir, guard mutex and
+  autostart value (T167, `src/remote/agent_lineage.zig`), and `LOCALAPPDATA`
+  for the files. `Set-GhozttyTestIsolation -ReleaseSandbox` sets all three in
+  one call. `test\win32\lib\BuildMode.ps1` refuses such a run before anything is
+  launched, and since T1158 it VERIFIES the sandbox rather than taking the
+  caller's word — `Get-GhozttyReleaseSandboxGaps` names whichever knob is
+  missing (acceptance: `test\win32\build-mode-guard.ps1` section D);
+  `GHOZTTY_TEST_ALLOW_RELEASE=1` is the opt-in for a script whose subject really
+  is the release build, and it is held to the same bar.
 - **And build it BEFORE you run an acceptance script, not after** (T1028). The
   same pre-flight now also refuses a `zig-out` exe that is OLDER than the sources
   it would measure: a stale exe that still passes exits 0, and exiting 0 stamps

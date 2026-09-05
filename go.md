@@ -1014,9 +1014,15 @@ the fix is the message.
    from the build mode, and a non-debug `zig-out` derives *the user's* — so the
    whole acceptance suite silently drives the terminal they are sitting in and
    passes. That is **endpoint isolation**, it is what the flag buys, and a
-   private `GHOZTTY_PIPE_SUFFIX` does not substitute for it (the agent pipe has
-   no env override). Acceptance scripts now refuse such a build before they
-   launch anything (`test\win32\lib\BuildMode.ps1`); if you hit that refusal,
+   private `GHOZTTY_PIPE_SUFFIX` does not substitute for it — it moves the APP
+   endpoint alone, and a release build under it still dials the agent holding
+   the user's live sessions. Isolating a release-lineage run takes all THREE
+   knobs (`GHOZTTY_PIPE_SUFFIX`, `GHOZTTY_AGENT_INSTANCE` for the agent's pipe /
+   state dir / autostart, `LOCALAPPDATA` for the files), which
+   `Set-GhozttyTestIsolation -ReleaseSandbox` sets in one call. Acceptance
+   scripts now refuse such a build before they
+   launch anything (`test\win32\lib\BuildMode.ps1`, which since T1158 checks the
+   sandbox rather than taking the caller's word); if you hit that refusal,
    rebuild rather than reach for the `GHOZTTY_TEST_ALLOW_RELEASE=1` opt-in,
    which exists for the handful of scripts whose subject IS the release build.
 4. Sync discipline: `git pull` before starting, and **push immediately after

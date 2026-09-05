@@ -46,11 +46,17 @@
 # were left alone rather than each given a prefix of their own.
 
 # T350: the suffix isolates the APP endpoint and nothing else - the local
-# agent's pipe is build-mode derived with no env override - so a release build
-# under a private suffix still dials the agent that owns the user's live
-# sessions. `Assert-GhozttyPrivateEndpoint` therefore checks the build mode
-# first, which also covers the ~half of the suite that sets a suffix by hand and
-# never loads CleanSlate.ps1.
+# agent's pipe is keyed separately (build mode, plus the GHOZTTY_AGENT_INSTANCE
+# lineage this file's -ReleaseSandbox switch sets) - so a release build under a
+# private suffix ALONE still dials the agent that owns the user's live sessions.
+# `Assert-GhozttyPrivateEndpoint` therefore checks the build mode first, which
+# also covers the ~half of the suite that sets a suffix by hand and never loads
+# CleanSlate.ps1.
+#
+# T490: the sentence here used to say the agent pipe had NO env override, which
+# stopped being true at T167 and is plausibly how a release-lineage script
+# concluded the app suffix was all there was (T1158). It is three knobs, not
+# one, and `-ReleaseSandbox` below is the one call that sets them.
 . (Join-Path $PSScriptRoot 'BuildMode.ps1')
 
 # T1168: minting a GHOZTTY_AGENT_INSTANCE is what makes the agent write its own

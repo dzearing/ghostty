@@ -61,8 +61,12 @@ if (-not (Test-Path $Exe)) { $Exe = Join-Path $repo 'zig-out\bin\ghoztty.exe' }
 $ClientExe = Resolve-RemoteTestClient -ClientExe $ClientExe -Repo $repo
 
 # Isolate the app's IPC endpoint (inherited through CreateProcessW). The AGENT
-# pipe has no env override - the debug agent is per-user - which is fine: setup
-# kills the repo's agent, so the app starts a fresh one this run owns.
+# half is left on the shared DEBUG lineage on purpose, which is fine here: this
+# is a debug-build script, so its agent pipe is already not the user's, and
+# setup kills the repo's agent so the app starts a fresh one this run owns.
+# (T490: the agent pipe DOES have an env override - GHOZTTY_AGENT_INSTANCE,
+# T167 - and a release-lineage script must set it; see
+# `Set-GhozttyTestIsolation -ReleaseSandbox`. This script is not one.)
 $env:GHOZTTY_PIPE_SUFFIX = "-t520$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')

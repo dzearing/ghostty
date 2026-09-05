@@ -1,10 +1,11 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-04T16:47:43-07:00",
-    "commit":  "e932f59c8",
+    "generated":  "2026-09-04T17:41:39-07:00",
+    "commit":  "3636936bc",
     "uncommitted":  [
-                        "test/win32/zig-repro-t476.ps1"
+                        "test/win32/chooser-orphan-badge.ps1",
+                        "test/win32/lib/Isolation.ps1"
                     ],
     "files":  {
                   "docs/claude/testing.md":  "75066e86f1dcb63299264139b1ca28da1f7025520011e33f7c3139d0d24fc9b1",
@@ -47,7 +48,7 @@
                   "test/win32/chooser-link-hover.ps1":  "9de29beaeb0ae0194f458a30bc0bb10e570decc4610dc3784f9e21629ed1e6d5",
                   "test/win32/chooser-menu.ps1":  "39bf0ac434cc2eb9b69f2d1a569be9be09502e2787cdc3d814516958366c9c5b",
                   "test/win32/chooser-open-chord.ps1":  "fbf6f3281efd358cdd41d49c2bf630e95b559861f0776ea3eb93167adeb7c028",
-                  "test/win32/chooser-orphan-badge.ps1":  "94aea913d64668ad537094bdd2dc030259a005617bfc0f931975d3eab9bea5e7",
+                  "test/win32/chooser-orphan-badge.ps1":  "b2595e279cf5fbba2431bafb3e310bb78c3c0d9d67ff5a669eae33ae4b18ba64",
                   "test/win32/chooser-restore-all.ps1":  "ced0ad850d422bf42cd4040a41863b5a1a1158d57a2937e485ff60468d716ceb",
                   "test/win32/chooser-restore-all-adopt.ps1":  "d05f84d8d6e52dcd0996ccbe3992b584cb5ba20969b41f3f21943a47361b2241",
                   "test/win32/chooser-restore-all-remote.ps1":  "a2addfc7741bd91fd9e685414f7638da78908ab5d94534b80b09fecce383916a",
@@ -178,7 +179,7 @@
                   "test/win32/lib/ForegroundAudit.ps1":  "7b5deda440053a6ce0b0e8fa4047a3febd432bdbabd4b65a09e5425f81dc9e3c",
                   "test/win32/lib/HarnessLeak.ps1":  "98c3df24fc6b37702f3b7c8ac80a8f5fffff94a7ed390f99f5b1146306274438",
                   "test/win32/lib/HoverCapture.ps1":  "ce62c60da9068be953b9c4bece7b10afda478af42ebc0942ab90e7a634b285a0",
-                  "test/win32/lib/Isolation.ps1":  "0ab9f3d4dc144b77e337d3a544121116df0ea8d1834ef232007a07ba3f441b60",
+                  "test/win32/lib/Isolation.ps1":  "93b2efed0772d8debdd7ccbda2ca5b51d63bee517d2a1fd1fe6b33da89024464",
                   "test/win32/lib/ModalSweep.ps1":  "ad1fde46a8704161d73608cf0ebcf58c1a0251d82fbea3967f79281065f91649",
                   "test/win32/lib/paint-blocks.ps1":  "c3b9ec5522cf016fe072c425c05969a0d4fab11cd3fdecb9d67b8b25c7b4702d",
                   "test/win32/lib/PaneCapture.ps1":  "3d4f94b82e864e1a4a8f248f811757ba19e4cad02366f1decb8cac397e75f93f",
