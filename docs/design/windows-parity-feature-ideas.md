@@ -219,3 +219,13 @@ as the digest that showed them.
 - Flip back to the pane I was just in (last-focused pane toggle binding)
 - Search a session you are not looking at (cross-session scrollback search with attach)
 - A release you can verify byte for byte (published checksums plus reproducible builds)
+
+## 2026-09-05
+
+- Run this project's scripts without remembering them (palette offers package.json/justfile/Makefile targets from the pane's directory)
+- Scrollback that survives a restart (bounded on-disk scrollback for persistent sessions)
+- Know which machine you are about to type into (remote/WSL pane marking plus confirmation on dangerous commands)
+- Do not close a window that is still working (close confirmation naming the running command, with keep-session-alive)
+- The tab knows which branch you are on (git branch and dirty-state chip in the tab)
+- Send a colleague your layout (export/import a named layout as a file)
+- Rewind what a pane printed (scrubber replay over the last few minutes of output)
