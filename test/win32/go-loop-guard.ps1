@@ -1809,6 +1809,19 @@ Assert 'Z4 yesterday''s publish reads ok, and stops nagging' `
 $z = ZHealth '{"date":"2026-09-03","at":"2026-09-03T06:10:00-07:00","tag":"win-v1.36.3","commit":"abc1234","result":"failed"}'
 Assert 'Z5 a tag that never became a release reads failed, even dated today' ($z -match 'publish=failed')
 Assert 'Z6 and the note names the tag to go and look at' ($z -match 'win-v1\.36\.3')
+Assert 'Z6b and the run is degraded, not healthy' ($z -match 'DEGRADED')
+Assert 'Z6c and the note says the loop retries once a fix lands (T1369)' ($z -match 'retries on its own')
+
+# T1369: a run that stamped `attempting` and never recorded an outcome - a
+# crash, a reboot, a killed turn - is a day that shipped nothing just as much as
+# a failed one, and it used to read `ok` on the strength of its date alone.
+$z = ZHealth '{"date":"2026-09-03","at":"2026-09-03T06:10:00-07:00","tag":"win-v1.36.4","commit":"abc1234","result":"attempting","attempts":1}'
+Assert 'Z6d an abandoned attempt reads failed rather than ok' ($z -match 'publish=failed')
+
+# ...but a publish that is running RIGHT NOW is not abandoned, and must not
+# light the board red for the ten minutes it takes.
+$z = ZHealth '{"date":"2026-09-03","at":"2026-09-03T08:58:00-07:00","tag":"win-v1.36.4","commit":"abc1234","result":"attempting","attempts":1}'
+Assert 'Z6e an attempt from two minutes ago is a publish in flight, not a failure' ($z -match 'publish=ok')
 
 $z = ZHealth $null
 Assert 'Z7 no watermark at all reads never, not ok' ($z -match 'publish=never')

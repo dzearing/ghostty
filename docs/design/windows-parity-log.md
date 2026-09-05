@@ -22659,3 +22659,49 @@ and `main_ghostty.zig` edits made due were re-run green. Also filed: **T1365** -
 a Repair rewrites the same bytes with a fresh mtime, so T1205's freshness test
 tells every open window a newer build exists when nothing changed; the new
 installer offer deliberately stays silent on that path, which is how it showed.
+
+## 2026-09-05 - A publish that fails no longer consumes the day (T1369)
+
+Yesterday's shape, in one line from the log: `PUBLISH DID NOT LAND:
+win-v1.36.13 was pushed 1h ago and there is still no release` immediately
+followed by `NOT DUE: already published today (2026-09-05)`. The
+reconciliation T1292 added knew perfectly well that nothing had shipped; the
+DUE calculation next to it still read only the watermark's DATE, so `failed`
+and `published` were the same state as far as trying again was concerned. The
+Release (Windows) run had died on T1364's wixl sequencing bug, the fix for it
+landed on the branch an hour later, and a retry would have shipped - but every
+run for the rest of the day answered "already published today" over a day with
+no release at all. It took a person noticing the line and typing
+`daily-publish.ps1 -Request` by hand.
+
+So a same-day watermark whose outcome is `failed` - or `attempting`, which is a
+run that died between the stamp and the publish - is no longer a publish, and
+the next task-boundary push publishes the branch as it now stands. Two bounds
+keep that from becoming a tag per push on a branch that is simply red: the head
+must have MOVED since the attempt that did not land (a retry over the same tree
+fails the same way, and that arm clears nothing and publishes nothing), and a
+day may make at most `-MaxAttemptsPerDay` attempts - 3, counted in a new
+`attempts` field on the watermark that restarts with the date. The failed tag
+is left exactly where it is; the retry walks to the next patch, because a tag
+naming a commit is not a lie, it is just a build nobody could make.
+
+`go-loop-health.ps1` had the `failed` half already and degraded the run for it.
+What it did not have was the crashed attempt: an `attempting` stamp nobody ever
+finished read `ok` on the strength of its date, which is the same silence one
+layer down. It now reads that as `failed` once the stamp is over two hours old,
+so a publish actually in flight still reads `ok` for the ten minutes it takes.
+
+Validation: `test\win32\daily-publish.ps1` grew section N - nine pure decider
+cases including the cap, the unmoved head, `tagged` (still building, NOT
+retried), an outcome-less pre-T1369 watermark, and `-MaxAttemptsPerDay 1` as
+the restore-the-old-behaviour control - and section O, the 2026-09-05 shape end
+to end through the real script with a sentinel publisher: publish, mark it
+failed, and watch the next push retry with no request and no `-Force`. 160
+assertions ALL PASS. `test\win32\go-loop-guard.ps1` Z6b/Z6d/Z6e cover the
+health line, with the in-flight publish as the positive control; ALL PASS. All
+four floor lanes PASS, P1 25 / P2 20 / P3 16 ALL PASS, and the seven guards the
+edits made due were re-run green. Also filed: **T1370** - `floor-lane.ps1`
+launched from the Bash tool crashes `zig.exe` in all four lanes at the same
+address in five seconds and reports a considered `FLOOR NOT GREEN` over a tree
+that is green from PowerShell, which is a false red articulate enough to be
+believed.

@@ -133,6 +133,21 @@
 # health line tells the truth about what actually shipped rather than about what
 # was attempted.
 #
+# AND A FAILED ATTEMPT DOES NOT CONSUME THE DAY (T1369). Knowing an attempt
+# failed was worth nothing while the DUE calculation still read only the date:
+# on 2026-09-05 win-v1.36.13 was tagged, its Release (Windows) run died on
+# T1364's wixl sequencing bug, the fix landed an hour later on the same branch,
+# and every run for the rest of the day answered `already published today` over
+# a day that had shipped nothing at all. So a watermark whose outcome is
+# `failed` (or `attempting`, which is a run that died mid-publish) is NOT a
+# publish, and the next task-boundary push publishes the branch as it now
+# stands. Two bounds keep that from becoming a tag per push on a branch that is
+# simply red: the head must have MOVED since the attempt that did not land - a
+# retry over the same tree would fail the same way - and a day may make at most
+# -MaxAttemptsPerDay attempts. The failed tag is left where it is; the retry
+# walks to the next patch, because a tag naming a commit is not a lie, it is
+# just a build nobody could make.
+#
 # Acceptance: test\win32\daily-publish.ps1
 [CmdletBinding(PositionalBinding = $false)]
 param(
@@ -146,6 +161,13 @@ param(
     # stalled before the evening ships its work the next morning instead of
     # never. 0 disables it and restores the pure evening gate.
     [int]$StaleHours = 24,
+    # T1369. How many publish ATTEMPTS a single local day may make. A day's first
+    # attempt failing is the normal case this exists for (the tag is cut, CI
+    # cannot build it, and the fix is usually already on the branch); a branch
+    # that is red all afternoon must not mint a tag per push, so the retry is
+    # bounded by this and by the head having moved. 1 restores the pre-T1369
+    # "one attempt consumes the day" behaviour.
+    [int]$MaxAttemptsPerDay = 3,
     # Test seam. Empty = now.
     [string]$Now = '',
     # Decide and print, change nothing, publish nothing.
@@ -206,6 +228,16 @@ function Test-DailyPublishDue {
         [string]$RequestReason = '',
         [string]$HeadCommit = '',
         [string]$LastCommit = '',
+        # T1369: what the day's last attempt actually came to, so a `failed` one
+        # does not read as a day that shipped. '' for an old-format watermark,
+        # which is treated as landed - a watermark that predates the outcome
+        # field cannot be re-litigated, and guessing "failed" there would
+        # re-publish every historical day.
+        [string]$LastResult = '',
+        [string]$LastTag = '',
+        # How many attempts this day has already made, and the cap.
+        [int]$Attempts = 0,
+        [int]$MaxAttemptsPerDay = 3,
         [switch]$Requested,
         [switch]$Force
     )
@@ -230,6 +262,24 @@ function Test-DailyPublishDue {
     # Ordered before the hour check on purpose: one publish per local day is the
     # invariant BOTH rules below sit under, so neither can double-publish.
     if ($last -eq $today) {
+        # T1369, and it is the ONE hole in the one-per-day rule that is not a
+        # request: a day whose attempt did not become a release has not
+        # published, and reading only the date made those two states identical.
+        # On 2026-09-05 win-v1.36.13 was tagged, its build failed, the fix
+        # landed an hour later, and every run for the rest of the day answered
+        # "already published today" over a day that had shipped nothing.
+        $unlanded = @('failed', 'attempting')
+        if ($unlanded -contains $LastResult) {
+            $what = if ($LastTag) { "today's publish ($LastTag)" } else { "today's publish" }
+            if ($HeadCommit -and $LastCommit -and $HeadCommit -eq $LastCommit) {
+                return Verdict $false "$what did not land, but nothing has landed since $LastCommit - a retry would build the same tree, so fix the build first"
+            }
+            if ($MaxAttemptsPerDay -gt 0 -and $Attempts -ge $MaxAttemptsPerDay) {
+                return Verdict $false "$what did not land and $Attempts attempt(s) have already been made today (cap $MaxAttemptsPerDay) - a branch this red needs a person, not another tag"
+            }
+            return Verdict $true ("retry: $what did not land and the head has moved since " +
+                "$(if ($LastCommit) { $LastCommit } else { 'it' }) - publishing the branch as it now stands (attempt $($Attempts + 1) of $MaxAttemptsPerDay today)")
+        }
         return Verdict $false "already published today ($today) - if work is waiting on a release, record it with -Request -Reason '<why>'"
     }
     if ($Now.Hour -lt $HourLocal) {
@@ -333,23 +383,29 @@ function Test-PublishPreconditions {
 # Read a watermark that may be this script's JSON or the older single date line.
 function Read-PublishWatermark {
     param([string]$Text = '')
-    $empty = [pscustomobject]@{ Date = ''; At = ''; Tag = ''; Commit = ''; Result = '' }
+    $empty = [pscustomobject]@{ Date = ''; At = ''; Tag = ''; Commit = ''; Result = ''; Attempts = 0 }
     if (-not $Text) { return $empty }
     $t = $Text.Trim()
     if ($t.StartsWith('{')) {
         try {
             $o = $t | ConvertFrom-Json
+            # `attempts` arrived with T1369. A watermark written before it counts
+            # as one attempt, which is what it was.
+            $n = 0
+            if ($null -ne $o.attempts) { try { $n = [int]$o.attempts } catch { $n = 0 } }
+            if ($n -le 0 -and $o.date) { $n = 1 }
             return [pscustomobject]@{
-                Date   = [string]$o.date
-                At     = [string]$o.at
-                Tag    = [string]$o.tag
-                Commit = [string]$o.commit
-                Result = [string]$o.result
+                Date     = [string]$o.date
+                At       = [string]$o.at
+                Tag      = [string]$o.tag
+                Commit   = [string]$o.commit
+                Result   = [string]$o.result
+                Attempts = $n
             }
         } catch { return $empty }
     }
     $first = ($t -split "`n")[0].Trim()
-    if ($first -match '^\d{4}-\d{2}-\d{2}$') { return [pscustomobject]@{ Date = $first; At = ''; Tag = ''; Commit = ''; Result = '' } }
+    if ($first -match '^\d{4}-\d{2}-\d{2}$') { return [pscustomobject]@{ Date = $first; At = ''; Tag = ''; Commit = ''; Result = ''; Attempts = 1 } }
     return $empty
 }
 
@@ -411,11 +467,12 @@ function Write-Confirmed-Watermark {
     param([string]$Path, $Mark, [string]$Result)
     try {
         $json = [ordered]@{
-            date   = $Mark.Date
-            at     = $Mark.At
-            tag    = $Mark.Tag
-            commit = $Mark.Commit
-            result = $Result
+            date     = $Mark.Date
+            at       = $Mark.At
+            tag      = $Mark.Tag
+            commit   = $Mark.Commit
+            result   = $Result
+            attempts = [int]$Mark.Attempts
         } | ConvertTo-Json -Compress
         [IO.File]::WriteAllText($Path, "$json`n", (New-Object Text.UTF8Encoding($false)))
     } catch {
@@ -489,7 +546,7 @@ if ($Request) {
 
 if ($Status) {
     $req = Read-RequestFile
-    Log "LAST PUBLISH: $(if ($mark.Date) { "$($mark.Date) $($mark.Tag) $($mark.Commit) ($($mark.Result))" } else { 'never' })"
+    Log "LAST PUBLISH: $(if ($mark.Date) { "$($mark.Date) $($mark.Tag) $($mark.Commit) ($($mark.Result), attempt $($mark.Attempts) of $MaxAttemptsPerDay that day)" } else { 'never' })"
     $stranded = Get-StrandedCommits $mark.Commit
     if ($null -eq $stranded) {
         Log 'STRANDED: unknown (no published commit on this box to measure from)'
@@ -554,6 +611,7 @@ $req = Read-RequestFile
 $d = Test-DailyPublishDue -Now $nowDt -LastDate $mark.Date -LastAt $mark.At `
     -HourLocal $HourLocal -StaleHours $StaleHours `
     -Requested:$req.Requested -RequestReason $req.Reason -HeadCommit $headHash -LastCommit $mark.Commit `
+    -LastResult $mark.Result -LastTag $mark.Tag -Attempts $mark.Attempts -MaxAttemptsPerDay $MaxAttemptsPerDay `
     -Force:$Force
 if (-not $d.Due) {
     if ($d.ClearRequest -and -not $Check) { Clear-Request '' }
@@ -605,18 +663,25 @@ if ($Check) {
 
 # Stamp before the publish, the way the morning refresh did: a publish that
 # fails and re-fires on every task-boundary push would spend the rest of the
-# evening running ten-minute ReleaseFast builds. One attempt per day. A SKIP
-# above never gets here, so an absent precondition costs nothing.
+# evening running ten-minute ReleaseFast builds. A SKIP above never gets here,
+# so an absent precondition costs nothing.
+#
+# The count is what bounds that now (T1369) rather than the date alone: a day
+# may attempt up to -MaxAttemptsPerDay times, and only while the head has moved
+# since the attempt that did not land. The number carries across the attempts of
+# one day and restarts with the date.
+$attemptNo = if ($mark.Date -eq $d.Today) { [int]$mark.Attempts + 1 } else { 1 }
 function Stamp([string]$result, [string]$tag) {
     try {
         $dir = Split-Path -Parent $WatermarkPath
         if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
         $json = [ordered]@{
-            date   = $d.Today
-            at     = $nowDt.ToString('yyyy-MM-ddTHH:mm:ssK')
-            tag    = $tag
-            commit = $hash
-            result = $result
+            date     = $d.Today
+            at       = $nowDt.ToString('yyyy-MM-ddTHH:mm:ssK')
+            tag      = $tag
+            commit   = $hash
+            result   = $result
+            attempts = $attemptNo
         } | ConvertTo-Json -Compress
         [IO.File]::WriteAllText($WatermarkPath, "$json`n", (New-Object Text.UTF8Encoding($false)))
         return $true

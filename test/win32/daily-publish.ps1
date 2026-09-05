@@ -140,6 +140,70 @@ Assert 'A11 a bare-date watermark still ages into a catch-up publish' $a11.Due
 $a12 = Test-DailyPublishDue -Now $morning -LastDate '2026-08-25' -HourLocal 17 -StaleHours 0
 Assert 'A12 -StaleHours 0 restores the pure evening gate' (-not $a12.Due)
 
+# ---- N. a failed attempt does not consume the day (T1369) ----------------
+#
+# The 2026-09-05 shape: win-v1.36.13 was tagged at 09:27, its Release (Windows)
+# run died, the fix for it landed an hour later on the same branch, and the day
+# answered `already published today` until midnight over a day that had shipped
+# nothing at all.
+"== N. a failed attempt does not consume the day (T1369) =="
+$tagged = [datetime]'2026-09-05T09:27:00'
+$fixIn = [datetime]'2026-09-05T11:01:00'
+
+$n1 = Test-DailyPublishDue -Now $fixIn -LastDate '2026-09-05' -LastAt '2026-09-05T09:27:00' -HourLocal 17 `
+    -LastResult 'failed' -LastTag 'win-v1.36.13' -Attempts 1 `
+    -HeadCommit 'ef67291' -LastCommit 'd234ae0'
+Assert 'N1 a day whose publish FAILED is due again once the head has moved' $n1.Due
+AssertMatch 'N1 and says it is a retry' 'retry' $n1.Why
+AssertMatch 'N1 naming the tag that did not land' 'win-v1\.36\.13' $n1.Why
+
+# The bound that keeps a red branch from minting a tag per push.
+$n2 = Test-DailyPublishDue -Now $fixIn -LastDate '2026-09-05' -LastAt '2026-09-05T09:27:00' -HourLocal 17 `
+    -LastResult 'failed' -LastTag 'win-v1.36.13' -Attempts 1 `
+    -HeadCommit 'd234ae0' -LastCommit 'd234ae0'
+Assert 'N2 an unmoved head is not a retry - the same tree fails the same way' (-not $n2.Due)
+AssertMatch 'N2 and says why' 'nothing has landed since' $n2.Why
+
+$n3 = Test-DailyPublishDue -Now $fixIn -LastDate '2026-09-05' -LastAt '2026-09-05T09:27:00' -HourLocal 17 `
+    -LastResult 'failed' -LastTag 'win-v1.36.15' -Attempts 3 -MaxAttemptsPerDay 3 `
+    -HeadCommit 'ef67291' -LastCommit 'd234ae0'
+Assert 'N3 the daily cap stops a branch that is simply red' (-not $n3.Due)
+AssertMatch 'N3 and names the cap' 'cap 3' $n3.Why
+
+# A publish that landed is untouched by any of this.
+$n4 = Test-DailyPublishDue -Now $fixIn -LastDate '2026-09-05' -LastAt '2026-09-05T09:27:00' -HourLocal 17 `
+    -LastResult 'published' -Attempts 1 -HeadCommit 'ef67291' -LastCommit 'd234ae0'
+Assert 'N4 a published day is still one-a-day' (-not $n4.Due)
+AssertMatch 'N4 and reads as it always did' 'already published today' $n4.Why
+
+# `tagged` is a promise CI has not answered yet, NOT a failure: retrying it
+# would cut a second tag while the first one is still building.
+$n5 = Test-DailyPublishDue -Now $tagged.AddMinutes(4) -LastDate '2026-09-05' -LastAt '2026-09-05T09:27:00' -HourLocal 17 `
+    -LastResult 'tagged' -Attempts 1 -HeadCommit 'ef67291' -LastCommit 'd234ae0'
+Assert 'N5 a tag still building is not retried' (-not $n5.Due)
+
+# A run that died between the stamp and the publish left `attempting`, which is
+# a day that shipped nothing just as much as `failed` is.
+$n6 = Test-DailyPublishDue -Now $fixIn -LastDate '2026-09-05' -LastAt '2026-09-05T09:27:00' -HourLocal 17 `
+    -LastResult 'attempting' -Attempts 1 -HeadCommit 'ef67291' -LastCommit 'd234ae0'
+Assert 'N6 a crashed attempt is retried too' $n6.Due
+
+# And the retry does not wait for the evening: the failure is already today's.
+$n7 = Test-DailyPublishDue -Now ([datetime]'2026-09-05T09:40:00') -LastDate '2026-09-05' -LastAt '2026-09-05T08:00:00' `
+    -HourLocal 17 -LastResult 'failed' -Attempts 1 -HeadCommit 'ef67291' -LastCommit 'd234ae0'
+Assert 'N7 a morning retry does not wait for 17:00' $n7.Due
+
+# An old-format watermark records no outcome. It must read as a day that
+# published, or every historical day would re-publish.
+$n8 = Test-DailyPublishDue -Now $fixIn -LastDate '2026-09-05' -HourLocal 17 `
+    -LastResult '' -HeadCommit 'ef67291' -LastCommit 'd234ae0'
+Assert 'N8 an outcome-less watermark is not treated as a failure' (-not $n8.Due)
+
+# -MaxAttemptsPerDay 1 restores the pre-T1369 behaviour exactly.
+$n9 = Test-DailyPublishDue -Now $fixIn -LastDate '2026-09-05' -LastAt '2026-09-05T09:27:00' -HourLocal 17 `
+    -LastResult 'failed' -Attempts 1 -MaxAttemptsPerDay 1 -HeadCommit 'ef67291' -LastCommit 'd234ae0'
+Assert 'N9 -MaxAttemptsPerDay 1 restores one-attempt-consumes-the-day' (-not $n9.Due)
+
 # ---- B. the version scheme ----------------------------------------------
 "== B. version scheme =="
 $b1 = Resolve-DailyPublishVersion -Tags @()
@@ -237,6 +301,14 @@ AssertEq 'D4 an empty watermark reads as never published' '' $d4.Date
 
 $d5 = Read-PublishWatermark -Text '{ this is not json'
 AssertEq 'D5 truncated JSON reads as never published rather than throwing' '' $d5.Date
+
+# T1369: the attempt count, and what a watermark written before it counts as.
+$d6 = Read-PublishWatermark -Text '{"date":"2026-09-05","at":"2026-09-05T09:27:00-07:00","tag":"win-v1.36.13","commit":"d234ae0","result":"failed","attempts":2}'
+AssertEq 'D6 the day''s attempt count is read back' 2 $d6.Attempts
+AssertEq 'D6 with the outcome the retry rule keys on' 'failed' $d6.Result
+
+$d7 = Read-PublishWatermark -Text '{"date":"2026-09-01","tag":"win-v1.36.1","result":"published"}'
+AssertEq 'D7 a pre-T1369 watermark counts as the one attempt it was' 1 $d7.Attempts
 
 # ---- J. the on-demand request (T1294) ------------------------------------
 #
@@ -501,6 +573,52 @@ try {
     AssertMatch 'M2 and names the last publish' 'LAST PUBLISH' $m.Text
     AssertMatch 'M3 and answers the stranded question' 'STRANDED' $m.Text
     Assert 'M4 and publishes nothing' (-not (Test-Path -LiteralPath $ranMarker))
+
+    "== O. the 2026-09-05 shape, end to end (T1369) =="
+    # The day's publish is tagged, its build fails, the fix lands an hour later.
+    # Every step is the real script, with a sentinel publisher.
+    Remove-Item -LiteralPath $watermark, $ranMarker, $requestFile -Force -ErrorAction SilentlyContinue
+    $o1 = Invoke-Decider -Extra @() -DockerCode 1 -GhCode 0 -At '2026-09-05T09:27:00'
+    AssertEq 'O1 the day publishes as usual' 10 $o1.Exit
+    $o1Mark = Read-PublishWatermark -Text ([IO.File]::ReadAllText($watermark))
+    AssertEq 'O1 and it is the day''s first attempt' 1 $o1Mark.Attempts
+    Remove-Item -LiteralPath $ranMarker -Force -ErrorAction SilentlyContinue
+
+    # CI could not build the tag, and the reconciliation pass recorded that. The
+    # tag went out at an earlier commit than the fix, which is the whole shape.
+    $o1Wm = [IO.File]::ReadAllText($watermark) -replace '"result":"[^"]*"', '"result":"failed"'
+    $o1Wm = $o1Wm -replace '"commit":"[^"]*"', "`"commit`":`"$((git -C $Repo rev-parse --short HEAD~1).Trim())`""
+    [IO.File]::WriteAllText($watermark, $o1Wm)
+
+    $o2 = Invoke-Decider -Extra @() -DockerCode 1 -GhCode 0 -At '2026-09-05T11:01:00'
+    AssertEq 'O2 the next push retries the failed day, with no request and no -Force' 10 $o2.Exit
+    Assert 'O2 and the publisher actually ran again' (Test-Path -LiteralPath $ranMarker)
+    AssertMatch 'O2 saying it is a retry' 'retry' $o2.Text
+    $o2Mark = Read-PublishWatermark -Text ([IO.File]::ReadAllText($watermark))
+    AssertEq 'O2 and the day''s attempt count advanced' 2 $o2Mark.Attempts
+    # The failed tag is left alone rather than re-pointed, so the retry has to
+    # walk past it. The sentinel publisher creates no tag, so the property is
+    # asserted on the version scheme over the tag set the real publisher would
+    # have left behind - the same shape as L5.
+    $o3 = Resolve-DailyPublishVersion -Tags (@(git -C $Repo tag --list 'v[0-9]*.[0-9]*.[0-9]*') +
+        @(git -C $Repo tag --list 'win-v[0-9]*.[0-9]*.[0-9]*') + @($o1Mark.Tag))
+    Assert "O3 the retry walks past the tag that did not land ($($o1Mark.Tag))" ("win-v$($o3.Version)" -ne $o1Mark.Tag)
+    Remove-Item -LiteralPath $ranMarker -Force -ErrorAction SilentlyContinue
+
+    # A retry over an unmoved tree publishes nothing: the same tree fails the
+    # same way, and this is what keeps a red branch from tagging every push.
+    [IO.File]::WriteAllText($watermark, ([IO.File]::ReadAllText($watermark) -replace '"result":"[^"]*"', '"result":"failed"'))
+    $o4 = Invoke-Decider -Extra @() -DockerCode 1 -GhCode 0 -At '2026-09-05T11:20:00'
+    AssertEq 'O4 a failed day with an unmoved head publishes nothing' 0 $o4.Exit
+    AssertMatch 'O4 and says why' 'nothing has landed since' $o4.Text
+    Assert 'O4 and no second tag was minted' (-not (Test-Path -LiteralPath $ranMarker))
+
+    # And a day that DID publish is unchanged: no retry, no extra release.
+    [IO.File]::WriteAllText($watermark, ([IO.File]::ReadAllText($watermark) -replace '"result":"[^"]*"', '"result":"published"'))
+    $o5 = Invoke-Decider -Extra @() -DockerCode 1 -GhCode 0 -At '2026-09-05T18:30:00'
+    AssertEq 'O5 a published day is still one-a-day' 0 $o5.Exit
+    AssertMatch 'O5 reading exactly as it always did' 'already published today' $o5.Text
+    Assert 'O5 and nothing was published' (-not (Test-Path -LiteralPath $ranMarker))
     Complete-TestBody
 } finally {
     Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue

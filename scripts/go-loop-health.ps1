@@ -244,7 +244,8 @@ if (Test-Path -LiteralPath (Join-Path $Repo $digestRel)) {
 #   ok+<n>     - the same, except n commits have landed since that release and
 #                are on nobody's machine (T1294)
 #   stale-<n>d - the last publish was n days ago, n >= 2
-#   failed     - the last attempt did not produce a release
+#   failed     - the last attempt did not produce a release, or died before it
+#                could record one (T1369)
 #   never      - nothing has ever been published from this box
 #
 # The `+<n>` suffix exists because `ok` was true and misleading on 2026-09-03:
@@ -255,6 +256,14 @@ if (Test-Path -LiteralPath (Join-Path $Repo $digestRel)) {
 # afternoon, and a light that is always red is not a light. What degrades is a
 # publish REQUEST that has gone unhonoured, because that is somebody asking for a
 # release and not getting one.
+# An `attempting` stamp older than this is a publish nobody finished (T1369).
+# Two hours: the local packaging path's ReleaseFast build is the slowest thing
+# that legitimately sits in this state, and it is nowhere near that.
+function Test-PublishAttemptAbandoned($Wm, [datetime]$AsOf) {
+    if (-not $Wm.at) { return $true }
+    try { return (($AsOf - [datetime]::Parse([string]$Wm.at)).TotalHours -ge 2) } catch { return $true }
+}
+
 $publishState = 'never'
 $publishTag = ''
 $publishDate = ''
@@ -274,6 +283,13 @@ try {
             $publishCommit = [string]$wm.commit
             $days = [int]([math]::Floor(($PublishAsOf.Date - ([datetime]::ParseExact($publishDate, 'yyyy-MM-dd', $null)).Date).TotalDays))
             if ([string]$wm.result -eq 'failed') { $publishState = 'failed' }
+            elseif ([string]$wm.result -eq 'attempting' -and (Test-PublishAttemptAbandoned $wm $PublishAsOf)) {
+                # A run that stamped `attempting` and never got as far as an
+                # outcome - a crash, a reboot, a killed turn. Live for the
+                # minutes a real publish takes, and after that it is a day that
+                # shipped nothing while reading `ok`.
+                $publishState = 'failed'
+            }
             elseif ($days -ge 2) { $publishState = "stale-${days}d" }
             elseif ($days -lt 0) { $publishState = 'ok' }
             else { $publishState = 'ok' }
@@ -345,7 +361,9 @@ if ($digestState -eq 'missing') {
 if ($publishState -eq 'never') {
     $notes += 'nothing has ever been published from this box - go.md step 6.5, scripts\daily-publish.ps1 -Check says whether one is due'
 } elseif ($publishState -eq 'failed') {
-    $notes += "the last publish did not land: $(if ($publishTag) { $publishTag } else { $publishDate }) was tagged and no release exists - check the Release (Windows) run for that tag"
+    $notes += ("the last publish did not land: $(if ($publishTag) { $publishTag } else { $publishDate }) was tagged and no release exists - " +
+        'check the Release (Windows) run for that tag; once a fix has landed, the next task-boundary run of ' +
+        'scripts\daily-publish.ps1 retries on its own (T1369)')
 } elseif ($publishState -like 'stale-*') {
     $notes += "nothing has shipped since $publishDate ($publishState) - the work that has landed since is not on the user's machine"
 }
