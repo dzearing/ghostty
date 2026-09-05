@@ -141,6 +141,16 @@ extension Ghostty {
             return ghostty_surface_needs_confirm_quit(surface)
         }
 
+        /// True if this surface's `confirm-close-surface` setting permits a
+        /// close confirmation at all. Unlike `needsConfirmQuit` this does NOT
+        /// fold in liveness, which is what lets the close paths prompt for an
+        /// IDLE remote pane (whose close ends a session on another machine)
+        /// without inventing a prompt for a user who turned confirmation off.
+        var confirmCloseEnabled: Bool {
+            guard let surface = self.surface else { return false }
+            return ghostty_surface_confirm_close_enabled(surface)
+        }
+
         // Returns true if the process in this surface has exited.
         var processExited: Bool {
             guard let surface = self.surface else { return true }
@@ -154,9 +164,41 @@ extension Ghostty {
         /// surface tree (undo restore). Never set on app quit, so persistent
         /// sessions survive quit for the next launch's restore. No-op for
         /// local exec surfaces.
+        ///
+        /// A CLOSE marking is REFUSED while the Disconnect pin is set — see
+        /// `pinSessionDetachOnFree()`.
         func setSessionCloseIntent(_ closeOnFree: Bool) {
+            guard let intent = sessionDetachPin.resolve(closeOnFree) else { return }
             guard let surface = self.surface else { return }
-            ghostty_surface_set_session_close_intent(surface, closeOnFree)
+            ghostty_surface_set_session_close_intent(surface, intent)
+        }
+
+        /// Records whether the user answered "Disconnect" to a close involving
+        /// this surface. See `pinSessionDetachOnFree()` and `SessionDetachPin`,
+        /// which carries the reasoning and is unit-tested.
+        private var sessionDetachPin = SessionDetachPin()
+
+        /// Pin this surface to DETACH-on-free: the user chose **Disconnect**,
+        /// so freeing the view must leave its agent session (and the remote
+        /// process inside it) running.
+        ///
+        /// This is a pin rather than a plain `setSessionCloseIntent(false)`
+        /// because a single close runs the CLOSE marking TWICE from two
+        /// independent places whose relative order varies with the close path;
+        /// `SessionDetachPin` states that invariant and is unit-tested.
+        ///
+        /// Cleared by `clearSessionDetachPin()` when the view is re-adopted
+        /// into a live tree (undo of the close, or a move to another window):
+        /// it is alive again, so a LATER close is a close like any other.
+        func pinSessionDetachOnFree() {
+            sessionDetachPin.pin()
+            guard let surface = self.surface else { return }
+            ghostty_surface_set_session_close_intent(surface, false)
+        }
+
+        /// Release the Disconnect pin (see `pinSessionDetachOnFree()`).
+        func clearSessionDetachPin() {
+            sessionDetachPin.clear()
         }
 
         /// The LIVE agent session id, published by the termio thread once

@@ -2255,6 +2255,14 @@ pub const CAPI = struct {
         surface.core_surface.setSessionCloseIntent(close_on_exit);
     }
 
+    /// Returns true if this surface's `confirm-close-surface` configuration
+    /// permits a close confirmation at all (i.e. it is not `false`). Distinct
+    /// from `ghostty_surface_needs_confirm_quit`, which also folds in whether
+    /// the child is alive and sitting at a prompt.
+    export fn ghostty_surface_confirm_close_enabled(surface: *Surface) bool {
+        return surface.core_surface.confirmCloseEnabled();
+    }
+
     /// Returns true if the surface process has exited.
     export fn ghostty_surface_process_exited(surface: *Surface) bool {
         return surface.core_surface.child_exited;
