@@ -27,6 +27,7 @@ const RenameDialog = @import("RenameDialog.zig");
 const ViewerPane = @import("ViewerPane.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
+const drag_perf = @import("drag_perf.zig");
 const clipboard_open = @import("clipboard_open.zig");
 const utf16_text = @import("utf16_text.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
@@ -3247,6 +3248,10 @@ pub fn handleResize(self: *Surface, width: u32, height: u32) void {
     // Skip zero-size events (minimized windows).
     if (width == 0 or height == 0) return;
 
+    // T1343: one line of the drag measurement — how many panes a layout pass
+    // actually resized, so "no frame waits" can be told apart from "no work".
+    self.parent_window.noteResize();
+
     self.height = height;
 
     // Pre-flight the scrollbar so we know whether to subtract its width.
@@ -3268,10 +3273,18 @@ pub fn handleResize(self: *Surface, width: u32, height: u32) void {
 
     // Notify the core surface so it recalculates the terminal grid,
     // updates the renderer viewport, and sends SIGWINCH to the PTY.
+    // T1343: the pane's own share of a motion tick — grid reflow, renderer
+    // viewport, PTY SIGWINCH — timed under GHOZTTY_PERF so the drag breakdown
+    // names it instead of lumping it into "everything that is not the wait".
+    var size_timer = if (self.parent_window.drag_perf_on)
+        std.time.Timer.start() catch null
+    else
+        null;
     self.core_surface.sizeCallback(.{ .width = grid_width, .height = height }) catch |err| {
         log.err("sizeCallback error: {}", .{err});
         return;
     };
+    if (size_timer) |*t| self.parent_window.addResizeUs(t.read() / std.time.ns_per_us);
 
     // During live resize (user dragging the border), block until the
     // renderer has presented one frame at the new size. This prevents
@@ -3288,9 +3301,27 @@ pub fn handleResize(self: *Surface, width: u32, height: u32) void {
         self.core_surface.renderer_thread.wakeup.notify() catch {};
 
         if (self.frame_event) |event| {
-            // Wait for the renderer to present. Use a short timeout
-            // so we never stall the UI if the renderer is slow.
-            _ = w32.WaitForSingleObject(event, 16);
+            // T1343: hand the event to the layout pass, which waits for every
+            // pane at once when it closes. Paid per pane this wait was the
+            // whole reason a splitter drag got slower with each split — four
+            // panes meant four 16 ms stalls for ONE mouse move. Only a resize
+            // with no pass around it (or `GHOZTTY_DRAG_SERIAL_WAIT`, which
+            // exists so the two shapes can be measured against each other)
+            // falls through to waiting for itself.
+            if (!self.parent_window.deferFrameWait(event)) {
+                var timer = if (self.parent_window.drag_perf_on)
+                    std.time.Timer.start() catch null
+                else
+                    null;
+                const rc = w32.WaitForSingleObject(
+                    event,
+                    @intCast(drag_perf.frame_wait_ms),
+                );
+                self.parent_window.addFrameWait(
+                    if (timer) |*t| t.read() / std.time.ns_per_us else 0,
+                    rc == w32.WAIT_TIMEOUT,
+                );
+            }
         }
     } else {
         // Outside live resize (programmatic resize, initial layout),

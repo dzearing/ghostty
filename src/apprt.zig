@@ -490,6 +490,13 @@ test {
     // against on box.
     _ = @import("apprt/win32/layout_cost.zig");
 
+    // What one motion tick of a splitter drag costs, and whether that reads as
+    // smooth or steppy to the person dragging (T1343), same no-OS-imports deal
+    // — arithmetic over a clock and a pane count. The two wait ceilings it
+    // owns are the before/after shape `test\win32\drag-perf.ps1` measures on
+    // box.
+    _ = @import("apprt/win32/drag_perf.zig");
+
     // Pure win32 agent-owned layout blobs — one window in and out of the
     // SET_LAYOUT/GET_LAYOUTS wire shape (T334), same no-OS-imports deal (its
     // only non-std import is `remote/protocol.zig`, which builds in every lane).

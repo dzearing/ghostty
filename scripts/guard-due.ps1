@@ -2595,6 +2595,21 @@ $GuardTable = @(
     # hundred unrelated reasons and would make this row due every other turn,
     # which is how a coverage table trains people to reach for -NoGuardDue.
     # About a minute, off the input desktop.
+    # T1343: what a splitter drag COSTS. The batched frame wait is invisible to
+    # every other check in the tree - a change that puts the per-pane wait back
+    # breaks no assertion, compiles clean, and is felt as "janky" weeks later by
+    # the user who reported it the first time. NARROW on purpose: the drag path
+    # and the pure cost module, not Window.zig at large. About three minutes,
+    # off the input desktop.
+    [pscustomobject]@{
+        Name   = 'drag-perf'
+        Script = 'test\win32\drag-perf.ps1'
+        Stamp  = 'test\win32\drag-perf.stamp.json'
+        Covers = @(
+            'src\apprt\win32\drag_perf.zig',
+            'test\win32\drag-perf.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'resize-flicker'
         Script = 'test\win32\resize-flicker.ps1'

@@ -105,12 +105,18 @@ const hero_math = @import("hero_math.zig");
 const dim_math = @import("dim_math.zig");
 const split_geometry = @import("split_geometry.zig");
 const split_resize = @import("split_resize.zig");
+const drag_perf = @import("drag_perf.zig");
 
 /// How large a tab's split tree may be for a divider drag to compensate the
 /// rest of it (T533). 128 nodes is 64 panes in one tab — far past anything a
 /// person arranges — and a tree past it simply drags the old way rather than
 /// costing the window a heap allocation on the message loop.
 const MAX_DRAG_NODES: usize = 128;
+/// Panes whose frame a single layout pass can wait for at once (T1343).
+/// `WaitForMultipleObjects` takes at most 64 handles, and a window with more
+/// than 64 visible panes is not a case worth a second wait — the overflow
+/// panes simply do not hold the pass up.
+const MAX_FRAME_WAITS: usize = 64;
 const tab_strip = @import("tab_strip_layout.zig");
 const caption_layout = @import("caption_layout.zig");
 const frame_size = @import("frame_size.zig");
@@ -402,6 +408,65 @@ drag_start_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
 /// rather than to a wrong one.
 drag_nodes: [MAX_DRAG_NODES]split_resize.Node = undefined,
 drag_node_len: usize = 0,
+
+/// What the drag the user is watching is COSTING them (T1343), accumulated per
+/// motion tick and reported once at drag end. Gated on `GHOZTTY_PERF` like
+/// every other measurement on this thread, so an ordinary drag pays a bool.
+drag_stats: drag_perf.Stats = .{},
+drag_perf_on: bool = false,
+
+/// Frame waits owed by the layout pass currently running (T1343).
+///
+/// A pane on the synchronous-present path blocks the UI thread until its
+/// renderer has presented at the new size, which is what keeps DWM from
+/// stretching stale content across a resize. Paid per pane it is also the
+/// whole reason a splitter drag got slower the more panes were open: four
+/// panes meant four 16 ms waits in a row for ONE mouse move. The panes render
+/// on their own threads in parallel, so the serialization was only ever in the
+/// waiting — collect the events here during the pass and wait for all of them
+/// ONCE at the end, and the anti-flicker guarantee survives at a flat cost.
+frame_wait_events: [MAX_FRAME_WAITS]w32.HANDLE = undefined,
+frame_wait_len: usize = 0,
+/// Nesting depth of `beginFrameWaitBatch`/`endFrameWaitBatch`. Layout paths
+/// call each other (a hero relayout runs inside `layoutSplits`), and only the
+/// outermost pass may do the waiting — an inner one that waited would put the
+/// serial cost straight back.
+frame_wait_depth: u8 = 0,
+/// Microseconds the last completed batch spent blocked, for the perf line.
+frame_wait_last_us: u64 = 0,
+/// Frame waits the current pass performed, and how many of them ran out the
+/// full timeout. The COUNT is the machine-independent statement of the defect:
+/// whether one wait costs 16 ms depends on whether the compositor is
+/// throttling presents, but how many times the UI thread stopped to wait is a
+/// property of the code and nothing else.
+frame_wait_count: usize = 0,
+frame_wait_timeouts: usize = 0,
+/// Where the rest of a motion tick goes, so the breakdown is measured instead
+/// of guessed at: the dim-overlay refresh at the end of every layout pass, and
+/// the sum of the panes' own `sizeCallback` (grid reflow + renderer viewport +
+/// PTY SIGWINCH). Both are `GHOZTTY_PERF`-only clocks.
+frame_overlay_us: u64 = 0,
+frame_resize_us: u64 = 0,
+/// The pane-placement batch (`BeginDeferWindowPos` .. `EndDeferWindowPos`,
+/// which dispatches every pane's `WM_SIZE` synchronously) and the divider-band
+/// repaint that follows it. The two halves of the layout pass that are not the
+/// wait or the overlays.
+frame_place_us: u64 = 0,
+frame_paint_us: u64 = 0,
+/// The whole layout pass a motion tick triggered. Everything in the tick that
+/// is NOT this is the ratio solve and the drag's own bookkeeping.
+frame_layout_us: u64 = 0,
+/// Panes that actually took a `WM_SIZE` in the current pass. Reported beside
+/// the wait count because "0 waits" has two very different explanations —
+/// nothing resized, or resizes are no longer synchronizing — and a measurement
+/// that cannot tell them apart is not a measurement.
+frame_wait_resizes: usize = 0,
+/// `GHOZTTY_DRAG_SERIAL_WAIT`: put the per-pane wait back, so the two shapes
+/// can be measured against each other on the same build and the same box
+/// rather than compared across two builds (T1343). Measurement knob only —
+/// nothing in the product sets it, and `test\win32\drag-perf.ps1` is what it
+/// exists for.
+frame_wait_serial: bool = false,
 
 /// The keyboard's equivalent of that snapshot (T1129). `resize_split` has no
 /// key-up to end a gesture on, so the gesture ends itself: it remembers the
@@ -882,6 +947,13 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
         .is_quick_terminal = options.is_quick_terminal,
         .pending_surface_overrides = options.surface_overrides,
     };
+
+    // T1343 measurement switches, read once per window: `GHOZTTY_PERF` turns
+    // the drag clock on (same env every other measurement on this thread uses),
+    // `GHOZTTY_DRAG_SERIAL_WAIT` puts the pre-T1343 per-pane frame wait back so
+    // the harness can measure both shapes on one build.
+    self.drag_perf_on = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_PERF");
+    self.frame_wait_serial = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_DRAG_SERIAL_WAIT");
 
     // Stable layout identity (T338), before anything can capture a layout.
     // A malformed recorded value is discarded rather than adopted: a bad key
@@ -2912,11 +2984,136 @@ pub fn layoutSplitsLive(self: *Window) void {
     self.layoutSplits();
 }
 
+/// What the drag that just ended cost, in one line a harness can parse and a
+/// human can read (T1343). Emitted at `info` when the average tick missed the
+/// frame budget, because that is the state the user called "janky".
+fn reportDragCost(self: *Window) void {
+    const st = self.drag_stats;
+    defer self.drag_stats.reset();
+    if (!self.drag_perf_on or st.ticks == 0) return;
+    const fmt = "divider drag ticks={d} mean_us={d} max_us={d} mean_wait_us={d} " ++
+        "fps={d} panes={d} resizes_max={d} waits_max={d} waits_total={d} timeouts={d} " ++
+        "mean_layout_us={d} mean_place_us={d} mean_paint_us={d} " ++
+        "mean_overlay_us={d} mean_resize_us={d} " ++
+        "over_budget={d} wait={s} verdict={s}";
+    const args = .{
+        st.ticks,
+        st.meanUs(),
+        st.max_us,
+        st.meanWaitUs(),
+        st.fps(),
+        st.panes_max,
+        st.resizes_max,
+        st.waits_max,
+        st.waits_total,
+        st.timeouts_total,
+        st.meanLayoutUs(),
+        st.meanPlaceUs(),
+        st.meanPaintUs(),
+        st.meanOverlayUs(),
+        st.meanResizeUs(),
+        st.over_budget,
+        if (self.frame_wait_serial) "serial" else "batched",
+        @tagName(st.verdict()),
+    };
+    switch (st.verdict()) {
+        .steppy => log.info(fmt, args),
+        else => log.debug(fmt, args),
+    }
+}
+
+/// Open a frame-wait batch for one layout pass (T1343). Nested passes join the
+/// outermost batch rather than opening their own.
+fn beginFrameWaitBatch(self: *Window) void {
+    if (self.frame_wait_depth == 0) {
+        self.frame_wait_len = 0;
+        // The pass's wait budget starts empty. Both shapes add to it — the
+        // batched wait below, and `Surface.handleResize`'s inline wait under
+        // `GHOZTTY_DRAG_SERIAL_WAIT` — so the perf line reports the same
+        // quantity whichever path the pass took.
+        self.frame_wait_last_us = 0;
+        self.frame_wait_count = 0;
+        self.frame_wait_timeouts = 0;
+        self.frame_wait_resizes = 0;
+        self.frame_overlay_us = 0;
+        self.frame_resize_us = 0;
+        self.frame_place_us = 0;
+        self.frame_paint_us = 0;
+    }
+    self.frame_wait_depth +|= 1;
+}
+
+/// Record a pane's `sizeCallback` cost against the current pass.
+pub fn addResizeUs(self: *Window, us: u64) void {
+    self.frame_resize_us +|= us;
+}
+
+/// Record that a pane took a `WM_SIZE` in the current pass.
+pub fn noteResize(self: *Window) void {
+    self.frame_wait_resizes +|= 1;
+}
+
+/// Record one frame wait against the current pass: how long it blocked, and
+/// whether it was woken by a presented frame or ran out the timeout.
+pub fn addFrameWait(self: *Window, us: u64, timed_out: bool) void {
+    self.frame_wait_last_us +|= us;
+    self.frame_wait_count +|= 1;
+    if (timed_out) self.frame_wait_timeouts +|= 1;
+}
+
+/// Take a pane's frame event instead of letting it wait for itself.
+/// Returns false when there is no open batch or the batch is full, which is
+/// the caller's signal to wait inline the way it always did.
+pub fn deferFrameWait(self: *Window, event: w32.HANDLE) bool {
+    if (self.frame_wait_serial) return false;
+    if (self.frame_wait_depth == 0) return false;
+    if (self.frame_wait_len >= MAX_FRAME_WAITS) return false;
+    self.frame_wait_events[self.frame_wait_len] = event;
+    self.frame_wait_len += 1;
+    return true;
+}
+
+/// Close the batch and, if this was the outermost pass, block ONCE until every
+/// collected pane has presented a frame at its new size — the same guarantee
+/// the per-pane wait gave, at a cost that no longer multiplies by the pane
+/// count. The timeout is the same single frame: a renderer that misses it is
+/// left behind rather than allowed to stall the drag.
+fn endFrameWaitBatch(self: *Window) void {
+    if (self.frame_wait_depth == 0) return;
+    self.frame_wait_depth -= 1;
+    if (self.frame_wait_depth != 0) return;
+
+    const n = self.frame_wait_len;
+    self.frame_wait_len = 0;
+    if (n == 0) return;
+
+    var timer = if (self.drag_perf_on) std.time.Timer.start() catch null else null;
+    const rc = w32.WaitForMultipleObjects(
+        @intCast(n),
+        &self.frame_wait_events,
+        1, // bWaitAll: every pane, not the first one to finish
+        @intCast(drag_perf.frame_wait_ms),
+    );
+    self.addFrameWait(
+        if (timer) |*t| t.read() / std.time.ns_per_us else 0,
+        rc == w32.WAIT_TIMEOUT,
+    );
+}
+
 pub fn layoutSplits(self: *Window) void {
     if (self.tab_count == 0) return;
     // Runs after every layout path below (including the hero/zoom early
     // returns) so the dim overlays track pane rects and layout state.
-    defer self.updateDimOverlays();
+    defer {
+        var ov = if (self.drag_perf_on) std.time.Timer.start() catch null else null;
+        self.updateDimOverlays();
+        if (ov) |*t| self.frame_overlay_us +|= t.read() / std.time.ns_per_us;
+    }
+    // One wait for the whole pass instead of one per pane (T1343). Opened
+    // unconditionally: a pass with no pane on the synchronous-present path
+    // collects nothing and the close is a no-op.
+    self.beginFrameWaitBatch();
+    defer self.endFrameWaitBatch();
     const tree = self.tab_trees[self.active_tab];
     const rect = self.surfaceRect();
     if (self.tab_hero_active[self.active_tab]) {
@@ -2956,11 +3153,13 @@ pub fn layoutSplits(self: *Window) void {
         endPaneBatch(hdwp);
         return;
     }
+    var place_timer = if (self.drag_perf_on) std.time.Timer.start() catch null else null;
     var hdwp = beginPaneBatch(self.leafCount(self.active_tab));
     self.layoutNode(tree, .root, rect, &hdwp);
     // Every pane of this pass lands in ONE frame here, before the divider
     // bands are painted below (T1031).
     endPaneBatch(hdwp);
+    if (place_timer) |*t| self.frame_place_us +|= t.read() / std.time.ns_per_us;
 
     // Paint divider lines directly using GetDC (not BeginPaint, which
     // clips to the invalid region and misses the content area gaps).
@@ -2974,11 +3173,13 @@ pub fn layoutSplits(self: *Window) void {
     // The distinction is "did the region move" vs "did its color change", and
     // it is invisible at the call site, which is why it is written down here.
     if (self.hwnd) |hwnd| {
+        var paint_timer = if (self.drag_perf_on) std.time.Timer.start() catch null else null;
         const hdc = w32.GetDC(hwnd);
         if (hdc) |dc| {
             self.paintDividers(dc);
             _ = w32.ReleaseDC(hwnd, dc);
         }
+        if (paint_timer) |*t| self.frame_paint_us +|= t.read() / std.time.ns_per_us;
     }
 }
 
@@ -3628,6 +3829,25 @@ fn dragSnapshotMatches(self: *Window) bool {
 
 fn updateDividerDrag(self: *Window, x: i32, y: i32) void {
     if (!self.dragging_split) return;
+    // T1343: this whole call is one frame of the drag the user is watching,
+    // so time it end to end rather than timing the parts we suspect.
+    var timer = if (self.drag_perf_on) std.time.Timer.start() catch null else null;
+    defer if (timer) |*t| {
+        const panes = if (self.tab_count == 0) 0 else self.leafCount(self.active_tab);
+        self.drag_stats.record(.{
+            .tick_us = t.read() / std.time.ns_per_us,
+            .wait_us = self.frame_wait_last_us,
+            .panes = panes,
+            .waits = self.frame_wait_count,
+            .timeouts = self.frame_wait_timeouts,
+            .resizes = self.frame_wait_resizes,
+            .overlay_us = self.frame_overlay_us,
+            .resize_us = self.frame_resize_us,
+            .layout_us = self.frame_layout_us,
+            .place_us = self.frame_place_us,
+            .paint_us = self.frame_paint_us,
+        });
+    };
     const rect = self.drag_start_rect;
     const handle = self.drag_split_handle;
 
@@ -3661,13 +3881,16 @@ fn updateDividerDrag(self: *Window, x: i32, y: i32) void {
             @floatCast(a.ratio),
         );
     }
+    var lt = if (self.drag_perf_on) std.time.Timer.start() catch null else null;
     self.layoutSplitsLive();
+    if (lt) |*t| self.frame_layout_us = t.read() / std.time.ns_per_us;
 }
 
 fn endDividerDrag(self: *Window) void {
     if (!self.dragging_split) return;
     self.dragging_split = false;
     self.drag_node_len = 0;
+    self.reportDragCost();
     _ = w32.ReleaseCapture();
     // Re-derive hover from where the pointer actually ended up: the ratio is
     // clamped to [0.1, 0.9], so a drag pushed to the limit leaves the band

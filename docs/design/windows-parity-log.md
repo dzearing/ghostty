@@ -22022,3 +22022,58 @@ none of them should be guessed at - which is what T1324 was filed to stop.
 PASS, and the eight meta-audits a `test\win32` edit puts on the due list
 (printclient, isolation-meta, launch-preflight, verdict-exit, cleanslate,
 stderr-capture, test-reach, desktop-launch) all re-ran green.
+
+## 2026-09-04 - A splitter drag waits once for the whole layout, not once per pane (T1343)
+
+Dragging the line between two panes got slower with every split you had open,
+and the user said so plainly: "resizing panes is janky and slow ... it feels so
+unpolished". The mechanism was a wait, not work. Every pane that a layout pass
+resizes blocks the UI thread until its renderer has presented a frame at the new
+size - the thing that stops the compositor stretching stale content across a
+resize, and worth keeping - but it was bought once PER PANE. Eight panes meant
+eight 16 ms stalls for one mouse move, in series, on the thread that has to be
+free for the next mouse move.
+
+The panes render on their own threads, in parallel, so the serialization was
+only ever in our waiting. `layoutSplits` now opens a frame-wait batch for the
+pass, `Surface.handleResize` hands the batch its frame event instead of waiting
+for itself, and one `WaitForMultipleObjects(bWaitAll)` on the same 16 ms budget
+closes the pass. The guarantee is unchanged - the UI thread still does not go
+back to the pump until the panes have presented - and it now costs one frame for
+the pass instead of one per pane.
+
+MEASURED FIRST, which is what the task asked for and what changed the plan. The
+app times its own drag under `GHOZTTY_PERF` and prints one line per drag
+(`Window.reportDragCost`), broken into the parts a motion tick is made of; the
+pure arithmetic behind it is `src\apprt\win32\drag_perf.zig`, in every test
+lane. At 8 panes, one mouse move: 20.0 ms per move with the per-pane wait (49
+fps of drag), 15.8 ms with the batched one (63 fps), and the wait itself 8.8 ms
+-> 2.6 ms. At 2 panes the two shapes are indistinguishable, which is the point -
+the defect was the growth.
+
+The numbers also say the lead in the task was real and INCOMPLETE, and that is
+the more useful half of this turn. After the fix, a move at 8 panes still spends
+9.7 ms placing panes and 3.3 ms re-gluing the dim and banner overlays, against
+0.02 ms in the panes' own `sizeCallback`. That is T1345 - the layered-popup
+fan-out - which was filed as a redesign that might turn out to be a small term.
+It is not a small term; it is the majority of the bill, so T1345 is now P1 with
+the measurement written into it rather than a hypothesis.
+
+`test\win32\drag-perf.ps1` is the harness, and it measures both shapes on ONE
+build: `GHOZTTY_DRAG_SERIAL_WAIT=1` puts the per-pane wait back, so the
+comparison is one box and one afternoon rather than two builds. What it ASSERTS
+is the wait COUNT, not the clock - one wait per move at every pane count, and
+the old shape demonstrably multiplying - because how long a wait costs is a
+property of the machine (the background test desktop does not throttle presents,
+so `timeouts=0`), while how many times the UI thread stopped is a property of the
+code. The absolute numbers are recorded beside the assertions, and
+`-NegativeControl` was run and does score red.
+
+The Mac side of "worse than the Mac" is still unmeasured and is not this seat's
+to measure: **T1346** files it for the Mac seat with the Windows numbers to
+compare against, rather than leaving the comparison as an impression.
+
+`drag-perf.ps1` ALL PASS (7 assertions), `resize-flicker.ps1` green over this
+build (the stale-content guarantee the wait exists for), all four floor lanes
+PASS, P1-P3 ALL PASS, and the meta-audits a `test\win32` edit puts on the due
+list all re-ran green.
