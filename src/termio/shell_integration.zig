@@ -12,11 +12,14 @@ const log = std.log.scoped(.shell_integration);
 /// Shell types we support
 pub const Shell = enum {
     bash,
+    /// cmd.exe (T512). It has no rcfile or profile to dot-source, so its
+    /// integration is carried entirely by an injected `PROMPT` — see
+    /// `setupCmd`. That buys OSC 2/7/133;A/133;B but not 133;C/D.
+    cmd,
     elvish,
     fish,
     nushell,
-    /// pwsh / powershell (Windows default shells; T27). cmd.exe cannot
-    /// support integration at all — it has no prompt hook.
+    /// pwsh / powershell (Windows default shells; T27).
     powershell,
     zsh,
 };
@@ -58,6 +61,12 @@ pub fn setup(
             alloc_arena,
             command,
             resource_dir,
+            env,
+        ),
+
+        .cmd => try setupCmd(
+            alloc_arena,
+            command,
             env,
         ),
 
@@ -185,7 +194,7 @@ fn detectShell(alloc: Allocator, command: config.Command) !?Shell {
     if (std.mem.eql(u8, "nu", name)) return .nushell;
     if (std.mem.eql(u8, "zsh", name)) return .zsh;
 
-    // cmd.exe has no prompt hook and cannot be integrated.
+    if (std.mem.eql(u8, "cmd", name)) return .cmd;
     if (std.mem.eql(u8, "pwsh", name)) return .powershell;
     if (std.mem.eql(u8, "powershell", name)) return .powershell;
 
@@ -218,7 +227,9 @@ test detectShell {
     try testing.expectEqual(.fish, try detectShell(alloc, .{ .shell = "fish.exe" }));
     try testing.expectEqual(.powershell, try detectShell(alloc, .{ .shell = "pwsh.exe" }));
     try testing.expectEqual(.powershell, try detectShell(alloc, .{ .shell = "PowerShell.exe" }));
-    try testing.expect(try detectShell(alloc, .{ .shell = "cmd.exe" }) == null);
+    try testing.expectEqual(.cmd, try detectShell(alloc, .{ .shell = "cmd.exe" }));
+    try testing.expectEqual(.cmd, try detectShell(alloc, .{ .shell = "CMD.EXE" }));
+    try testing.expectEqual(.cmd, try detectShell(alloc, .{ .shell = "cmd" }));
     if (comptime builtin.target.os.tag == .windows) {
         // Backslash paths only split on Windows' basename rules.
         try testing.expectEqual(.bash, try detectShell(
@@ -283,8 +294,15 @@ test bareShellCommand {
         .{ .direct = &.{ "bash", "-c", "ls" } },
     ) == null);
 
-    // Unrecognized programs (cmd.exe cannot integrate; scripts are commands).
-    try testing.expect(try bareShellCommand(alloc, .{ .shell = "cmd.exe" }) == null);
+    // cmd is a shell like any other since T512, so a bare one unwraps rather
+    // than travelling as a command the agent would run under `cmd /c`.
+    {
+        const got = (try bareShellCommand(alloc, .{ .shell = "cmd.exe" })).?;
+        defer alloc.free(got);
+        try testing.expectEqualStrings("cmd.exe", got);
+    }
+
+    // Unrecognized programs (scripts are commands).
     try testing.expect(try bareShellCommand(alloc, .{ .shell = "python" }) == null);
 
     if (comptime builtin.target.os.tag == .windows) {
@@ -932,6 +950,86 @@ fn setupNushell(
     return .{ .shell = try alloc.dupeZ(u8, try cmd.toOwnedSlice()) };
 }
 
+/// The OSC 133;A prompt mark, written in cmd's PROMPT escape language
+/// (`$E` is ESC, and `$E\` is therefore ST). Also doubles as the marker that
+/// says our integration is already in a PROMPT we inherited.
+const cmd_prompt_mark = "$E]133;A$E\\";
+
+/// Set up cmd.exe integration (T512).
+///
+/// cmd has no profile, no rcfile and no prompt hook, so for a long time it was
+/// treated as unintegrable. What it does have is `PROMPT`, whose `$E` expands
+/// to ESC and which is re-rendered on every prompt — enough to emit OSC
+/// sequences at prompt time. Windows Terminal uses exactly this mechanism for
+/// its own cwd tracking.
+///
+/// What that buys, versus a real integration:
+///
+///   * OSC 7   — working-directory reporting, which stands the T185 live
+///               process-cwd fallback down AND, by way of `reportPwd`'s
+///               untitled-window rule, makes the tab title follow the
+///               directory: a strip of cmd tabs stops being a row of
+///               identical labels
+///   * OSC 133;A / 133;B — prompt start and prompt end, so prompt jumping
+///               works. There is no hook for 133;C/D (command start and exit
+///               status), and cmd offers no way to get one.
+///
+/// Deliberately NOT OSC 2, which every other integration here sends. cmd's
+/// `title` command is the documented way a user names a window, and an OSC 2
+/// on every prompt would overwrite it a fraction of a second later — the
+/// terminal already does the right thing without one, showing the working
+/// directory until something sets a real title and then leaving that alone
+/// (`stream_handler.zig`'s `seen_title`).
+///
+/// The user's own `PROMPT` is WRAPPED, never replaced, so a customized prompt
+/// still renders. `argv` is left completely alone — unlike every other shell
+/// here, this integration is carried by the environment only.
+fn setupCmd(
+    alloc: Allocator,
+    command: config.Command,
+    env: *EnvMap,
+) !?config.Command {
+    // `cmd /c ...` and `cmd /k ...` are running a command rather than opening
+    // an interactive shell. Injecting a prompt into those would emit OSC into
+    // the middle of somebody's script output, so leave them alone entirely.
+    {
+        var iter = try command.argIterator(alloc);
+        defer iter.deinit();
+        _ = iter.next() orelse return null;
+        while (iter.next()) |arg| {
+            if (arg.len < 2) continue;
+            if (arg[0] != '/' and arg[0] != '-') continue;
+            switch (std.ascii.toLower(arg[1])) {
+                'c', 'k' => return null,
+                else => {},
+            }
+        }
+    }
+
+    // cmd's own default when PROMPT is unset is `$P$G` ("C:\dir>").
+    const user_prompt = env.get("PROMPT") orelse "$P$G";
+
+    // A nested cmd inherits the PROMPT we already wrote. Wrapping it a second
+    // time would emit every sequence twice per prompt, so this is a no-op when
+    // our mark is already there.
+    if (std.mem.indexOf(u8, user_prompt, cmd_prompt_mark) != null) {
+        return try command.clone(alloc);
+    }
+
+    // The OSC 7 host is `localhost` rather than the machine name: PROMPT does
+    // not expand `%COMPUTERNAME%` at render time, and OSC 7's locality check
+    // accepts `localhost` unconditionally. The `kitty-shell-cwd` scheme takes
+    // the path raw, which is what lets `$P`'s native `D:\dir` spelling through
+    // unescaped — stream_handler's reportPwd normalizes it back.
+    const prompt = try std.fmt.allocPrint(alloc, "{s}$E]7;kitty-shell-cwd://localhost/$P$E\\{s}$E]133;B$E\\", .{
+        cmd_prompt_mark,
+        user_prompt,
+    });
+    try env.put("PROMPT", prompt);
+
+    return try command.clone(alloc);
+}
+
 /// Set up PowerShell (pwsh 7 / Windows PowerShell 5.1) integration (T27).
 ///
 /// PowerShell has no ENV/rcfile hook we can inject from the outside, so the
@@ -994,6 +1092,70 @@ fn setupPowershell(
     try env.put("GHOSTTY_POWERSHELL", script);
 
     return .{ .direct = try args.toOwnedSlice(alloc) };
+}
+
+test "cmd wraps the user's prompt" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var env = EnvMap.init(alloc);
+    defer env.deinit();
+    try env.put("PROMPT", "[mine]$P$G");
+    try env.put("GHOSTTY_SHELL_FEATURES", "cursor:blink,title");
+
+    const command = (try setupCmd(alloc, .{ .shell = "cmd.exe" }, &env)).?;
+
+    // argv is untouched: this integration lives entirely in the environment.
+    try testing.expectEqualStrings("cmd.exe", command.shell);
+
+    const prompt = env.get("PROMPT").?;
+    try testing.expect(std.mem.startsWith(u8, prompt, "$E]133;A$E\\"));
+    try testing.expect(std.mem.endsWith(u8, prompt, "$E]133;B$E\\"));
+    // The user's own prompt survives, unmodified and in one piece.
+    try testing.expect(std.mem.indexOf(u8, prompt, "[mine]$P$G") != null);
+    try testing.expect(std.mem.indexOf(u8, prompt, "$E]7;kitty-shell-cwd://localhost/$P$E\\") != null);
+
+    // No OSC 2, even with the title feature on: cmd's own `title` command has
+    // to survive, and the terminal titles an untitled window from the pwd for
+    // us. An OSC 2 here would overwrite `title foo` at the very next prompt.
+    try testing.expect(std.mem.indexOf(u8, prompt, "]2;") == null);
+}
+
+test "cmd defaults, gating and idempotence" {
+    const testing = std.testing;
+    var arena = ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // No PROMPT set: cmd's own default ($P$G) is what gets wrapped.
+    {
+        var env = EnvMap.init(alloc);
+        defer env.deinit();
+        _ = (try setupCmd(alloc, .{ .shell = "cmd" }, &env)).?;
+        const prompt = env.get("PROMPT").?;
+        try testing.expect(std.mem.indexOf(u8, prompt, "$P$G$E]133;B") != null);
+    }
+
+    // Running it twice does not stack a second copy (a nested cmd inherits
+    // the PROMPT we wrote).
+    {
+        var env = EnvMap.init(alloc);
+        defer env.deinit();
+        _ = (try setupCmd(alloc, .{ .shell = "cmd" }, &env)).?;
+        const once = try alloc.dupe(u8, env.get("PROMPT").?);
+        _ = (try setupCmd(alloc, .{ .shell = "cmd" }, &env)).?;
+        try testing.expectEqualStrings(once, env.get("PROMPT").?);
+    }
+
+    // /c and /k are commands, not interactive shells: no integration at all.
+    for ([_][:0]const u8{ "cmd /c dir", "cmd.exe /K build.bat", "cmd -c dir" }) |line| {
+        var env = EnvMap.init(alloc);
+        defer env.deinit();
+        try testing.expect(try setupCmd(alloc, .{ .shell = line }, &env) == null);
+        try testing.expect(env.get("PROMPT") == null);
+    }
 }
 
 test "powershell" {

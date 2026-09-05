@@ -172,6 +172,23 @@ test "parse: raw_path" {
     try testing.expectEqual(null, uri3.fragment);
 }
 
+test "parse: kitty-shell-cwd with a native Windows path" {
+    const testing = @import("std").testing;
+
+    // T512: cmd.exe's PROMPT can only spell the working directory as `$P`,
+    // which renders natively ("D:\git\ghoztty") — no way to swap separators or
+    // percent-encode. The raw_path form has to carry that through unharmed for
+    // the OSC 7 handler to normalize it.
+    var buf: [256]u8 = undefined;
+    const u = try parse(
+        "kitty-shell-cwd://localhost/D:\\git\\ghoztty",
+        .{ .raw_path = true },
+    );
+    try testing.expectEqualStrings("kitty-shell-cwd", u.scheme);
+    try testing.expectEqualStrings("localhost", u.host.?.percent_encoded);
+    try testing.expectEqualStrings("/D:\\git\\ghoztty", try u.path.toRaw(&buf));
+}
+
 /// Checks if a string represents a valid MAC address, e.g. 12:34:56:ab:cd:ef.
 fn isValidMacAddress(s: []const u8) bool {
     if (s.len != 17) return false;

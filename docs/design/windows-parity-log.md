@@ -22220,3 +22220,60 @@ asserting the real tracker has no open task without a category, so this is an
 invariant rather than a sweep somebody has to repeat. The ~400 files closed
 before T502 are deliberately out of scope - no activity card surfaces them
 any more - and are T1351.
+
+## 2026-09-04 - T512: a cmd pane's tab title now follows the directory
+
+A strip of cmd tabs used to be a row of identical labels. Every other shell
+Ghoztty knows reports its working directory and marks its prompts, so its tab
+says where it is; cmd said "cmd" forever, and prompt jumping did nothing in it.
+The reason was real rather than an oversight - cmd has no profile, no rcfile
+and no prompt hook, so there is nothing to dot-source, and the code said as
+much in a comment.
+
+What it does have is `PROMPT`, whose `$E` expands to ESC and which is
+re-rendered on every prompt. That is enough to emit OSC sequences at prompt
+time, and it is the same mechanism Windows Terminal uses for its own cwd
+tracking. So `cmd` is now a `Shell` like any other, and `setupCmd` wraps
+whatever `PROMPT` the user already has (cmd's own `$P$G` when they have none)
+in OSC 133;A, OSC 7 and OSC 133;B. The user's prompt survives in one piece -
+this appends, it does not replace - and unlike every other integration here
+this one touches no argv at all: `cmd /c` and `cmd /k` are running a command
+rather than opening a shell and are left completely alone, and a nested cmd
+that inherits the PROMPT we wrote is not wrapped a second time.
+
+Notably absent from that list is the OSC 2 every other integration sends, and
+the reason is the more interesting half of this task. Sending one does make the
+title track the directory - and it also overwrites cmd's `title` command a
+fraction of a second after the user types it, which `ipc-p2.ps1` caught
+immediately, since three of its assertions have always used `title` as their
+oracle. Dropping the OSC 2 and leaning on `reportPwd`'s untitled-window rule
+did not work either, and measuring said why: cmd titles its console with its
+own image path on startup, so a pane arrives already titled
+`C:\WINDOWS\system32\cmd.exe` and `seen_title` is true before the first prompt
+ever renders. That is the real mechanism behind "it says cmd forever".
+
+So the title half moved into the terminal, where it belongs: the FIRST valid
+OSC 7 clears `seen_title` (`seen_pwd`, `src/termio/stream_handler.zig`). A
+shell reporting its directory for the first time means the shell is up, so any
+title from before that was startup noise rather than intent - and a title set
+AFTER it still wins and stays won. cmd gets both halves out of that: a tab that
+follows `cd`, and a `title` command that sticks. It is a no-op for bash, zsh
+and pwsh, whose integrations re-title on the same prompt.
+
+What the PROMPT still cannot buy: OSC 133;C/D. cmd has no hook for "a command
+started" or "it exited with N", and no amount of PROMPT gets one. The OSC 7
+host is `localhost` rather than the machine name because PROMPT does not expand
+`%COMPUTERNAME%` at render time, and the path rides as `$P`'s native `D:\dir`
+spelling, which the `kitty-shell-cwd` scheme carries raw and `reportPwd`
+normalizes. That link is the one that could plausibly have broken, so it has
+its own regression test in `src/os/uri.zig`.
+
+Section B of `test\win32\agent-shell-integration.ps1` is the acceptance, and
+writing it turned up a trap worth naming: the obvious probe, `echo %PROMPT%`,
+is expanded by the harness's own outer `cmd.exe` before ghoztty ever sees it,
+so it passed against the HARNESS's prompt while the pane's was never read.
+`set PROMPT` is the correct probe.
+
+Filed while here: T1352, `shell-integration` still cannot be forced to either
+Windows shell - the config enum knows nothing of `cmd` or `powershell` even
+though `setup()`'s force path handles both.

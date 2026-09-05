@@ -90,6 +90,11 @@ pub const StreamHandler = struct {
     /// this to determine if we need to default the window title.
     seen_title: bool = false,
 
+    /// Set once a shell has reported a working directory (OSC 7). See
+    /// `reportPwd` for what the FIRST one means: any title set before it is
+    /// startup noise from the shell image, not something a user asked for.
+    seen_pwd: bool = false,
+
     pub const Stream = terminal.Stream(StreamHandler);
 
     /// True if we have tmux control mode built in.
@@ -1255,6 +1260,23 @@ pub const StreamHandler = struct {
             std.mem.replaceScalar(u8, native, '/', '\\');
             break :win native;
         } else raw_path;
+
+        // The FIRST valid OSC 7 says the shell is up and talking to us, so any
+        // title that arrived before it came from the shell starting rather than
+        // from anyone's intent — and it must not suppress pwd-titling for the
+        // rest of the session. cmd.exe is why this exists (T512): it titles its
+        // console with its own image path on startup, so a cmd pane read
+        // "C:\WINDOWS\system32\cmd.exe" forever and a whole strip of them was a
+        // row of identical labels. A title set AFTER this still wins and stays
+        // won, which is what keeps cmd's own `title` command working — the
+        // alternative, an OSC 2 on every prompt, would overwrite it a fraction
+        // of a second later. Shells whose integration titles the window itself
+        // (bash, zsh, pwsh) re-set it on the same prompt, so this is a no-op
+        // for them.
+        if (!self.seen_pwd) {
+            self.seen_pwd = true;
+            self.seen_title = false;
+        }
 
         log.debug("terminal pwd: {s}", .{path});
         try self.terminal.setPwd(path);

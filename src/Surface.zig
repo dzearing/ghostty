@@ -695,7 +695,9 @@ fn appendLocalShellIntegrationEnv(
             // Env-only shells are fully integrated by the env we just built; the
             // agent's default `<shell> -li` invocation is exactly right for them,
             // so forward no argv (a rewrite would strip login/interactive flags).
-            .zsh, .fish, .elvish => {
+            // cmd (T512) is env-only too, and more so than the rest: its whole
+            // integration is the PROMPT that setup() just wrote into `env`.
+            .zsh, .fish, .elvish, .cmd => {
                 log.info(
                     "local shell integration injected shell={s}",
                     .{@tagName(integration.shell)},

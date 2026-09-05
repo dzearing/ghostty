@@ -20,9 +20,13 @@
 #      pane updates the cwd `+list` reports, which only OSC 7 can do for
 #      PowerShell (Set-Location never moves the process cwd, so the T185 PEB
 #      fallback cannot explain it).
-#   B  default pane (no --shell): spawns plain cmd.exe with NO integration
-#      argv — the client must not forward a bogus rewrite for a shell that
-#      cannot be integrated.
+#   B  (T512) default pane (no --shell): spawns plain cmd.exe. Its argv stays
+#      bare — cmd has no profile to dot-source, so a rewrite would be the old
+#      defect — and its integration arrives instead as an injected PROMPT
+#      whose `$E` renders ESC at every prompt (OSC 7 + OSC 133;A/133;B). The
+#      user-visible payoff is a tab title that follows `cd` rather than saying
+#      "cmd" forever — carried by OSC 7, deliberately not by an OSC 2, so
+#      cmd's own `title` command still works.
 #   C  (T513) `--shell=<full path to git-bash's bash.exe>`: detection must
 #      survive the Windows spelling (full path + .exe), proven by the child
 #      command line carrying bash's `--posix` integration rewrite. Uses the
@@ -194,8 +198,11 @@ while ((Get-Date) -lt $deadline -and -not $cwdSeen) {
 Assert "A7 +list reports the cd'd directory (OSC 7 flowed from the integration)" $cwdSeen
 
 # ============================================================================
-"== B: a default pane (no --shell) spawns plain cmd.exe, no integration argv"
+"== B: a default cmd.exe pane is integrated through PROMPT, not through argv (T512)"
 # ============================================================================
+# cmd has no profile to dot-source, so its integration is carried entirely by
+# an injected PROMPT whose `$E` renders ESC at every prompt. The argv must stay
+# bare — a rewrite here would be the old defect, not the fix.
 $codeB = Run-Cli '+new-window --target=t151def' "$root\new-b.txt" 60
 Assert "B1 +new-window (no shell) succeeded (exit 0)" ($codeB -eq 0)
 
@@ -210,6 +217,88 @@ Assert "B3 the default pane's child is cmd.exe (COMSPEC default)" `
     ($null -ne $procB -and $procB.Name -ieq 'cmd.exe')
 Assert "B4 no integration argv leaked into the default pane" `
     ($null -ne $procB -and $procB.CommandLine -notmatch 'ghostty\.ps1' -and $procB.CommandLine -notmatch '-NoExit')
+
+# The env half. `set PROMPT` prints `PROMPT=<template>` out of cmd's own
+# environment — deliberately NOT `echo %PROMPT%`, which Run-Cli's own outer
+# cmd.exe would expand against the HARNESS's prompt and pass through as a
+# literal `$P$G` that passes every assertion below for the wrong reason.
+# The template reads back verbatim because `$E` is only interpreted by the
+# prompt renderer, never by `set`.
+$promptSeen = $false
+$promptText = ''
+Run-Cli '+send-keys --target=t151def --when-idle --idle-timeout=20 "set PROMPT" Enter' "$root\sk-b.txt" 45 | Out-Null
+$deadline = (Get-Date).AddSeconds(25)
+while ((Get-Date) -lt $deadline -and -not $promptSeen) {
+    Start-Sleep -Milliseconds 900
+    Run-Cli '+read --name=t151def --lines=40' "$root\read-b.txt" 20 | Out-Null
+    # The template is longer than the pane is wide, so it comes back wrapped;
+    # flatten before matching or every token straddles a line break.
+    $promptText = (Out-Text "$root\read-b.txt") -replace '\r?\n', ''
+    if ($promptText -match 'PROMPT=.*133;A') { $promptSeen = $true }
+}
+Assert "B5 the injected PROMPT reached the cmd pane" $promptSeen
+Assert "B6 it emits OSC 133;A / 133;B prompt marks" `
+    ($promptText -match '133;A' -and $promptText -match '133;B')
+Assert "B7 it emits OSC 7 cwd reporting" ($promptText -match 'kitty-shell-cwd://localhost/')
+Assert "B8 the user's own prompt survives inside it (append, not replace)" `
+    ($promptText -match 'PROMPT=\$E\]133;A.*\$P\$G')
+
+# The user-visible payoff, and the proof the OSCs are not merely EMITTED but
+# arrive and parse: a cmd pane's title used to say "cmd" forever. The title
+# moves here because OSC 7 reached the terminal and it titles an untitled
+# window from the reported pwd — deliberately NOT because we sent an OSC 2,
+# which would overwrite cmd's own `title` command a prompt later (B11).
+$titleDir = 'C:\Windows'
+Run-Cli "+send-keys --target=t151def `"cd /d $titleDir`" Enter" "$root\sk-bcd.txt" 30 | Out-Null
+$titleSeen = $false
+$deadline = (Get-Date).AddSeconds(30)
+$n = 0
+while ((Get-Date) -lt $deadline -and -not $titleSeen) {
+    Start-Sleep -Milliseconds 900
+    foreach ($w in (Windows-Of (Get-Tree "btitle$n"))) {
+        if ($w.target -ne 't151def') { continue }
+        foreach ($t in @($w.tabs)) {
+            if ((Norm $t.title) -eq (Norm $titleDir)) { $titleSeen = $true }
+        }
+    }
+    $n++
+}
+Assert "B9 the cmd pane's tab title followed the cd (OSC 7 arrived and parsed)" $titleSeen
+
+# And the thing that must NOT have broken: cmd's `title` is how a user names a
+# window, and it has to outlive the next prompt. An OSC 2 in the injected
+# PROMPT (which is what the first cut of this shipped) clobbers it instantly.
+Run-Cli '+send-keys --target=t151def "title T512-STICKS" Enter' "$root\sk-btitle.txt" 30 | Out-Null
+$stuck = $false
+$deadline = (Get-Date).AddSeconds(30)
+$n = 0
+while ((Get-Date) -lt $deadline -and -not $stuck) {
+    Start-Sleep -Milliseconds 900
+    foreach ($w in (Windows-Of (Get-Tree "bstick$n"))) {
+        if ($w.target -ne 't151def') { continue }
+        foreach ($t in @($w.tabs)) { if ($t.title -match 'T512-STICKS') { $stuck = $true } }
+    }
+    $n++
+}
+# Give the prompt several more renders to overwrite it, then look again.
+Run-Cli '+send-keys --target=t151def "cd /d C:\Windows" Enter' "$root\sk-bre.txt" 30 | Out-Null
+Start-Sleep -Seconds 3
+$stillStuck = $false
+foreach ($w in (Windows-Of (Get-Tree 'bstick-after'))) {
+    if ($w.target -ne 't151def') { continue }
+    foreach ($t in @($w.tabs)) { if ($t.title -match 'T512-STICKS') { $stillStuck = $true } }
+}
+Assert 'B11 cmd''s own `title` command still sets the tab title' $stuck
+Assert "B12 and the prompt does not overwrite it on the next render" $stillStuck
+
+# The cwd the pane reports. `cd` moves cmd's PROCESS cwd too, so the T185 PEB
+# fallback could produce this string on its own — what neither mechanism could
+# survive is the OSC 7 path being MANGLED: `$P` spells the directory natively
+# ("C:\Windows"), so the URL carries backslashes and an unencoded drive colon,
+# and a wrong normalization would report something other than the directory.
+$paneB2 = Pane-In (Get-Tree 'bpwd') 't151def'
+Assert "B13 +list reports the cd'd directory for the cmd pane" `
+    ($null -ne $paneB2 -and (Norm $paneB2.working_directory) -eq (Norm $titleDir))
 
 # ============================================================================
 "== C: --shell=<full git-bash path> gets the --posix rewrite (T513)"
