@@ -377,7 +377,10 @@ class BaseTerminalController: NSWindowController,
         // pending CLOSE-on-free intent. (didSet does not fire for this init
         // assignment, so the surfaceTreeDidChange clearing doesn't run here.)
         if tree != nil {
-            for view in surfaceTree { view.setSessionCloseIntent(false) }
+            for view in surfaceTree {
+                view.clearSessionDetachPin()
+                view.setSessionCloseIntent(false)
+            }
         }
 
         // Setup our bell state for the window
@@ -915,7 +918,16 @@ class BaseTerminalController: NSWindowController,
             from: from.root?.leaves() ?? [],
             to: to.root?.leaves() ?? [],
             sessionID: { $0.surfaceView?.boundRemoteSessionID })
-        for view in plan.keepAlive { view.setSessionCloseIntent(false) }
+        // `keepAlive` is a re-adoption (an undone close, a pane moved between
+        // windows): the pane is live again, so a Disconnect the user chose for
+        // the close that is being undone no longer applies and a LATER close
+        // must close normally. `spared` is NOT — it is a rebuild swap, where
+        // the departing leaf was never re-adopted by anyone and its pin is
+        // still the user's standing answer.
+        for view in plan.keepAlive {
+            view.clearSessionDetachPin()
+            view.setSessionCloseIntent(false)
+        }
         for view in plan.spared { view.setSessionCloseIntent(false) }
         for view in plan.close { view.setSessionCloseIntent(true) }
 
@@ -1029,9 +1041,38 @@ class BaseTerminalController: NSWindowController,
         window.isRestorable = false
     }
 
+    /// The panes of `views` whose agent session lives on a REMOTE machine and
+    /// is still alive — exactly the ones a "Disconnect" would leave running.
+    ///
+    /// Empty for a plain local window, for a session-persistence window on the
+    /// LOCAL agent (see `SessionDisconnectPolicy.machineIsDisconnectable`), for
+    /// viewer panes, for panes whose child already exited, and for a user who
+    /// turned `confirm-close-surface` off. An empty result is the signal that
+    /// this close is an ordinary one: no third button, no widened prompt.
+    func disconnectableViews(in views: [PaneView]) -> [PaneView] {
+        guard SessionDisconnectPolicy.machineIsDisconnectable(remoteMachine) else { return [] }
+        return views.filter { SessionDisconnectPolicy.isDisconnectable($0.disconnectFacts) }
+    }
+
+    /// This window's Disconnect offer: the panes a Disconnect would spare plus
+    /// the machine to name in the alert. Empty when there is nothing to offer.
+    /// A tab-group close merges the offers of every affected controller (see
+    /// `SessionDisconnectPolicy.merge`).
+    func disconnectOffer(in views: [PaneView]) -> SessionDisconnectPolicy.Offer<PaneView> {
+        let panes = disconnectableViews(in: views)
+        guard !panes.isEmpty, let name = remoteMachine?.name else { return .none }
+        return .init(panes: panes, machineNames: [name])
+    }
+
+    /// This whole window's Disconnect offer.
+    var disconnectOffer: SessionDisconnectPolicy.Offer<PaneView> {
+        disconnectOffer(in: Array(surfaceTree))
+    }
+
     func confirmClose(
         messageText: String,
         informativeText: String,
+        disconnect: SessionDisconnectPolicy.Offer<PaneView> = .none,
         completion: @escaping () -> Void
     ) {
         // If we already have an alert, we need to wait for that one.
@@ -1048,14 +1089,56 @@ class BaseTerminalController: NSWindowController,
         // in the tab group.
         let alert = NSAlert()
         alert.messageText = messageText
-        alert.informativeText = informativeText
-        alert.addButton(withTitle: "Close")
-        alert.addButton(withTitle: "Cancel")
         alert.alertStyle = .warning
+
+        // A close that would end live sessions on another machine gets a third
+        // button. The sessions are resumable from the Cmd-Shift-N chooser, so
+        // ending them is the destructive answer and keeping them is the safe
+        // one — Disconnect is therefore added FIRST, which makes it both the
+        // rightmost button and the default (Return). A button literally titled
+        // "Cancel" picks up Escape from AppKit automatically.
+        //
+        // The informative text is generated HERE rather than by each caller:
+        // it has to name the machine and count the sessions, and the wording
+        // is deliberately scope-neutral so one sentence serves a pane, a tab,
+        // a window and a tab group alike.
+        if disconnect.isEmpty {
+            alert.informativeText = informativeText
+            alert.addButton(withTitle: "Close")
+            alert.addButton(withTitle: "Cancel")
+        } else {
+            alert.informativeText = SessionDisconnectPolicy.informativeText(
+                machineNames: disconnect.machineNames,
+                count: disconnect.panes.count)
+            alert.addButton(withTitle: "Disconnect")
+            alert.addButton(withTitle: "Close")
+            alert.addButton(withTitle: "Cancel")
+        }
+
         alert.beginSheetModal(for: window) { response in
             let alertWindow = alert.window
             self.alert = nil
-            if response == .alertFirstButtonReturn {
+
+            // Proceeding with the close is the first button in the 2-button
+            // alert and the SECOND in the 3-button one; the first there keeps
+            // the sessions alive first and then proceeds identically.
+            let proceed: Bool
+            if !disconnect.isEmpty {
+                if response == .alertFirstButtonReturn {
+                    // Pin BEFORE the close runs: the close marks CLOSE-on-free
+                    // from two independent places whose relative order varies
+                    // by path, and the pin is what makes the user's answer win
+                    // regardless. See `SurfaceView.pinSessionDetachOnFree()`.
+                    for view in disconnect.panes { view.pinSessionDetachOnFree() }
+                    proceed = true
+                } else {
+                    proceed = response == .alertSecondButtonReturn
+                }
+            } else {
+                proceed = response == .alertFirstButtonReturn
+            }
+
+            if proceed {
                 // This is important so that we avoid losing focus when Stage
                 // Manager is used (#8336)
                 alertWindow.orderOut(nil)
@@ -1158,7 +1241,8 @@ class BaseTerminalController: NSWindowController,
         // being shown, and provides no callback to detect this.
         confirmClose(
             messageText: "Close Terminal?",
-            informativeText: "The terminal still has a running process. If you close the terminal the process will be killed."
+            informativeText: "The terminal still has a running process. If you close the terminal the process will be killed.",
+            disconnect: disconnectOffer(in: node.leaves())
         ) { [weak self] in
             if let self {
                 self.removeSurfaceNode(node)
@@ -1333,7 +1417,17 @@ class BaseTerminalController: NSWindowController,
         guard let node = surfaceTree.root?.node(view: target) else { return }
         let processAlive = (notification.userInfo?["process_alive"] as? Bool) ?? false
         Ghostty.logger.warning("ghosttyDidCloseSurface processAlive=\(processAlive)")
-        closeSurface(node, withConfirmation: processAlive)
+
+        // A remote pane is confirmed even when it is IDLE: closing it ends a
+        // session on another machine, which — unlike a local idle shell — is
+        // not something the user can just start again where they left off.
+        // Widened HERE, at the interactive `close_surface` caller, and never
+        // inside `closeSurface` itself: that would put a modal on the IPC /
+        // AppleScript / App Intents paths, which pass `withConfirmation: false`
+        // precisely because a modal there wedges every later `ghoztty +…`
+        // command until someone dismisses it.
+        let confirm = processAlive || !disconnectableViews(in: node.leaves()).isEmpty
+        closeSurface(node, withConfirmation: confirm)
     }
 
     @objc private func ghosttyDidNewSplit(_ notification: Notification) {
@@ -2084,13 +2178,19 @@ class BaseTerminalController: NSWindowController,
         // If we already have an alert, continue with it
         guard alert == nil else { return false }
 
-        // If our surfaces don't require confirmation, close.
-        if !surfaceTree.contains(where: { $0.needsConfirmQuit }) { return true }
+        // If our surfaces don't require confirmation, close. A live REMOTE
+        // session requires it even when idle — closing it ends a process on
+        // another machine (see `disconnectableViews`).
+        let disconnect = disconnectOffer
+        if !surfaceTree.contains(where: { $0.needsConfirmQuit }) && disconnect.isEmpty {
+            return true
+        }
 
         // We require confirmation, so show an alert as long as we aren't already.
         confirmClose(
             messageText: "Close Terminal?",
-            informativeText: "The terminal still has a running process. If you close the terminal the process will be killed."
+            informativeText: "The terminal still has a running process. If you close the terminal the process will be killed.",
+            disconnect: disconnect
         ) {
             window.close()
         }

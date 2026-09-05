@@ -38,7 +38,10 @@ ghoztty +split --direction=right|down|left|up --target=<name> --name=<name> --co
 Close a named pane or window. Closing a nonexistent target succeeds silently.
 For a session-persistence pane this ENDS the agent session (the process is
 killed once the close's undo window expires) — same as closing the pane in the
-GUI. Only an app quit keeps sessions alive for re-attach.
+GUI. Only an app quit keeps sessions alive for re-attach. For a pane on a
+genuinely REMOTE machine, `+close` likewise ends the session: the interactive
+Disconnect answer (see `+new-remote-window`) is not offered here, because a
+modal on the IPC path would wedge every later `ghoztty +…` command.
 
 ```
 ghoztty +close --target=<name>
@@ -283,6 +286,52 @@ row `⋯` menu → "Host Settings…") and persist in UserDefaults keyed by rela
 device id or `host:port`; explicit `--working-directory`/`--shell` flags
 override them per window. New tabs/splits on a remote window use the per-host
 default shell too (their cwd inherits from the parent pane).
+
+#### Closing a remote window: Close vs Disconnect
+
+Freeing a remote surface DETACHes its agent session by default and only CLOSEs
+it — terminating the remote child — when the app marked the surface
+CLOSE-on-free, which it does on every user-initiated close. **Disconnect** is
+the third button that skips that marking, so you can walk away from a remote
+session and resume it later from the Cmd-Shift-N chooser.
+
+- The close confirmation for a window whose terminals run on a **remote**
+  machine gets three buttons: `Disconnect` (rightmost, and the **default** —
+  Return picks it), `Close`, `Cancel`. The wording names the machine and counts
+  the sessions at stake, and is scope-neutral so one sentence serves a pane, a
+  tab, a window and a tab group.
+- **A remote window is confirmed even when it is IDLE.** Ending a process on
+  another machine is not the recoverable thing an idle local shell is, so the
+  usual "only prompt while something is running" gate is widened for remote
+  panes — at every *interactive* close (Cmd-W, the red X, Close Tab / Other
+  Tabs / Tabs on the Right / Window). It is deliberately NOT widened inside
+  `closeSurface`, because that is the path IPC `+close`, AppleScript, App
+  Intents and viewer panes take: a modal there wedges every later `ghoztty +…`
+  command until someone dismisses it.
+- **`confirm-close-surface = false` still means no prompt.** A user who turned
+  confirmation off does not get one invented for them.
+- **Local-agent (session-persistence) windows are excluded on purpose.** Their
+  machine is `isLocalMachine`, and "closing a pane ends its session" is that
+  feature's documented contract (see `+close`); the way to leave one running is
+  to quit the app.
+- **A tab group can mix machines.** A group-scoped close offers Disconnect when
+  any affected window has something to spare, pins only the panes that actually
+  live on a remote machine, and names the machine only when there is exactly
+  one (several read as "other machines" rather than naming one and lying about
+  the rest).
+- A Disconnect is still a deliberate close: the window's `RemoteSessionManifest`
+  entry is removed, so the WINDOW does not come back on next launch. The
+  SESSION stays alive and is resumed from the chooser.
+
+The user's answer is recorded as a **pin** (`SessionDetachPin`), not as a
+one-shot intent write, because a single close marks CLOSE-on-free twice from two
+independent places — `surfaceTreeDidChange` (the leaf left the tree) and
+`windowWillClose` (the window is going away) — in an order that varies by close
+path. The pin refuses later CLOSE markings, and is released when the view is
+re-adopted into a live tree (an undone close, a pane moved between windows) so a
+LATER close closes normally. Policy + wording live in `SessionDisconnectPolicy`;
+tests: `SessionDisconnectPolicyTests`, `SessionDetachPinTests`,
+`SessionDetachPinPlanTests`.
 
 ### Naming
 

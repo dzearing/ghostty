@@ -58,6 +58,17 @@ final class PaneView: NSView, Codable, Identifiable, ObservableObject {
     /// Viewers have no child process; treat them as never-exited.
     var processExited: Bool { surfaceView?.processExited ?? false }
 
+    /// Viewers have no `confirm-close-surface` setting to honor.
+    var confirmCloseEnabled: Bool { surfaceView?.confirmCloseEnabled ?? false }
+
+    /// The facts `SessionDisconnectPolicy` needs about this pane.
+    var disconnectFacts: SessionDisconnectPolicy.PaneFacts {
+        .init(
+            hasSurface: surfaceView != nil,
+            processExited: processExited,
+            confirmCloseEnabled: confirmCloseEnabled)
+    }
+
     var pwd: String? { surfaceView?.pwd }
 
     /// Forward geometry to the mounted content view (see class doc).
@@ -128,6 +139,20 @@ final class PaneView: NSView, Codable, Identifiable, ObservableObject {
     func setSessionCloseIntent(_ intent: Bool) {
         surfaceView?.setSessionCloseIntent(intent)
         viewerView?.setDetached(intent)
+    }
+
+    /// Pin this pane's agent session to DETACH-on-free: the user answered
+    /// **Disconnect** to a close, so the remote process must keep running.
+    /// Terminal content only — a viewer has no session, and it still detaches
+    /// through `setSessionCloseIntent` like any other close.
+    func pinSessionDetachOnFree() {
+        surfaceView?.pinSessionDetachOnFree()
+    }
+
+    /// Release the Disconnect pin — the pane is live again (undo of a close,
+    /// or adoption into another window), so a later close closes normally.
+    func clearSessionDetachPin() {
+        surfaceView?.clearSessionDetachPin()
     }
 
     // MARK: - Codable

@@ -1404,6 +1404,19 @@ pub fn needsConfirmQuit(self: *Surface) bool {
     };
 }
 
+/// True if `confirm-close-surface` permits a close confirmation for this
+/// surface at all. This is the CONFIGURATION alone; `needsConfirmQuit` folds
+/// that setting together with liveness (child exited, cursor at prompt).
+///
+/// The apprt needs the setting BY ITSELF because an idle remote pane still
+/// warrants a prompt: closing it ends a session on another machine, which is
+/// not recoverable the way a local idle shell is. `needsConfirmQuit` would say
+/// false there (cursor at prompt) and the apprt could not tell that apart from
+/// the user having opted out of close confirmation entirely.
+pub fn confirmCloseEnabled(self: *const Surface) bool {
+    return self.config.confirm_close_surface != .false;
+}
+
 /// Mark whether this surface's remote/agent session should be CLOSEd
 /// (terminate the child, free the session) rather than DETACHed (keep-alive)
 /// when the surface is freed. The apprt sets this when the USER closes the
