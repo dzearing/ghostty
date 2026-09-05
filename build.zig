@@ -160,7 +160,7 @@ pub fn build(b: *std.Build) !void {
         // There is exactly ONE test binary in this lane, on purpose (T434).
         // `remote/agent/main.zig` imports server, session, grid_snapshot,
         // session_meta, ring_snapshot, metrics, foreground, descendants,
-        // keepalive, self_update, socket_stream, socket_rw and pipe_stream, and
+        // keepalive, socket_stream, socket_rw and pipe_stream, and
         // a zig test binary carries the tests of every file in its import
         // graph — so the `src/remote/agent_test.zig` aggregator that used to be
         // wired here as `ghoztty-agent-core-test` was a strict SUBSET of this

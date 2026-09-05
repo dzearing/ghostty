@@ -1007,6 +1007,10 @@ $GuardTable = @(
             'relay\deploy\publish-agent.sh',
             'relay\deploy\Caddyfile.example',
             'relay\README.md',
+            '.claude\commands\release.md',
+            # Section C reads the agent's relay entry point to assert the
+            # self-updater is GONE from the code, not merely unpublished (T550).
+            'src\remote\agent\main.zig',
             'test\win32\one-installer.ps1'
         )
     },

@@ -15,21 +15,13 @@ Categorize changes into: new features, improvements, bug fixes, upstream syncs.
   LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null)
   git diff --quiet "$LAST_TAG" HEAD -- src macos build.zig dist pkg po && echo "APP: unchanged" || echo "APP: changed"
   ```
-- **Windows agent** — compare HEAD to the commit the *currently-deployed* agent was built from (recorded in the live `version.json`) over the agent's inputs:
-  ```bash
-  PREV=$(curl -fsS https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/version.json \
-         | sed -n 's/.*"commit"[^"]*"\([0-9a-f]*\)".*/\1/p')
-  [ -z "$PREV" ] && PREV=$(curl -fsS https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/version.json \
-         | sed -n 's/.*"version"[^"]*"[0-9]\{8\}-\([0-9a-f]*\)".*/\1/p')  # pre-commit-field fallback
-  git diff --quiet "$PREV" HEAD -- src/remote src/build/GhosttyAgent.zig build.zig relay/deploy && echo "AGENT: unchanged" || echo "AGENT: changed"
-  ```
-  (Step 4 runs `publish-agent.sh --if-changed`, which repeats this check and self-skips — so a wrong guess here is not fatal, it just informs the plan.)
+- **Windows agent** — nothing to detect. The agent ships inside the Windows MSI (`release-windows.yml`), not from the relay, so there is no separately-published agent build to compare against. Step 4 publishes only the download signpost and the landing page, and self-skips when `relay/deploy` is unchanged.
 
 Recommend a version tag (e.g. `v1.4.1`) with clear reasoning:
 - Use standard semver — bump patch for fixes, minor for features, major for breaking changes
 - The base version should stay in sync with the upstream Ghostty version when syncing
 
-State plainly which artifacts will publish, e.g. "app + agent both changed → full release", "agent-only changed → skip the DMG/tag, just run Step 4", or "app-only → tag + DMG, agent auto-skips". If NEITHER changed, there is nothing to release — say so and stop. If only the agent changed you can skip the macOS tag/DMG entirely (Steps 3, 5, 6) and jump to Step 4.
+State plainly which artifacts will publish, e.g. "app changed → full release" or "nothing changed → nothing to release". If nothing changed, say so and stop. Step 4 (the relay signpost) is cheap and self-skipping, so it runs either way.
 
 Present the recommendation and ask the user to confirm or override. Do NOT proceed until confirmed.
 
@@ -118,33 +110,30 @@ They are separate workflows so a Windows failure cannot interrupt the signing/no
 
 **The release does not prove the Windows build — it expects to find it already green** (T578). `fork-ci.yml`'s `windows-cross` job runs that same `build-release-artifacts.sh` (exe + MSI + portable ZIP, msitools from the shared `dist/windows-installer/install-msitools.sh`) on every push to `users/dzearing/windows-amd64`, so a broken cross-compile is red on the commit that broke it. Before tagging, glance at the branch's latest Fork CI run (`gh run list --repo dzearing/ghoztty --branch users/dzearing/windows-amd64 --workflow "Fork CI" --limit 1`); a red `windows-cross` there means the release tag would fail the same way, and the fix belongs on the commit, not in the release.
 
-### Step 4: Publish the Windows Agent Installer
+### Step 4: Publish the Relay Download Signpost
 
-Every release also publishes the Windows agent (installer + self-update manifest) so the two ship together. This runs LOCALLY from the tagged commit and is independent of the GitHub DMG build — do it while Step 5 monitors that build.
+Every release refreshes the relay's `/dl/` signpost and landing page. This runs LOCALLY from the tagged commit and is independent of the GitHub DMG build — do it while Step 5 monitors that build.
 
 Prerequisites (all already set up on the release machine):
-- Zig toolchain: `export PATH=/opt/homebrew/opt/zig@0.15/bin:/opt/homebrew/opt/gettext/bin:$PATH; export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer`
 - SSH access to the relay VM as a sudo-capable user (`azureuser@ghoztty-relay-dz17575.westus2.cloudapp.azure.com`)
 
-Build the Windows agent and publish it (exe + `version.json` + the `install.ps1` signpost + relay landing page) to the relay's `/dl/`:
+Publish the relay's download signpost and landing page to `/dl/`:
 
 ```bash
-zig build agent -Dtarget=x86_64-windows-gnu
 relay/deploy/publish-agent.sh --if-changed
 ```
 
-`--if-changed` makes this a no-op when nothing in the agent/site changed since the deployed build (it compares HEAD to the `commit` recorded in the live `version.json` over the agent's input paths, and exits without uploading) — so it's always safe to run this step on every release; it publishes only when the agent actually changed. When it does publish, it stamps the build as `$(date +%Y%m%d)-$(git rev-parse --short HEAD)` (the same string the binary embeds), regenerates `version.json`, and uploads exe + `install.ps1` + landing page. Already-installed agents pick it up on their next self-update check (idle-gated, seamless — no session interruption).
+`--if-changed` makes this a no-op when nothing under `relay/deploy` changed since the deployed copy (it compares HEAD to the `# published-from:` commit stamped into the live `install.ps1`, and exits without uploading) — so it is always safe to run on every release.
 
-There is no standalone agent MSI here any more (T1175): Windows ships one installer, the Ghoztty MSI, and it carries `ghoztty-agent.exe`. `/dl/install.ps1` is a signpost that says so.
+**No binary is published here.** Windows ships one installer, the Ghoztty MSI, and it carries `ghoztty-agent.exe` (T1175). T550 then retired `/dl/ghoztty-agent.exe` and `/dl/version.json` along with the agent's self-updater, which was their only reader — the agent binary is owned by the Ghoztty install and moves with it. `/dl/install.ps1` is a signpost that says so.
 
 Verify it went live:
 ```bash
-curl -fsS  https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/version.json
-curl -fsSI https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/ghoztty-agent.exe | head -1
+curl -fsS https://ghoztty-relay-dz17575.westus2.cloudapp.azure.com/dl/install.ps1 | head -5
 ```
-`version.json` should show the new `date-hash` version and the download should be HTTP 200.
+The signpost should answer 200 and name the product site.
 
-Note: this step is independent of the macOS release — if the SSH upload fails, the DMG release is still valid; just re-run the two commands above. Skip this step only if you deliberately want to hold the agent back (then say so in the report).
+Note: this step is independent of the macOS release — if the SSH upload fails, the DMG release is still valid; just re-run the command above.
 
 ### Step 5: Monitor Build
 
@@ -194,9 +183,8 @@ git worktree add /tmp/ghoztty-gh-pages gh-pages
 
 In `/tmp/ghoztty-gh-pages/index.html`, replace the **macOS** occurrences of the old version with `vX.Y.Z` (download button text, DMG download URL including filename, and the `macOS vX.Y.Z` note line).
 
-Do NOT touch two things by hand:
+Do NOT touch this by hand:
 
-- The **Remote Agent** section — its version badge fetches the agent's `version.json` from the relay live, so it updates itself when Step 4 publishes.
 - The **Windows** download card and its `Windows vX.Y.Z` note line (`id="win-msi-link"`, `id="win-zip-link"`, `id="win-version"`) — `release-windows.yml` retargets those at the `win-vX.Y.Z` release it just published, in the same run, via `dist/website/update-windows-links.py` (T39). Editing them by hand is how they would come to advertise a Windows build that does not exist. If a release ran with `publish=false`, the site correctly still points at the previous `win-v` release.
 
 ```bash

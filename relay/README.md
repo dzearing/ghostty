@@ -410,4 +410,4 @@ rename preserves it, the control-connect header updates it).
 | `enroll_test.go`             | Self-enroll tests against fake Google device-code/token endpoints (happy path, idempotent re-enroll, denied/expired, allowlist rejection, poll rate limit). |
 | `agent_enroll_e2e_test.go`   | Gated e2e: the REAL Zig `ghoztty-agent --enroll` against this relay + the fake issuer (`GHOZTTY_AGENT_BIN`). |
 | `deploy/install.ps1`         | Source of the hosted `/dl/install.ps1`, which since T1175 is a signpost that prints where to get Ghoztty rather than an installer (re-upload after editing). |
-| `deploy/publish-agent.sh`    | Publishes `ghoztty-agent.exe`, `version.json`, the signpost and the relay's landing page to the VM. |
+| `deploy/publish-agent.sh`    | Publishes the signpost and the relay's landing page to the VM. Since T550 it publishes no binary: `ghoztty-agent.exe` and `version.json` went with the agent self-updater that was their only reader. |

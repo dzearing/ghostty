@@ -1,49 +1,42 @@
 #!/usr/bin/env bash
-# publish-agent.sh — publish the Windows agent binary + download site to the
-# relay VM.
+# publish-agent.sh — publish the relay VM's download signpost and landing page.
 #
 # Uploads (idempotent; safe to re-run):
-#   ghoztty-agent.exe            -> /var/www/ghoztty-dl/ghoztty-agent.exe
-#   version.json                 -> /var/www/ghoztty-dl/version.json   (generated here)
 #   install.ps1                  -> /var/www/ghoztty-dl/install.ps1
 #   www/index.html               -> /var/www/ghoztty-www/index.html
 #
-# WHAT IS NO LONGER HERE (T1175). This script used to build and publish a
-# standalone Ghoztty-Agent MSI, plus a stable-URL alias for it, so a Windows
-# box could install the agent on its own. Windows ships ONE installer now and
-# it carries `ghoztty-agent.exe` as a required sibling of `ghoztty.exe`, so the
-# second installer only ever let a new user end up with half a product. The
-# `msi/` directory went with it, `install.ps1` is a signpost that keeps the
-# hosted one-liner answering, and `www/index.html` points at the product site.
-# See docs/design/one-installer-agent-consolidation.md.
+# WHAT IS NO LONGER HERE. This script used to publish a whole second way to get
+# Ghoztty onto a Windows box, and it has been dismantled in two steps:
 #
-# The exe and version.json stay because the standalone `--relay` agent's
-# self-updater still reads them (`src/remote/agent/self_update.zig`,
-# `GET /dl/version.json`); retiring that code path is T550.
+#   T1175 removed the standalone Ghoztty-Agent MSI (and its `msi/` directory and
+#   stable-URL alias). Windows ships ONE installer, and it carries
+#   `ghoztty-agent.exe` as a required sibling of `ghoztty.exe`, so the second
+#   installer only ever let a new user end up with half a product.
 #
-# version.json schema (FIXED — shared with the agent updater; do not reorder or
-# rename fields without changing self_update.zig in the same commit):
-#   {"windows-x86_64": {"version": "20260703-c322788", "commit": "<hash>",
-#     "sha256": "<hex>", "path": "/dl/ghoztty-agent.exe"}}
+#   T550 removed `ghoztty-agent.exe` and `version.json`. They outlived the MSI
+#   only because the agent's own self-updater read them (`GET /dl/version.json`,
+#   then swap the exe in place). That code is gone: the agent binary is owned by
+#   the Ghoztty install and moves with it, so an agent that could replace itself
+#   would be fighting the app's own updater. Nothing reads either file now, and
+#   publishing a Windows binary nobody consumes is a download surface with no
+#   purpose.
+#
+# What is left is a SIGNPOST: `install.ps1` keeps the old hosted one-liner
+# ANSWERING (it installs nothing and names the product site), and
+# `www/index.html` points at the product site. See
+# docs/design/one-installer-agent-consolidation.md.
 #
 # Usage:
-#   relay/deploy/publish-agent.sh [path/to/ghoztty-agent.exe]
-#                                 [--version <string>] [--host <ssh-host>]
-#                                 [--if-changed] [--dry-run]
+#   relay/deploy/publish-agent.sh [--host <ssh-host>] [--if-changed] [--dry-run]
 #
 # Defaults:
-#   exe      zig-out/bin/ghoztty-agent.exe (relative to the repo root)
-#   version  $(date +%Y%m%d)-$(git rev-parse --short HEAD)  — same stamp the
-#            agent build embeds, so --version is only needed when publishing
-#            a binary built from a different commit than HEAD.
 #   host     azureuser@ghoztty-relay-dz17575.westus2.cloudapp.azure.com
 #
-# --if-changed: skip publishing when nothing that goes into the agent or the
-#   download site has changed since the currently-DEPLOYED build. The live
-#   version.json records the `commit` it was built from; this compares that
-#   commit to HEAD over AGENT_PATHS (below) and exits 0 without uploading when
-#   the diff is empty. Over-inclusive on purpose (a needless republish is
-#   harmless — self-update is idle-gated — but a missed one ships stale bits).
+# --if-changed: skip publishing when nothing that goes into the download site
+#   has changed since the currently-DEPLOYED copy. The deployed install.ps1
+#   carries the commit it was published from (`# published-from: <hash>`, added
+#   here at upload time); this compares that commit to HEAD over SITE_PATHS
+#   (below) and exits 0 without uploading when the diff is empty.
 #
 # Requires: ssh access to the VM as a sudo-capable user. Caddy must already
 # route /dl/* and / per relay/deploy/Caddyfile.example.
@@ -57,89 +50,65 @@ HOST="azureuser@ghoztty-relay-dz17575.westus2.cloudapp.azure.com"
 DL_DIR="/var/www/ghoztty-dl"
 WWW_DIR="/var/www/ghoztty-www"
 
-EXE="$REPO_ROOT/zig-out/bin/ghoztty-agent.exe"
-VERSION=""
 DRY_RUN=0
 IF_CHANGED=0
 
-# Source paths whose changes require re-publishing the agent + site.
-# Deliberately broad (over-inclusion just costs an unnecessary, seamless
-# self-update; under-inclusion ships stale bits). Relative to the repo root.
-AGENT_PATHS=(
-  "src/remote"                 # agent + shared remote protocol/transport code
-  "src/build/GhosttyAgent.zig" # agent build + version stamping
-  "build.zig"                  # agent build wiring
+# Source paths whose changes require re-publishing the download site.
+SITE_PATHS=(
   "relay/deploy"               # install.ps1 signpost, website, this script
 )
 
-usage() { sed -n '2,49p' "${BASH_SOURCE[0]}"; }
+usage() { sed -n '2,42p' "${BASH_SOURCE[0]}"; }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --version)  VERSION="${2:?--version needs a value}"; shift 2 ;;
-    --version=*) VERSION="${1#*=}"; shift ;;
     --host)     HOST="${2:?--host needs a value}"; shift 2 ;;
     --host=*)   HOST="${1#*=}"; shift ;;
     --if-changed) IF_CHANGED=1; shift ;;
     --dry-run)  DRY_RUN=1; shift ;;
     -h|--help)  usage; exit 0 ;;
-    -*)         echo "error: unknown flag: $1" >&2; usage >&2; exit 2 ;;
-    *)          EXE="$1"; shift ;;
+    *)          echo "error: unexpected argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
 
 INSTALL_PS1="$SCRIPT_DIR/install.ps1"
 INDEX_HTML="$SCRIPT_DIR/www/index.html"
 
-[[ -f "$EXE" && -s "$EXE" ]] || { echo "error: agent exe not found or empty: $EXE" >&2; exit 1; }
 [[ -f "$INSTALL_PS1" ]] || { echo "error: missing $INSTALL_PS1" >&2; exit 1; }
 [[ -f "$INDEX_HTML"  ]] || { echo "error: missing $INDEX_HTML" >&2; exit 1; }
 
 CUR_COMMIT="$(git -C "$REPO_ROOT" rev-parse --short HEAD)"
 
-if [[ -z "$VERSION" ]]; then
-  VERSION="$(date +%Y%m%d)-$CUR_COMMIT"
-fi
-
 DL_BASE="https://${HOST#*@}/dl"
-PREV_JSON="$(curl -fsS "$DL_BASE/version.json" 2>/dev/null || true)"
 
-# --if-changed: compare HEAD to the commit the DEPLOYED agent was built from
-# (recorded in the live version.json) over AGENT_PATHS. Skip when unchanged.
+# --if-changed: compare HEAD to the commit the DEPLOYED signpost was published
+# from over SITE_PATHS. Skip when unchanged.
 if [[ "$IF_CHANGED" -eq 1 ]]; then
-  PREV_COMMIT="$(printf '%s' "$PREV_JSON" | sed -n 's/.*"commit"[[:space:]]*:[[:space:]]*"\([0-9a-fA-F]*\)".*/\1/p')"
-  # Fallback for manifests published before the `commit` field existed: parse
-  # the trailing hash out of the `YYYYMMDD-<hash>` version string.
-  if [[ -z "$PREV_COMMIT" ]]; then
-    PREV_COMMIT="$(printf '%s' "$PREV_JSON" | sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"[0-9]\{8\}-\([0-9a-fA-F]*\)".*/\1/p')"
-  fi
+  PREV_PS1="$(curl -fsS "$DL_BASE/install.ps1" 2>/dev/null || true)"
+  PREV_COMMIT="$(printf '%s' "$PREV_PS1" | sed -n 's/^#[[:space:]]*published-from:[[:space:]]*\([0-9a-fA-F]*\).*/\1/p' | head -1)"
   if [[ -n "$PREV_COMMIT" ]] && git -C "$REPO_ROOT" cat-file -e "${PREV_COMMIT}^{commit}" 2>/dev/null; then
-    if git -C "$REPO_ROOT" diff --quiet "$PREV_COMMIT" HEAD -- "${AGENT_PATHS[@]}"; then
-      echo "== publish-agent: no agent/site changes since deployed build ($PREV_COMMIT); skipping publish. =="
+    if git -C "$REPO_ROOT" diff --quiet "$PREV_COMMIT" HEAD -- "${SITE_PATHS[@]}"; then
+      echo "== publish-agent: no site changes since the deployed copy ($PREV_COMMIT); skipping publish. =="
       exit 0
     fi
-    echo "== publish-agent: changes since deployed build ($PREV_COMMIT):"
-    git -C "$REPO_ROOT" diff --name-only "$PREV_COMMIT" HEAD -- "${AGENT_PATHS[@]}" | sed 's/^/     /'
+    echo "== publish-agent: changes since the deployed copy ($PREV_COMMIT):"
+    git -C "$REPO_ROOT" diff --name-only "$PREV_COMMIT" HEAD -- "${SITE_PATHS[@]}" | sed 's/^/     /'
   else
-    echo "== publish-agent: no resolvable deployed commit (first publish, or manifest predates the commit field); publishing unconditionally. =="
+    echo "== publish-agent: no resolvable deployed commit (first publish, or a copy predating the stamp); publishing unconditionally. =="
   fi
 fi
-
-SHA256="$(shasum -a 256 "$EXE" | awk '{print $1}')"
 
 STAGE="$(mktemp -d "${TMPDIR:-/tmp}/ghoztty-publish.XXXXXX")"
 trap 'rm -rf "$STAGE"' EXIT
 
-VERSION_JSON="$STAGE/version.json"
-printf '{"windows-x86_64": {"version": "%s", "commit": "%s", "sha256": "%s", "path": "/dl/ghoztty-agent.exe"}}\n' \
-  "$VERSION" "$CUR_COMMIT" "$SHA256" > "$VERSION_JSON"
+# Stamp the signpost with the commit it was published from, so --if-changed has
+# something to compare against on the next run.
+STAGED_PS1="$STAGE/install.ps1"
+{ echo "# published-from: $CUR_COMMIT"; cat "$INSTALL_PS1"; } > "$STAGED_PS1"
 
 echo "== publish-agent =="
-echo "   exe      : $EXE ($(du -h "$EXE" | awk '{print $1}'))"
-echo "   version  : $VERSION"
-echo "   sha256   : $SHA256"
+echo "   commit   : $CUR_COMMIT"
 echo "   host     : $HOST"
-echo "   manifest : $(cat "$VERSION_JSON")"
 
 run() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -153,25 +122,21 @@ run() {
 # Stage on the VM under a unique dir, then sudo-install into place (atomic
 # enough for our purposes: `install` replaces each file in one step).
 REMOTE_STAGE="ghoztty-publish.$$"
-UPLOADS=("$EXE" "$VERSION_JSON" "$INSTALL_PS1" "$INDEX_HTML")
+UPLOADS=("$STAGED_PS1" "$INDEX_HTML")
 run ssh "$HOST" "mkdir -p $REMOTE_STAGE"
 run scp "${UPLOADS[@]}" "$HOST:$REMOTE_STAGE/"
 run ssh "$HOST" "
   set -eu
   sudo install -d -m 755 $DL_DIR $WWW_DIR
-  sudo install -m 644 $REMOTE_STAGE/$(basename "$EXE") $DL_DIR/ghoztty-agent.exe
-  sudo install -m 644 $REMOTE_STAGE/version.json       $DL_DIR/version.json
   sudo install -m 644 $REMOTE_STAGE/install.ps1        $DL_DIR/install.ps1
   sudo install -m 644 $REMOTE_STAGE/index.html         $WWW_DIR/index.html
   rm -rf $REMOTE_STAGE
 "
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  echo "OK (dry-run): nothing uploaded. version.json rendered above."
+  echo "OK (dry-run): nothing uploaded."
 else
-  echo "OK: published agent $VERSION."
-  echo "   verify: curl -fsS https://${HOST#*@}/dl/version.json"
-  echo "           curl -fsSI https://${HOST#*@}/dl/ghoztty-agent.exe | head -5"
-  echo "           curl -fsS https://${HOST#*@}/dl/install.ps1 | head -5"
+  echo "OK: published the download signpost from $CUR_COMMIT."
+  echo "   verify: curl -fsS https://${HOST#*@}/dl/install.ps1 | head -5"
   echo "           curl -fsS https://${HOST#*@}/ | head -5"
 fi

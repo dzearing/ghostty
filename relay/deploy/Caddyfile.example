@@ -8,11 +8,12 @@
 # mutually exclusive and matched by path specificity):
 #
 #   /dl/*            -> file_server from /var/www/ghoztty-dl
-#                       (ghoztty-agent.exe + version.json for the agent's
-#                        self-updater; install.ps1, which since T1175 is a
-#                        signpost that prints where to get Ghoztty rather than
-#                        an installer — the standalone agent MSI is gone and
-#                        its /dl/*.msi URLs with it)
+#                       (install.ps1 alone: since T1175 it is a signpost
+#                        that prints where to get Ghoztty rather than an
+#                        installer, and the standalone agent MSI went with
+#                        it. T550 retired the last two files served here,
+#                        ghoztty-agent.exe and version.json, along with the
+#                        agent self-updater that was their only reader.)
 #   /   (exact)      -> file_server from /var/www/ghoztty-www (landing page)
 #   everything else  -> reverse_proxy to the Go relay on 127.0.0.1:8080
 #
@@ -35,9 +36,8 @@
 
 ghoztty-relay-dz17575.westus2.cloudapp.azure.com {
 	# Downloads. handle_path strips the /dl prefix before the filesystem
-	# lookup, so /dl/ghoztty-agent.exe -> /var/www/ghoztty-dl/ghoztty-agent.exe.
-	# CORS: the GitHub Pages site (https://dzearing.github.io) fetches
-	# /dl/version.json cross-origin to show the current agent version.
+	# lookup, so /dl/install.ps1 -> /var/www/ghoztty-dl/install.ps1.
+	# CORS stays permissive so the GitHub Pages site can fetch from here.
 	handle_path /dl/* {
 		root * /var/www/ghoztty-dl
 		header Access-Control-Allow-Origin "*"

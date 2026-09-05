@@ -22443,3 +22443,81 @@ The mac half of this is a null branch: `queryForegroundCommandFn` has a Windows
 arm and a Linux arm and macOS was deferred at T429, so a Mac roster stays blank.
 Filed as T1360 (`seat: mac`). T1359 carries the same value onto the machine
 chooser's session cards, which are the GUI half of this roster.
+
+## 2026-09-05 - The agent can no longer replace its own binary, and has no tray (T550)
+
+The `ghoztty-agent` still carried the machinery of an agent that installed
+itself: a background updater that read a manifest off the relay, downloaded a
+new copy of the exe and swapped itself out when no sessions were live, and a
+Windows system-tray icon with an About box, a session list, a
+Disconnect/Reconnect item, a Sign in / Sign out item and a "Check for updates"
+item. Both were correct for a standalone install and are wrong for this one:
+since T89h the agent ships inside Ghoztty as a required sibling of
+`ghoztty.exe`, so its binary is owned by the app install and moves with it -
+and code that can replace that binary is code that can fight the app's own
+updater. T1175 removed the standalone MSI and the surfaces that offered it;
+this is the other half, the code, which was left for its own change because
+deleting a self-updater is the kind of thing you want isolated in a diff.
+
+Deleted: `self_update.zig` (994 lines), `tray.zig` (743), `tray_account.zig`
+(220) and `scripts/deploy-windows-agent.sh`. 2,327 lines out, 267 in.
+
+**One piece of the tray was never about the tray and had to survive.**
+`tray.zig` also owned `showStartupError`, a plain message box for a daemon that
+fails before it starts - today that is a failed first-run enrollment. The agent
+is built as the GUI subsystem, so it has no console for stderr to land in, and
+a launch from the app or the Run entry that hits this path would otherwise just
+exit silently. It is now `startup_error.zig`, a 40-line module with the
+MessageBoxW binding and nothing else, and it is what makes the build still need
+`user32`. `shell32` went with the tray.
+
+The wiring simplification is the visible part of the diff. `runListen` and
+`runRelay` each used to branch: on Windows without `--headless`, put the accept
+or control loop on a worker thread and hand the MAIN thread to the Win32
+message pump, because a message loop must run on the thread that created its
+window - and fall back to the main-thread loop if any tray setup step failed,
+because the daemon must never stop serving just because the UI broke. All of
+that is gone; every mode now runs its loop on the main thread, which is exactly
+the shape `--headless` used to select. The flag is still parsed and still means
+something in relay mode (it forbids the interactive browser self-enroll), so it
+stays; T1361 carries the question of what to do with it on the listen paths,
+where it is now inert.
+
+`LinkControl` outlived the tray because the tray was not its only driver: the
+app's "Share this machine" toggle parks and resumes the same relay link through
+`SharingUplink` (T546). What changed there is only the account of who calls it -
+a dozen comments that said "the tray's Disconnect" now say what actually does
+it, which matters because the next reader would otherwise go looking for a
+caller that no longer exists.
+
+**The two files nobody reads any more stopped being published.** `/dl/version.json`
+and `/dl/ghoztty-agent.exe` were deliberately kept by T1175 - the self-updater
+still read them, and retiring an endpoint before its reader is how you break a
+running fleet. With the reader gone they retire in the same change, which is
+what T1175 said would happen. `publish-agent.sh` is now a signpost publisher:
+`install.ps1` (which keeps the old hosted one-liner answering) and the relay's
+landing page, nothing else. Its `--if-changed` check keyed off the `commit`
+field in the manifest it no longer writes, so it now stamps `# published-from:
+<sha>` into the uploaded `install.ps1` and compares against that.
+
+`one-installer.ps1` section C is where this is enforced, and its whole meaning
+inverted: it used to assert the two sides AGREED (the manifest carries the
+field names `self_update.zig` parses, both sides name the same path), and it now
+asserts both are GONE - no Windows binary in the uploads, no `self_update` in
+the agent's relay entry point, and no `curl` anywhere still fetching either
+retired URL. A mention of them in prose is fine and expected, since the docs now
+explain what was retired; a fetch is not. Four `C0` rows assert the deleted
+source files are actually absent, next to the existing `B0`. `-TeethCheck` was
+run and every rewritten check was fed the state it exists to catch and went red.
+The guard's coverage row gained `.claude/commands/release.md` and
+`src/remote/agent/main.zig`, so a self-updater sneaking back into either surface
+marks the harness due - and `guard-due.ps1`'s own table check caught the two
+paths when a scripted edit mangled their backslashes, which is a gate earning
+its keep in the same turn.
+
+Validation: all four floor lanes PASS; P1 25 / P2 20 / P3 16 ALL PASS;
+`one-installer.ps1` 25 ALL PASS plus `-TeethCheck`; `agent-relay-session-e2e.ps1`
+18 ALL PASS - relay mode enrols, serves a session, and takes its control link
+down and back up, with no updater thread and no tray. Nine further guards that
+`main.zig` touches were re-run green. Also filed: T1362, five design notes that
+still tell a reader to run the deploy script this change deleted.

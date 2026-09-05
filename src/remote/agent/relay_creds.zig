@@ -18,7 +18,7 @@
 //!     changed it adopts the new one and BOUNCES the control link
 //!     (`LinkControl.bounce`): the live connection closes, the loop redials
 //!     within one backoff, and the redial picks up the fresh snapshot. A
-//!     user-chosen tray Disconnect is respected — bounce never changes the
+//!     user-chosen park is respected — bounce never changes the
 //!     desired state, so a parked link stays parked (and adopts the new token
 //!     whenever the user reconnects).
 //!
@@ -227,7 +227,7 @@ pub const Watcher = struct {
                 );
                 // Drop the live control connection (if any): the loop redials
                 // within one backoff and `dial` snapshots the new token.
-                // Desired state is untouched — a tray Disconnect stays parked.
+                // Desired state is untouched — a user-parked link stays parked.
                 self.link.bounce();
             },
         }

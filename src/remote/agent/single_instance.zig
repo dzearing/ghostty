@@ -5,7 +5,7 @@
 //! Multiple supervisors can (and did, live) race to keep the agent alive on the
 //! same box — the installer's scheduled-task launcher AND an SMB deploy-watcher
 //! script both respawn-on-exit, and each happily launched its own agent (two
-//! tray icons, two daemons fighting over the listen port / relay control
+//! daemons fighting over the listen port / relay control
 //! socket). The agent itself must be idempotent at the process level: the
 //! SECOND daemon instance detects the first and exits immediately with a
 //! distinct, documented exit code, so a supervisor's keep-alive loop degrades
@@ -150,7 +150,7 @@ pub const AcquireError = error{
     AlreadyRunning,
     /// The guard infrastructure itself failed (couldn't create the mutex /
     /// lock file). Callers should log and CONTINUE serving — daemon
-    /// availability beats guard integrity (mirrors the tray-failure policy).
+    /// availability beats guard integrity (the daemon serves anyway).
     GuardUnavailable,
 };
 
@@ -722,7 +722,7 @@ fn readHeartbeatDefault(alloc: Allocator, instance: Instance) ?HeartbeatInfo {
 /// The holder's heartbeat writer: a daemon-lifetime thread touching the file
 /// every `heartbeat_interval_ms`. Start it right after winning the guard.
 /// Failures only cost takeover-ability, never the daemon (same availability-
-/// first policy as the guard itself and the tray).
+/// first policy as the guard itself).
 pub const Heartbeat = struct {
     alloc: Allocator,
     path: []u8,

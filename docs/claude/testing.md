@@ -856,7 +856,7 @@ a real Ghoztty is using. And a test server thread blocked in `accept()` is woken
 with a **real connection** before its listener is closed: on Windows
 `closesocket` does not signal a blocking call pending in another thread, so
 close-then-`join()` is an indefinite hang (`TestPage`/`ReloadPage` in
-`ViewerPane.zig`, `keepalive.zig`, `link_control.zig`, `self_update.zig`).
+`ViewerPane.zig`, `keepalive.zig`, `link_control.zig`).
 
 On Windows, behavior that unit tests cannot reach is covered by non-interactive
 PowerShell acceptance scripts in `test/win32/` (80+ of them). The standing

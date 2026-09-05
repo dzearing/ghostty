@@ -149,13 +149,24 @@ registration or `%LOCALAPPDATA%\Programs\Ghoztty Agent\`):
 
 ## Decision 5 — what retires, what must keep answering (T550)
 
-Deleted once T547+T549 ship: `relay/deploy/msi/` (wxs + its build script),
-`relay/deploy/install.ps1`, `relay/deploy/publish-agent.sh`,
-`scripts/deploy-windows-agent.sh`, and the self-update + tray-account code
-paths that exist only for the standalone install. Docs pointing at them
-(`relay/README.md`, `remote-relay-roadmap.md`,
-`remote-machines-CONTINUATION-3.md`, `.claude/commands/release.md`) get
-updated in the same change.
+**Done, in two steps.** T1175 deleted `relay/deploy/msi/` (wxs + its build
+script) and the MSI half of `publish-agent.sh`. T550 then deleted
+`scripts/deploy-windows-agent.sh` and the agent code that existed only for the
+standalone install: `self_update.zig` (the relay-hosted binary swap),
+`tray.zig` and `tray_account.zig` (the standalone install's only UI). The
+startup-error message box moved out of the tray into `startup_error.zig`, which
+is the one piece of it that was never about the tray - it fires before any
+daemon setup, when a first-run enrollment fails and there is no console to
+print to.
+
+With the updater gone, `publish-agent.sh` stopped publishing
+`/dl/ghoztty-agent.exe` and `/dl/version.json` in the same change: the updater
+was their only reader, and an unsigned Windows binary served from a host nobody
+audits is a download surface with no purpose. Docs pointing at any of it
+(`relay/README.md`, `Caddyfile.example`, `.claude/commands/release.md`,
+`session-persistence.md`) were updated in the same change; `one-installer.ps1`
+section C flipped from asserting the two sides AGREED to asserting both are
+GONE.
 
 The hosted `https://<relay>/dl/install.ps1` URL **keeps working**: the
 hosted copy becomes a stub that prints where to get Ghoztty (the app install

@@ -403,7 +403,7 @@ pub const WhoamiResult = struct {
 };
 
 /// Ask the relay which account this device token is bound to — the data the
-/// tray shows as "Signed in as <email>". `GET <base>/v1/agent/whoami` with the
+/// machine chooser shows as "Signed in as <email>". `GET <base>/v1/agent/whoami` with the
 /// bearer token. Returns null on ANY failure (network, non-200, parse, OOM): the
 /// caller falls back to a neutral "Signed in" rather than surfacing an error.
 pub fn whoami(alloc: Allocator, relay_base: []const u8, token: []const u8) ?WhoamiResult {

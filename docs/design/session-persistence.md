@@ -110,8 +110,9 @@ Everything below was verified in code on branch `users/dzearing/session-persiste
   relay). All feed one versioned, muxed frame protocol
   (`src/remote/protocol.zig`, `proto_version = 1`, HELLO-negotiated).
 - **Single-instance guard** (flock + heartbeat + takeover,
-  `single_instance.zig`), **self-update** (idle-gated binary swap,
-  `self_update.zig`), cross-platform POSIX/Windows.
+  `single_instance.zig`), cross-platform POSIX/Windows. The agent has no
+  self-update of its own (T550): its binary is owned by the Ghoztty install
+  and moves with it.
 
 **Gaps (each becomes a work item in §7):** no session enumeration on the wire
 (no LIST frame — a client can only attach to an id it already knows); the

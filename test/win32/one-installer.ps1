@@ -21,10 +21,15 @@
 #      script no longer fetches a separate agent version to advertise.
 #   B  the MSI pipeline is GONE, not flagged off: relay/deploy/msi/ does not
 #      exist and publish-agent.sh neither builds nor uploads an MSI.
-#   C  what must KEEP working still does: /dl/install.ps1 still has a source
-#      file (an old one-liner must inform, not 404) that installs NOTHING,
-#      and publish-agent.sh still ships the exe + version.json the agent's
-#      self-updater reads -- with the field names self_update.zig parses.
+#   C  the relay serves a SIGNPOST and nothing else: /dl/install.ps1 still
+#      has a source file (an old one-liner must inform, not 404) that installs
+#      NOTHING, and publish-agent.sh no longer publishes a Windows binary at
+#      all. T550 retired /dl/ghoztty-agent.exe and /dl/version.json along with
+#      the agent self-updater that was their only reader -- until then this
+#      section asserted the two SIDES AGREED, because the updater still read
+#      what the script still wrote. With the reader gone, publishing an
+#      unsigned Windows exe from a host nobody audits is a download surface
+#      with no purpose, so what is asserted flipped from agreement to absence.
 #   D  the pages send people to the ONE installer instead.
 #   E  the docs describe one install path, not two.
 #
@@ -62,7 +67,9 @@ $paths = [ordered]@{
     caddy     = 'relay\deploy\Caddyfile.example'
     readme    = 'relay\README.md'
     release   = '.claude\commands\release.md'
-    selfupd   = 'src\remote\agent\self_update.zig'
+    # The agent's relay-mode entry point. Section C reads it to assert the
+    # self-updater is GONE from the code, not merely unpublished.
+    mainzig   = 'src\remote\agent\main.zig'
 }
 
 $text = [ordered]@{}
@@ -77,6 +84,17 @@ foreach ($k in $paths.Keys) {
 }
 
 $msiDir = Join-Path $Repo 'relay\deploy\msi'
+
+# Source files T550 retired outright. Asserted by existence rather than by
+# content, so they are checked next to B0 rather than in $checks (a file that
+# is not there has nothing to poison, which is why the mutation registry below
+# does not cover these).
+$retired = @(
+    'src\remote\agent\self_update.zig',
+    'src\remote\agent\tray.zig',
+    'src\remote\agent\tray_account.zig',
+    'scripts\deploy-windows-agent.sh'
+)
 
 # ---------------------------------------------------------------------------
 # The checks. Each takes the content map and returns $true when the tree is in
@@ -111,20 +129,22 @@ $checks = [ordered]@{
         { param($t) $t.installps -match 'dzearing\.github\.io/ghoztty' }
     'C2 install.ps1 installs nothing' =
         { param($t) $t.installps -notmatch 'msiexec|Start-Process|Invoke-WebRequest|Invoke-RestMethod|\bcurl\b' }
-    'C3 publish-agent still ships the exe and manifest' =
-        { param($t) $t.publish -match 'ghoztty-agent\.exe' -and $t.publish -match 'version\.json' }
+    'C3 publish-agent uploads no Windows binary and no manifest' =
+        { param($t) $t.publish -notmatch 'UPLOADS=.*ghoztty-agent\.exe' -and
+                    $t.publish -notmatch '\$DL_DIR/ghoztty-agent\.exe' -and
+                    $t.publish -notmatch '\$DL_DIR/version\.json' -and
+                    $t.publish -notmatch 'VERSION_JSON' }
     'C4 publish-agent still uploads the install.ps1 signpost' =
         { param($t) $t.publish -match 'INSTALL_PS1' }
-    'C5 manifest carries the fields self_update.zig parses' =
+    'C5 no agent code reads a hosted version manifest' =
+        { param($t) $t.mainzig -notmatch 'self_update' -and $t.mainzig -notmatch '/dl/version\.json' }
+    # A MENTION is fine and expected -- both files are named in prose as
+    # retired. What must not come back is a FETCH of either one.
+    'C6 nothing still fetches the retired downloads' =
         { param($t)
-          $ok = $true
-          foreach ($f in @('version', 'sha256', 'path')) {
-              if ($t.publish -notmatch ('"' + $f + '"')) { $ok = $false }
-              if ($t.selfupd -notmatch ('"' + $f + '"')) { $ok = $false }
-          }
-          $ok }
-    'C6 the manifest path both sides use still agrees' =
-        { param($t) $t.selfupd -match '/dl/version\.json' -and $t.publish -match 'version\.json' }
+          $pat = '(curl|Invoke-WebRequest|Invoke-RestMethod|wget)[^
+]*(/dl/ghoztty-agent\.exe|/dl/version\.json)'
+          ($t.caddy -notmatch $pat) -and ($t.release -notmatch $pat) -and ($t.readme -notmatch $pat) }
 
     # D - the pages point at the one installer.
     # The Remote Agent section this used to check was REMOVED on 2026-08-31
@@ -163,10 +183,10 @@ $mutations = @{
     'B3 Caddyfile advertises no hosted agent MSI'             = @('caddy',     '#   /dl/ghoztty-agent.msi')
     'C1 install.ps1 names where to get Ghoztty'               = @('installps', '')   # emptied
     'C2 install.ps1 installs nothing'                         = @('installps', 'msiexec /i $msi /qn')
-    'C3 publish-agent still ships the exe and manifest'       = @('publish',   '')   # emptied
+    'C3 publish-agent uploads no Windows binary and no manifest' = @('publish', 'sudo install -m 644 $REMOTE_STAGE/agent.exe $DL_DIR/ghoztty-agent.exe')
     'C4 publish-agent still uploads the install.ps1 signpost' = @('publish',   '')   # emptied
-    'C5 manifest carries the fields self_update.zig parses'   = @('publish',   '')   # emptied
-    'C6 the manifest path both sides use still agrees'        = @('selfupd',   '')   # emptied
+    'C5 no agent code reads a hosted version manifest'        = @('mainzig',   'const updater = self_update.maybeStart(alloc, ws_host, agent_version, &store);')
+    'C6 nothing still fetches the retired downloads'          = @('release',   'curl -fsS https://relay/dl/version.json')
     'D1 the page offers the Windows installer exactly once'   = @('ghpages',   '<a id="win-msi-link" href="/dl/Ghoztty-x64.msi">Get the Windows installer</a>')
     'D2 relay landing page sends you to the product site'     = @('www',       '')   # emptied
     'E1 relay README does not present a standalone installer as live' = @('readme',  'Ghoztty-Agent-1.2.3-x64.msi')
@@ -176,6 +196,9 @@ $mutations = @{
 if (-not $TeethCheck) {
     "== one-installer: the shipped tree =="
     Assert 'B0 relay/deploy/msi/ is gone' (-not (Test-Path -LiteralPath $msiDir))
+    foreach ($gone in $retired) {
+        Assert "C0 $gone is gone" (-not (Test-Path -LiteralPath (Join-Path $Repo $gone)))
+    }
     foreach ($name in $checks.Keys) {
         Assert $name (& $checks[$name] $text)
     }

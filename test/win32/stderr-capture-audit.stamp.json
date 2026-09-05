@@ -1,13 +1,14 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-05T05:13:40-07:00",
-    "commit":  "82b87b0d2",
+    "generated":  "2026-09-05T06:06:08-07:00",
+    "commit":  "805622a98",
     "uncommitted":  [
-                        "test/win32/sessions-running-cmd.ps1"
+                        "docs/claude/testing.md",
+                        "test/win32/one-installer.ps1"
                     ],
     "files":  {
-                  "docs/claude/testing.md":  "75066e86f1dcb63299264139b1ca28da1f7025520011e33f7c3139d0d24fc9b1",
+                  "docs/claude/testing.md":  "c67089bfa8dbe5ee19cfdcabbdd52945d88e392dddd90d90b6ad1dbac0592b8e",
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
                   "test/win32/activity-monitor-probe-fail.ps1":  "3ca33b2b1d163db1fe2b2f8d0cb573c0f9d7decd435f61d64bb5906e71dc6aa4",
@@ -206,7 +207,7 @@
                   "test/win32/msi-upgrade.ps1":  "596f855376fa9af1f3ed137c55c060c10e872f2c6555b20b774688f0ca28e425",
                   "test/win32/new-window-cwd.ps1":  "0c35d0adaf39cdd7fa733c5e2912f1cb4dce1f7c12f05ed63b90a851acd5c440",
                   "test/win32/notification-click-focus.ps1":  "7382c18defc188e5036e2549119e6611615af455dbd696ceec2fe7eacb39040a",
-                  "test/win32/one-installer.ps1":  "0f46024d68471f83002eff1cf3f547fbac6e062ec79e3f2a64707982cdc24e64",
+                  "test/win32/one-installer.ps1":  "e8f2855cab4c267362f75fe7d78b810375ebc6fd253a31ab70c43579b3cea76e",
                   "test/win32/orphan-notify.ps1":  "200452e245fcaca1b85e2ee96a2a226b93e71ac607d1f30f41a1c623458149de",
                   "test/win32/overlay-zorder.ps1":  "48f8bcc2f312e6031dede6f4c19fa50a961804fdbe81de80b2ed27247f92c6aa",
                   "test/win32/palette-close-crash.ps1":  "e6046113e0de2c089224b358bac4ef12ed298e86983c3bf68bd48588a34c964d",

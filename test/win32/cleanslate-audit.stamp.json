@@ -1,10 +1,10 @@
 {
     "guard":  "cleanslate",
     "script":  "test/win32/cleanslate-audit.ps1",
-    "generated":  "2026-09-05T05:13:27-07:00",
-    "commit":  "82b87b0d2",
+    "generated":  "2026-09-05T06:06:00-07:00",
+    "commit":  "805622a98",
     "uncommitted":  [
-                        "test/win32/sessions-running-cmd.ps1"
+                        "test/win32/one-installer.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -205,7 +205,7 @@
                   "test/win32/msi-upgrade.ps1":  "596f855376fa9af1f3ed137c55c060c10e872f2c6555b20b774688f0ca28e425",
                   "test/win32/new-window-cwd.ps1":  "0c35d0adaf39cdd7fa733c5e2912f1cb4dce1f7c12f05ed63b90a851acd5c440",
                   "test/win32/notification-click-focus.ps1":  "7382c18defc188e5036e2549119e6611615af455dbd696ceec2fe7eacb39040a",
-                  "test/win32/one-installer.ps1":  "0f46024d68471f83002eff1cf3f547fbac6e062ec79e3f2a64707982cdc24e64",
+                  "test/win32/one-installer.ps1":  "e8f2855cab4c267362f75fe7d78b810375ebc6fd253a31ab70c43579b3cea76e",
                   "test/win32/orphan-notify.ps1":  "200452e245fcaca1b85e2ee96a2a226b93e71ac607d1f30f41a1c623458149de",
                   "test/win32/overlay-zorder.ps1":  "48f8bcc2f312e6031dede6f4c19fa50a961804fdbe81de80b2ed27247f92c6aa",
                   "test/win32/palette-close-crash.ps1":  "e6046113e0de2c089224b358bac4ef12ed298e86983c3bf68bd48588a34c964d",

@@ -71,13 +71,13 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Agent {
     const version_module = version_opts.createModule();
     exe.root_module.addImport("agent_build_options", version_module);
 
-    // On Windows the agent shows a system-tray icon in its daemon modes (the
-    // MSI/installer autostart it as the always-on `--relay` daemon). Build it as
-    // the GUI subsystem so Windows never allocates a console window for it — no
-    // stray black box pops up next to the tray. Logging is unaffected: stdout/
-    // stderr go to log files via inherited handles regardless of subsystem, so
-    // the readiness banner is still captured. This is windows-only;
-    // the macOS host + the `test-agent` build are left untouched.
+    // On Windows the agent is a background daemon with no UI of its own (T550
+    // retired the tray). Build it as the GUI subsystem so Windows never
+    // allocates a console window for it — no stray black box pops up when the
+    // app or the Run entry starts it. Logging is unaffected: stdout/stderr go to
+    // log files via inherited handles regardless of subsystem, so the readiness
+    // banner is still captured. This is windows-only; the macOS host + the
+    // `test-agent` build are left untouched.
     var ca_dll_install_step: ?*std.Build.Step.InstallArtifact = null;
     if (cfg.target.result.os.tag == .windows) {
         exe.subsystem = .Windows;
@@ -96,17 +96,17 @@ pub fn init(b: *std.Build, cfg: *const Config, deps: *const SharedDeps) !Agent {
             .use_llvm = true,
         });
         ca_dll_install_step = b.addInstallArtifact(ca_dll, .{});
-        // The tray pulls in user32/shell32. kernel32 is auto-linked, but these
-        // are not, so request them explicitly (windows-target only).
+        // The startup-error message box (`startup_error.zig`) pulls in user32.
+        // kernel32 is auto-linked, this is not, so request it explicitly
+        // (windows-target only). shell32 went with the tray (T550).
         exe.linkSystemLibrary("user32");
-        exe.linkSystemLibrary("shell32");
         // relay.env DACL hardening (enroll.zig) uses the token/security APIs.
         exe.linkSystemLibrary("advapi32");
-        // Embed the ghost icon (id 1) so the exe and its tray icon aren't the
-        // generic Windows application icon. `tray.zig` loads it by id from this
-        // module's own instance handle. The /d defines stamp VERSIONINFO so
-        // Explorer's Details tab shows the release semver (matching the DMG
-        // tag) and the date-hash self-update stamp; see ghoztty-agent.rc.
+        // Embed the ghost icon (id 1) so the exe isn't the generic Windows
+        // application icon in Explorer and Task Manager. The /d defines stamp
+        // VERSIONINFO so Explorer's Details tab shows the release semver
+        // (matching the DMG tag) and the date-hash build stamp; see
+        // ghoztty-agent.rc.
         const semver = semverString(b);
         const sv = parseSemver(semver);
         exe.addWin32ResourceFile(.{

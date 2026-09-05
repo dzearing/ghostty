@@ -3,7 +3,7 @@
 //!
 //! Why a DLL: MSI "run an exe" custom actions (type 50) spawn real processes,
 //! and console-subsystem tools (taskkill, powershell, schtasks) each pop a
-//! console window over the installer UI — ugly for what is a tray app. wixl
+//! console window over the installer UI — ugly during an install. wixl
 //! (GNOME msitools) doesn't support inline-script custom actions (type 37/38),
 //! but it DOES support type-1 Binary-table DLL actions, which run in-process
 //! inside msiexec: no child console can ever appear. The one external tool we

@@ -1,19 +1,26 @@
 {
     "guard":  "one-installer",
     "script":  "test/win32/one-installer.ps1",
-    "generated":  "2026-09-04T13:45:32-07:00",
-    "commit":  "f07b0d33e",
+    "generated":  "2026-09-05T05:54:18-07:00",
+    "commit":  "805622a98",
     "uncommitted":  [
-                        "relay/deploy/ghpages/index.html"
+                        ".claude/commands/release.md",
+                        "relay/deploy/Caddyfile.example",
+                        "relay/deploy/publish-agent.sh",
+                        "relay/README.md",
+                        "src/remote/agent/main.zig",
+                        "test/win32/one-installer.ps1"
                     ],
     "files":  {
-                  "relay/deploy/Caddyfile.example":  "efdfea28b5c583192668cea11509496edbfc2c0126cc800257347d4a154dbd83",
+                  ".claude/commands/release.md":  "57241da77f199f6af3a021b725c828f41abfd57c2768c66e814f2687a243a5b6",
+                  "relay/deploy/Caddyfile.example":  "68976c8bf26255febe085ecfb23896513d4ba93e4deb5a8296cd5c118bab5aa2",
                   "relay/deploy/ghpages/index.html":  "d6b67154e1367ac22cc4fcc189fd8afcb510ff2aae7529e854c0fbda5b2edc8e",
                   "relay/deploy/ghpages/landing/main.js":  "31620c4f632e63d7aa46efb2a2bbae280da1dc347f3c72392b2e1dd946281ae5",
                   "relay/deploy/install.ps1":  "708e187dc3511b38ea0d00b2dd94fd754334fe345d528cb1995812e09c1a0a1c",
-                  "relay/deploy/publish-agent.sh":  "1eaf4ae5df861fa784c545c5679052a50077640f9e6d269df012007e29900075",
+                  "relay/deploy/publish-agent.sh":  "2d81df89a033ae30f4a6d693d5e60dd74c5cecaf165ea20b8b81f866e20f4b8c",
                   "relay/deploy/www/index.html":  "760ea43a1e910c1009620fd798003f76e7d1886e126e909f60cb4760dccbbf9f",
-                  "relay/README.md":  "a6f999de56e39b90538ecf7748098daf27368f5519c10ef6f951be5e21d0f7b9",
-                  "test/win32/one-installer.ps1":  "0f46024d68471f83002eff1cf3f547fbac6e062ec79e3f2a64707982cdc24e64"
+                  "relay/README.md":  "bee8ff05a3755a987e080f8c344d18f5ed26ef74f28638bf282a3e3c5c5ff92c",
+                  "src/remote/agent/main.zig":  "cdebea227f5e6c750b5a5294eaa478877d1c7fdffa8c3f27d66df80c79ecb156",
+                  "test/win32/one-installer.ps1":  "e8f2855cab4c267362f75fe7d78b810375ebc6fd253a31ab70c43579b3cea76e"
               }
 }

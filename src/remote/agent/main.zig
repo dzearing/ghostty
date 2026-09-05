@@ -127,8 +127,6 @@ const mux_mod = @import("mux.zig");
 const socket_stream = @import("../socket_stream.zig");
 const pipe_stream = @import("../pipe_stream.zig");
 const ws_client = @import("../ws_client.zig");
-const tray = @import("tray.zig");
-const tray_account = @import("tray_account.zig");
 const enroll = @import("enroll.zig");
 const atomic_write = @import("atomic_write.zig");
 const keepalive = @import("keepalive.zig");
@@ -136,17 +134,17 @@ const link_control = @import("link_control.zig");
 const relay_creds = @import("relay_creds.zig");
 const sharing = @import("sharing.zig");
 const adopt = @import("adopt.zig");
-const self_update = @import("self_update.zig");
 const single_instance = @import("single_instance.zig");
+const startup_error = @import("startup_error.zig");
 const agent_lineage = @import("../agent_lineage.zig");
 
 /// The agent's baked build version: `YYYYMMDD-<git short hash>` (commit date),
 /// or `"dev"` when git was unavailable at build time. Stamped by
 /// `src/build/GhosttyAgent.zig` through the `agent_build_options` module
 /// (`-Dagent-version=` overrides). Shown by `--version`, the startup banners,
-/// and the tray About line, and compared against the relay's
-/// `/dl/version.json` by the self-updater (`self_update.zig`) — dev builds
-/// never self-update.
+/// and the startup banners. Since T550 the agent has no self-updater of its
+/// own: the binary is owned by the Ghoztty install and moves with it, so this
+/// stamp identifies a build rather than gating an update.
 const agent_version: []const u8 = @import("agent_build_options").agent_version;
 
 /// The private handoff pipe a retiring agent named on our command line (T907),
@@ -228,7 +226,7 @@ pub fn main() !void {
             // it is started inside runListen once the store exists. POSIX-only.
             blockSigterm();
             // DAEMON mode: enforce single-instance BEFORE anything user-visible
-            // (bind, banner, tray icon). Exits the process on conflict.
+            // (bind, banner). Exits the process on conflict.
             // TCP listen keeps the legacy (relay) guard identity — only the
             // local persistence transport (`--listen-pipe`) takes a distinct
             // instance key (T89d1).
@@ -292,8 +290,8 @@ pub fn main() !void {
         },
         .relay => |r| {
             // DAEMON mode: single-instance first (before the token lookup, long
-            // before the tray could flash an icon — and before a first-run
-            // auto-enroll could pop a browser from a doomed duplicate). The
+            // before a first-run auto-enroll could pop a browser from a
+            // doomed duplicate). The
             // relay agent keeps the legacy guard identity (unchanged by T89d1).
             var lock = acquireDaemonLockOrExit(alloc, r.force_replace, daemonInstance(.relay));
             defer lock.release();
@@ -425,9 +423,9 @@ const DaemonLock = struct {
 ///     self-explanatory in its captured stderr log.
 ///   - guard infrastructure failed → log a warning and return an empty lock:
 ///     the daemon serves anyway (availability beats guard integrity, same
-///     policy as tray failures).
-/// Called BEFORE any user-visible daemon setup (bind / banner / tray icon), so
-/// a losing instance never flashes a tray icon or steals the port.
+///     policy as every other non-fatal daemon failure).
+/// Called BEFORE any user-visible daemon setup (bind / banner), so a losing
+/// instance never steals the port.
 fn acquireDaemonLockOrExit(alloc: Allocator, force_replace: bool, instance: single_instance.Instance) DaemonLock {
     const guard = single_instance.acquireWithTakeover(alloc, force_replace, instance) catch |err| switch (err) {
         error.AlreadyRunning => {
@@ -534,11 +532,11 @@ fn autoEnrollForRelay(alloc: Allocator, base_url: []const u8) ![]u8 {
 }
 
 /// Windows-only user-visible surface for a first-run enrollment failure: a
-/// plain error message box. At this point NO tray icon exists yet (the tray
-/// starts with the connect loop, which we never reach) and the GUI-subsystem
-/// exe launched from the Start Menu / Run key has no console for stderr, so a
-/// box is the only thing the user can see. No-op elsewhere; headless never
-/// reaches here (`decideRelayCred` fails headless launches without enrolling).
+/// plain error message box. The daemon never starts at this point, and the
+/// GUI-subsystem exe launched from the app / Start Menu / Run key has no
+/// console for stderr, so the box is the only thing the user can see. No-op
+/// elsewhere; headless never reaches here (`decideRelayCred` fails headless
+/// launches without enrolling).
 fn surfaceEnrollFailure(err: anyerror) void {
     if (builtin.os.tag != .windows) return;
     var buf: [256]u8 = undefined;
@@ -547,7 +545,7 @@ fn surfaceEnrollFailure(err: anyerror) void {
         "First-run enrollment failed ({s}).\n\nThe agent will retry at the next launch, or enroll manually with:\nghoztty-agent --enroll --relay=<base>",
         .{@errorName(err)},
     ) catch "First-run enrollment failed.";
-    tray.showStartupError(msg);
+    startup_error.show(msg);
 }
 
 /// The T911 durability gate: whether a holder-backed session's ACK means the
@@ -708,7 +706,8 @@ const Enroll = struct {
 };
 
 /// Relay-mode parameters. `base_url` is the relay HTTPS/WSS base (owned — duped
-/// from argv so it outlives `argsFree`). `headless` suppresses the Windows tray.
+/// from argv so it outlives `argsFree`). `headless` marks a non-interactive
+/// launch: it must never open a browser to self-enroll (`decideRelayCred`).
 /// `force_replace` (`--force-replace`/`--replace`) kills a live single-instance
 /// holder instead of yielding to it.
 const Relay = struct {
@@ -717,9 +716,10 @@ const Relay = struct {
     force_replace: bool = false,
 };
 
-/// TCP listen-daemon parameters. `headless` suppresses the Windows system-tray
-/// icon (for CI / non-interactive runs); the default (tray ON) is what the deploy
-/// watcher uses so the human running the Windows box gets a visible daemon handle.
+/// TCP listen-daemon parameters. `headless` is accepted and carried for
+/// symmetry with the relay path (where it still forbids an interactive
+/// self-enroll); since T550 the agent has no UI in any mode, so it selects
+/// nothing here.
 const Listen = struct {
     addr: std.net.Address,
     headless: bool = false,
@@ -796,8 +796,8 @@ const allow_public_flag = "--insecure-allow-public";
 
 /// Parse `--version` | `--stdio` | `--listen <addr:port>` | `--relay <url>` |
 /// `--enroll --relay <url>` | (no args ⇒ default TCP listen).
-/// `--headless` (anywhere on the line) suppresses the tray for listen mode; the
-/// stdio path is ALWAYS headless (an ssh-piped agent has no desktop to draw on).
+/// `--headless` (anywhere on the line) marks a non-interactive launch: in relay
+/// mode it forbids the browser self-enroll. The stdio path is always headless.
 /// `--enroll` (anywhere on the line) turns the `--relay` base into a one-shot
 /// enrollment instead of the relay daemon; `--no-browser`/`--headless-enroll`
 /// makes that enrollment use the device-code flow instead of the browser.
@@ -1446,54 +1446,13 @@ fn runListen(
     // still captured and the readiness poll still works.)
     stdout.writeAll(std.fmt.allocPrint(alloc, "ghoztty-agent {s}: listening on {f}\n", .{ agent_version, bound_addr }) catch "ghoztty-agent: listening\n") catch {};
 
-    // The accept loop is the whole daemon. WHERE it runs depends on the tray:
-    //
-    //   • Windows + tray (the default, !headless): the Win32 message loop MUST own
-    //     the MAIN thread (it pumps the window that owns the tray icon), so we run
-    //     the accept loop on a detached worker thread and hand the main thread to
-    //     `tray.run`. When the user picks Exit, `tray.run` returns and we exit the
-    //     process. If tray setup fails, we FALL BACK to the main-thread accept loop
-    //     below — the daemon must never fail to serve because the UI broke.
-    //
-    //   • Everything else (headless, or any non-Windows OS): run the accept loop on
-    //     the MAIN thread exactly as before — unchanged behavior.
-    if (builtin.os.tag == .windows and !headless) {
-        const args: AcceptArgs = .{
-            .alloc = alloc,
-            .encoding = encoding,
-            .store = &store,
-            .spawner = spawner.spawner(),
-            .listener = &listener,
-            // TCP listener: no peercred gate (loopback + --insecure-allow-public).
-            .enforce_same_uid = false,
-        };
-        if (std.Thread.spawn(.{}, acceptLoopThread, .{args})) |t| {
-            // Hand the MAIN thread to the tray message loop. It returns TRUE only if
-            // the tray actually showed and the user picked Exit; FALSE if any tray
-            // setup step failed (RegisterClass / CreateWindow / Shell_NotifyIcon).
-            // No relay link/account/updater in listen mode → null (no
-            // Disconnect/Reconnect, Sign in/out, or self-update items).
-            if (tray.run(&store, agent_version, null, null, null)) {
-                // User chose Exit: flush any dirty output rings first (the tray
-                // Exit is a graceful stop — T89a decision 7, the SIGTERM-watcher
-                // analog), then a clean process exit tears down the
-                // (still-running) accept loop + reaper daemon threads.
-                store.snapshotRings();
-                std.process.exit(0);
-            }
-            // Tray setup FAILED — never kill the daemon just because the UI couldn't
-            // start. The accept loop is the whole daemon and is already serving on
-            // the worker thread; park the main thread on it so the process lives on.
-            t.join();
-            return;
-        } else |err| {
-            // Couldn't spawn the worker thread — fall through to the main-thread
-            // accept loop so the daemon still serves (no tray, but functional).
-            std.debug.print("ghoztty-agent: tray worker spawn failed ({s}); serving headless\n", .{@errorName(err)});
-        }
-    }
-
-    // Headless / non-windows / tray-fallback: run the accept loop right here.
+    // The accept loop is the whole daemon and it owns the MAIN thread. Until
+    // T550 this branched on a Windows system-tray UI, which needed the Win32
+    // message pump on the main thread and pushed the accept loop onto a worker.
+    // The consolidated agent has no UI of its own - it ships inside Ghoztty and
+    // the product's account surface is the machine chooser - so every mode is
+    // now the shape `--headless` used to select, on every platform.
+    _ = headless; // still accepted on the command line; no longer selects a UI
     try acceptLoop(alloc, encoding, &store, spawner.spawner(), &listener, false);
 }
 
@@ -1513,7 +1472,7 @@ fn runListenUnix(
     port_file: ?[]const u8,
     sessions_file: ?[]const u8,
 ) !void {
-    _ = headless; // no Windows tray on the unix path; reserved for symmetry.
+    _ = headless; // no UI in any mode since T550; reserved for symmetry.
 
     // Stale-socket livecheck: if something ANSWERS at `path`, a live agent owns
     // it — refuse rather than clobber. The single-instance guard normally means
@@ -1649,8 +1608,8 @@ fn runListenPipe(
     port_file: ?[]const u8,
     sessions_file: ?[]const u8,
 ) !void {
-    // The LOCAL agent is a background daemon (the LaunchAgent analog): no tray
-    // icon — the relay agent owns the visible tray. Reserved for symmetry.
+    // Every agent mode is a background daemon with no UI of its own (T550);
+    // `headless` survives on the listen paths only as an accepted flag.
     _ = headless;
 
     // Bind claims the name via FILE_FLAG_FIRST_PIPE_INSTANCE, which doubles as
@@ -2060,7 +2019,7 @@ fn currentPid() i64 {
 }
 
 /// Bundles the accept-loop parameters so they can ride a single `std.Thread.spawn`
-/// argument (the Windows tray path runs the loop on a worker thread).
+/// argument, for the callers that run the loop on a worker thread.
 const AcceptArgs = struct {
     alloc: Allocator,
     encoding: protocol.TransferEncoding,
@@ -2080,8 +2039,8 @@ fn acceptLoopThread(args: AcceptArgs) void {
 
 /// THE DAEMON: accept connections forever, serving each on its own detached
 /// thread. This is the loop that was previously inlined in `runListen`; it was
-/// extracted verbatim so it can run on EITHER the main thread (headless / non-
-/// windows) or a worker thread (so the Windows tray can own the main thread).
+/// extracted verbatim so it can run on EITHER the main thread (every daemon
+/// mode since T550) or a worker thread.
 fn acceptLoop(
     alloc: Allocator,
     encoding: protocol.TransferEncoding,
@@ -2150,8 +2109,8 @@ fn realNow(_: *anyopaque) i64 {
 // process-wide and consumed synchronously by a dedicated `sigwait` watcher
 // thread running in ordinary context, where the mutex + I/O are safe.
 //
-// POSIX-only: Windows has no real SIGTERM (its graceful stop is the tray Exit
-// path). `blockSigterm`/`startSigtermWatcher` are no-ops there.
+// POSIX-only: Windows has no real SIGTERM. `blockSigterm`/`startSigtermWatcher`
+// are no-ops there.
 // -----------------------------------------------------------------------------
 
 /// The signal set containing just SIGTERM. Declared once so `blockSigterm` and
@@ -2397,8 +2356,8 @@ fn runRelay(
     // the life of the daemon.
     const ws_base = try wssBase(alloc, base_url);
     defer alloc.free(ws_base);
-    // Host part (scheme stripped): the tray tooltip label and the
-    // self-updater's HTTPS host. wssBase guarantees a scheme prefix.
+    // Host part (scheme stripped): what the link status reports as the host we
+    // are connected to. wssBase guarantees a scheme prefix.
     const ws_host = ws_base[(std.mem.indexOf(u8, ws_base, "://") orelse unreachable) + "://".len ..];
 
     // DAEMON-SCOPED shared session store + spawner (§7.1 survival) — identical to
@@ -2428,24 +2387,18 @@ fn runRelay(
     const stdout = std.fs.File.stdout();
     stdout.writeAll(std.fmt.allocPrint(alloc, "ghoztty-agent {s}: relay mode, control={s}/v1/agent/control\n", .{ agent_version, ws_base }) catch "ghoztty-agent: relay mode\n") catch {};
 
-    // SELF-UPDATE (relay mode only): clear a previous swap's leftovers
-    // (`.old`/stale `.new` next to the exe — best-effort; Windows may still
-    // hold the `.old` of the process we just replaced), then start the
-    // background updater. It stages new binaries from the relay's
-    // /dl/version.json and swap+respawns ONLY when `store` has zero live
-    // sessions. No-op for dev builds or under GHOSTTY_AGENT_NO_SELFUPDATE=1.
-    self_update.cleanupLeftovers(alloc);
-    // The returned handle (null if disabled/dev) lets the tray "Check for
-    // updates" trigger an immediate check.
-    const updater = self_update.maybeStart(alloc, ws_host, agent_version, &store);
+    // No self-updater (T550, and Decision 1 of
+    // docs/design/one-installer-agent-consolidation.md). This binary is owned by
+    // the Ghoztty install and moves with it, so an agent that could download and
+    // swap in a replacement of itself would be fighting the app's own updater.
 
     // Tighten the existing relay.env DACL to owner-only (Windows). Freshly
     // written credentials are hardened in saveRelayEnv; this catches installs
     // whose credential predates that, so a self-update fixes them in place.
     enroll.hardenLocalCredential(alloc);
 
-    // User-controlled relay link state (tray Disconnect/Reconnect). The tray
-    // toggles it from its message-pump thread; the control loop obeys it.
+    // User-controlled relay link state (the app's "Share this machine" toggle,
+    // via `SharingUplink`); the control loop obeys it.
     // `host` (scheme stripped) is what the tooltip shows: "Connected to <host>".
     var link = link_control.LinkControl{ .host = ws_host };
 
@@ -2458,9 +2411,10 @@ fn runRelay(
 
     // Watch relay.env so a re-enroll is adopted WITHOUT an agent restart:
     // on a token change the watcher swaps the credential and bounces the
-    // control link (tray Disconnect stays parked — bounce never overrides the
-    // user's desired state). Watch failures only cost the hot-reload feature,
-    // never the daemon (same availability-first policy as tray failures).
+    // control link (a user-parked link stays parked — a bounce never overrides
+    // the user's desired state). Watch failures only cost the hot-reload
+    // feature, never the daemon (the same availability-first policy the rest of
+    // the daemon's optional machinery follows).
     var creds_watch: relay_creds.Watcher = undefined;
     if (enroll.relayEnvPath(alloc)) |env_path| {
         creds_watch = relay_creds.Watcher.init(alloc, env_path, &creds, &link, ws_base);
@@ -2474,42 +2428,12 @@ fn runRelay(
         std.debug.print("ghoztty-agent: relay.env path unavailable ({s}); a re-enroll needs an agent restart\n", .{@errorName(err)});
     }
 
-    // Tray account controller (Sign in / Sign out + "Signed in as <email>").
-    // Reads the live creds + drives the link; borrows `base_url` (http(s) relay
-    // base) for whoami/deEnroll/enroll. Lives on this frame (outlives the tray).
-    var acct_host_buf: [256]u8 = undefined;
-    const acct_name = hostName(&acct_host_buf) orelse "unknown-host";
-    var account = tray_account.TrayAccount.init(alloc, base_url, acct_name, &creds, &link);
-    // Populate "Signed in as <email>" in the background so the first menu open
-    // shows it (best-effort; a menu opened before it lands just shows "Signed in").
-    account.requestRefresh();
-
-    // The relay control loop is the whole daemon. WHERE it runs depends on the
-    // tray, exactly mirroring `runListen`'s accept-loop placement.
-    if (builtin.os.tag == .windows and !headless) {
-        const args: RelayArgs = .{
-            .alloc = alloc,
-            .encoding = encoding,
-            .ws_base = ws_base,
-            .creds = &creds,
-            .store = &store,
-            .spawner = spawner.spawner(),
-            .link = &link,
-        };
-        if (std.Thread.spawn(.{}, relayLoopThread, .{args})) |t| {
-            if (tray.run(&store, agent_version, &link, &account, updater)) {
-                std.process.exit(0); // user chose Exit (from any link state)
-            }
-            // Tray setup failed: park the main thread on the (already-serving)
-            // control loop so the daemon lives on.
-            t.join();
-            return;
-        } else |err| {
-            std.debug.print("ghoztty-agent: tray worker spawn failed ({s}); serving headless\n", .{@errorName(err)});
-        }
-    }
-
-    // Headless / non-windows / tray-fallback: run the control loop right here.
+    // The relay control loop is the whole daemon and it owns the MAIN thread.
+    // Until T550 this branched on a Windows system-tray UI (which also carried
+    // the Sign in / Sign out menu, hence a `tray_account` controller on this
+    // frame). The consolidated agent has no UI of its own: signing a machine in
+    // and out is the machine chooser's job, on both platforms.
+    _ = headless; // still accepted on the command line; no longer selects a UI
     relayLoop(alloc, encoding, ws_base, &creds, &store, spawner.spawner(), &link);
 }
 
@@ -2536,7 +2460,7 @@ fn wssBase(alloc: Allocator, base: []const u8) ![]u8 {
 }
 
 /// Bundles the relay-loop parameters so they can ride a single `std.Thread.spawn`
-/// argument (the Windows tray path runs the loop on a worker thread).
+/// argument, for the callers that run the loop on a worker thread.
 const RelayArgs = struct {
     alloc: Allocator,
     encoding: protocol.TransferEncoding,
@@ -2553,10 +2477,10 @@ fn relayLoopThread(args: RelayArgs) void {
 
 /// THE RELAY DAEMON: hold the control WebSocket; on drop, back off and reconnect
 /// (reusing the SAME store, so sessions survive). The loop itself lives in
-/// `link_control.runLoop` so the user-facing suspend/resume transitions (tray
+/// `link_control.runLoop` so the user-facing suspend/resume transitions (the
 /// Disconnect/Reconnect via `link`) are unit-testable; this function builds the
-/// real-WsClient `Transport` it drives. Runs until the process exits (the tray
-/// Exit path) — `link.stopLoop` would return it, but nothing calls that today.
+/// real-WsClient `Transport` it drives. Runs until the process exits —
+/// `link.stopLoop` would return it, but nothing calls that today.
 fn relayLoop(
     alloc: Allocator,
     encoding: protocol.TransferEncoding,
@@ -2778,7 +2702,7 @@ const SharingUplink = struct {
 /// synchronous reconcile so an enabled flag raises before the daemon starts
 /// accepting, then keep reconciling on a background tick thread. All failure
 /// modes degrade to "local-only", never to a dead daemon — same
-/// availability-first policy as the tray and the creds watcher.
+/// availability-first policy as the creds watcher.
 fn maybeStartSharingUplink(
     alloc: Allocator,
     encoding: protocol.TransferEncoding,
@@ -2826,7 +2750,7 @@ const RelayConn = struct {
 /// The production `link_control.Transport`: dial the authenticated control
 /// WebSocket (+ spawn its keepalive), serve it with `serveControl`, close it
 /// via `WsClient.close` (idempotent; unblocks the blocked control read — the
-/// same contract the keepalive and the tray's Disconnect rely on).
+/// same contract the keepalive and the sharing toggle's park rely on).
 const RelayTransport = struct {
     alloc: Allocator,
     encoding: protocol.TransferEncoding,
@@ -2904,7 +2828,7 @@ const RelayTransport = struct {
     }
 
     /// Thread-safe, idempotent; unblocks `serveControl`'s blocked read with
-    /// EOF. This is what the tray's Disconnect ends up calling (via
+    /// EOF. This is what parking the uplink ends up calling (via
     /// `LinkControl.closeLive`) — and what the keepalive calls on staleness.
     fn close(_: *anyopaque, connp: *anyopaque) void {
         const conn: *RelayConn = @ptrCast(@alignCast(connp));
@@ -3049,7 +2973,7 @@ test {
     _ = @import("relay_creds.zig");
     _ = @import("sharing.zig");
     _ = @import("adopt.zig");
-    _ = @import("self_update.zig");
+    _ = @import("startup_error.zig");
     _ = @import("single_instance.zig");
     _ = @import("../agent_lineage.zig");
     _ = @import("descendants.zig");

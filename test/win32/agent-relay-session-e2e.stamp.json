@@ -1,16 +1,16 @@
 {
     "guard":  "agent-relay-session",
     "script":  "test/win32/agent-relay-session-e2e.ps1",
-    "generated":  "2026-09-05T05:12:38-07:00",
-    "commit":  "82b87b0d2",
+    "generated":  "2026-09-05T06:02:26-07:00",
+    "commit":  "805622a98",
     "uncommitted":  [
-                        "src/cli/sessions.zig",
-                        "src/remote/agent/server.zig"
+                        "src/remote/agent/link_control.zig",
+                        "src/remote/agent/main.zig"
                     ],
     "files":  {
                   "src/cli/sessions.zig":  "d9d748c52c062fbead0270383e89db74c5b20e2d5cd4bf087fc2c51c821de7cf",
-                  "src/remote/agent/link_control.zig":  "fe127515d37ebba9bb9cb77af3565f03c1fcab8809effa1fb50d3cca1be53996",
-                  "src/remote/agent/main.zig":  "23fddf078ff07a9ed448791738cfedc316fa301c35d93ffda9afa915ef3185e1",
+                  "src/remote/agent/link_control.zig":  "e3138c9c1326081092f25b9c090388fe58a3561c17734a83778df474ededd40a",
+                  "src/remote/agent/main.zig":  "cdebea227f5e6c750b5a5294eaa478877d1c7fdffa8c3f27d66df80c79ecb156",
                   "src/remote/agent/server.zig":  "e5dda12a758f39d4a0858c038e07b953cfb26c3c0b0b92cdd6a0dfa0592bb4ac",
                   "src/remote/agent/session.zig":  "406ea4bef2bcfeb0962b00c8822f97db57ca4896ac8ef8fb1759844501cb9daa",
                   "src/remote/ws_client.zig":  "9d6bf5343afa0c3a934d110e7e0b0a505a867170f1de76bba0ff4f77dccf522b",

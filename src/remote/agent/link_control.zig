@@ -1,24 +1,25 @@
-//! User-controlled relay-link state (tray "Disconnect"/"Reconnect") + the
+//! User-controlled relay-link state ("Share this machine" on / off) + the
 //! reconnect-loop driver that obeys it.
 //!
 //! ## Why this exists
 //! `--relay` mode holds one control WebSocket to the relay and redials it
 //! forever (3s base backoff, escalating on repeated fast drops — see
-//! `ReconnectBackoff`). The Windows tray needs to let the human take that
-//! link DOWN on demand — the agent goes offline on the relay, but LOCAL
+//! `ReconnectBackoff`). Turning sharing off has to take that link DOWN on
+//! demand — the agent goes offline on the relay, but LOCAL
 //! sessions stay alive (a control drop only ever DETACHes sessions, never
 //! terminates them — see `main.zig` §7.1), so bringing the link back UP
 //! re-exposes them — and bring it back UP without waiting out a backoff.
 //!
-//! The tray runs on its own Win32 message-pump thread, so the toggle must be
-//! thread-safe and must take effect promptly in BOTH directions:
+//! The toggle is driven from another thread (`main.zig`'s `SharingUplink`
+//! reconciler), so it must be thread-safe and take effect promptly in BOTH
+//! directions:
 //!
-//!   - **Disconnect** (`disconnect`): store desired=offline, close the LIVE
+//!   - **Park** (`disconnect`): store desired=offline, close the LIVE
 //!     control connection (the exact teardown contract `keepalive.zig` relies
 //!     on: `WsClient.close` is idempotent and unblocks a concurrently blocked
 //!     `readMessage` with EOF), and set the wake event so the loop parks
 //!     instead of redialing.
-//!   - **Reconnect** (`reconnect`): store desired=online and set the wake
+//!   - **Resume** (`reconnect`): store desired=online and set the wake
 //!     event — the parked loop redials IMMEDIATELY (and a loop mid-backoff
 //!     after a dial failure is woken early too; every wait in the loop is
 //!     interruptible, mirroring the keepalive stop event).
@@ -32,13 +33,12 @@
 //!     relay connection so the loop is unit-testable without a network.
 //!   - `runLoop`: THE connect loop — park while offline, dial, serve, back
 //!     off, repeat — extracted from `main.zig`'s relay mode so its transitions
-//!     are testable on any host (the tray itself only runs on Windows).
+//!     are testable on any host.
 //!
 //! `main.zig` wires a real-WsClient `Transport` (dial = control WS + keepalive
-//! thread; serve = `serveControl`); `tray.zig` calls `disconnect`/`reconnect`/
-//! `display` from the message-pump thread. `--listen` TCP mode has no relay
-//! link and never constructs one of these (the tray gets a null and shows no
-//! Disconnect/Reconnect items).
+//! thread; serve = `serveControl`) and calls `disconnect`/`reconnect`/`display`
+//! from the sharing reconciler. `--listen` TCP mode has no relay link and never
+//! constructs one of these.
 
 const std = @import("std");
 
@@ -46,14 +46,15 @@ const std = @import("std");
 pub const Desired = enum(u8) {
     /// Keep a control connection up (dial, serve, back off, redial).
     online,
-    /// User chose Disconnect: no connection, no redialing; park until told
+    /// User turned sharing off: no connection, no redialing; park until told
     /// otherwise. Local sessions stay alive in the store.
     offline,
     /// Terminate the loop (tests / clean shutdown). `runLoop` returns.
     stop,
 };
 
-/// The user-facing link status (tray tooltip / menu status line).
+/// The user-facing link status (what the machine chooser and `+sessions`
+/// report about this machine's relay uplink).
 pub const Display = enum(u8) {
     /// A control connection is up.
     connected,
@@ -159,11 +160,11 @@ pub const Transport = struct {
 };
 
 /// Thread-safe desired-state + live-connection registry shared between the
-/// control loop (one thread) and the tray (another). All public methods are
+/// control loop (one thread) and the sharing reconciler (another). All public methods are
 /// callable from any thread; only `runLoop` may wait on `wake`.
 pub const LinkControl = struct {
     /// Relay host for display ("Connected to <host>"). Borrowed; must outlive
-    /// the tray + loop (daemon lifetime in practice).
+    /// the reconciler + loop (daemon lifetime in practice).
     host: []const u8 = "",
 
     desired: std.atomic.Value(Desired) = .{ .raw = .online },
@@ -227,7 +228,7 @@ pub const LinkControl = struct {
         self.wake.set();
     }
 
-    /// Current user-facing status (tray tooltip / menu text / status line).
+    /// Current user-facing status (what the machine chooser reports).
     pub fn display(self: *const LinkControl) Display {
         if (self.desired.load(.acquire) != .online) return .offline;
         return if (self.connected.load(.acquire)) .connected else .reconnecting;
@@ -248,7 +249,7 @@ pub const LinkControl = struct {
         }
     }
 
-    /// Sleep up to `ms`, waking early if the tray toggles state. Every reset
+    /// Sleep up to `ms`, waking early if the toggle changes state. Every reset
     /// here is followed by a desired-state re-check in the loop, so a
     /// "swallowed" set can never lose a transition.
     pub fn interruptibleSleep(self: *LinkControl, ms: u64) void {
@@ -294,7 +295,7 @@ pub const LinkControl = struct {
 /// THE connect loop: park while offline, dial, serve until the connection
 /// ends, back off (`ReconnectBackoff`: `backoff_ms` base cadence normally,
 /// escalating with jitter on repeated fast drops), repeat. Every wait is
-/// interruptible by the tray's `disconnect`/`reconnect`/`stopLoop`. Returns
+/// interruptible by `disconnect`/`reconnect`/`stopLoop`. Returns
 /// only on `.stop`.
 ///
 /// This is `main.zig`'s relay control loop with the transport abstracted out,
@@ -317,7 +318,7 @@ pub fn runLoop(link: *LinkControl, transport: Transport, backoff_ms: u64) void {
 
         const conn = transport.vtable.dial(transport.ctx) orelse {
             // Dial failed: back off (base cadence — see ReconnectBackoff),
-            // but wake early on any tray toggle so a user Disconnect parks
+            // but wake early on any toggle so turning sharing off parks
             // (and a Reconnect-after-Disconnect redials) without waiting out
             // the backoff.
             link.interruptibleSleep(ReconnectBackoff.jittered(backoff.onDialFailed(), rand));
@@ -578,7 +579,7 @@ test "stopLoop exits cleanly while connected" {
 
 // -----------------------------------------------------------------------------
 // Integration: the REAL WsClient as the transport against a local loopback WS
-// server — proves `disconnect` (the exact call the tray makes) closes the live
+// server — proves `disconnect` (the exact call the reconciler makes) closes the live
 // WebSocket and unblocks its blocked `readMessage`, and `reconnect` redials.
 // Plaintext `ws://` per `WsClient.Options.tls` — loopback only. (Same pattern
 // as keepalive.zig's integration tests.)
@@ -742,7 +743,7 @@ test "integration: disconnect closes the real WsClient (unblocking its read); re
     try poll(10_000, &link, isConnected);
     try testing.expectEqual(@as(u32, 1), srv.upgrades.load(.monotonic));
 
-    // The tray's Disconnect: must close the live WebSocket, which unblocks
+    // Turning sharing off: must close the live WebSocket, which unblocks
     // the loop's blocked readMessage (the keepalive teardown contract), and
     // park the loop offline.
     link.disconnect();
@@ -755,7 +756,7 @@ test "integration: disconnect closes the real WsClient (unblocking its read); re
     // second dial ("expected 2, found 1", T89b).
     try poll(10_000, &link, isDisconnected);
 
-    // The tray's Reconnect: redials immediately (well inside the 60s backoff).
+    // Turning sharing back on: redials immediately (well inside the 60s backoff).
     link.reconnect();
     try poll(10_000, &link, isConnected);
     try testing.expectEqual(@as(u32, 2), srv.upgrades.load(.monotonic));
