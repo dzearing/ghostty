@@ -21922,3 +21922,53 @@ All four floor lanes PASS, P1-P3 ALL PASS, and the three guards this edit made
 due (`holder-volume`, `session-vanished`, `agent-relay-session`) re-ran green,
 plus `session-snapshot-reattach`, `session-relaunch-notify` and
 `agent-session-cap`.
+
+## 2026-09-04 - The compiler crash that blocked the self-hosted backend is now fifteen lines anyone can run (T476)
+
+`zig build -Dtest-llvm=false` has killed `zig.exe` outright since T473 measured
+it on 2026-08-04, which is why `build.zig` still pins `use_llvm = true` on all
+three test binaries. The crash was real but unreportable: it needed the whole
+ghoztty tree to happen, and the compiler died without printing a single
+character.
+
+Re-verified first, per the CHECK FIRST rule - still `0xC0000005` at
+`zig.exe+0xfcb364` on zig 0.15.2, unchanged in a month. Then bisected down,
+re-measuring at every step: `src/main.zig` -> `main_ghostty.zig`'s test block
+-> `input.zig` -> `input/command.zig` -> `input/Binding.zig` -> its tests ->
+`test "set: parseAndPut typical binding"` -> `Set.put` -> `Trigger.hash()` ->
+`foldedCodepoint` -> one call to
+`uucode.get(.case_folding_full, cp).with(&buffer, cp)`.
+
+`test/zig-repro/t476-selfhosted-backend` is that call, standing alone: a
+fifteen-line test root, `uucode` 0.2.0 pinned to the same tarball the repo
+pins, and a verbatim copy of `src/build/uucode_config.zig`. No ghoztty source
+in it, and it kills the compiler two ways - `0x80000003` STATUS_BREAKPOINT on
+the default target, `0xC0000005` STATUS_ACCESS_VIOLATION with
+`-Dtarget=native-native-msvc -Dcpu=baseline`. `zig build` renders both as
+`exited with error code 3` / `code 5`, which is the T444 NTSTATUS truncation
+again; the real codes come out of the Windows Application Error log.
+
+The reduction has a shape worth knowing: the generated table's SIZE is the
+trigger, not the ten lines that read it. A `uucode_config.zig` carrying only
+the `runtime` table compiles clean, and so does one with a second table holding
+a single plain field. It takes the real `buildtime` table with its four
+extensions. That is why the copy is verbatim rather than trimmed, and why
+`test\win32\zig-repro-t476.ps1` fails when the copy and
+`src\build\uucode_config.zig` drift apart - a reduction that no longer
+describes the build it came from is worse than none.
+
+That harness also answers the question nobody was ever going to remember to
+ask: it FAILS the day the reduction compiles clean, and prints the three steps
+that follow (re-run ghoztty's own test binary, drop `-Dtest-llvm`, delete the
+directory). Registered in `scripts\guard-due.ps1` as `zig-repro-t476`, so a
+future zig upgrade cannot quietly leave a workaround in `build.zig` forever.
+
+What is NOT done: the upstream report. Opening an issue on `ziglang/zig` posts
+publicly under the user's GitHub identity on a repo this project has no other
+relationship with, so the material is prepared and the posting waits for them -
+**T1341**, with everything the report needs already written down.
+
+`test\win32\zig-repro-t476.ps1` ALL PASS (12 assertions). All four floor lanes
+PASS, P1-P3 ALL PASS, and the seven meta-audits that a new `test\win32` script
+puts on the due list (isolation-meta, launch-preflight, verdict-exit,
+cleanslate, stderr-capture, body-complete, desktop-launch) all re-ran green.

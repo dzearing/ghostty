@@ -1,0 +1,23 @@
+{
+    "guard":  "zig-repro-t476",
+    "script":  "test/win32/zig-repro-t476.ps1",
+    "generated":  "2026-09-04T16:46:12-07:00",
+    "commit":  "e932f59c8",
+    "uncommitted":  [
+                        "test/win32/zig-repro-t476.ps1",
+                        "test/zig-repro/t476-selfhosted-backend/build.zig",
+                        "test/zig-repro/t476-selfhosted-backend/build.zig.zon",
+                        "test/zig-repro/t476-selfhosted-backend/README.md",
+                        "test/zig-repro/t476-selfhosted-backend/src/main.zig",
+                        "test/zig-repro/t476-selfhosted-backend/src/uucode_config.zig"
+                    ],
+    "files":  {
+                  "src/build/uucode_config.zig":  "668ee0c8ce90c607cc50b7a3b42fc103e7682b8f1e35fcffdc301d1a5585bd4c",
+                  "test/win32/zig-repro-t476.ps1":  "d6f0fa7635fa5872b80b8fe33373e30ea95aae4cc0a0b431ab0de2809e7d3bdc",
+                  "test/zig-repro/t476-selfhosted-backend/build.zig":  "4c3243fe1ce019e2d904db813bd6ec3592b5c4bdeb3f2a1b514e8c4478628f3a",
+                  "test/zig-repro/t476-selfhosted-backend/build.zig.zon":  "0e7057d0defead9ec5dde806e974f19884a408b69f3414c8d22502f639ff495a",
+                  "test/zig-repro/t476-selfhosted-backend/README.md":  "c78c539a8de495fbf703a7ccb9e2761b9b77d0e2d63ef30b9601ff4c8758066a",
+                  "test/zig-repro/t476-selfhosted-backend/src/main.zig":  "1ec71c87a8b7bbebf6e7c7e8805eb1541c5d05512a4e021ec79d1a9b53441d13",
+                  "test/zig-repro/t476-selfhosted-backend/src/uucode_config.zig":  "668ee0c8ce90c607cc50b7a3b42fc103e7682b8f1e35fcffdc301d1a5585bd4c"
+              }
+}

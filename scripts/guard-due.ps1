@@ -2519,6 +2519,26 @@ $GuardTable = @(
     # it is where the three knobs are now set in one call, and the gate's whole
     # question is whether they were. Non-interactive, launches nothing (release
     # builds are played by stub exes), a few seconds.
+    # The T476 compiler-crash reduction. The reduction pins ghoztty's
+    # `src\build\uucode_config.zig` verbatim - and the crash NEEDS that config,
+    # since a trimmed one compiles clean - so an edit to the real config that
+    # leaves the copy behind turns the reduction into a description of a build
+    # that no longer exists. The harness also re-asks whether the compiler bug
+    # is still there, which is the only thing standing between a zig upgrade
+    # that fixes it and `-Dtest-llvm` living in build.zig forever. Two to three
+    # minutes when it has to generate uucode's tables, seconds after that;
+    # `-SkipCompile` runs the drift checks alone.
+    [pscustomobject]@{
+        Name   = 'zig-repro-t476'
+        Script = 'test\win32\zig-repro-t476.ps1'
+        Stamp  = 'test\win32\zig-repro-t476.stamp.json'
+        Covers = @(
+            'src\build\uucode_config.zig',
+            'test\zig-repro\t476-selfhosted-backend\*',
+            'test\zig-repro\t476-selfhosted-backend\src\*',
+            'test\win32\zig-repro-t476.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'build-mode'
         Script = 'test\win32\build-mode-guard.ps1'

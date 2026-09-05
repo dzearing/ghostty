@@ -1,0 +1,18 @@
+.{
+    .name = .zig_selfhosted_uucode_repro,
+    .version = "0.0.0",
+    .fingerprint = 0x215d56e24f634bde,
+    .minimum_zig_version = "0.15.2",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+    .dependencies = .{
+        .uucode = .{
+            .url = "https://deps.files.ghostty.org/uucode-0.2.0-ZZjBPqZVVABQepOqZHR7vV_NcaN-wats0IB6o-Exj6m9.tar.gz",
+            .hash = "uucode-0.2.0-ZZjBPqZVVABQepOqZHR7vV_NcaN-wats0IB6o-Exj6m9",
+        },
+    },
+}
+

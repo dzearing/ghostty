@@ -1,10 +1,10 @@
 {
     "guard":  "cleanslate",
     "script":  "test/win32/cleanslate-audit.ps1",
-    "generated":  "2026-09-04T15:11:28-07:00",
-    "commit":  "2d9959fd6",
+    "generated":  "2026-09-04T16:47:34-07:00",
+    "commit":  "e932f59c8",
     "uncommitted":  [
-                        "test/win32/go-loop-guard.ps1"
+                        "test/win32/zig-repro-t476.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -325,6 +325,7 @@
                   "test/win32/window-name-restore.ps1":  "056f50b36cb6a75b5a96f286fb7041b805a5031216cb83c44a267bbff5077f0e",
                   "test/win32/window-placement-isolation.ps1":  "20d8b605382eb89ef87c19898b48f0c3a195236f29a7ff46d82f92a2ff87e560",
                   "test/win32/window-size-memory.ps1":  "02ff1ad3e3602b2233ebb1d6867168238fad6ec68f6e36293a3eaaec754e1bb1",
-                  "test/win32/window-title.ps1":  "bb55adb77b3705d08c1ad8f3f9091a92c8e1fd975ac44ed4132d8b49d920b97c"
+                  "test/win32/window-title.ps1":  "bb55adb77b3705d08c1ad8f3f9091a92c8e1fd975ac44ed4132d8b49d920b97c",
+                  "test/win32/zig-repro-t476.ps1":  "d6f0fa7635fa5872b80b8fe33373e30ea95aae4cc0a0b431ab0de2809e7d3bdc"
               }
 }
