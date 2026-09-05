@@ -22366,3 +22366,43 @@ dim-overlay sweep then walks the pane being freed) - section F leaves its probe
 window open to avoid inheriting it. And T1357, section E's widest-band capture
 is taken before the nav strip has settled, which reds the run about half the
 time on a build where nothing is wrong.
+
+## 2026-09-05 - Closing a window that holds a viewer no longer kills the app (T1356)
+
+Close a window with a document or diff viewer in it and Ghoztty disappeared -
+every window, not just that one. The fault was a teardown ordering rule this
+file already knew: `replaceTabRoot` and two of its neighbours swap the new tree
+into `tab_trees` BEFORE releasing the old one, with a comment saying the window
+must never be observable holding a freed tree. Three sites did it the other way
+round (`closeSplitPane`, `splitPane`, `equalizeSplits`), and `cleanupAllSurfaces`
+deinit'ed each tree in place.
+
+That is normally invisible, because nothing runs between the free and the swap.
+A viewer pane changes that: its `deinit` calls the WebView2 controller's
+`Close`, which PUMPS MESSAGES. A focus message dispatched in that pump reached
+`ViewerPane`'s WM_SETFOCUS arm, which asked `Window.updateDimOverlays` to
+re-place every wash in the window, and the sweep walked the tree that was
+mid-free - dereferencing a terminal `Surface` that had already gone.
+`STATUS_FATAL_USER_CALLBACK_EXCEPTION`, whole process.
+
+All four sites now swap first and release second. `Window.close` also raises
+`closing` before it tears anything down (only the last-tab path ever did, so a
+title-bar X on a window with tabs ran the whole teardown with the flag false),
+`updateDimOverlays` bails on it exactly as `healOverlayZOrders` has since T142,
+and the viewer's focus arm bails on it too.
+
+`test\win32\viewer-close.ps1` is new and is the first thing in the suite that
+closes a window holding a viewer and then keeps asserting - five sections: one
+viewer, a terminal beside a focused viewer, two viewers, one pane out of a
+split, and the last window where the close IS the shutdown (read through
+`Get-GuiPostmortem`, so a crash cannot pass as the quit it asked for). Getting
+it to score red took three drafts, which is the finding worth keeping: a window
+of viewers alone survives the broken build, and so does a terminal+viewer window
+with no contents card up. The CARD is load-bearing - it is a second popup the
+teardown destroys and a focus target while it is up - so section B stretches the
+window, rearranges to the gutter layout and asserts the card is there before it
+closes anything. Against the pre-fix `Window.zig` that section fails with the
+report's own `0xC000041D`.
+
+`test\win32\viewer-narrow-pane.ps1` closes its section F probe window again;
+the comment that had it leave the window open to dodge this crash is gone.

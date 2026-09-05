@@ -2329,9 +2329,17 @@ pub fn closeSplitPane(self: *Window, pane: *PaneView) void {
     // termio backend tears down.
     pane.setSessionCloseIntent(true);
 
+    // Same swap-then-release order as `replaceTabRoot`, and here it is what
+    // keeps the app alive (T1356): a viewer pane's `deinit` closes its
+    // WebView2 controller, and that close PUMPS MESSAGES. Anything dispatched
+    // during the pump — a WM_SETFOCUS landing on a sibling pane, and the
+    // dim-overlay sweep that arm triggers — walks `tab_trees`, so the slot has
+    // to already describe the world AFTER the removal rather than during it.
+    // `new_tree` owns its own arena and holds its own references, so this is a
+    // pure value swap and `old_tree` still frees everything it owns.
     var old_tree = self.tab_trees[tab];
-    old_tree.deinit();
     self.tab_trees[tab] = new_tree;
+    old_tree.deinit();
 
     if (next_pane) |ns| {
         log.debug("closeSplitPane: focusing next pane", .{});
@@ -3217,6 +3225,12 @@ pub fn layoutSplits(self: *Window) void {
 /// Idempotent and cheap; called from layoutSplits, focus changes, WM_MOVE,
 /// and config reload.
 pub fn updateDimOverlays(self: *Window) void {
+    // A window on its way out has no dim worth placing, and its panes are
+    // being torn down under us — the same guard `healOverlayZOrders` has kept
+    // since T142, for the same reason. This sweep is the one that was reached
+    // re-entrantly from a viewer pane's WebView2 `close()` pump and walked a
+    // surface mid-free (T1356).
+    if (self.closing) return;
     const config = &self.app.config;
     // Config clamps opacity to [0.15, 1]; 1 → alpha 0 → feature off.
     const alpha = dim_math.overlayAlpha(config.@"unfocused-split-opacity");
@@ -4161,10 +4175,12 @@ fn insertPaneAsSplit(
         &insert_tree,
     );
 
-    // Replace old tree.
+    // Replace old tree, swap-then-release (T1356): the window must never be
+    // observable holding a freed tree, and `old_tree.deinit()` frees the arena
+    // the old node array lives in.
     var old_tree = self.tab_trees[tab];
-    old_tree.deinit();
     self.tab_trees[tab] = new_tree;
+    old_tree.deinit();
 
     // Focus the new pane...
     self.tab_active_pane[tab] = new_pane;
@@ -4392,9 +4408,10 @@ pub fn equalizeSplits(self: *Window) void {
     const tab = self.active_tab;
 
     const new_tree = self.tab_trees[tab].equalize(alloc) catch return;
+    // Swap-then-release (T1356), same rule as everywhere else.
     var old_tree = self.tab_trees[tab];
-    old_tree.deinit();
     self.tab_trees[tab] = new_tree;
+    old_tree.deinit();
     self.layoutSplits();
     self.app.markLayoutDirty(); // T110: equalized ratios must survive restore
 }
@@ -7430,6 +7447,14 @@ pub fn close(self: *Window) void {
     // The app-quit teardown path is Window.deinit (which also calls
     // cleanupAllSurfaces but deliberately does NOT mark), so quitting keeps
     // sessions alive for re-attach.
+    //
+    // `closing` goes up FIRST (T1356). Everything below can pump messages — a
+    // viewer pane's WebView2 `close()` does it outright — and this flag is what
+    // tells the arms that run during that pump that the window has no layout
+    // left worth maintaining. Until now only the last-tab path
+    // (`closeTabByIndex`) ever raised it, so a title-bar X on a window that
+    // still had tabs tore itself down with the flag still false.
+    self.closing = true;
     self.markAllSessionsClose();
 
     // First, cleanly shut down all surfaces (renderer/IO threads, WGL, DC).
@@ -7443,15 +7468,29 @@ pub fn close(self: *Window) void {
 
 /// Deinit and free all tab trees (which unrefs and frees surfaces).
 fn cleanupAllSurfaces(self: *Window) void {
-    // Deinit in place and reset to .empty. SplitTree.deinit sets self.*
-    // to undefined; deinit'ing a local copy would only mark the copy,
-    // leaving stale arena/node pointers in tab_trees that any post-WM_CLOSE
-    // message walking the slot could dereference.
-    for (self.tab_trees[0..self.tab_count]) |*tree| {
-        tree.deinit();
-        tree.* = .empty;
-    }
+    // DETACH FIRST, then tear down (T1356). This used to deinit each tree in
+    // place and reset the slot afterwards, which left the window observable
+    // holding a tree whose panes were being freed underneath it — and a viewer
+    // pane's `deinit` closes its WebView2 controller, which PUMPS MESSAGES.
+    // A WM_SETFOCUS dispatched during that pump reached
+    // `Window.updateDimOverlays`, which walked exactly those slots and
+    // dereferenced a half-freed surface. Taking the trees off the window first
+    // means anything that runs during the teardown sees a window with no tabs,
+    // which is the truth by then anyway.
+    //
+    // The copies are values: `SplitTree` owns an arena plus a node slice, so
+    // moving the struct out moves the ownership with it. (The old in-place
+    // form existed because `SplitTree.deinit` sets `self.*` to undefined and
+    // deinit'ing a local COPY of a still-installed tree would leave the slot
+    // holding stale arena/node pointers — that hazard is gone here precisely
+    // because the slot is reset to `.empty` before anything is freed.)
+    const count = self.tab_count;
     self.tab_count = 0;
+    for (self.tab_trees[0..count]) |*slot| {
+        var tree = slot.*;
+        slot.* = .empty;
+        tree.deinit();
+    }
 }
 
 /// Mark every pane in every tab to END its agent session (CLOSE) rather than

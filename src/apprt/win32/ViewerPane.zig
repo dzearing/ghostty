@@ -5716,8 +5716,14 @@ pub fn wndProc(
             // viewers (T90g). `updateDimOverlays` IS (T380): the active pane
             // just changed, so the dim has to move off this pane and onto the
             // one the user left, exactly as the terminal focus path does.
+            //
+            // Not while the window is closing (T1356). Our own `deinit`
+            // closes the WebView2 controller, and that close pumps messages:
+            // a focus change dispatched during it would ask a window whose
+            // panes are being freed to re-place every overlay it owns.
             if (self.pane_view) |pv| {
                 const win = self.parent_window;
+                if (win.closing) return 0;
                 const tab = win.active_tab;
                 win.tab_active_pane[tab] = pv;
                 win.refreshTabTitle(tab);

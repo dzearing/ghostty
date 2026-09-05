@@ -302,6 +302,24 @@ $GuardTable = @(
             'src\apprt\win32\viewer_error_card.zig'
         )
     },
+    # Closing a viewer, and the window around one (T1356): the only thing that
+    # closes a window holding a viewer pane and then keeps asserting. Every
+    # other viewer harness opens viewers and lets the desktop teardown reap the
+    # process, so the teardown ORDER - a WebView2 `Close` pumping messages into
+    # a window whose tree is mid-free - had no coverage at all, and the one
+    # script that stumbled on the crash was edited to stop closing. Covers the
+    # window teardown sites and the sweep the pump re-entered.
+    [pscustomobject]@{
+        Name   = 'viewer-close'
+        Script = 'test\win32\viewer-close.ps1'
+        Stamp  = 'test\win32\viewer-close.stamp.json'
+        Covers = @(
+            'test\win32\viewer-close.ps1',
+            'src\apprt\win32\Window.zig',
+            'src\apprt\win32\PaneView.zig',
+            'src\apprt\win32\ViewerPane.zig'
+        )
+    },
     # Narrow viewer panes (T1130): the only thing that measures viewer chrome
     # against the pane it lives in. The unit lanes assert the pure layout
     # modules and cannot see a WINDOW placed outside its parent, and the P1-P3

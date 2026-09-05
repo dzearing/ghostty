@@ -1,9 +1,10 @@
 {
     "guard":  "cleanslate",
     "script":  "test/win32/cleanslate-audit.ps1",
-    "generated":  "2026-09-05T03:37:33-07:00",
-    "commit":  "de5fe2fe3",
+    "generated":  "2026-09-05T04:29:17-07:00",
+    "commit":  "1c955d9c9",
     "uncommitted":  [
+                        "test/win32/viewer-close.ps1",
                         "test/win32/viewer-narrow-pane.ps1"
                     ],
     "files":  {
@@ -298,6 +299,7 @@
                   "test/win32/url-scheme.ps1":  "18d667f6dd3cc51627926901654339da82fcdc2c31ffb07cfffdb2dd126c96e2",
                   "test/win32/verdict-exit-audit.ps1":  "02f5dc6471e5790a9609eeb47a5cb4b3810c8d480ec19626b89bc716bb025d8d",
                   "test/win32/verify-release-clean.ps1":  "756fee5cbd0b8a1ad8d3d01987658087b62efb6dd8327de4cb9aef10d5107dd3",
+                  "test/win32/viewer-close.ps1":  "e375513a3f89b5a111e6624a7daa4cadb603050b88181c2ee77631b1a65d4d36",
                   "test/win32/viewer-composer.ps1":  "a6ee294b66489b65bad593890320052fe11c6677643cff68d4596719fb3e292f",
                   "test/win32/viewer-diff.ps1":  "15b282dfeed59d7764b4b427aa85978ec2c0275188d4c2e3c931e415050765a3",
                   "test/win32/viewer-diff-tree.ps1":  "5877f359c51ec7de7fdd91e626c11f008e99dac36fcece9733eafad7302a2661",
@@ -310,7 +312,7 @@
                   "test/win32/viewer-find.ps1":  "74a7b442cf836c478727fe882fa7aedcabf58e962d9f7a77cd1083a0096dbf6d",
                   "test/win32/viewer-html.ps1":  "da63fa5c0af6cb62ef6852187d873d89cc860d22e1f55435cc85c59c4e98769d",
                   "test/win32/viewer-image.ps1":  "c9cd6b45f00b3138dd1c93860e04f3705127ac8dde2c5a9005a13208b7f5bfde",
-                  "test/win32/viewer-narrow-pane.ps1":  "e602d7dc2e522c2c8d275024cf2dc22bdc9663d6b24f51f665e4722b3be6f66d",
+                  "test/win32/viewer-narrow-pane.ps1":  "2f2bc89fea2356c4b15ce26628c0caca9883d063d4c36654b94f6bd54c723e1d",
                   "test/win32/viewer-nav-pin.ps1":  "7cbcd650ee1a3dd4ea2a8e47847185ecf2c870949c5671cb174f01b06f79a115",
                   "test/win32/viewer-panes.ps1":  "f679e363da3a45c230d2ef91e3e7b61d8baa34ae59af3b05cfd43a0fb3ea632c",
                   "test/win32/viewer-popup.ps1":  "207d22eddae6f4326f1c25a3d64e1e745b705bf53651526519b596318b8de890",

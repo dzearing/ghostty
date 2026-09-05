@@ -677,11 +677,16 @@ try {
                 }
             }
         }
-        # The probe window is left open on purpose: closing a window that owns
-        # a viewer pane crashes the app on this build (T1356 - the WebView2
-        # Close pumps messages, and the window's dim-overlay sweep then walks
-        # the pane it is in the middle of freeing). The desktop teardown below
-        # takes it down either way; a probe must not carry an unrelated defect.
+        # Closed again as of T1356. This window was left open for a while
+        # because closing one that owns a viewer pane took the whole app down
+        # (the WebView2 `Close` pumps messages and the dim-overlay sweep then
+        # walked the pane being freed); the teardown sites now swap the new
+        # tree in BEFORE releasing the old one, so a probe can clean up after
+        # itself again. `test\win32\viewer-close.ps1` is what holds that fixed.
+        [void](Invoke-Verb @('+close', '--target=vnf'))
+        Start-Sleep -Milliseconds 800
+        Assert (-not ($app.Process -and $app.Process.HasExited)) `
+            'F: closing the probe window did not take the app with it (T1356)'
     }
     Remove-Item $mdFile -ErrorAction SilentlyContinue
 
