@@ -1,10 +1,10 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-09-04T20:27:27-07:00",
-    "commit":  "45d8a2a6c",
+    "generated":  "2026-09-04T22:08:04-07:00",
+    "commit":  "980a149a3",
     "uncommitted":  [
-                        "test/win32/pane-banner.ps1"
+                        "test/win32/drag-perf.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -88,7 +88,7 @@
                   "test/win32/desktop-launch-audit.ps1":  "df0f8241a82fb625a5309378e3d96de7951876f8d2c394564e3f3326d8889a53",
                   "test/win32/divergence-inventory.ps1":  "829edd00d4ed65595adf6d9a837414af1f212b18f4cbfff9f4ce4568e43b7c09",
                   "test/win32/docs-routing.ps1":  "a41cfb788e2bece0a400d8214b6149d9e97a6dd823c3924a1ea098ce738dec76",
-                  "test/win32/drag-perf.ps1":  "9ea46b5c4e05238eb841c155a91b659283b2d8d299eefddfe0ada2df403db99d",
+                  "test/win32/drag-perf.ps1":  "d6077a30dfd50fb3fe9cc0e8b019b76dc8830f6b36e47bfd851282cdf508bf26",
                   "test/win32/false-positive-report.ps1":  "3e4c34e6b40b6b99969d38afbd1c055899802cfa119529c06f84c6ad24a4e981",
                   "test/win32/feedback-user-report.ps1":  "0b85eddc062d701c1cfe16d603156cdc5702e2d6c78fdc5a2bbd70b088f292cc",
                   "test/win32/float-on-top.ps1":  "1d6c2fb69c3f28f0fbbeb99a8d37634b09784ecf0e14f4c5bcc97383fe31e538",
