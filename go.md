@@ -323,8 +323,11 @@ Concretely, in order, with no stops in between:
    **Tag it when you file it.** `new -Tags fix,polish` (closed set: `feature`
    / `fix` / `polish` / `perf` / `test` / `infra` / `docs` / `security`) —
    tags are how the dashboard tells user-facing work from internal work at a
-   glance. When you claim an untagged task, add tags to its frontmatter as
-   part of making it readable.
+   glance. When you claim an untagged task, tag it as part of making it
+   readable — `set-tags <id> -Tags fix,polish` (T503), which validates against
+   the same closed set and takes `-Add` to union with what is already there.
+   Every open task carries one as of T503, so in practice this is for a
+   category you realise is missing rather than a blank field.
 
    **And say so when a USER reported it** (T1315): `new -UserReport` writes
    `user-report: true`, and that flag is what makes closing the task ask for the

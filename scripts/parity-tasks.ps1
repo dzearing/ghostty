@@ -53,11 +53,13 @@
   scripts\parity-tasks.ps1 note T144 -Text "caption_layout re-pinned; next: slab fills"
   scripts\parity-tasks.ps1 set-order T377 -Order 2
   scripts\parity-tasks.ps1 set-order T500 -Order 2.5   # inject without renumbering
+  scripts\parity-tasks.ps1 set-tags T503 -Tags infra,docs
+  scripts\parity-tasks.ps1 set-tags T503 -Tags polish -Add
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('list', 'next', 'show', 'new', 'set-status', 'set-priority', 'set-order', 'note', 'ack-stranded', 'stale-scan', 'validate')]
+    [ValidateSet('list', 'next', 'show', 'new', 'set-status', 'set-priority', 'set-order', 'set-tags', 'note', 'ack-stranded', 'stale-scan', 'validate')]
     [string]$Command,
 
     [Parameter(Position = 1)]
@@ -71,6 +73,12 @@ param(
     # Vocabulary is closed (see $ValidTags) so the same idea cannot be spelled
     # three ways.
     [string[]]$Tags,
+
+    # `set-tags -Add` unions with what the task already carries instead of
+    # replacing it, which is the shape triage wants when it recognises one more
+    # thing a task is about. Without it `set-tags` writes exactly what you
+    # passed, which is the shape a correction wants.
+    [switch]$Add,
 
     # `note` appends one timestamped line to the task's `## Progress log`.
     # The loop journals meaningful steps there (claimed, built, validated,
@@ -980,6 +988,63 @@ switch ($Command) {
         }
         [System.IO.File]::WriteAllText($path, $new, (New-Object System.Text.UTF8Encoding $false))
         Write-Host ("{0} -> order {1}" -f $tid, $num)
+    }
+
+    # Tags were introduced by T502 on `new` alone, so the only way to give an
+    # already-filed task a category was to hand-edit its frontmatter - which is
+    # why several hundred tasks carried none and the dashboard's category
+    # filter simply could not see them (T503). This is that missing verb: the
+    # same closed vocabulary `new -Tags` validates against, applied to a task
+    # that already exists.
+    'set-tags' {
+        $tid = Get-TaskId $Id
+        $tagList = Get-TagList $Tags
+        if ($tagList.Count -eq 0) {
+            throw "set-tags requires -Tags (one or more of: $($ValidTags -join ', '))."
+        }
+        $path = Get-TaskPath $tid
+        $text = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+
+        # Read what is there now so the line this prints names the change
+        # rather than only its result - a bulk backfill is read as a diff.
+        $old = @()
+        $om = [regex]::Match($text, '(?m)^tags:\s*\[(.*)\]\s*$')
+        if ($om.Success) {
+            foreach ($piece in ($om.Groups[1].Value -split ',')) {
+                $piece = $piece.Trim().Trim('"').Trim()
+                if ($piece) { $old += $piece }
+            }
+        }
+
+        $final = @()
+        if ($Add) { foreach ($t in $old) { if ($final -notcontains $t) { $final += $t } } }
+        foreach ($t in $tagList) { if ($final -notcontains $t) { $final += $t } }
+
+        $tagsJson = '[' + (($final | ForEach-Object { ConvertTo-Json $_ -Compress }) -join ', ') + ']'
+        if ($om.Success) {
+            $new = [regex]::Replace($text, '(?m)^tags:\s*\[.*\]\s*$', "tags: $tagsJson", 1)
+        }
+        elseif ($text -match '(?m)^tags:\s*.*$') {
+            $new = [regex]::Replace($text, '(?m)^tags:\s*.*$', "tags: $tagsJson", 1)
+        }
+        elseif ($text -match '(?m)^priority:\s*.*$') {
+            # Where `new` puts it, so a backfilled file is shaped like a fresh
+            # one and a reader is not hunting for the field.
+            $new = [regex]::Replace($text, '(?m)^(priority:\s*.*)$', "`$1`ntags: $tagsJson", 1)
+        }
+        elseif ($text -match '(?m)^seat:\s*.*$') {
+            $new = [regex]::Replace($text, '(?m)^(seat:\s*.*)$', "`$1`ntags: $tagsJson", 1)
+        }
+        else {
+            $new = [regex]::Replace($text, '(?m)^(status:\s*.*)$', "`$1`ntags: $tagsJson", 1)
+        }
+        if ($new -eq $text) {
+            Write-Host ("{0} -> tags {1} (unchanged)" -f $tid, ($final -join ','))
+            break
+        }
+        [System.IO.File]::WriteAllText($path, $new, (New-Object System.Text.UTF8Encoding $false))
+        $wasText = if ($old.Count) { $old -join ',' } else { 'none' }
+        Write-Host ("{0} -> tags {1} (was {2})" -f $tid, ($final -join ','), $wasText)
     }
 
     'set-priority' {

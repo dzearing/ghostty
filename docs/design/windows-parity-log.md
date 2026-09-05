@@ -22197,3 +22197,26 @@ down again - 22 moves / 15 blits / 22 walks per mouse move at 8 panes becoming
 switch was for: the counts repeat exactly and only the clock wanders. The
 `drag-perf` guard now covers `chrome_fanout.zig` as well, since the harness
 asserts the counters that module produces.
+
+## 2026-09-04 - T503: every open tracker task now carries a category
+
+The dashboard has been able to show task categories since T502, but only
+tasks filed after it carried any: tags were written by `new -Tags` alone, so
+an already-filed task could only be categorised by hand-editing its
+frontmatter and nobody did. Twenty-five open tasks had none, and the Tasks
+view's category filter drops an untagged task from every category - so
+filtering the tracker by "fix" quietly showed a fraction of the real work.
+
+The missing piece was a verb, so this adds one: `parity-tasks.ps1 set-tags
+<id> -Tags fix,polish` validates against the same closed vocabulary `new`
+does, writes the field where `new` puts it (falling back past `priority:` on
+a file old enough not to have one), replaces by default so a correction can
+remove a tag, and unions under `-Add`. An out-of-vocabulary tag or an empty
+set is refused with the file left byte-identical. The backfill then went
+through that verb rather than an editor.
+
+Section R of `test\win32\parity-tasks-seat.ps1` covers the verb and closes by
+asserting the real tracker has no open task without a category, so this is an
+invariant rather than a sweep somebody has to repeat. The ~400 files closed
+before T502 are deliberately out of scope - no activity card surfaces them
+any more - and are T1351.

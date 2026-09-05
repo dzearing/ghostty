@@ -70,6 +70,14 @@
 #      task naming only a directory must not count (ranked by raw hit count the
 #      first cut put every task naming `test\win32` on top), and outside a repo
 #      the whole signal degrades to silence rather than guessing.
+#   R. `set-tags` (T503). Tags arrived on `new` alone, so an already-filed task
+#      could only be categorised by hand-editing frontmatter and the backlog
+#      carried none - invisible to the dashboard's category filter. The verb
+#      writes the field where `new` puts it, replaces by default so a
+#      correction can remove a tag, unions under `-Add`, refuses an
+#      out-of-vocabulary tag and an empty set without touching the file, and
+#      the section closes by asserting the REAL tracker has no open task
+#      without a category.
 #
 # Hermetic: sections A-H run against a fixture task dir under $env:TEMP via
 # `-TaskDir`; docs\design\windows-parity-tasks\ is only ever READ (section I).
@@ -827,6 +835,69 @@ Assert 'Q5b ...and next still hands out the task, silent about staleness rather 
     $r.Out -match 'NEXT: T1' -and $r.Out -notmatch 'CHECK FIRST' -and $r.Out -notmatch 'filed \d{4}')
 
 if (Test-Path $qrepo) { Remove-Item -Recurse -Force $qrepo -ErrorAction SilentlyContinue }
+
+# --- R. set-tags on an already-filed task (T503) -----------------------------
+# Tags arrived on `new` alone, so a task filed before them could only be
+# categorised by hand-editing frontmatter - which is why the backlog carried
+# none and the dashboard's category filter could not see those tasks at all.
+""
+"R. set-tags backfills a category onto a task that already exists"
+Reset-Fixture
+# Deliberately a PRE-TAG file: no tags: line anywhere, which is the shape the
+# whole backfill had to handle.
+New-FixtureTask -Id 'T1' -PriorityLine 'priority: "P2"'
+New-FixtureTask -Id 'T2' -PriorityLine 'priority: "P2"' -ExtraLines @('tags: ["docs"]')
+# A file from before priorities existed either: the insert has to fall back
+# through seat: to status: rather than dropping the field on the floor.
+New-FixtureTask -Id 'T3'
+
+$r = Task-Run -CmdArgs @('set-tags', 'T1', '-Tags', 'fix,polish')
+$t1 = Get-FixtureText 'T1'
+Assert 'R1 set-tags writes the field onto a file that had none' ($t1 -match '(?m)^tags: \["fix", "polish"\]$')
+Assert 'R1b ...directly under priority:, where new puts it' ($t1 -match '(?m)^priority: "P2"\r?\ntags: ')
+Assert 'R1c ...and names what changed, not only what it became' ($r.Out -match 'T1 -> tags fix,polish \(was none\)')
+
+# Replace is the default, because a correction has to be able to REMOVE a tag.
+$r = Task-Run -CmdArgs @('set-tags', 'T2', '-Tags', 'perf')
+Assert 'R2 without -Add the new set replaces the old one' ((Get-FixtureText 'T2') -match '(?m)^tags: \["perf"\]$')
+Assert 'R2b ...reporting the tags it dropped' ($r.Out -match '\(was docs\)')
+
+$r = Task-Run -CmdArgs @('set-tags', 'T2', '-Tags', 'docs,perf', '-Add')
+Assert 'R3 -Add unions instead, and does not duplicate one already there' (
+    (Get-FixtureText 'T2') -match '(?m)^tags: \["perf", "docs"\]$')
+
+$r = Task-Run -CmdArgs @('set-tags', 'T3', '-Tags', 'infra')
+Assert 'R4 a pre-priority file still gets the field (falls back past priority:)' (
+    (Get-FixtureText 'T3') -match '(?m)^tags: \["infra"\]$')
+
+# The vocabulary is closed on this verb for the same reason it is on `new`:
+# one idea spelled three ways is a filter that silently misses tasks.
+$before = Get-FixtureText 'T1'
+$r = Task-Run -CmdArgs @('set-tags', 'T1', '-Tags', 'bugfix')
+Assert 'R5 an out-of-vocabulary tag is refused' ($r.Code -ne 0 -and $r.Out -match "Unknown tag 'bugfix'")
+Assert 'R5b ...and the file is left untouched' ((Get-FixtureText 'T1') -eq $before)
+
+$r = Task-Run -CmdArgs @('set-tags', 'T1')
+Assert 'R6 set-tags with no -Tags is refused rather than blanking the field' (
+    $r.Code -ne 0 -and $r.Out -match 'set-tags requires -Tags')
+Assert 'R6b ...and the file is still untouched' ((Get-FixtureText 'T1') -eq $before)
+
+# The backfill's own closing condition, asked of the REAL tracker: every open
+# task carries at least one category, so the dashboard's tag filter covers the
+# whole live queue rather than only what was filed after T502.
+$untagged = @()
+foreach ($f in (Get-ChildItem -LiteralPath $realDir -Filter 'T*.md')) {
+    $head = Get-Content -LiteralPath $f.FullName -TotalCount 20 -Encoding UTF8
+    $st = ($head | Select-String '^status:\s*"?([^"]*)"?')
+    if (-not $st) { continue }
+    if ($st.Matches.Groups[1].Value -notmatch '^(todo|in-progress|blocked)') { continue }
+    if (($head | Select-String '^tags:\s*\[.+\]').Count -eq 0) { $untagged += $f.BaseName }
+}
+Assert "R7 every OPEN task in the real tracker carries a category ($($untagged.Count) without)" (
+    $untagged.Count -eq 0)
+if ($untagged.Count) { "      untagged: " + (($untagged | Select-Object -First 12) -join ', ') }
+
+Reset-Fixture
 
 # --- teardown ---------------------------------------------------------------
 if (Test-Path $fixture) { Remove-Item -Recurse -Force $fixture }
