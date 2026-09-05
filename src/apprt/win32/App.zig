@@ -56,6 +56,7 @@ const update_progress = @import("update_progress.zig");
 const UpdateProgress = @import("UpdateProgress.zig");
 const install_prepare = @import("install_prepare.zig");
 const install_maintenance = @import("install_maintenance.zig");
+const install_restart = @import("install_restart.zig");
 const utf16_text = @import("utf16_text.zig");
 const tray_notify = @import("tray_notify.zig");
 const orphan_notify = @import("orphan_notify.zig");
@@ -8605,6 +8606,18 @@ pub fn runInstallPrepare(alloc: Allocator) ?u8 {
 /// A DECL on the apprt for the same reason `runRelaunchGuard` is one.
 pub fn runInstallMaintenance(alloc: Allocator) ?u8 {
     return install_maintenance.runFromArgs(alloc);
+}
+
+/// Was this process started as the installer's RESTART OFFER (T1352)? If so,
+/// make the offer and hand `main` the exit code — an offer never becomes a
+/// terminal. msiexec runs it out of INSTALLDIR after the files have been
+/// replaced, because the exe it has just written is the only process on the box
+/// guaranteed to contain code new enough to say that the windows on screen are
+/// running the old build.
+///
+/// A DECL on the apprt for the same reason `runRelaunchGuard` is one.
+pub fn runInstallRestart(alloc: Allocator) ?u8 {
+    return install_restart.runFromArgs(alloc);
 }
 
 /// T675: is this process inside a kill-on-close job it does not own — the

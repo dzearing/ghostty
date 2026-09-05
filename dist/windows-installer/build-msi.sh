@@ -579,6 +579,67 @@ template = """<?xml version="1.0" encoding="utf-8"?>
                   Execute="immediate"
                   Return="check"/>
 
+    <!-- T1352: an upgrade over a RUNNING Ghoztty must not end in silence.
+
+         (No double hyphen anywhere in this comment: XML forbids one inside a
+         comment and wixl rejects the whole document over it. Flags are written
+         without their leading dashes.)
+
+         What the user hit on 2026-09-05: "i ran the latest ghoztty installer
+         but it didn't reset this window at all. what's going on?" The install
+         had succeeded. Windows cannot replace a running image, but MSI renames
+         it aside and writes the new one, so the transaction completed with
+         nothing to prompt about and every window carried on executing
+         five day old code.
+
+         Nothing that already existed could cover it. The Restart Manager
+         (T1204) speaks only when it cannot proceed otherwise, and here it
+         could. The stale build balloon and the About restart offer (T1205)
+         live in the build that is NOT running, and a feature cannot announce
+         itself retroactively out of a process started before it shipped.
+         LaunchApp below is suppressed on the upgrade path, and would only have
+         added a window to the old process anyway.
+
+         The one process on the box guaranteed to hold today's code at that
+         moment is the exe msiexec has just written, so the package runs it:
+         `[INSTALLDIR]ghoztty.exe install-restart` (spelled with its leading
+         dashes in the ExeCommand below). It finds the windows of the install it
+         just replaced, offers Restart Now / Later in the app's own dark dialog,
+         and on accept closes them with the same WM_QUERYENDSESSION /
+         WM_ENDSESSION pair the Restart Manager sends, which the app answers by
+         flushing its layout and exiting without marking any session closed
+         (src/apprt/win32/install_restart.zig).
+
+         asyncNoWait, exactly like LaunchApp: the files are on disk before this
+         runs, and an installer that waits on a dialog, or that can be failed by
+         one, is worse than the silence being fixed.
+
+         When it does NOT fire, and why:
+           NOT Installed          the maintenance and repair paths rewrite the
+                                  same version the running process already is.
+           OLDERVERSIONFOUND      the upgrade in place is the ONLY case where a
+                                  running window is a build behind. This is the
+                                  exact complement of LaunchApp's condition
+                                  below: a double clicked MSI either opens a
+                                  terminal (fresh install) or offers to restart
+                                  the one already open (upgrade).
+           UILevel > 3            the in app updater installs with /qb!
+                                  (UILevel 3) and closes and relaunches the app
+                                  itself; a modal inside an unattended update is
+                                  a hang, not a courtesy.
+           RESTARTAPP = "1"       the escape hatch, mirroring LAUNCHAPP: a
+                                  scripted full UI install can suppress the
+                                  offer without suppressing the UI. -->
+    <Property Id="RESTARTAPP" Value="1"/>
+    <CustomAction Id="SetRestartAppCmd"
+                  Property="RESTARTAPPCMD"
+                  Value="[INSTALLDIR]ghoztty.exe"/>
+    <CustomAction Id="RestartApp"
+                  Property="RESTARTAPPCMD"
+                  ExeCommand="--install-restart --installed-version=[ARPDISPLAYVERSION]"
+                  Execute="immediate"
+                  Return="asyncNoWait"/>
+
     <Property Id="LAUNCHAPP" Value="1"/>
     <CustomAction Id="SetLaunchAppCmd"
                   Property="LAUNCHAPPCMD"
@@ -599,6 +660,8 @@ template = """<?xml version="1.0" encoding="utf-8"?>
       <Custom Action="MaintenancePrompt" After="SetMaintenancePromptCmd">Installed AND NOT REMOVE AND NOT PATCH AND NOT UPGRADINGPRODUCTCODE AND UILevel &gt; 3</Custom>
       <Custom Action="SetLaunchAppCmd" Before="LaunchApp"/>
       <Custom Action="LaunchApp" After="InstallFinalize">NOT Installed AND NOT OLDERVERSIONFOUND AND UILevel &gt; 3 AND LAUNCHAPP = "1"</Custom>
+      <Custom Action="SetRestartAppCmd" Before="RestartApp"/>
+      <Custom Action="RestartApp" After="LaunchApp">NOT Installed AND OLDERVERSIONFOUND AND UILevel &gt; 3 AND RESTARTAPP = "1"</Custom>
     </InstallExecuteSequence>
   </Product>
 </Wix>
@@ -815,6 +878,83 @@ if errs:
     sys.exit(1)
 print("launch-on-finish ok: SetLaunchAppCmd -> LaunchApp (asyncNoWait) after InstallFinalize")
 print("session-safe upgrade ok: PrepareInstallDir (immediate, ignore) before InstallValidate")
+PYEOF
+
+# Read the upgrade RESTART OFFER back out of the compiled package (T1352). Its
+# own verifier rather than more of the launch-on-finish block above, for the
+# reason the maintenance one gives next door: each block is EXTRACTED and fed
+# synthetic tables by an acceptance script (test/win32/install-restart.ps1), and
+# a verifier that answers one question is one a demonstration can aim at.
+#
+# What it is guarding: an upgrade over a running Ghoztty used to finish in
+# silence, leaving every window on the old build. A RestartApp row that is
+# missing, synchronous, gated on the wrong case, or sequenced before the files
+# exist is indistinguishable from that silence - which is precisely how this
+# shipped unnoticed for five days.
+echo "==> verify upgrade restart offer (CustomAction + sequence)"
+python3 - "$WORK/CustomAction.idt" "$WORK/InstallExecuteSequence.idt" <<'PYEOF'
+import sys
+
+def rows(path):
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        lines = f.read().replace("\r\n", "\n").split("\n")
+    return [l.split("\t") for l in lines[3:] if l.strip()]
+
+ca = {r[0]: r for r in rows(sys.argv[1])}
+seq = {r[0]: r for r in rows(sys.argv[2])}
+errs = []
+
+# msidbCustomActionTypeExe(2) + msidbCustomActionTypeProperty(48) = 50, plus
+# Async(64) + Continue(128) for Return="asyncNoWait" - the installer must not
+# block on a dialog, and a person who takes ten seconds to read it must not be
+# able to fail an install whose files are already written.
+if "RestartApp" not in ca:
+    errs.append("CustomAction table has no RestartApp row - an upgrade over a running Ghoztty would end in silence with every window on the old build")
+else:
+    t = int(ca["RestartApp"][1])
+    if t & 0x3F != 50:
+        errs.append(f"RestartApp base type is {t & 0x3F}, expected 50 (exe from property)")
+    if not (t & 64) or not (t & 128):
+        errs.append(f"RestartApp type {t} is not asyncNoWait - msiexec would block on the offer dialog, or fail the install on its answer")
+    if ca["RestartApp"][2] != "RESTARTAPPCMD":
+        errs.append(f"RestartApp source is {ca['RestartApp'][2]!r}, expected RESTARTAPPCMD")
+    args = ca["RestartApp"][3]
+    if "--install-restart" not in args:
+        errs.append(f"RestartApp arguments are {args!r}, expected to carry --install-restart")
+
+if "SetRestartAppCmd" not in ca:
+    errs.append("CustomAction table has no SetRestartAppCmd row - RESTARTAPPCMD would be empty and nothing would be offered")
+else:
+    if int(ca["SetRestartAppCmd"][1]) != 51:
+        errs.append(f"SetRestartAppCmd type is {ca['SetRestartAppCmd'][1]}, expected 51 (property set)")
+    if ca["SetRestartAppCmd"][3] != "[INSTALLDIR]ghoztty.exe":
+        errs.append(f"SetRestartAppCmd target is {ca['SetRestartAppCmd'][3]!r}, expected [INSTALLDIR]ghoztty.exe")
+
+for action in ("RestartApp", "SetRestartAppCmd", "InstallFinalize"):
+    if action not in seq:
+        errs.append(f"InstallExecuteSequence has no {action} row")
+if not errs:
+    n_restart = int(seq["RestartApp"][2])
+    n_set = int(seq["SetRestartAppCmd"][2])
+    n_final = int(seq["InstallFinalize"][2])
+    if n_restart <= n_final:
+        errs.append(f"RestartApp is sequenced at {n_restart}, before InstallFinalize at {n_final} - the new exe would not be on disk to make the offer")
+    if n_set >= n_restart:
+        errs.append(f"SetRestartAppCmd is sequenced at {n_set}, not before RestartApp at {n_restart}")
+    cond = seq["RestartApp"][1]
+    # The upgrade case and nothing else. UILevel is the one that keeps the
+    # in-app updater's unattended install free of a dialog it cannot answer.
+    for want in ("NOT Installed", "OLDERVERSIONFOUND", "UILevel", "RESTARTAPP"):
+        if want not in cond:
+            errs.append(f"RestartApp condition {cond!r} does not gate on {want}")
+    if "NOT OLDERVERSIONFOUND" in cond:
+        errs.append(f"RestartApp condition {cond!r} excludes the upgrade - the ONLY case where a running window is a build behind")
+
+if errs:
+    for e in errs:
+        print(f"error: {e}", file=sys.stderr)
+    sys.exit(1)
+print("upgrade restart offer ok: SetRestartAppCmd -> RestartApp (asyncNoWait) after InstallFinalize, upgrade only")
 PYEOF
 
 # Read the already-installed maintenance wiring back out of the compiled

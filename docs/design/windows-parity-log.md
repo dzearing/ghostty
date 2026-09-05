@@ -22580,3 +22580,56 @@ printing `CRASHED` for the app its own teardown force-killed, because
 `0xFFFFFFFF` is indistinguishable by value from an exception code, and a green
 run that shouts CRASHED teaches everyone to skim the one block a real crash
 would report itself in.
+
+## 2026-09-05 - The installer now offers to restart the terminal it just replaced (T1352)
+
+The user, this morning: *"i ran the latest ghoztty installer but it didn't
+reset this window at all. what's going on?"* The install had worked. Windows
+cannot replace a running image, but MSI renames it aside and writes the new one,
+so the upgrade finished with nothing to prompt about and every window carried on
+running five-day-old code.
+
+Three near-misses is what made it invisible. The Restart Manager (T1204) speaks
+only when it cannot proceed otherwise, and here it could. The stale-build
+balloon and the About restart offer (T1205) live in the build that is NOT
+running - a feature cannot announce itself retroactively out of a process
+started before it shipped. Launch-on-finish (T1176) is suppressed on the upgrade
+path and would only have added a window to the old process anyway.
+
+The one process on the box guaranteed to hold today's code at that moment is the
+exe msiexec has just written, so the package now runs it: a `RestartApp` custom
+action, `[INSTALLDIR]ghoztty.exe --install-restart`, after `InstallFinalize`, on
+the true upgrade only (`NOT Installed AND OLDERVERSIONFOUND AND UILevel > 3`) -
+the exact complement of launch-on-finish, so a double-clicked MSI either opens a
+terminal or offers to restart the one already open. `asyncNoWait`, so the
+installer never waits on a dialog and a person who takes ten seconds to read it
+cannot fail an install whose files are already written.
+
+`install_restart.zig` is the other half: it finds top-level `GhozttyWindow`
+windows whose process image is `<INSTALLDIR>\ghoztty.exe` (a developer's
+zig-out build beside it is never a target), offers Restart Now / Later in the
+app's own dark dialog, and on accept sends the pair the Restart Manager sends -
+`WM_QUERYENDSESSION` then `WM_ENDSESSION` with `ENDSESSION_CLOSEAPP`. That is
+not an imitation of the update path, it IS the update path: the window handler
+answers it by flushing the layout and exiting without marking any session CLOSE,
+so the agent keeps the PTYs and the relaunched app re-attaches them. Declining
+leaves a tray balloon naming the installed version, because "installed but not
+running yet" must not look identical to "nothing happened". A window that will
+not close - a build older than T1204, which never sees the message - is reported
+in a dialog and never terminated: a restart offer that loses the user's work
+would be worse than the silence being fixed.
+
+Validation: all four floor lanes PASS; P1 25 / P2 20 / P3 16 ALL PASS.
+`install-restart.ps1` grew ten source-shape checks (each with its mutation, so
+`-TeethCheck` still covers all 22), section R - seven negative controls against
+the build-time read-back extracted from `build-msi.sh` itself, including an
+offer a silent install would see and one that excludes the upgrade - and the
+live arms L8-L13, which are the ones that matter: an offer aimed at a DIFFERENT
+install leaves this one alone (the control, without which "it closes the app"
+could pass for the reason that would close the user's terminal), declining keeps
+it running, and accepting closes it and brings a new terminal up with a window.
+53 assertions, ALL PASS. Fourteen further guards the `build-msi.sh`, `App.zig`
+and `main_ghostty.zig` edits made due were re-run green. Also filed: **T1365** -
+a Repair rewrites the same bytes with a fresh mtime, so T1205's freshness test
+tells every open window a newer build exists when nothing changed; the new
+installer offer deliberately stays silent on that path, which is how it showed.

@@ -1,10 +1,10 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-09-05T06:48:03-07:00",
-    "commit":  "e569b0469",
+    "generated":  "2026-09-05T07:44:51-07:00",
+    "commit":  "187d3b61f",
     "uncommitted":  [
-                        "test/win32/sessions-running-cmd.ps1"
+                        "test/win32/install-restart.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "53d02dd670831a90e581d21c3f31efa53bb1353c42f7ba4f1039a324350c7310",
@@ -126,7 +126,7 @@
                   "test/win32/install-maintenance.ps1":  "db2c31ab1fd5febe1fa61d2aada2f953a8b027c96b6fca56613b90c1b3b2488b",
                   "test/win32/install-ownership.ps1":  "0c574d3d71e1b8b86c3ff21fbd54eb8dd8a5341a117ad83ea969480ec9e188ad",
                   "test/win32/install-prepare.ps1":  "ac1f575172c802935bd99d0635db38007eea2a7df81d3e150ec42eaeaa998e1a",
-                  "test/win32/install-restart.ps1":  "c41b5d41f9a6f3aadcbdde6f99989c35e77ddfe412b4968deb0baf956e5af1b2",
+                  "test/win32/install-restart.ps1":  "f6b5dc1479ed6c6fd91087a7dc0aaac3ed00885d8662b5c17be3d483f153768f",
                   "test/win32/install-walkthrough.ps1":  "52f1194df11a1ee5d77271e8a2feaa26cffc5475d999a60079a8194efb653354",
                   "test/win32/ipc-child-exited.ps1":  "d976a5172b4773f582972eedc3fa1b00bb1c03f5c33eeb5efc06e5d52542112b",
                   "test/win32/ipc-command-keepalive.ps1":  "3e16597ad1d157d43c6581b946f35aada744b80f52ca38d52f678095975c2b14",

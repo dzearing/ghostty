@@ -1,14 +1,13 @@
 {
     "guard":  "update-real-msi",
     "script":  "test/win32/update-real-msi.ps1",
-    "generated":  "2026-09-03T12:06:46-07:00",
-    "commit":  "56c99bc78",
+    "generated":  "2026-09-05T07:51:12-07:00",
+    "commit":  "187d3b61f",
     "uncommitted":  [
-                        "scripts/msi-test-identity.ps1",
-                        "test/win32/lib/ThrowawayProduct.ps1"
+                        "dist/windows-installer/build-msi.sh"
                     ],
     "files":  {
-                  "dist/windows-installer/build-msi.sh":  "584d1cfa7718610ff007c89eca299cabbee608901ab4fee8a1f400ff9ed6afd6",
+                  "dist/windows-installer/build-msi.sh":  "e53b4f24b6964eff9af22b6b54f0d0f559b72107d3694a1d900257e7da6054ce",
                   "scripts/msi-test-identity.ps1":  "375396ad262bf0cd1905b85707fa70f48604f9d8d79a14174311d968e428c2ac",
                   "src/apprt/win32/update_apply.zig":  "74f3697471e258291f733b76ef3e667e63020e755484b931eda16b80d0e9a21f",
                   "src/apprt/win32/update_install.zig":  "d46a6f766a57b16d799f7e21dce6f06a5c4de5e1cdd3853afe2a2d23dea2e153",

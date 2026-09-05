@@ -78,6 +78,8 @@ $paths = [ordered]@{
     msi = 'dist\windows-installer\build-msi.sh'
     rm  = 'src\apprt\win32\restart_manager.zig'
     app = 'src\apprt\win32\App.zig'
+    off = 'src\apprt\win32\install_restart.zig'
+    mai = 'src\main_ghostty.zig'
     win = 'src\apprt\win32\Window.zig'
     agg = 'src\apprt\win32.zig'
 }
@@ -125,6 +127,26 @@ $checks = [ordered]@{
         { param($t) $t.msi -match 'Property table has no REBOOT row' }
     'A12 disabling the Restart Manager is refused, not merely avoided' =
         { param($t) $t.msi -match 'MSIRESTARTMANAGERCONTROL' -and $t.msi -match 'MSIDISABLERMRESTART' }
+    'A14 the installer can OFFER a restart from the build it just wrote (T1352)' =
+        { param($t) $t.off -match 'pub const flag = "--install-restart";' }
+    'A15 the offer closes with the Restart Manager pair, not a window close' =
+        { param($t) $t.off -match 'w32\.WM_QUERYENDSESSION' -and $t.off -match 'w32\.WM_ENDSESSION' -and $t.off -match 'restart_manager\.ENDSESSION_CLOSEAPP' -and $t.off -notmatch 'w32\.WM_CLOSE' }
+    'A16 and never terminates a window that will not close' =
+        { param($t) $t.off -notmatch 'TerminateProcess' }
+    'A17 a declined offer still leaves a reminder' =
+        { param($t) $t.off -match 'fn remind\(' -and $t.off -match 'w32\.NIM_ADD' }
+    'A18 only this install is ever offered up, never a dev build beside it' =
+        { param($t) $t.off -match 'pub fn isInstalledApp' -and $t.off -match 'isInstalledApp\(path, dir\)' }
+    'A19 an ordinary launch dispatches the flag before it becomes a terminal' =
+        { param($t) $t.mai -match 'runInstallRestart' }
+    'A20 the offer module tests are wired into the lane (T1191)' =
+        { param($t) $t.agg -match '_ = @import\("win32/install_restart\.zig"\);' }
+    'A21 the package runs the offer on the UPGRADE path, with a UI, only' =
+        { param($t) $t.msi -match '<Custom Action="RestartApp" After="LaunchApp">NOT Installed AND OLDERVERSIONFOUND AND UILevel &gt; 3 AND RESTARTAPP = "1"</Custom>' }
+    'A22 the offer never blocks the install it follows' =
+        { param($t) $t.msi -match '(?s)<CustomAction Id="RestartApp".{0,400}?Return="asyncNoWait"' }
+    'A23 the build reads that wiring back out of the compiled package' =
+        { param($t) $t.msi -match 'CustomAction table has no RestartApp row' }
 }
 
 $mutations = [ordered]@{
@@ -152,6 +174,26 @@ $mutations = [ordered]@{
         @{ Key = 'msi'; Find = 'Property table has no REBOOT row'; Replace = 'warning only' }
     'A12 disabling the Restart Manager is refused, not merely avoided' =
         @{ Key = 'msi'; Find = 'MSIDISABLERMRESTART'; Replace = 'SOMETHINGELSE' }
+    'A14 the installer can OFFER a restart from the build it just wrote (T1352)' =
+        @{ Key = 'off'; Find = 'pub const flag = "--install-restart";'; Replace = 'pub const flag = "--nope";' }
+    'A15 the offer closes with the Restart Manager pair, not a window close' =
+        @{ Key = 'off'; Find = 'w32.WM_QUERYENDSESSION'; Replace = 'w32.WM_CLOSE' }
+    'A16 and never terminates a window that will not close' =
+        @{ Key = 'off'; Find = 'const still_open = waitForExit(targets);'; Replace = 'const still_open = TerminateProcess(targets);' }
+    'A17 a declined offer still leaves a reminder' =
+        @{ Key = 'off'; Find = 'fn remind('; Replace = 'fn unusedRemind(' }
+    'A18 only this install is ever offered up, never a dev build beside it' =
+        @{ Key = 'off'; Find = 'if (!isInstalledApp(path, dir)) continue;'; Replace = '_ = path;' }
+    'A19 an ordinary launch dispatches the flag before it becomes a terminal' =
+        @{ Key = 'mai'; Find = 'runInstallRestart'; Replace = 'runNothingAtAll' }
+    'A20 the offer module tests are wired into the lane (T1191)' =
+        @{ Key = 'agg'; Find = '_ = @import("win32/install_restart.zig");'; Replace = '' }
+    'A21 the package runs the offer on the UPGRADE path, with a UI, only' =
+        @{ Key = 'msi'; Find = 'NOT Installed AND OLDERVERSIONFOUND AND UILevel &gt; 3 AND RESTARTAPP = "1"'; Replace = 'NOT Installed AND OLDERVERSIONFOUND' }
+    'A22 the offer never blocks the install it follows' =
+        @{ Key = 'msi'; Find = 'Return="asyncNoWait"'; Replace = 'Return="check"' }
+    'A23 the build reads that wiring back out of the compiled package' =
+        @{ Key = 'msi'; Find = 'CustomAction table has no RestartApp row'; Replace = 'warning only' }
 }
 
 if ($TeethCheck) {
@@ -241,6 +283,79 @@ if (-not $py) {
                 ((RunVerifier ($goodProps + "`r`nMSIDISABLERMRESTART${t}1")) -ne 0)
         } finally {
             Remove-Item -LiteralPath $tmpE -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# R - the upgrade restart offer's build-time read-back, watched failing (T1352,
+# and the T1133 rule that a gate ships with the demonstration that it can say
+# no). Extracted from build-msi.sh itself and fed synthetic CustomAction /
+# InstallExecuteSequence tables, so it needs python and nothing else.
+# ---------------------------------------------------------------------------
+"== install-restart R: the restart-offer gate, fed each MSI it must reject =="
+if (-not $py) {
+    Skip 'R  restart-offer gate demonstration' 'no python interpreter on PATH'
+} else {
+    $rv = ([regex]'(?ms)^echo "==> verify upgrade restart offer.*?<<''PYEOF''\r?\n(.*?)\r?\nPYEOF$').Match($text.msi)
+    if (-not $rv.Success) {
+        Assert 'R0 the restart-offer verifier is extractable from build-msi.sh' $false
+    } else {
+        $tmpR = Join-Path ([System.IO.Path]::GetTempPath()) ("install-restart-r-" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $tmpR | Out-Null
+        try {
+            $utf8R = New-Object System.Text.UTF8Encoding($false)
+            function PutR($name, $body) {
+                $f = Join-Path $tmpR $name
+                [System.IO.File]::WriteAllText($f, $body, $utf8R)
+                return $f
+            }
+            $vpR = PutR 'verify-restart.py' $rv.Groups[1].Value
+            $t = "`t"
+            # 242 = exe-from-property (50) + Async (64) + Continue (128), i.e.
+            # Return="asyncNoWait".
+            $goodCa = @(
+                "Action${t}Type${t}Source${t}Target",
+                "s72${t}i2${t}S72${t}S255",
+                "CustomAction${t}Action",
+                "RestartApp${t}242${t}RESTARTAPPCMD${t}--install-restart --installed-version=[ARPDISPLAYVERSION]",
+                "SetRestartAppCmd${t}51${t}RESTARTAPPCMD${t}[INSTALLDIR]ghoztty.exe"
+            ) -join "`r`n"
+            $upgradeCond = 'NOT Installed AND OLDERVERSIONFOUND AND UILevel > 3 AND RESTARTAPP = "1"'
+            function SeqTable($restartSeq, $cond) {
+                return @(
+                    "Action${t}Condition${t}Sequence",
+                    "s72${t}S255${t}I2",
+                    "InstallExecuteSequence${t}Action",
+                    "InstallFinalize${t}${t}6600",
+                    "SetRestartAppCmd${t}${t}6602",
+                    "RestartApp${t}${cond}${t}${restartSeq}"
+                ) -join "`r`n"
+            }
+            function RunRestartVerifier($ca, $seq) {
+                $f1 = PutR ("ca-" + [guid]::NewGuid().ToString('N') + '.idt') $ca
+                $f2 = PutR ("seq-" + [guid]::NewGuid().ToString('N') + '.idt') $seq
+                & $py $vpR $f1 $f2 2>&1 | Out-Null
+                return $LASTEXITCODE
+            }
+
+            $goodSeq = SeqTable 6603 $upgradeCond
+            Assert 'R1 a correctly wired offer passes' `
+                ((RunRestartVerifier $goodCa $goodSeq) -eq 0)
+            Assert 'R2 an MSI with no RestartApp action is rejected - the silence this fixes' `
+                ((RunRestartVerifier (($goodCa -split "`r`n" | Where-Object { $_ -notmatch '^RestartApp' }) -join "`r`n") $goodSeq) -ne 0)
+            Assert 'R3 a SYNCHRONOUS offer, which would block the installer on a dialog, is rejected' `
+                ((RunRestartVerifier ($goodCa -replace [regex]::Escape("RestartApp${t}242"), "RestartApp${t}50") $goodSeq) -ne 0)
+            Assert 'R4 an offer sequenced before the files are written is rejected' `
+                ((RunRestartVerifier $goodCa (SeqTable 6500 $upgradeCond)) -ne 0)
+            Assert 'R5 an offer a SILENT install would see is rejected' `
+                ((RunRestartVerifier $goodCa (SeqTable 6603 'NOT Installed AND OLDERVERSIONFOUND AND RESTARTAPP = "1"')) -ne 0)
+            Assert 'R6 an offer that excludes the upgrade - the only case it exists for - is rejected' `
+                ((RunRestartVerifier $goodCa (SeqTable 6603 'NOT Installed AND NOT OLDERVERSIONFOUND AND UILevel > 3 AND RESTARTAPP = "1"')) -ne 0)
+            Assert 'R7 an offer that runs something other than --install-restart is rejected' `
+                ((RunRestartVerifier ($goodCa -replace '--install-restart --installed-version=\[ARPDISPLAYVERSION\]', '--version') $goodSeq) -ne 0)
+        } finally {
+            Remove-Item -LiteralPath $tmpR -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 }
@@ -390,6 +505,88 @@ try {
         if ($proc2) { $stillUp = -not $proc2.HasExited }
         Assert 'L7 a cancelled end and a logoff leave the terminal running' $stillUp
 
+        # ====================================================================
+        "== install-restart L: the upgrade restart OFFER (T1352) =="
+        # ====================================================================
+        # The offer is the installed exe run by msiexec after the files have
+        # been replaced. Here it is the repo build run against the repo build,
+        # which is the same relationship: the exe making the offer is not the
+        # process being offered up.
+        #
+        # Driven through --answer, the acceptance seam: what is worth measuring
+        # is the OUTCOME - the running app exits and a new one takes its place -
+        # and a dialog cannot be clicked on a background desktop, where
+        # synthetic input does not reach.
+        [void](Stop-RepoGhoztty -Exe $Exe -SettleMs 600)
+        $tmpN = Join-Path $root 'n'
+        New-Item -ItemType Directory -Force $tmpN | Out-Null
+        $env:LOCALAPPDATA = $tmpN
+        $installDir = Split-Path -Parent $Exe
+
+        $app3 = Start-OnTestDesktop -Exe $Exe -Arguments @('--title=t1352-offer')
+        $proc3 = $app3.Process
+        if ($proc3) { $null = $proc3.Handle }
+        $win3 = Wait-TestWindow -ProcessId $app3.Pid -Class 'GhozttyWindow' -TimeoutMs 30000
+        Assert 'L8 the instance to be offered up came up' ($win3 -ne [IntPtr]::Zero)
+
+        function Invoke-Offer($offerArgs, $tag, $timeoutMs) {
+            $errFile = Join-Path $root "offer-$tag.err"
+            $h = Start-OnTestDesktop -Exe $Exe -Arguments $offerArgs -StdErr $errFile
+            if ($h.Process) {
+                $null = $h.Process.Handle
+                [void]$h.Process.WaitForExit($timeoutMs)
+            }
+            $err = ''
+            if (Test-Path -LiteralPath $errFile) { $err = (Get-Content -LiteralPath $errFile -Raw) }
+            return [pscustomobject]@{ Pid = $h.Pid; Process = $h.Process; Err = $err }
+        }
+
+        # The control, and the reason the dir filter exists: an installer for a
+        # DIFFERENT install must not touch this one. Without this arm, L11 is
+        # equally satisfied by code that closes every Ghoztty it can find -
+        # which on this box would be the user's terminal.
+        $wrongDir = Join-Path $root 'not-an-install'
+        $offerA = Invoke-Offer @('--install-restart', "--install-dir=$wrongDir", '--answer=restart') 'wrongdir' 30000
+        $survived = $false
+        if ($proc3) { $survived = -not $proc3.HasExited }
+        Assert 'L9 an offer for a DIFFERENT install leaves this one alone' $survived
+        Assert 'L9b and says it found nothing to offer' ($offerA.Err -match 'no running windows')
+
+        # Declining leaves the app running - and says so, which is the half the
+        # user could not see on 2026-09-05.
+        $offerB = Invoke-Offer @('--install-restart', "--install-dir=$installDir", '--answer=later',
+            '--installed-version=1.36.99') 'later' 60000
+        $stillThere = $false
+        if ($proc3) { $stillThere = -not $proc3.HasExited }
+        Assert 'L10 declining the offer leaves the terminal running' $stillThere
+        Assert 'L10b and the offer FOUND the running window' ($offerB.Err -match 'window\(s\) from')
+        Assert 'L10c and recorded the declined answer' ($offerB.Err -match 'answer=later')
+
+        # And accepting: the running app exits, and a new one comes up on the
+        # exe that made the offer.
+        $before = @(Get-Process -Name 'ghoztty' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Path -eq $Exe } | ForEach-Object { $_.Id })
+        $offerC = Invoke-Offer @('--install-restart', "--install-dir=$installDir", '--answer=restart',
+            '--installed-version=1.36.99') 'restart' 90000
+        $wentAway = $false
+        if ($proc3) { $wentAway = $proc3.WaitForExit(30000) }
+        Assert 'L11 accepting the offer closes the running terminal' $wentAway
+        Assert 'L11b and it was closed for an UPDATE, not asked to quit' ($offerC.Err -match 'answer=restart')
+
+        $fresh = 0
+        for ($i = 0; $i -lt 60 -and $fresh -eq 0; $i++) {
+            $now = @(Get-Process -Name 'ghoztty' -ErrorAction SilentlyContinue |
+                Where-Object { $_.Path -eq $Exe -and $_.Id -ne $app3.Pid -and $_.Id -ne $offerC.Pid })
+            if ($now.Count -gt 0) { $fresh = $now[0].Id }
+            if ($fresh -eq 0) { Start-Sleep -Milliseconds 500 }
+        }
+        Assert "L12 and a new terminal comes up on the new build (pid $fresh)" ($fresh -ne 0)
+        if ($fresh -ne 0) {
+            $script:GhozttyTestDesktopPids += $fresh
+            $freshWin = Wait-TestWindow -ProcessId $fresh -Class 'GhozttyWindow' -TimeoutMs 30000
+            Assert 'L13 with a window, not just a process' ($freshWin -ne [IntPtr]::Zero)
+        }
+
     }
 
     # LAST statement of the top-level try (T1039): an unwind from anywhere
@@ -413,4 +610,4 @@ if ($script:failures -eq 0 -and $script:skipped -eq 0) {
 }
 
 Write-Host ''
-Write-TestVerdict -Pass $script:passes -Fail $script:failures -Label 'install-restart' -MinPass 20
+Write-TestVerdict -Pass $script:passes -Fail $script:failures -Label 'install-restart' -MinPass 30

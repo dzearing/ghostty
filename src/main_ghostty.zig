@@ -126,6 +126,24 @@ pub fn main() !MainReturn {
         }
     }
 
+    // T1352: this process may be the installer's RESTART OFFER — msiexec
+    // running `[INSTALLDIR]ghoztty.exe --install-restart` after it has replaced
+    // the files, because the exe it just wrote is the only thing on the box
+    // guaranteed to be new enough to know that the windows on screen are
+    // running the build the install replaced. It offers a restart, closes the
+    // old process the way the Restart Manager does, and starts the new one.
+    //
+    // Asked beside its neighbours above and for the same reasons: it must never
+    // look like a second instance of the terminal it is about to close, and it
+    // is gated on there being no `+action` so a pane that somehow carries the
+    // flag stays whatever verb it asked for.
+    if (@hasDecl(apprt.App, "runInstallRestart") and state.action == null) {
+        if (apprt.App.runInstallRestart(alloc)) |code| {
+            posix.exit(code);
+            return;
+        }
+    }
+
     // T695: this process may be a `ghoztty://` URL activation — the shell
     // launching our registered protocol handler with a clicked link as argv.
     // Asked before the single-instance bind, because an activation must never

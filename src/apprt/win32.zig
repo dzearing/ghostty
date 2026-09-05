@@ -76,6 +76,7 @@ test {
     // error 1721 in the user's face — and no lane can learn that from a real
     // install, because a real install would replace the user's Ghoztty.
     _ = @import("win32/install_maintenance.zig");
+    _ = @import("win32/install_restart.zig");
     // Escaping the app's job object, and measuring who is in it (T524, T426).
     // Both are what stands between a daemon/supervisor and dying with the
     // process it exists to outlive, so the lane compiles and checks them in
