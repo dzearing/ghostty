@@ -1,11 +1,10 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-04T17:41:39-07:00",
-    "commit":  "3636936bc",
+    "generated":  "2026-09-04T18:21:26-07:00",
+    "commit":  "56e5706d8",
     "uncommitted":  [
-                        "test/win32/chooser-orphan-badge.ps1",
-                        "test/win32/lib/Isolation.ps1"
+                        "test/win32/banner-resize-repaint.ps1"
                     ],
     "files":  {
                   "docs/claude/testing.md":  "75066e86f1dcb63299264139b1ca28da1f7025520011e33f7c3139d0d24fc9b1",
@@ -34,7 +33,7 @@
                   "test/win32/agent-user-env.ps1":  "7ea19bc9332a520cec15cf4ff3c2b40a2c1daa7968c5a6bf9951d4c3151e9df3",
                   "test/win32/asserted-nothing.ps1":  "3a930fa9a26bdf5ed95254373cb55c047d3f803d5cc413059ed94391d19126ed",
                   "test/win32/auto-launch-cwd.ps1":  "eec10c5396d125e017edde1280851d1fce687337742a64ca5f34da9eee36bec3",
-                  "test/win32/banner-resize-repaint.ps1":  "0bc8faac62d36ee99ffa8434cad91226046235902584fd93e7d5af61d440377b",
+                  "test/win32/banner-resize-repaint.ps1":  "499fac53076f7641063f8ce3dab59a859ee9a947ce44ca6f2b05b08767c677f8",
                   "test/win32/body-complete-audit.ps1":  "9da2ab2336bc36df1d9243e85becb7b0f9223c7382849b842a9180015b652c9c",
                   "test/win32/build-cache.ps1":  "7d2681f0f6ecd8b5d0bbf99087cda3034e56c30ca7bd3f1f9b90f11ede846ab8",
                   "test/win32/build-fresh-guard.ps1":  "e104706bfed3e0183b462abdf421b820556f5b1cb0552909c9d3c8e939870e65",
