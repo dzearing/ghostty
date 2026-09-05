@@ -22744,3 +22744,43 @@ split the bottom pane right - and walks it. With the hero paths pointed back at
 go red (2 FAILED / 46 passed); both are green on the fix. All four floor lanes
 PASS, P1 25 / P2 20 / P3 16 ALL PASS, hero-mode 72 and hero-viewer-tile 18 ALL
 PASS, and the nine guards the edits made due were re-run green.
+
+## 2026-09-05 - The Activity Monitor's dismiss-banner check stopped guessing where to click and when to look (T561)
+
+`test\win32\activity-monitor.ps1` section J clicks the little x that closes the
+Activity Monitor's error strip and then asserts the strip is gone. On
+2026-08-07 it failed once and passed on an immediate re-run of the same binary,
+which is the worst kind of red: nobody can tell a real regression from that
+check's mood.
+
+The check made two bets. It hunted the glyph inside a box 60 px tall pinned to
+the panel's bottom-right, and the banner is only 37 px tall - the other 23 px
+are TABLE, whose path column is both the LAST column and painted in the same
+`p.secondary` ink the glyph is found by. And it clicked, slept a flat 600 ms,
+and asserted. Neither bet is reported anywhere, so a failure said only "still
+there".
+
+Only one of those was measured to be a real risk. A height sweep (26 client
+heights, 600 -> 575, the fixed box's first match compared against the band top
+read out of the same capture) found no secondary pixel in that strip on this
+box - it is the table's unpainted remainder below its last full row - so the
+click was landing all along. The third candidate is disproved by reading:
+`setError` has exactly two call sites, both in the kill/spawn handlers, so an
+adopted sample cannot re-raise the banner behind the click. That leaves the
+600 ms.
+
+So section J now derives the band's top edge from the capture and searches only
+inside it, clicks the CENTROID of the glyph's pixels rather than the first one
+scanning down (a glyph is a shape; its first pixel is the tip of a stroke), and
+waits for the dismissal instead of sleeping through it. It prints what it did:
+the band top, the click target and how long the banner took to leave a capture -
+135-141 ms quiet on this box, against the 600 ms that used to be the whole
+budget. A new in-section negative control clicks the band BESIDE the glyph and
+asserts the banner is still up, so the wait loop cannot pass by patience and
+the click POSITION is what is being tested.
+
+Validation: 5 consecutive `ALL PASS (159 assertions)` runs, the script's own
+`-NegativeControl` still fails as designed, and the oracle was proved able to
+go red - building the app with `if (false) self.clearError();` turns J into
+`FAIL J clicking the glyph DISMISSES the banner` (7 FAILURE(S)); that patch was
+reverted and the tree rebuilt. All four floor lanes PASS and P1-P3 ALL PASS.

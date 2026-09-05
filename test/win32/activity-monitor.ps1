@@ -259,6 +259,79 @@ function Find-ExactPixel($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1, [int[]]$
     return $null
 }
 
+# The topmost screen row, scanning UP from $YBottom, that still carries a pixel
+# of exactly $Rgb - i.e. where a bottom-anchored painted BAND begins.
+#
+# T561: section J used to hunt the dismiss glyph inside a fixed 60px-tall box at
+# the panel's bottom-right, and the banner is only `gap + 20dip + gap` tall - 37px
+# measured here. The remaining ~23px of that box are TABLE, and the table's path
+# column is BOTH the last column (`columnDividerX(.., .path) == table.right`) and
+# painted in `p.secondary` - the very ink the glyph is found by - so a row whose
+# ellipsized path reached the last 40 columns would have been returned instead of
+# the glyph by a top-to-bottom search.
+#
+# Measured, not assumed: a height sweep (26 client heights, 600 -> 575) found no
+# secondary pixel in that strip on this box, so this was NOT the mechanism behind
+# the 2026-08-07 failure - the strip is the table's unpainted remainder below its
+# last full row. It stays fixed anyway, because a search box that reaches into a
+# region painted in the same ink is a coincidence away from mis-targeting, and
+# the band's top edge is a thing the capture can simply be asked for.
+function Find-BandTop($Shot, [int]$X0, [int]$X1, [int]$YFloor, [int]$YBottom, [int[]]$Rgb) {
+    $top = $null
+    for ($y = $YBottom - 1; $y -ge $YFloor; $y -= 1) {
+        $hit = $false
+        for ($x = $X0; $x -lt $X1; $x += 1) {
+            $c = Get-TestPixel -Shot $Shot -X $x -Y $y
+            if ($null -eq $c) { continue }
+            if ($c.R -eq $Rgb[0] -and $c.G -eq $Rgb[1] -and $c.B -eq $Rgb[2]) { $hit = $true; break }
+        }
+        if ($hit) { $top = $y } elseif ($null -ne $top) { break }
+    }
+    return $top
+}
+
+# The CENTRE of mass of every exactly-$Rgb pixel in the box, plus how many there
+# were. A glyph is a shape, not a pixel: its first matching pixel is an outer tip
+# of the stroke (and, with the font path, an antialiased one), while its centroid
+# is the middle of the mark and therefore the middle of the click target.
+function Get-ExactPixelCentroid($Shot, [int]$X0, [int]$Y0, [int]$X1, [int]$Y1, [int[]]$Rgb) {
+    $n = 0; $sx = 0; $sy = 0
+    for ($y = $Y0; $y -lt $Y1; $y += 1) {
+        for ($x = $X0; $x -lt $X1; $x += 1) {
+            $c = Get-TestPixel -Shot $Shot -X $x -Y $y
+            if ($null -eq $c) { continue }
+            if ($c.R -eq $Rgb[0] -and $c.G -eq $Rgb[1] -and $c.B -eq $Rgb[2]) {
+                $n++; $sx += $x; $sy += $y
+            }
+        }
+    }
+    if ($n -eq 0) { return $null }
+    return [pscustomobject]@{ X = [int]($sx / $n); Y = [int]($sy / $n); Count = $n }
+}
+
+# Is the error banner still painted at the panel's bottom? One capture, one
+# question - which is what a wait-for-condition loop needs (T561).
+#
+# Sampled on a coarse grid rather than pixel by pixel. The band is a SOLID fill
+# hundreds of pixels wide, so no grid this dense can miss it, and the cost is
+# what makes the answer usable as a clock: Test-ExactPixel exits early when the
+# band IS there but walks all ~60k pixels of the box when it is NOT, so a
+# full-fidelity poll spends ~2.5s to say "gone" and every latency it reports is
+# its own.
+function Test-BannerUp([IntPtr]$Panel, $Rect, [int[]]$Rgb) {
+    $s = Get-TestWindowPixels -Window $Panel -Sync
+    try {
+        for ($y = $Rect.Bottom - 1; $y -gt $Rect.Bottom - 60; $y -= 3) {
+            for ($x = $Rect.Left + 4; $x -lt $Rect.Right; $x += 7) {
+                $c = Get-TestPixel -Shot $s -X $x -Y $y
+                if ($null -eq $c) { continue }
+                if ($c.R -eq $Rgb[0] -and $c.G -eq $Rgb[1] -and $c.B -eq $Rgb[2]) { return $true }
+            }
+        }
+        return $false
+    } finally { Close-TestWindowPixels -Shot $s }
+}
+
 # Click a control by POSTING a mouse pair to it.
 #
 # Send-TestControlClick SENDS BM_CLICK, and every T286 action button opens a
@@ -921,25 +994,61 @@ try {
     $GLYPH = Get-PanelSecondary $PANEL_BG   # the dismiss glyph rides the secondary ramp
     $shotB = Get-TestWindowPixels -Window $panel -Sync
     $xspot = $null
+    $bannerTop = $null
     try {
         Assert (Test-ExactPixel $shotB $client.Left ($client.Bottom - 60) $client.Right $client.Bottom $BANNER_BG) 'J the error banner painted at the panel bottom'
         # Control: the banner is a BAND at the bottom, not a panel-wide tint.
         Assert (-not (Test-ExactPixel $shotB $client.Left $client.Top $client.Right $fr.Bottom $BANNER_BG)) 'J (control) the banner tint is confined to the bottom band'
-        $xspot = Find-ExactPixel $shotB ($client.Right - 40) ($client.Bottom - 60) $client.Right $client.Bottom $GLYPH
-        Assert ($null -ne $xspot) 'J the banner has a dismiss glyph at its trailing edge'
+        # Where the band actually STARTS, measured (T561) rather than assumed to
+        # be 60px up. Everything above this line is table, and the table paints
+        # the same secondary ink the glyph is found by.
+        $bannerTop = Find-BandTop $shotB $client.Left $client.Right ($client.Bottom - 160) $client.Bottom $BANNER_BG
+        Assert ($null -ne $bannerTop) 'J the banner band has a measurable top edge'
+        if ($null -ne $bannerTop) {
+            $xspot = Get-ExactPixelCentroid $shotB ($client.Right - 60) ($bannerTop + 1) $client.Right $client.Bottom $GLYPH
+            Assert ($null -ne $xspot) 'J the banner has a dismiss glyph at its trailing edge'
+            # Evidence for the next reader of a red run (T561): where the band
+            # and the glyph actually were, and - printed below - how long the
+            # dismissal took to reach a capture. The old oracle asserted at a
+            # fixed 600ms with none of this on the record, so a failure said
+            # only "still there" and every diagnosis after it was a theory.
+            $oldFirst = Find-ExactPixel $shotB ($client.Right - 40) ($client.Bottom - 60) $client.Right $client.Bottom $GLYPH
+            $oldTxt = if ($null -eq $oldFirst) { 'none' } else { "$($oldFirst.X),$($oldFirst.Y)" }
+            $inTable = ($null -ne $oldFirst -and $oldFirst.Y -lt $bannerTop)
+            Write-Host ("      note: band top y=$bannerTop; glyph centroid $($xspot.X),$($xspot.Y) " +
+                        "over $($xspot.Count)px; first-pixel target would have been $oldTxt" +
+                        $(if ($inTable) { ' <- ABOVE THE BAND, i.e. in the table' } else { '' }))
+        }
     } finally {
         Close-TestWindowPixels -Shot $shotB
     }
 
-    if ($null -ne $xspot) {
-        Send-TestMouse -Window $panel -X $xspot.X -Y $xspot.Y -Button left -Action click | Out-Null
+    if ($null -ne $xspot -and $null -ne $bannerTop) {
+        # NEGATIVE CONTROL, and it is load-bearing twice over: it proves the band
+        # does not evaporate on its own (so the wait loop below cannot pass by
+        # patience), and it proves the click POSITION is what dismisses - the
+        # rest of the band swallows its clicks by design (activity_input.zig).
+        $midY = [int](($bannerTop + $client.Bottom) / 2)
+        Send-TestMouse -Window $panel -X ([int]($client.Left + ($client.Right - $client.Left) / 2)) -Y $midY `
+            -Button left -Action click | Out-Null
         Start-Sleep -Milliseconds 600
-        $shotC = Get-TestWindowPixels -Window $panel -Sync
-        try {
-            Assert (-not (Test-ExactPixel $shotC $client.Left ($client.Bottom - 60) $client.Right $client.Bottom $BANNER_BG)) 'J clicking the glyph DISMISSES the banner'
-        } finally {
-            Close-TestWindowPixels -Shot $shotC
+        Assert (Test-BannerUp $panel $client $BANNER_BG) 'J (control) clicking the band beside the glyph leaves the banner up'
+
+        Send-TestMouse -Window $panel -X $xspot.X -Y $xspot.Y -Button left -Action click | Out-Null
+        # WAIT for the repaint instead of sleeping through it: the click posts,
+        # the dismissal invalidates, and a fixed sleep is a bet on how fast the
+        # WM_PAINT lands. Polling asserts the same thing without the bet.
+        $gone = $false
+        $sw = [System.Diagnostics.Stopwatch]::StartNew()
+        $deadline = (Get-Date).AddSeconds(4)
+        while ((Get-Date) -lt $deadline) {
+            if (-not (Test-BannerUp $panel $client $BANNER_BG)) { $gone = $true; break }
+            Start-Sleep -Milliseconds 150
         }
+        $sw.Stop()
+        Assert $gone 'J clicking the glyph DISMISSES the banner'
+        Write-Host ("      note: the banner left the capture after $([int]$sw.ElapsedMilliseconds)ms " +
+                    "(the retired oracle asserted at a flat 600ms)")
     }
 
     # --- K. A panel nobody can see does not enumerate (T290) -----------------
