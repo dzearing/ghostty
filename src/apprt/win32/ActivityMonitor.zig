@@ -173,6 +173,7 @@ pub const pushSample = sample_mod.pushSample;
 pub const paint = paint_mod.paint;
 pub const columnAt = paint_mod.columnAt;
 pub const columnSortKey = paint_mod.columnSortKey;
+pub const sortKeyColumn = paint_mod.sortKeyColumn;
 pub const thumbMin = paint_mod.thumbMin;
 pub const thumbWidth = paint_mod.thumbWidth;
 
@@ -188,6 +189,7 @@ pub const caretIndex = input_mod.caretIndex;
 pub const ensureCaret = input_mod.ensureCaret;
 pub const moveFocus = input_mod.moveFocus;
 pub const noteFocus = input_mod.noteFocus;
+pub const logHeaderCursor = input_mod.logHeaderCursor;
 pub const syncFocus = input_mod.syncFocus;
 pub const onFilterChanged = input_mod.onFilterChanged;
 pub const onLeftDown = input_mod.onLeftDown;
@@ -584,6 +586,14 @@ panel_focused: bool = false,
 /// anything. Keyed by pid for the same reason the selection is — a re-sort or
 /// a re-poll moves rows under it. 0 means "no caret".
 caret_pid: i64 = 0,
+/// The HEADER's keyboard cursor (T567): which column heading Left/Right have
+/// walked to while the table holds focus, or null while the keyboard is on the
+/// rows. Space or Enter re-sorts by it and any vertical key returns to the
+/// rows, so the table's one focus stop covers both bands without costing a Tab
+/// press for a control used rarely. Not a column INDEX because "no cursor" is a
+/// real state — the panel opens on the rows, which is what the arrow keys are
+/// for nine times out of ten.
+header_cursor: ?layout_mod.Column = null,
 
 /// Set while `close` is unwinding, so a WM_CLOSE arriving from DestroyWindow
 /// cannot re-enter it.

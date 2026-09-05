@@ -478,6 +478,27 @@ pub fn paintTable(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) vo
 pub fn paintTableFocus(self: *ActivityMonitor, hdc: w32.HDC, l: layout_mod.Layout) void {
     if (!self.panel_focused or self.focus != .table) return;
 
+    // The HEADER's cursor takes the ring while it is up (T567). One focus stop
+    // draws ONE indicator: a rim on a heading AND a rim on the caret row would
+    // say the keyboard was in two places, which is the doubled-outline defect
+    // §2.2 is about — and the caret row keeps its selection fill either way, so
+    // nothing is lost by lending the rim to the header.
+    if (self.header_cursor) |col| {
+        const widths = layout_mod.columnWidths(self.scale, l.table.width());
+        const band = layout_mod.headerCursorRect(l.table_header, widths, col);
+        const path = layout_mod.focusRingPath(band, self.scale);
+        if (path.width() <= 0 or path.height() <= 0) return;
+        const hp = self.pal();
+        strokeRoundRect(
+            hdc,
+            path,
+            0,
+            cr(list_selection.focusRim(hp.header)),
+            layout_mod.focusRing(self.scale).width,
+        );
+        return;
+    }
+
     const visible = layout_mod.visibleRows(l);
     const on_row: ?layout_mod.Rect = blk: {
         const idx = self.caretIndex() orelse break :blk null;

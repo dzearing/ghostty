@@ -22873,3 +22873,46 @@ the real directory validates green at 92 of 92. Floor: all four zig lanes PASS,
 `parity-tasks-seat.ps1` ALL PASS, ipc-p1/p2/p3 ALL PASS, and the seven standing
 harness audits pass over the new script. Filed T1376: `new` can still mint a
 decision this validate rejects, so the two ends do not yet agree.
+
+## 2026-09-05 - The Activity Monitor's column headings can be sorted from the keyboard (T567)
+
+You could sort the process list by clicking a heading, and only by clicking it.
+`onLeftDown` was the single path into `toggleSort`, so someone working without a
+mouse opened the panel on CPU-descending and stayed there. T289 gave the panel a
+focus ring and made its controls tabbable; the header band it deliberately left
+alone, and this is that half.
+
+The table stays ONE Tab stop and now covers two bands. Left or Right walks a
+cursor along the headings - the first press lands on the column the table is
+already sorted by, so the ring appears where the eye is looking, and after that
+the arrows step one column and clamp rather than wrapping the long way across the
+panel. Space or Enter re-sorts by the heading under the cursor and flips its
+direction on a second press, exactly what a click does. Any vertical key puts the
+cursor away and moves the rows in the same keystroke, so coming back from the
+header costs nothing. The alternative - making the header a seventh `Focusable`
+stop - would have spent a Tab press on every walk through the panel for a control
+used rarely.
+
+The cursor draws design system 2.2's ring on its whole column band, not around
+the title text, because the cursor names a column. While it is up the caret row's
+rim yields to it: one focus stop draws ONE indicator, and a rim on a heading plus
+a rim on a row would say the keyboard was in two places at once - the doubled
+outline the user reported on the chooser. The caret row keeps its selection fill
+either way, so nothing is lost by lending the rim upward.
+
+Walking the cursor has no side effect until Space commits it, which is the T300
+problem one band down: an acceptance script could only infer "Right moved the
+cursor" from a sort two keystrokes later, which tests the commit and not the
+walk. So the panel says where the cursor is (`activity monitor: header cursor
+<column>`), and section N reads that line.
+
+Validation: `test\win32\activity-monitor.ps1` section N - the cursor walks and
+clamps on the first column, paints a visible indicator there (22 px) with the
+caret row's rim measured at 0 as the control, Space sorts by the column under it,
+a second press flips the direction, two Rights reach CPU and Space sorts by THAT
+one (so the cursor is a position and not a decoration that commits the sorted
+column back to itself), and Down puts it away while selecting a row. ALL PASS
+(169 assertions). `headerCursorMove` and `headerCursorRect` are pure and asserted
+at 1.0/1.25/1.5/2.0 in the `none` lane. Floor: `floor-lane.ps1 -Lane all` ALL
+LANES PASS. Filed T1377: one of three consecutive acceptance runs flaked in M1's
+ctrl-click, which is the harness dropping a posted click, not this.

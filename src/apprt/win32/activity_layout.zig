@@ -712,6 +712,41 @@ pub fn cellRect(row: Rect, widths: [column_count]i32, col: Column, scale: f32) R
     };
 }
 
+/// The rect the header's keyboard cursor ring goes around (T567): the FULL
+/// column band in the header, not the padded text cell `cellRect` returns. The
+/// cursor names a COLUMN, and a ring drawn tight around the title alone would
+/// look like it named the word — the same reason the caret ring is a rim on the
+/// whole row rather than around the name cell.
+pub fn headerCursorRect(header: Rect, widths: [column_count]i32, col: Column) Rect {
+    var left = header.left;
+    for (0..@intFromEnum(col)) |i| left += widths[i];
+    return .{
+        .left = left,
+        .top = header.top,
+        .right = left + widths[@intFromEnum(col)],
+        .bottom = header.bottom,
+    };
+}
+
+/// Where one Left/Right press puts the header's keyboard cursor (T567).
+///
+/// `cur` is null while the keyboard is on the ROWS, and the first press then
+/// lands on the column the table is already SORTED by — the cursor appears
+/// where the eye is already looking rather than at an arbitrary end of the
+/// band. After that the arrows step one column and CLAMP at the ends, which is
+/// what the carousel's `focusFor` does one band up: an edge key that wrapped
+/// would move the ring the long way across the panel. Pure — unit-tested.
+pub fn headerCursorMove(cur: ?Column, sorted: Column, right: bool) Column {
+    const from = cur orelse return sorted;
+    const step: i32 = if (right) 1 else -1;
+    const next = std.math.clamp(
+        @as(i32, @intCast(@intFromEnum(from))) + step,
+        0,
+        @as(i32, column_count) - 1,
+    );
+    return @enumFromInt(@as(usize, @intCast(next)));
+}
+
 /// The x of the divider on the trailing edge of `col`, for painting column
 /// separators and for hit-testing a drag.
 pub fn columnDividerX(table: Rect, widths: [column_count]i32, col: Column) i32 {
@@ -1133,6 +1168,52 @@ test "columns: cells are inset so adjacent columns never touch" {
         }
         // The last cell ends a pad short of the table's trailing edge.
         try testing.expectEqual(l.table.right - pad, prev.?.right);
+    }
+}
+
+test "headerCursorMove: the first press lands on the sorted column, then arrows step and clamp" {
+    // No cursor yet: the ring appears on the column the table is sorted by,
+    // whichever arrow was pressed.
+    try testing.expectEqual(Column.cpu, headerCursorMove(null, .cpu, true));
+    try testing.expectEqual(Column.cpu, headerCursorMove(null, .cpu, false));
+    // Then it steps.
+    try testing.expectEqual(Column.mem, headerCursorMove(.cpu, .cpu, true));
+    try testing.expectEqual(Column.name, headerCursorMove(.cpu, .cpu, false));
+    // And holds at both ends rather than wrapping across the panel.
+    try testing.expectEqual(Column.pid, headerCursorMove(.pid, .cpu, false));
+    try testing.expectEqual(Column.path, headerCursorMove(.path, .cpu, true));
+    // Every column is reachable by walking from one end to the other.
+    var col = headerCursorMove(.pid, .pid, false);
+    inline for (.{ Column.name, Column.cpu, Column.mem, Column.path }) |want| {
+        col = headerCursorMove(col, .pid, true);
+        try testing.expectEqual(want, col);
+    }
+}
+
+test "headerCursorRect: the cursor band covers its whole column, and the bands tile the header" {
+    for (scales) |scale| {
+        const d = defaultClient(scale);
+        const l = layout(scale, d.w, d.h, .{});
+        const widths = columnWidths(scale, l.table.width());
+        var prev: ?Rect = null;
+        inline for (.{ Column.pid, Column.name, Column.cpu, Column.mem, Column.path }) |col| {
+            const band = headerCursorRect(l.table_header, widths, col);
+            // The band is the header's own height, and it holds the cell the
+            // painter draws the title into.
+            try testing.expectEqual(l.table_header.top, band.top);
+            try testing.expectEqual(l.table_header.bottom, band.bottom);
+            const cell = cellRect(l.table_header, widths, col, scale);
+            try testing.expect(band.left <= cell.left and band.right >= cell.right);
+            // Bands tile: no gap and no overlap, so the ring never straddles
+            // two columns or leaves a sliver of one uncovered.
+            if (prev) |p| try testing.expectEqual(p.right, band.left);
+            prev = band;
+            // A ring fits inside it at every scale.
+            const path = focusRingPath(band, scale);
+            try testing.expect(path.width() > 0 and path.height() > 0);
+        }
+        try testing.expectEqual(l.table.left, headerCursorRect(l.table_header, widths, .pid).left);
+        try testing.expectEqual(l.table.right, prev.?.right);
     }
 }
 

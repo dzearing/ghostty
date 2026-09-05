@@ -40,6 +40,12 @@
 #      holds focus, and the table - an owner-drawn region no theme rings for us
 #      - paints design system 2.2's ring on its caret row exactly while it has
 #      the keyboard;
+#   N. (T567) the column headings have a KEYBOARD route to the sort: while the
+#      table holds focus Left/Right walk a cursor along the headings, that cursor
+#      draws design system 2.2's indicator on the column it is on (and the caret
+#      row's rim yields to it, so the panel never shows two), Space commits the
+#      column under it and flips its direction on a second press, and a vertical
+#      key puts the cursor away and moves the rows in the same keystroke;
 #   M. (T293) a MULTI-ROW kill: ctrl-click and shift-click really accumulate a
 #      selection, the button re-captions to "Kill 3" as it grows, the
 #      confirmation counts the batch instead of naming a pid, a clean sweep
@@ -179,6 +185,16 @@ function Wait-PanelShown([int]$Shown, [int]$TimeoutMs = 12000) {
         Start-Sleep -Milliseconds 250
     }
     return $st
+}
+
+# The panel's most recent header-cursor line (T567), or $null when it has never
+# logged one. `none` is a real value - the cursor put away is a state the panel
+# reports, not an absence.
+function Get-HeaderCursor {
+    if (-not (Test-Path $errlog)) { return $null }
+    $m = @(Select-String -Path $errlog -Pattern 'activity monitor: header cursor (\w+)') | Select-Object -Last 1
+    if (-not $m) { return $null }
+    return $m.Matches[0].Groups[1].Value
 }
 
 function Count-PanelLines {
@@ -1272,6 +1288,96 @@ try {
     } finally {
         Close-TestWindowPixels -Shot $shotL5
     }
+
+    # --- N. The column headings have a KEYBOARD route to the sort (T567) -----
+    # Before this the headings were mouse-only: `onLeftDown` was the single path
+    # into `toggleSort`, so someone working without a mouse was stuck with
+    # whatever sort the panel opened on. The table is still ONE Tab stop and it
+    # now covers two bands - Left/Right walk the headings, Space commits, and a
+    # vertical key drops back to the rows - so the route costs no extra Tab.
+    #
+    # Same two oracles as L, for the same reasons: the panel's own state line
+    # for what the keys DID, and its own paint for the indicator that says where
+    # the keyboard is. Walking the cursor has no side effect until Space, so the
+    # walk itself is read from the panel's `header cursor` line (the T300
+    # argument, one band down).
+    $tabs = 0
+    while ((Get-TestFocusedWindow -Window $panel) -ne $panel -and $tabs -lt 6) {
+        Send-TestControlKey -Control (Get-TestFocusedWindow -Window $panel) -Key Tab | Out-Null
+        Start-Sleep -Milliseconds 250
+        $tabs++
+    }
+    Assert ((Get-TestFocusedWindow -Window $panel) -eq $panel) 'N the table holds focus for the header-key probes'
+
+    # N1. Left walks the cursor into the header and clamps at the first column,
+    # so where it ends up is a fact about the keys and not about the sort the
+    # earlier sections left behind.
+    foreach ($i in 1..6) {
+        Send-TestControlKey -Control $panel -Key Left | Out-Null
+        Start-Sleep -Milliseconds 120
+    }
+    Start-Sleep -Milliseconds 250
+    $hc = Get-HeaderCursor
+    Assert ($hc -eq 'pid') "N1 Left walks the header cursor and clamps on the first column (cursor=$hc)"
+
+    # N2. And it is VISIBLE (design system 2.2). The PID band is the table's
+    # leading edge, and a cell's text is inset by 8 DIP, so the first pixels of
+    # the band are bare header fill until the ring lands on them.
+    if ($headerY -ge 0) {
+        $hx0 = $client.Left
+        $hx1 = $client.Left + 5
+        $hy0 = $headerY + 3
+        $hy1 = $headerY + 10
+        $shotN = Get-TestWindowPixels -Window $panel -Sync
+        try {
+            $ring = Count-NonMatching $shotN $hx0 $hy0 $hx1 $hy1 $PANEL_HEADER
+            Assert ($ring -gt 0) "N2 the header cursor draws a visible indicator on its column ($ring px)"
+            # Control: the caret row's rim is NOT also painted. One focus stop
+            # draws one indicator - a rim on a heading AND a rim on a row would
+            # say the keyboard was in two places at once.
+            $row = Count-NonMatching $shotN $client.Left $ringY0 $ringX1 $ringY1 $PANEL_BG
+            Assert ($row -eq 0) "N2 (control) the caret row's rim yields to the header's ($row px)"
+        } finally {
+            Close-TestWindowPixels -Shot $shotN
+        }
+    }
+
+    # N3. Space commits the cursor's column, and pressing it again flips the
+    # direction - the same two acts G asserts for the mouse.
+    $before = Count-PanelLines
+    Send-TestControlKey -Control $panel -Key Space | Out-Null
+    $st = Wait-PanelState $before
+    Assert ($st.SortKey -eq 'pid') "N3 Space sorts by the column under the cursor (got $($st.SortKey)/$($st.SortDir))"
+    $dir1 = $st.SortDir
+    $before = Count-PanelLines
+    Send-TestControlKey -Control $panel -Key Space | Out-Null
+    $st = Wait-PanelState $before
+    Assert ($st.SortKey -eq 'pid' -and $st.SortDir -ne $dir1) "N3 Space again flips the direction ($dir1 -> $($st.SortDir))"
+
+    # N4. The walk really moves: two Rights from PID reach the CPU column, and
+    # Space sorts by THAT one - so the cursor is a position and not a decoration
+    # that always commits the sorted column back to itself.
+    foreach ($i in 1..2) {
+        Send-TestControlKey -Control $panel -Key Right | Out-Null
+        Start-Sleep -Milliseconds 120
+    }
+    Start-Sleep -Milliseconds 250
+    $hc = Get-HeaderCursor
+    Assert ($hc -eq 'cpu') "N4 two Rights from PID reach the CPU heading (cursor=$hc)"
+    $before = Count-PanelLines
+    Send-TestControlKey -Control $panel -Key Space | Out-Null
+    $st = Wait-PanelState $before
+    Assert ($st.SortKey -eq 'cpu' -and $st.SortDir -eq 'asc') "N4 Space sorts by the walked-to column, ascending (got $($st.SortKey)/$($st.SortDir))"
+
+    # N5. A vertical key returns to the rows, and does what it always did on the
+    # way - so leaving the header costs no extra keystroke.
+    $before = Count-PanelLines
+    Send-TestControlKey -Control $panel -Key Down | Out-Null
+    $st = Wait-PanelState $before
+    Start-Sleep -Milliseconds 200
+    $hc = Get-HeaderCursor
+    Assert ($hc -eq 'none') "N5 Down puts the header cursor away (cursor=$hc)"
+    Assert ($st.Selected -eq 1) "N5 ...and selects a row in the same press (selected=$($st.Selected))"
 
     # --- M. The MULTI-ROW kill: what only a batch can show (T293) -------------
     # T286 asserted every WORD of an N > 1 kill in the pure lane and every ACT of

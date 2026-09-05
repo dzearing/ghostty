@@ -28,6 +28,7 @@ const log = ActivityMonitor.log;
 const filter_wide_cap = ActivityMonitor.filter_wide_cap;
 const columnAt = ActivityMonitor.columnAt;
 const columnSortKey = ActivityMonitor.columnSortKey;
+const sortKeyColumn = ActivityMonitor.sortKeyColumn;
 const thumbMin = ActivityMonitor.thumbMin;
 const thumbWidth = ActivityMonitor.thumbWidth;
 
@@ -361,6 +362,26 @@ pub fn syncFocus(self: *ActivityMonitor) void {
 pub fn noteFocus(self: *ActivityMonitor, f: Focusable) void {
     log.info("activity monitor: focus {s} -> {s}", .{ @tagName(self.focus), @tagName(f) });
     self.focus = f;
+    // The header's cursor belongs to the table's focus stop, so leaving the
+    // stop puts it away: coming back should start on the rows, the way opening
+    // the panel does, rather than on a heading the user walked to minutes ago.
+    if (f != .table and self.header_cursor != null) {
+        self.header_cursor = null;
+        logHeaderCursor(self);
+    }
+}
+
+/// Say where the header's keyboard cursor is (T567).
+///
+/// Logged for the same reason `noteFocus` is (T300): moving the cursor has no
+/// other observable effect until Space commits it, so without this line an
+/// acceptance script could only infer "Right moved the cursor" from the sort it
+/// produces two keystrokes later — which is a test of the commit, not of the
+/// walk.
+pub fn logHeaderCursor(self: *const ActivityMonitor) void {
+    log.info("activity monitor: header cursor {s}", .{
+        if (self.header_cursor) |c| @tagName(c) else "none",
+    });
 }
 
 /// Move keyboard focus to `f` and repaint, so the ring follows it.
@@ -455,6 +476,46 @@ pub fn handleKey(self: *ActivityMonitor, vk: u16) bool {
         .table => {
             const l = self.layout();
             const page: i32 = @max(1, layout_mod.visibleRows(l) - 1);
+
+            // The HEADER band's keys (T567). The table is one focus stop and it
+            // covers two bands: Left/Right walk the column headings, Space or
+            // Enter re-sorts by the one under the cursor, and any vertical key
+            // drops back to the rows. Before this the headings were mouse-only
+            // — `onLeftDown` was the single path into `toggleSort` — so a
+            // keyboard user was stuck with whatever sort the panel opened on.
+            switch (vk) {
+                w32.VK_LEFT, w32.VK_RIGHT => {
+                    self.header_cursor = layout_mod.headerCursorMove(
+                        self.header_cursor,
+                        sortKeyColumn(self),
+                        vk == w32.VK_RIGHT,
+                    );
+                    logHeaderCursor(self);
+                    _ = w32.InvalidateRect(self.hwnd, null, 0);
+                    return true;
+                },
+                w32.VK_RETURN, w32.VK_SPACE => {
+                    const col = self.header_cursor orelse return false;
+                    self.sort = rows_mod.toggleSort(self.sort, columnSortKey(col));
+                    self.rebuild();
+                    _ = w32.InvalidateRect(self.hwnd, null, 0);
+                    return true;
+                },
+                else => {},
+            }
+            if (self.header_cursor != null) switch (vk) {
+                // A vertical key means "back to the rows" — and then does what
+                // it always did, so returning from the header costs no extra
+                // keystroke. A key this panel does not use leaves the cursor
+                // where it is rather than silently dropping it.
+                w32.VK_UP, w32.VK_DOWN, w32.VK_PRIOR, w32.VK_NEXT, w32.VK_HOME, w32.VK_END => {
+                    self.header_cursor = null;
+                    logHeaderCursor(self);
+                    _ = w32.InvalidateRect(self.hwnd, null, 0);
+                },
+                else => {},
+            };
+
             switch (vk) {
                 w32.VK_UP => {
                     moveSelection(self, -1);
