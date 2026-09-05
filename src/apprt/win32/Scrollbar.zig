@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const w32 = @import("win32.zig");
 const terminal = @import("../../terminal/main.zig");
 const Surface = @import("Surface.zig");
+const chrome_fanout = @import("chrome_fanout.zig");
 const testing = std.testing;
 
 const log = std.log.scoped(.win32_scrollbar);
@@ -28,6 +29,18 @@ const ALPHA_DRAG: u8 = 200;
 
 /// Computed thumb rectangle within the track.
 pub const ThumbRect = struct { y: i32, h: i32 };
+
+/// Where the scrollbar popup sits on screen (T1345).
+pub const Placement = struct {
+    x: i32 = 0,
+    y: i32 = 0,
+    w: i32 = 0,
+    h: i32 = 0,
+
+    pub fn eql(a: Placement, b: Placement) bool {
+        return a.x == b.x and a.y == b.y and a.w == b.w and a.h == b.h;
+    }
+};
 
 /// Compute thumb_y and thumb_h given scrollback state and track height.
 /// Enforces a 20-px minimum (DPI-scaled by caller via min_h).
@@ -186,6 +199,20 @@ pub const Scrollbar = struct {
     dragging: bool = false,
     drag_anchor: i32 = 0,
 
+    /// The popup has been placed on screen at least once (T1345). Until it
+    /// has, a reposition is a hidden→shown transition and still owes the
+    /// z-order heal that `SWP_SHOWWINDOW` makes necessary.
+    shown: bool = false,
+    /// What the layered surface currently holds. `repaint` compares against
+    /// this and hands the compositor a new bitmap only when the pixels would
+    /// actually differ (T1345) — a vertical-divider drag moves this popup
+    /// without changing a single pixel of it, and blitting anyway was one of
+    /// the fan-out costs the drag measurement was looking for.
+    painted: ?chrome_fanout.Signature = null,
+    /// Where the popup was last placed, in screen coordinates. Only meaningful
+    /// while `shown`.
+    placed: Placement = .{},
+
     pub fn create(
         alloc: std.mem.Allocator,
         owner: w32.HWND,
@@ -309,19 +336,45 @@ pub const Scrollbar = struct {
         var top_right = w32.POINT{ .x = rect.right - width, .y = rect.top };
         _ = w32.ClientToScreen(self.owner, &top_right);
 
-        _ = w32.SetWindowPos(
-            self.hwnd,
-            null,
-            top_right.x,
-            top_right.y,
-            width,
-            client_h,
-            w32.SWP_NOACTIVATE | w32.SWP_NOZORDER | w32.SWP_SHOWWINDOW,
-        );
-        // Every reposition re-checks the z-order instead of leaving it to
-        // whatever last touched it (T142).
-        w32.healOverlayZOrder(self.hwnd, self.owner);
+        // T1345: a moved pane sends its surface BOTH `WM_MOVE` and `WM_SIZE`,
+        // and both of them landed here — so a splitter drag repositioned every
+        // scrollbar twice per mouse move (measured: 15 moves at 8 panes, where
+        // 8 is the honest number), paying two `SetWindowPos` calls, two z-order
+        // walks and two layered blits for one placement. Whichever of the two
+        // messages arrives second sees the same final geometry as the first, so
+        // it is answered from the cache. `dim_math.needsReposition` is the same
+        // argument on the dim wash (T1295).
+        const placement: Placement = .{
+            .x = top_right.x,
+            .y = top_right.y,
+            .w = width,
+            .h = client_h,
+        };
+        if (chrome_fanout.moveNeeded(self.shown, Placement.eql(self.placed, placement))) {
+            const was_shown = self.shown;
+            chrome_fanout.noteMove(.scrollbar);
+            _ = w32.SetWindowPos(
+                self.hwnd,
+                null,
+                placement.x,
+                placement.y,
+                placement.w,
+                placement.h,
+                w32.SWP_NOACTIVATE | w32.SWP_NOZORDER | w32.SWP_SHOWWINDOW,
+            );
+            self.shown = true;
+            self.placed = placement;
+            // Every reposition re-checks the z-order instead of leaving it to
+            // whatever last touched it (T142) — except inside a live layout
+            // pass, where an already-shown popup cannot have moved in the
+            // z-order and the walk is the fan-out's biggest per-pane cost
+            // (T1345).
+            w32.healOverlayZOrderAfterMove(self.hwnd, self.owner, was_shown);
+        }
 
+        // Always asked, never unconditional: the pixels can change with the
+        // scroll state while the popup has not moved at all, and `repaint`
+        // decides for itself whether the compositor already holds this bitmap.
         self.repaint();
 
         // Return the width that the caller should subtract from the grid area.
@@ -335,6 +388,10 @@ pub const Scrollbar = struct {
     /// Show or hide the popup when the owner surface is shown/hidden.
     pub fn setOwnerVisible(self: *Scrollbar, visible: bool) void {
         _ = w32.ShowWindow(self.hwnd, if (visible) w32.SW_SHOWNOACTIVATE else w32.SW_HIDE);
+        // A hidden popup owes the z-order heal again when it comes back:
+        // `SWP_SHOWWINDOW` lifts it above unrelated windows, which is the
+        // T142 case the heal exists for (T1345).
+        if (!visible) self.shown = false;
     }
 
     /// Update cached theme colors and repaint if they changed.
@@ -359,12 +416,51 @@ pub const Scrollbar = struct {
         };
     }
 
+    /// What this scrollbar's layered surface WOULD hold if it were painted
+    /// right now (T1345). Two equal signatures mean the blit would hand the
+    /// compositor the bitmap it is already showing.
+    fn signature(self: *const Scrollbar, w: i32, h: i32) chrome_fanout.Signature {
+        const r = thumbRect(
+            self.state.total,
+            self.state.offset,
+            self.state.len,
+            h,
+            self.dpiScaled(THUMB_MIN_HEIGHT_BASE),
+        );
+        return .{
+            .width = w,
+            .height = h,
+            .fill = switch (self.mode) {
+                .always_visible => packBGRA(self.bg, 255),
+                .overlay => 0,
+            },
+            .accent = packBGRA(self.fg, self.thumbAlpha()),
+            .accent_y = r.y,
+            .accent_h = r.h,
+        };
+    }
+
     fn repaint(self: *Scrollbar) void {
         var client: w32.RECT = undefined;
         if (w32.GetClientRect(self.hwnd, &client) == 0) return;
         const w = client.right - client.left;
         const h = client.bottom - client.top;
         if (w <= 0 or h <= 0) return;
+
+        // A splitter drag repositions this popup on every mouse move, and
+        // every reposition used to re-blit it — a whole BGRA bitmap handed to
+        // the compositor per pane per frame of drag, even when the bitmap was
+        // identical to the one already on screen (dragging a VERTICAL divider
+        // changes the scrollbar's x, not one of its pixels). T1345: blit only
+        // when the pixels or the size would actually differ. Size is the
+        // load-bearing half — a popup that was resized keeps its old layered
+        // surface until something hands over a new one, and leaving that stale
+        // is the stretched-content defect T1343 was told not to reintroduce.
+        const sig = self.signature(w, h);
+        if (!chrome_fanout.blitNeeded(self.painted, sig)) {
+            chrome_fanout.noteBlitSkipped();
+            return;
+        }
 
         // Allocate a temp BGRA buffer, fill it, blit via UpdateLayeredWindow.
         const screen_dc = w32.GetDC(null) orelse return;
@@ -399,6 +495,7 @@ pub const Scrollbar = struct {
             .SourceConstantAlpha = 255, // per-pixel alpha only
         };
 
+        chrome_fanout.noteBlit();
         _ = w32.UpdateLayeredWindow(
             self.hwnd,
             screen_dc,
@@ -410,6 +507,7 @@ pub const Scrollbar = struct {
             &blend,
             w32.ULW_ALPHA,
         );
+        self.painted = sig;
     }
 
     fn drawBitmap(self: *Scrollbar, pixels: [*]u32, w: i32, h: i32) void {

@@ -497,6 +497,12 @@ test {
     // box.
     _ = @import("apprt/win32/drag_perf.zig");
 
+    // What that same motion tick costs in LAYERED-CHROME operations — the
+    // window moves, the `UpdateLayeredWindow` blits and the z-order walks one
+    // pane's banner/dim/scrollbar/badge/pill fan out into (T1345). Counting
+    // and the two skip policies only; no OS imports.
+    _ = @import("apprt/win32/chrome_fanout.zig");
+
     // Pure win32 agent-owned layout blobs — one window in and out of the
     // SET_LAYOUT/GET_LAYOUTS wire shape (T334), same no-OS-imports deal (its
     // only non-std import is `remote/protocol.zig`, which builds in every lane).

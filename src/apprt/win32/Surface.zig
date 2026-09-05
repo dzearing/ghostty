@@ -1234,7 +1234,7 @@ pub fn setVisible(self: *Surface, visible: bool) void {
 /// Show (or reposition) this pane's dim overlay at the given fill color
 /// (COLORREF) and alpha. Lazily creates the overlay popup on first use.
 /// Called by Window.updateDimOverlays (T74).
-pub fn showDimOverlay(self: *Surface, color: u32, alpha: u8) void {
+pub fn showDimOverlay(self: *Surface, color: u32, alpha: u8, batch: ?*?w32.HDWP) void {
     const hwnd = self.hwnd orelse return;
     if (self.dim_overlay == null) {
         self.dim_overlay = DimOverlay.create(
@@ -1246,7 +1246,7 @@ pub fn showDimOverlay(self: *Surface, color: u32, alpha: u8) void {
             return;
         };
     }
-    _ = self.dim_overlay.?.show(color, alpha);
+    _ = self.dim_overlay.?.show(color, alpha, batch);
 }
 
 /// Hide this pane's dim overlay if it exists.

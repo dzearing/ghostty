@@ -16,6 +16,7 @@
 const std = @import("std");
 const w32 = @import("win32.zig");
 const dim_math = @import("dim_math.zig");
+const chrome_fanout = @import("chrome_fanout.zig");
 
 const log = std.log.scoped(.win32_dim_overlay);
 
@@ -97,7 +98,18 @@ pub const DimOverlay = struct {
     ///
     /// Returns whether it actually touched the window, which is the unit
     /// test's only handle on "did this re-blend?" (T1295).
-    pub fn show(self: *DimOverlay, color: u32, alpha: u8) bool {
+    /// `batch` is the layout pass's `BeginDeferWindowPos` handle, when there
+    /// is one (T1345). Every unfocused pane's wash moves on the same layout
+    /// pass, and one `SetWindowPos` per popup is one window-manager
+    /// transaction and one composite per popup; deferring them means the whole
+    /// set lands in a single transaction, the way the PANES themselves have
+    /// been placed since T1031. A null batch (a focus change, a config
+    /// reload, a window move) places directly, exactly as before.
+    ///
+    /// A failed `DeferWindowPos` invalidates the batch handle, so the caller's
+    /// handle is nulled and this — and every later popup in the pass — drops
+    /// to a direct `SetWindowPos`. Same contract as `Window.placePane`.
+    pub fn show(self: *DimOverlay, color: u32, alpha: u8, batch: ?*?w32.HDWP) bool {
         const color_changed = self.brush == null or color != self.color;
         if (color_changed) {
             if (self.brush) |b| _ = w32.DeleteObject(@ptrCast(b));
@@ -150,18 +162,44 @@ pub const DimOverlay = struct {
             );
         }
 
-        _ = w32.SetWindowPos(
-            self.hwnd,
-            null,
-            placement.left,
-            placement.top,
-            placement.width,
-            placement.height,
-            w32.SWP_NOACTIVATE | w32.SWP_NOZORDER | w32.SWP_SHOWWINDOW,
-        );
+        const was_shown = self.shown;
+        chrome_fanout.noteMove(.dim);
+        const flags: u32 = w32.SWP_NOACTIVATE | w32.SWP_NOZORDER | w32.SWP_SHOWWINDOW;
+        placed: {
+            // A popup coming back from hidden is placed DIRECTLY: the heal
+            // below has to run against the window's real, final z-order, and
+            // `SWP_SHOWWINDOW` arriving later out of the batch would undo it.
+            if (was_shown) if (batch) |b| if (b.*) |h| {
+                if (w32.DeferWindowPos(
+                    h,
+                    self.hwnd,
+                    null,
+                    placement.left,
+                    placement.top,
+                    placement.width,
+                    placement.height,
+                    flags,
+                )) |next| {
+                    b.* = next;
+                    break :placed;
+                }
+                b.* = null;
+            };
+            _ = w32.SetWindowPos(
+                self.hwnd,
+                null,
+                placement.left,
+                placement.top,
+                placement.width,
+                placement.height,
+                flags,
+            );
+        }
         // Every reposition re-checks the z-order instead of leaving it to
-        // whatever last touched it (T142).
-        w32.healOverlayZOrder(self.hwnd, self.owner);
+        // whatever last touched it (T142) — except inside a live layout pass,
+        // where an already-shown popup cannot have moved in the z-order and
+        // the walk is the fan-out's biggest per-pane cost (T1345).
+        w32.healOverlayZOrderAfterMove(self.hwnd, self.owner, was_shown);
         self.placement = placement;
         self.shown = true;
         return true;

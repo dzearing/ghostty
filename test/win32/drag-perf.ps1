@@ -133,8 +133,11 @@ function Get-DragSamples([string]$log) {
                 'mean_wait_us=(\d+) fps=(\d+) panes=(\d+) resizes_max=(\d+) waits_max=(\d+) ' +
                 'waits_total=(\d+) timeouts=(\d+) mean_layout_us=(\d+) ' +
                 'mean_place_us=(\d+) mean_paint_us=(\d+) ' +
-                'mean_overlay_us=(\d+) mean_resize_us=(\d+) over_budget=(\d+) ' +
-                'wait=(\w+) verdict=(\w+)')) {
+                'mean_overlay_us=(\d+) mean_resize_us=(\d+) ' +
+                'chrome_moves=(\d+) chrome_sb=(\d+) chrome_dim=(\d+) ' +
+                'chrome_blits=(\d+) chrome_heals=(\d+) ' +
+                'chrome_skipped=(\d+) over_budget=(\d+) ' +
+                'wait=(\w+) chrome=(\w+) verdict=(\w+)')) {
             $out += [pscustomobject]@{
                 Ticks       = [int]$Matches[1]
                 MeanUs      = [int]$Matches[2]
@@ -151,9 +154,16 @@ function Get-DragSamples([string]$log) {
                 PaintUs     = [int]$Matches[13]
                 OverlayUs   = [int]$Matches[14]
                 ResizeUs    = [int]$Matches[15]
-                OverBudget  = [int]$Matches[16]
-                Wait        = $Matches[17]
-                Verdict     = $Matches[18]
+                ChromeMoves = [int]$Matches[16]
+                ChromeSb    = [int]$Matches[17]
+                ChromeDim   = [int]$Matches[18]
+                ChromeBlits = [int]$Matches[19]
+                ChromeHeals = [int]$Matches[20]
+                ChromeSkip  = [int]$Matches[21]
+                OverBudget  = [int]$Matches[22]
+                Wait        = $Matches[23]
+                Chrome      = $Matches[24]
+                Verdict     = $Matches[25]
             }
         }
     }
@@ -219,6 +229,11 @@ function Measure-DragShape([string]$mode, [int[]]$counts, [int]$moves) {
     Kill-RepoInstances
     if ($mode -eq 'serial') { $env:GHOZTTY_DRAG_SERIAL_WAIT = '1' }
     else { Remove-Item env:GHOZTTY_DRAG_SERIAL_WAIT -ErrorAction SilentlyContinue }
+    # T1345's control shape: the pre-fix layered-chrome fan-out, on the same
+    # build and the same box, so the two are comparable at all. The wait stays
+    # batched here so the only thing that differs from 'batched' is the chrome.
+    if ($mode -eq 'fanout') { $env:GHOZTTY_CHROME_FANOUT_LEGACY = '1' }
+    else { Remove-Item env:GHOZTTY_CHROME_FANOUT_LEGACY -ErrorAction SilentlyContinue }
     $env:GHOZTTY_PERF = '1'
 
     $results = @{}
@@ -257,16 +272,20 @@ function Measure-DragShape([string]$mode, [int[]]$counts, [int]$moves) {
                 # last fragment to -f alone and prints the placeholders.
                 $line = '  {0,-8} panes={1,-2} ticks={2,-3} mean={3,6}us max={4,6}us ' +
                 'layout={13,6}us place={14,6}us paint={15,6}us wait={5,6}us overlay={7,6}us ~{8,4} fps ' +
-                'resizes/move={9,-2} waits/move={10,-2} timeouts={11,-3} {12}'
+                'resizes/move={9,-2} waits/move={10,-2} timeouts={11,-3} ' +
+                'chrome move={16,-3}(sb {17,-2}/dim {18,-2}) blit={19,-2} heal={20,-3} skip={21,-3} {12}'
                 Rep ($line -f $mode, $s.Panes, $s.Ticks, $s.MeanUs, $s.MaxUs,
                     $s.MeanWaitUs, $s.ResizeUs, $s.OverlayUs, $s.Fps, $s.ResizesMax,
-                    $s.WaitsMax, $s.Timeouts, $s.Verdict, $s.LayoutUs, $s.PlaceUs, $s.PaintUs)
+                    $s.WaitsMax, $s.Timeouts, $s.Verdict, $s.LayoutUs, $s.PlaceUs, $s.PaintUs,
+                    $s.ChromeMoves, $s.ChromeSb, $s.ChromeDim, $s.ChromeBlits,
+                    $s.ChromeHeals, $s.ChromeSkip)
                 $results[$want] = $s
             }
         }
     } finally {
         Kill-RepoInstances
         Remove-Item env:GHOZTTY_DRAG_SERIAL_WAIT -ErrorAction SilentlyContinue
+        Remove-Item env:GHOZTTY_CHROME_FANOUT_LEGACY -ErrorAction SilentlyContinue
     }
     return $results
 }
@@ -280,6 +299,7 @@ try {
     Rep 'measurements (mean = one mouse move, end to end, on the UI thread):'
 
     $serial = Measure-DragShape 'serial' $PaneCounts $Moves
+    $fanout = Measure-DragShape 'fanout' $PaneCounts $Moves
     $batched = Measure-DragShape 'batched' $PaneCounts $Moves
     Rep ''
 
@@ -341,6 +361,52 @@ try {
     $ticks = ($batched.Values | Measure-Object -Property Ticks -Minimum).Minimum
     Assert ($ticks -ge 8) `
     ("each measured drag really moved (fewest ticks in a batched drag: $ticks)")
+
+    # ---- E. the layered-chrome fan-out (T1345) ---------------------------
+    #
+    # Same discipline as B/C above: the COUNT is the assertion, the clock is
+    # reported. One mouse move used to re-glue every pane's chrome twice over -
+    # `WM_MOVE` and `WM_SIZE` both landed on the scrollbar - and each reposition
+    # walked the desktop z-order and re-blitted a layered bitmap that had not
+    # changed. `fanout` is that shape, on this build, so the two are comparable
+    # on the same box in the same minute rather than against a number written
+    # down on a quieter afternoon.
+    $fLo = $fanout[$lo]; $fHi = $fanout[$hi]
+    Assert ($fanout.Keys.Count -eq $PaneCounts.Count) `
+    ("the legacy-chrome shape produced a drag summary at every pane count " +
+        "($($fanout.Keys.Count)/$($PaneCounts.Count))")
+
+    $fewer = ($bHi.ChromeMoves -lt $fHi.ChromeMoves)
+    if ($NegativeControl) { $fewer = -not $fewer }
+    Assert $fewer ("one mouse move repositions less chrome than it used to: at $hi " +
+        "panes $($fHi.ChromeMoves) moves became $($bHi.ChromeMoves)")
+
+    Assert ($bHi.ChromeHeals -eq 0 -and $fHi.ChromeHeals -gt 0) `
+    ("a live layout pass no longer walks the z-order for popups that were " +
+        "already up (at $hi panes: $($fHi.ChromeHeals) walks/move -> " +
+        "$($bHi.ChromeHeals))")
+
+    Assert ($bHi.ChromeBlits -lt $fHi.ChromeBlits) `
+    ("...and no longer hands the compositor bitmaps it already has (at $hi " +
+        "panes: $($fHi.ChromeBlits) layered blits/move -> $($bHi.ChromeBlits))")
+
+    # The skips are counted so a change that quietly stops skipping reads as a
+    # number rather than as a feeling.
+    Assert ($bHi.ChromeSkip -gt 0) `
+    ("the skipped work is accounted for rather than merely absent " +
+        "($($bHi.ChromeSkip) declined blits+walks per move at $hi panes)")
+
+    # Timing is REPORTED, not asserted: the difference is a few ms on a box
+    # whose run-to-run spread is about that wide, and a perf harness that fails
+    # on noise gets disabled rather than believed.
+    Rep ("  chrome fan-out at $hi panes: legacy $($fHi.ChromeMoves) moves/" +
+        "$($fHi.ChromeBlits) blits/$($fHi.ChromeHeals) z-order walks per mouse move, " +
+        "overlay term $($fHi.OverlayUs)us, mean $($fHi.MeanUs)us")
+    Rep ("                          now: $($bHi.ChromeMoves) moves/" +
+        "$($bHi.ChromeBlits) blits/$($bHi.ChromeHeals) z-order walks, " +
+        "overlay term $($bHi.OverlayUs)us, mean $($bHi.MeanUs)us")
+    Rep ("                    at $lo panes: legacy $($fLo.ChromeMoves) moves -> " +
+        "now $($bLo.ChromeMoves)")
 
     Rep ''
     Rep "report: $report"

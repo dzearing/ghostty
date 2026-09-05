@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const w32 = @import("win32.zig");
+const chrome_fanout = @import("chrome_fanout.zig");
 const badge = @import("readonly_badge.zig");
 const icon_paint = @import("icon_button_paint.zig");
 const icon_button = @import("icon_button.zig");
@@ -182,6 +183,8 @@ pub const ReadonlyBadge = struct {
         self.pane_bg = pane_bg;
         self.placed = rect;
 
+        const was_shown = self.visible;
+        chrome_fanout.noteMove(.badge);
         _ = w32.SetWindowPos(
             self.hwnd,
             null,
@@ -196,8 +199,11 @@ pub const ReadonlyBadge = struct {
         if (moved or bg_changed) self.repaint(m, l, pane_bg, rect);
 
         // Every reposition re-checks the z-order rather than leaving it to
-        // whatever last touched it (T142, `overlay_zorder.zig`).
-        w32.healOverlayZOrder(self.hwnd, self.owner);
+        // whatever last touched it (T142, `overlay_zorder.zig`) — except
+        // inside a live layout pass, where an already-shown popup cannot have
+        // moved in the z-order and the walk is the fan-out's biggest per-pane
+        // cost (T1345).
+        w32.healOverlayZOrderAfterMove(self.hwnd, self.owner, was_shown);
     }
 
     pub fn hide(self: *ReadonlyBadge) void {

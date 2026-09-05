@@ -2607,6 +2607,10 @@ $GuardTable = @(
         Stamp  = 'test\win32\drag-perf.stamp.json'
         Covers = @(
             'src\apprt\win32\drag_perf.zig',
+            # The chrome fan-out counters the harness asserts on since T1345 —
+            # the drag line's chrome_moves/blits/heals come from here, so an
+            # edit to this module is an edit to what drag-perf.ps1 measures.
+            'src\apprt\win32\chrome_fanout.zig',
             'test\win32\drag-perf.ps1'
         )
     },

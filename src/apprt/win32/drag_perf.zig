@@ -86,6 +86,23 @@ pub const Sample = struct {
     /// How many of those waits ran out the full timeout rather than being woken
     /// by a presented frame — the shape that costs the drag a whole frame each.
     timeouts: usize = 0,
+    /// The layered-chrome fan-out this tick paid for (T1345): how many
+    /// `SetWindowPos` calls landed on a chrome popup, how many
+    /// `UpdateLayeredWindow` blits were handed to the compositor, and how many
+    /// z-order walks ran. These are the operations, not the clock — the same
+    /// distinction `waits` draws against `wait_us`, and for the same reason:
+    /// what a window move costs depends on the machine, how many the tick
+    /// issued is a property of the code.
+    chrome_moves: u32 = 0,
+    /// Of those moves, the ones the scrollbar and the dim wash issued — the
+    /// two that exist on every pane, and therefore the two that scale.
+    chrome_sb_moves: u32 = 0,
+    chrome_dim_moves: u32 = 0,
+    chrome_blits: u32 = 0,
+    chrome_heals: u32 = 0,
+    /// Blits and heals the skip policies declined. Counted so a change that
+    /// quietly stops skipping shows up as a number rather than as a feeling.
+    chrome_skipped: u32 = 0,
 
     /// Work the UI thread actually did, as opposed to waited for.
     pub fn workUs(self: Sample) u64 {
@@ -117,6 +134,16 @@ pub const Stats = struct {
     layout_us: u64 = 0,
     place_us: u64 = 0,
     paint_us: u64 = 0,
+    /// The most chrome operations any single tick performed. Max rather than
+    /// mean for the same reason `waits_max` is: the fan-out is a per-tick
+    /// property and averaging it over a drag that started before the panes
+    /// existed would hide it.
+    chrome_moves_max: u32 = 0,
+    chrome_sb_moves_max: u32 = 0,
+    chrome_dim_moves_max: u32 = 0,
+    chrome_blits_max: u32 = 0,
+    chrome_heals_max: u32 = 0,
+    chrome_skipped_max: u32 = 0,
 
     pub fn reset(self: *Stats) void {
         self.* = .{};
@@ -137,6 +164,12 @@ pub const Stats = struct {
         self.resize_us += s.resize_us;
         self.waits_total += s.waits;
         self.timeouts_total += s.timeouts;
+        if (s.chrome_moves > self.chrome_moves_max) self.chrome_moves_max = s.chrome_moves;
+        if (s.chrome_sb_moves > self.chrome_sb_moves_max) self.chrome_sb_moves_max = s.chrome_sb_moves;
+        if (s.chrome_dim_moves > self.chrome_dim_moves_max) self.chrome_dim_moves_max = s.chrome_dim_moves;
+        if (s.chrome_blits > self.chrome_blits_max) self.chrome_blits_max = s.chrome_blits;
+        if (s.chrome_heals > self.chrome_heals_max) self.chrome_heals_max = s.chrome_heals;
+        if (s.chrome_skipped > self.chrome_skipped_max) self.chrome_skipped_max = s.chrome_skipped;
         if (s.overBudget()) self.over_budget += 1;
     }
 
@@ -291,4 +324,39 @@ test "stats accumulate mean, max, fps and the over-budget count" {
     fast.reset();
     try testing.expectEqual(@as(u64, 0), fast.ticks);
     try testing.expectEqual(Verdict.no_data, fast.verdict());
+}
+
+test "the chrome fan-out is carried as a per-tick maximum, not an average" {
+    // T1345: the number that matters is how many chrome operations ONE mouse
+    // move issues — a mean over a drag that began at two panes and ended at
+    // eight would report neither.
+    var st: Stats = .{};
+    st.record(.{
+        .tick_us = 1_000,
+        .chrome_moves = 4,
+        .chrome_sb_moves = 2,
+        .chrome_dim_moves = 2,
+        .chrome_blits = 2,
+        .chrome_heals = 4,
+    });
+    st.record(.{
+        .tick_us = 1_000,
+        .chrome_moves = 16,
+        .chrome_sb_moves = 8,
+        .chrome_dim_moves = 8,
+        .chrome_blits = 0,
+        .chrome_heals = 0,
+        .chrome_skipped = 32,
+    });
+
+    try testing.expectEqual(@as(u32, 16), st.chrome_moves_max);
+    try testing.expectEqual(@as(u32, 8), st.chrome_sb_moves_max);
+    try testing.expectEqual(@as(u32, 8), st.chrome_dim_moves_max);
+    try testing.expectEqual(@as(u32, 2), st.chrome_blits_max);
+    try testing.expectEqual(@as(u32, 4), st.chrome_heals_max);
+    try testing.expectEqual(@as(u32, 32), st.chrome_skipped_max);
+
+    st.reset();
+    try testing.expectEqual(@as(u32, 0), st.chrome_moves_max);
+    try testing.expectEqual(@as(u32, 0), st.chrome_skipped_max);
 }

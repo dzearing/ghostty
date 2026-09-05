@@ -22122,3 +22122,78 @@ scratch on every animation frame is **T1349**.
 `pane-banner.ps1` ALL PASS (132), `banner-resize-repaint.ps1` ALL PASS (15),
 all four floor lanes PASS, P1-P3 ALL PASS, and the eight test-tree audit guards
 a `test\win32` edit puts on the due list re-ran green.
+
+## 2026-09-04 - Dragging a splitter moves a fifth as much window chrome (T1345)
+
+T1343 left the drag with a measured 15.8 ms per mouse move at 8 panes and a
+named suspect for most of it: the layered-popup fan-out. Every piece of chrome
+over a pane - the banner strip, the dim wash, the scrollbar, the read-only
+badge, the key-state pill - is its own `WS_EX_LAYERED` popup, so a layout pass
+moves and repaints all of them. T1343 had TIMED the block that happens in; it
+had never COUNTED what happens inside it, so "the placement costs 9.7 ms" still
+did not say what the placement was doing.
+
+`chrome_fanout.zig` counts it: window moves, `UpdateLayeredWindow` blits and
+z-order walks, per motion tick, split by which popup issued them, on the same
+`GHOZTTY_PERF` drag line as everything else. The first reading, at 8 panes, for
+ONE mouse move: **22 moves, 15 layered blits, 22 z-order walks**. Three
+redundancies fell out of it, none of them visible from reading the code:
+
+- **Every scrollbar repositioned twice.** A moved pane sends its surface both
+  `WM_MOVE` and `WM_SIZE`, and both arms called `repositionAndResize` - 15 moves
+  where 8 is the honest number, each redundant one dragging a z-order walk and a
+  layered blit behind it. It now remembers where it placed the popup and answers
+  the second arrival from that cache, which is the argument
+  `dim_math.needsReposition` already made for the wash in T1295.
+- **Every reposition walked the desktop z-order.** `seatedAboveOwner` walks up
+  to 64 windows with three `GetWindow` calls a step; a live layout pass moves
+  already-visible popups with `SWP_NOZORDER`, so the walk could only confirm
+  what it found last time. A live pass now skips it for popups that were already
+  up. A hidden->shown transition still heals - `SWP_SHOWWINDOW` is the lift the
+  heal exists for (T142) - and `WM_ACTIVATE` still heals every overlay a window
+  owns, which is where a stray topmost set by another process is caught.
+- **Every scrollbar reposition re-blitted its layered surface.** Dragging a
+  vertical divider changes the scrollbar's x and not one of its pixels.
+  `repaint` now compares a content signature against what the surface already
+  holds. Size is load-bearing on the must-blit side: a resized popup keeps its
+  old layered surface, and leaving that stale is exactly the stretched-content
+  defect T1343 was told not to reintroduce.
+
+And the unfocused-split washes move through one `BeginDeferWindowPos` batch
+instead of one `SetWindowPos` each - what T1031 did for the panes, one level up.
+
+The measurement is the point, so it is a CONTROLLED one:
+`GHOZTTY_CHROME_FANOUT_LEGACY` puts the old fan-out back on the same build, the
+way `GHOZTTY_DRAG_SERIAL_WAIT` does for T1343's half. The improvement here is a
+few milliseconds on a box whose run-to-run spread is about that wide, and
+comparing today's number against one written down yesterday cannot tell a fix
+from a quiet afternoon. Both shapes, same build, same minute, 8 panes:
+
+| shape | per move | overlay term | moves | blits | z-order walks | verdict |
+|---|---|---|---|---|---|---|
+| legacy | 19.3 ms | 4.03 ms | 22 | 15 | 22 | steppy |
+| now | 15.5 ms | 2.72 ms | 11 | 0 | 0 | **smooth** |
+
+59 window-manager operations per mouse move become 11, about a fifth off the
+tick, and the 8-pane drag crosses from `steppy` to `smooth`.
+
+What this did NOT do is stated in the task rather than claimed away: the popups
+are still one popup each, and the 15.5 ms that remains is the window manager
+genuinely moving 19 windows - 8 panes plus 11 pieces of chrome. Collapsing the
+five popups a pane owns into one is **T1350**, and it now has a number to beat
+instead of a hypothesis.
+
+`drag-perf.ps1` ALL PASS (12) with five new assertions on the counts rather than
+the clock, `-NegativeControl` scores them red, all four floor lanes PASS, P1-P3
+ALL PASS, and the overlay acceptance scripts the change touches re-ran green:
+`overlay-zorder` (34) is the T142 z-order case, `hero-mode` (72) the hero one,
+plus `split-dim` (29), `split-dim-viewer` (29), `pane-banner` (132),
+`readonly-badge` (28), `key-state-pill` (53), `viewer-nav-pin` (24) and
+`scrollback-narrow` (11).
+
+A second, independent run of the harness the next hour put the same numbers
+down again - 22 moves / 15 blits / 22 walks per mouse move at 8 panes becoming
+11 / 0 / 0, and 18.1 ms becoming 15.1 ms - which is what the same-build control
+switch was for: the counts repeat exactly and only the clock wanders. The
+`drag-perf` guard now covers `chrome_fanout.zig` as well, since the harness
+asserts the counters that module produces.

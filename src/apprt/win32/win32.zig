@@ -2316,6 +2316,7 @@ pub extern "user32" fn GetWindow(
 ) callconv(.winapi) ?HWND;
 
 const overlay_zorder = @import("overlay_zorder.zig");
+const chrome_fanout = @import("chrome_fanout.zig");
 
 comptime {
     // The policy module duplicates this bit so it can be pure.
@@ -2408,6 +2409,7 @@ pub fn setTopmost(hwnd: HWND, want: bool) bool {
 /// `owner` may be a child window (the pane overlays are owned by the surface
 /// HWND); the z-order — and the topmost bit — live on its top-level ancestor.
 pub fn healOverlayZOrder(hwnd: HWND, owner: HWND) void {
+    chrome_fanout.noteHeal();
     const root = GetAncestor(owner, GA_ROOT) orelse owner;
     const root_ex = GetWindowLongW(root, GWL_EXSTYLE);
 
@@ -2423,6 +2425,33 @@ pub fn healOverlayZOrder(hwnd: HWND, owner: HWND) void {
     // its owner when the SYSTEM orders them, but an explicit SetWindowPos is
     // honored as given, and the banner would vanish behind the terminal.
     _ = SetWindowPos(hwnd, GetWindow(root, GW_HWNDPREV), 0, 0, 0, 0, flags);
+}
+
+/// `healOverlayZOrder` for the case that dominates a splitter drag: an overlay
+/// being re-glued to a pane that just moved (T1345).
+///
+/// The heal is not cheap — `seatedAboveOwner` walks the desktop's z-order with
+/// `GetWindow`, up to 64 steps of three kernel transitions each — and a
+/// splitter drag pays it once per overlay per pane per mouse move. At 8 panes
+/// that is dozens of walks for a single frame of drag, and every one of them
+/// asks a question whose answer cannot have changed: the pass moved
+/// already-visible popups with `SWP_NOZORDER`, so it did not touch the
+/// ordering, and nothing else runs on this thread while it does.
+///
+/// So during a live layout pass an already-shown overlay skips the walk.
+/// A popup coming back from hidden still heals — `SWP_SHOWWINDOW` lifts it
+/// above unrelated windows, which is the T142 case the heal exists for — and
+/// `WM_ACTIVATE` still heals every overlay a window owns, which is where a
+/// stray topmost set by another process is caught either way.
+pub fn healOverlayZOrderAfterMove(hwnd: HWND, owner: HWND, was_shown: bool) void {
+    if (!chrome_fanout.shouldHeal(.{
+        .suppressed = chrome_fanout.state.suppressed(),
+        .was_shown = was_shown,
+    })) {
+        chrome_fanout.noteHealSkipped();
+        return;
+    }
+    healOverlayZOrder(hwnd, owner);
 }
 
 // -----------------------------------------------------------------------

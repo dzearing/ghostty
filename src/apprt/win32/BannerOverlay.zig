@@ -26,6 +26,7 @@
 
 const std = @import("std");
 const w32 = @import("win32.zig");
+const chrome_fanout = @import("chrome_fanout.zig");
 const App = @import("App.zig");
 const markdown = @import("banner_markdown.zig");
 const card = @import("banner_card.zig");
@@ -462,6 +463,10 @@ pub const BannerOverlay = struct {
         var flags: u32 = w32.SWP_NOACTIVATE | w32.SWP_NOZORDER | w32.SWP_SHOWWINDOW;
         if (resized) flags |= w32.SWP_NOCOPYBITS;
 
+        // Cheap enough to ask every pass (one flag read), and it is what
+        // decides whether this reposition owes a z-order heal (T1345).
+        const was_shown = w32.IsWindowVisible_(self.hwnd) != 0;
+        chrome_fanout.noteMove(.banner);
         _ = w32.SetWindowPos(self.hwnd, null, rect.left, top, new_w, new_h, flags);
 
         // Repaint NOW, not on the next pumped WM_PAINT (T456). This runs
@@ -473,8 +478,10 @@ pub const BannerOverlay = struct {
         // same card render, moved earlier in the same frame.
         if (resized) _ = w32.UpdateWindow(self.hwnd);
         // Every reposition re-checks the z-order instead of leaving it to
-        // whatever last touched it (T142).
-        w32.healOverlayZOrder(self.hwnd, self.owner);
+        // whatever last touched it (T142) — except inside a live layout pass,
+        // where an already-shown popup cannot have moved in the z-order and
+        // the walk is the fan-out's biggest per-pane cost (T1345).
+        w32.healOverlayZOrderAfterMove(self.hwnd, self.owner, was_shown);
     }
 
     /// The strip's natural height at `scale` in a `pane_w`-wide pane slot,

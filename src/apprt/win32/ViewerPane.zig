@@ -1455,7 +1455,7 @@ pub fn focus(self: *ViewerPane) void {
 /// Called by `Window.updateDimOverlays` through the PaneView arm; takes the
 /// allocator as a parameter (the ViewerPane convention) so the host floor
 /// stays drivable from a unit test without an `App` or a `Window`.
-pub fn showDimOverlay(self: *ViewerPane, alloc: Allocator, color: u32, alpha: u8) void {
+pub fn showDimOverlay(self: *ViewerPane, alloc: Allocator, color: u32, alpha: u8, batch: ?*?w32.HDWP) void {
     const hwnd = self.hwnd orelse return;
     if (self.dim_overlay == null) {
         // The host window's own module handle; createHostWindow recorded it.
@@ -1469,7 +1469,7 @@ pub fn showDimOverlay(self: *ViewerPane, alloc: Allocator, color: u32, alpha: u8
             return;
         };
     }
-    _ = self.dim_overlay.?.show(color, alpha);
+    _ = self.dim_overlay.?.show(color, alpha, batch);
 }
 
 /// Hide this pane's dim overlay if it exists.
@@ -9343,13 +9343,13 @@ test "T380: the dim overlay glues to the host window and follows it" {
 
     // No host window yet: the call must be a safe no-op, the way every other
     // pre-createHostWindow entry point is.
-    pane.showDimOverlay(alloc, w32.RGB(16, 16, 20), 77);
+    pane.showDimOverlay(alloc, w32.RGB(16, 16, 20), 77, null);
     try testing.expect(pane.dim_overlay == null);
 
     try pane.createHostWindow(hinstance, parent, .{ .left = 0, .top = 0, .right = 300, .bottom = 200 });
     const host = pane.hwnd.?;
 
-    pane.showDimOverlay(alloc, w32.RGB(16, 16, 20), 77);
+    pane.showDimOverlay(alloc, w32.RGB(16, 16, 20), 77, null);
     const d = pane.dim_overlay orelse return error.NoOverlay;
     try testing.expect(shownByStyle(d.hwnd));
 
@@ -9369,7 +9369,7 @@ test "T380: the dim overlay glues to the host window and follows it" {
 
     // A divider drag moves the host; the next update call must re-glue.
     _ = w32.MoveWindow(host, 40, 30, 150, 100, 0);
-    pane.showDimOverlay(alloc, w32.RGB(16, 16, 20), 77);
+    pane.showDimOverlay(alloc, w32.RGB(16, 16, 20), 77, null);
     try testing.expect(w32.GetWindowRect(host, &host_rect) != 0);
     try testing.expect(w32.GetWindowRect(d.hwnd, &overlay_rect) != 0);
     try testing.expectEqual(host_rect, overlay_rect);
@@ -9441,34 +9441,34 @@ test "T1295: a redundant dim-overlay show does not re-blend" {
     try pane.createHostWindow(hinstance, parent, .{ .left = 0, .top = 0, .right = 300, .bottom = 200 });
     const host = pane.hwnd.?;
 
-    pane.showDimOverlay(alloc, w32.RGB(16, 16, 20), 77);
+    pane.showDimOverlay(alloc, w32.RGB(16, 16, 20), 77, null);
     const d = pane.dim_overlay orelse return error.NoOverlay;
     try testing.expect(d.shown);
 
     // Every steady-state event - a focus change elsewhere, a WM_MOVE that did
     // not move this pane, a config reload that changed nothing - lands here
     // with identical arguments and must do nothing at all.
-    try testing.expect(!d.show(w32.RGB(16, 16, 20), 77));
-    try testing.expect(!d.show(w32.RGB(16, 16, 20), 77));
-    try testing.expect(!d.show(w32.RGB(16, 16, 20), 77));
+    try testing.expect(!d.show(w32.RGB(16, 16, 20), 77, null));
+    try testing.expect(!d.show(w32.RGB(16, 16, 20), 77, null));
+    try testing.expect(!d.show(w32.RGB(16, 16, 20), 77, null));
 
     // A real change still gets through: the pane moves...
     _ = w32.MoveWindow(host, 40, 30, 150, 100, 0);
-    try testing.expect(d.show(w32.RGB(16, 16, 20), 77));
-    try testing.expect(!d.show(w32.RGB(16, 16, 20), 77));
+    try testing.expect(d.show(w32.RGB(16, 16, 20), 77, null));
+    try testing.expect(!d.show(w32.RGB(16, 16, 20), 77, null));
 
     // ...unfocused-split-opacity changes...
-    try testing.expect(d.show(w32.RGB(16, 16, 20), 128));
-    try testing.expect(!d.show(w32.RGB(16, 16, 20), 128));
+    try testing.expect(d.show(w32.RGB(16, 16, 20), 128, null));
+    try testing.expect(!d.show(w32.RGB(16, 16, 20), 128, null));
 
     // ...unfocused-split-fill changes...
-    try testing.expect(d.show(w32.RGB(32, 0, 0), 128));
-    try testing.expect(!d.show(w32.RGB(32, 0, 0), 128));
+    try testing.expect(d.show(w32.RGB(32, 0, 0), 128, null));
+    try testing.expect(!d.show(w32.RGB(32, 0, 0), 128, null));
 
     // ...and a hide/show flip (focus out and back) always replaces it.
     d.hide();
     try testing.expect(!d.shown);
-    try testing.expect(d.show(w32.RGB(32, 0, 0), 128));
+    try testing.expect(d.show(w32.RGB(32, 0, 0), 128, null));
 }
 
 // -------------------------------------------------------------------------

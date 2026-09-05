@@ -140,6 +140,7 @@ const commands = @import("commands.zig");
 const menu_bar = @import("menu_bar.zig");
 const menu_label = @import("menu_label.zig");
 const overlay_zorder = @import("overlay_zorder.zig");
+const chrome_fanout = @import("chrome_fanout.zig");
 const tab_tooltip = @import("tab_tooltip.zig");
 const internal_os = @import("../../os/main.zig");
 
@@ -954,6 +955,11 @@ pub fn init(self: *Window, app: *App, options: InitOptions) !void {
     // the harness can measure both shapes on one build.
     self.drag_perf_on = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_PERF");
     self.frame_wait_serial = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_DRAG_SERIAL_WAIT");
+    // T1345's control, read the same way and for the same reason: the pre-fix
+    // chrome fan-out, so both shapes are measurable on one build.
+    chrome_fanout.state.legacy = std.process.hasNonEmptyEnvVarConstant(
+        "GHOZTTY_CHROME_FANOUT_LEGACY",
+    );
 
     // Stable layout identity (T338), before anything can capture a layout.
     // A malformed recorded value is discarded rather than adopted: a bad key
@@ -2981,6 +2987,14 @@ pub fn layoutSplitsLive(self: *Window) void {
     const was = self.in_live_layout;
     self.in_live_layout = true;
     defer self.in_live_layout = was;
+    // T1345: for the length of this pass an already-shown chrome popup skips
+    // the z-order walk it would otherwise do on every reposition. The pass
+    // moves visible popups with `SWP_NOZORDER` and nothing else runs on this
+    // thread while it does, so the walk can only ever confirm what it found
+    // last time — and a splitter drag pays it once per popup per pane per
+    // mouse move, which is where the fan-out's placement time was going.
+    chrome_fanout.state.beginSuppress();
+    defer chrome_fanout.state.endSuppress();
     self.layoutSplits();
 }
 
@@ -2995,7 +3009,9 @@ fn reportDragCost(self: *Window) void {
         "fps={d} panes={d} resizes_max={d} waits_max={d} waits_total={d} timeouts={d} " ++
         "mean_layout_us={d} mean_place_us={d} mean_paint_us={d} " ++
         "mean_overlay_us={d} mean_resize_us={d} " ++
-        "over_budget={d} wait={s} verdict={s}";
+        "chrome_moves={d} chrome_sb={d} chrome_dim={d} " ++
+        "chrome_blits={d} chrome_heals={d} chrome_skipped={d} " ++
+        "over_budget={d} wait={s} chrome={s} verdict={s}";
     const args = .{
         st.ticks,
         st.meanUs(),
@@ -3012,8 +3028,15 @@ fn reportDragCost(self: *Window) void {
         st.meanPaintUs(),
         st.meanOverlayUs(),
         st.meanResizeUs(),
+        st.chrome_moves_max,
+        st.chrome_sb_moves_max,
+        st.chrome_dim_moves_max,
+        st.chrome_blits_max,
+        st.chrome_heals_max,
+        st.chrome_skipped_max,
         st.over_budget,
         if (self.frame_wait_serial) "serial" else "batched",
+        if (chrome_fanout.state.legacy) "legacy" else "batched",
         @tagName(st.verdict()),
     };
     switch (st.verdict()) {
@@ -3039,6 +3062,9 @@ fn beginFrameWaitBatch(self: *Window) void {
         self.frame_resize_us = 0;
         self.frame_place_us = 0;
         self.frame_paint_us = 0;
+        // T1345: and the chrome fan-out this pass will pay for — the window
+        // moves, layered blits and z-order walks the per-pane popups cost.
+        chrome_fanout.state.counts.reset();
     }
     self.frame_wait_depth +|= 1;
 }
@@ -3197,6 +3223,20 @@ pub fn updateDimOverlays(self: *Window) void {
     const fill = config.@"unfocused-split-fill" orelse config.background;
     const color = w32.RGB(fill.r, fill.g, fill.b);
 
+    // T1345: every unfocused pane's wash moves on the same layout pass, so
+    // they move together. One `SetWindowPos` per popup is one window-manager
+    // transaction and one composite each — at 8 panes that is 7 of them for a
+    // single mouse move of a splitter drag, which the drag measurement found
+    // sitting in the `overlay` term. The panes themselves have been placed
+    // this way since T1031; this is the same argument one level up.
+    // Only during a LIVE pass. Outside one there is no drag to keep up with,
+    // and a deferred move plus an immediate z-order heal on the same popup is
+    // an interaction worth not having for nothing.
+    var hdwp = if (chrome_fanout.state.suppressed())
+        beginPaneBatch(self.paneCountAllTabs())
+    else
+        null;
+
     for (0..self.tab_count) |tab| {
         const tree = self.tab_trees[tab];
         var it = tree.iterator();
@@ -3210,12 +3250,17 @@ pub fn updateDimOverlays(self: *Window) void {
                 .focused_pane = entry.view == self.tab_active_pane[tab],
             });
             if (dim) {
-                entry.view.showDimOverlay(color, alpha);
+                entry.view.showDimOverlay(color, alpha, &hdwp);
             } else {
                 entry.view.hideDimOverlay();
             }
         }
     }
+    // Closed HERE, not at the end of this function: the banner/badge/pill
+    // passes below place their popups directly, and leaving the batch open
+    // across them would land the washes after chrome computed from the same
+    // layout. There is no early return between the open and this line.
+    endPaneBatch(hdwp);
 
     // Pane banners glue to the same layout/visibility/config events (T35).
     self.updatePaneBanners();
@@ -3339,6 +3384,14 @@ fn hidePane(hdwp: *?w32.HDWP, h: w32.HWND) void {
         hdwp.* = null;
     }
     _ = w32.SetWindowPos(h, null, 0, 0, 0, 0, flags);
+}
+
+/// How many panes this window holds across every tab — the size hint for a
+/// batch that walks all of them (T1345).
+fn paneCountAllTabs(self: *Window) usize {
+    var n: usize = 0;
+    for (0..self.tab_count) |tab| n += self.leafCount(tab);
+    return n;
 }
 
 /// Open a defer batch for `n` pane placements, or null when the OS says no.
@@ -3846,6 +3899,13 @@ fn updateDividerDrag(self: *Window, x: i32, y: i32) void {
             .layout_us = self.frame_layout_us,
             .place_us = self.frame_place_us,
             .paint_us = self.frame_paint_us,
+            .chrome_moves = chrome_fanout.state.counts.moves,
+            .chrome_sb_moves = chrome_fanout.state.counts.moveCount(.scrollbar),
+            .chrome_dim_moves = chrome_fanout.state.counts.moveCount(.dim),
+            .chrome_blits = chrome_fanout.state.counts.blits,
+            .chrome_heals = chrome_fanout.state.counts.heals,
+            .chrome_skipped = chrome_fanout.state.counts.blits_skipped +|
+                chrome_fanout.state.counts.heals_skipped,
         });
     };
     const rect = self.drag_start_rect;
