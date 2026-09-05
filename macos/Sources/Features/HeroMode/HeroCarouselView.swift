@@ -47,8 +47,24 @@ class HeroCarouselContainer: NSView {
     private var currentLeaves: [PaneView] = []
     private var snapshotTimer: Timer?
     private var needsInitialSnapshot = false
-    private var isScrolling = false
-    private var scrollEndTimer: Timer?
+
+    /// Decides which tiles may capture on each heartbeat. See
+    /// `HeroSnapshotScheduler` for the measurements behind the schedule.
+    /// Internal rather than private so tests can assert that events reaching
+    /// the window actually reach the pacing.
+    let scheduler = HeroSnapshotScheduler()
+
+    /// Watches the window's event stream so that interaction *anywhere in the
+    /// window* — above all scrolling the web page in the hero pane — pauses
+    /// thumbnail capture. The carousel's own `scrollWheel` is not enough: the
+    /// hero pane's WKWebView consumes its own scroll events and the carousel
+    /// never sees them.
+    private var eventMonitor: Any?
+
+    /// How many thumbnail captures this carousel has started. Read by tests, to
+    /// prove from outside that a fresh carousel fills its tiles rather than
+    /// waiting for an interaction that may never come.
+    private(set) var captureCount: Int = 0
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -77,7 +93,30 @@ class HeroCarouselContainer: NSView {
         super.viewDidMoveToWindow()
         if window == nil {
             stopTimers()
+            removeEventMonitor()
+        } else {
+            installEventMonitor()
+            startSnapshotTimer()
         }
+    }
+
+    private func installEventMonitor() {
+        guard eventMonitor == nil else { return }
+        eventMonitor = NSEvent.addLocalMonitorForEvents(
+            matching: HeroSnapshotScheduler.interactionEventMask
+        ) { [weak self] event in
+            guard let self else { return event }
+            if HeroSnapshotScheduler.isInteraction(event, in: self.window) {
+                self.scheduler.noteInteraction()
+            }
+            return event
+        }
+    }
+
+    private func removeEventMonitor() {
+        guard let eventMonitor else { return }
+        NSEvent.removeMonitor(eventMonitor)
+        self.eventMonitor = nil
     }
 
     func update(leaves: [PaneView], state: HeroModeState, heroAspectRatio: CGFloat) {
@@ -225,13 +264,8 @@ class HeroCarouselContainer: NSView {
         let ts = thumbSize
         guard ts.height > 0 else { return }
 
-        isScrolling = true
-        scrollEndTimer?.invalidate()
-        scrollEndTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: false) { [weak self] _ in
-            self?.isScrolling = false
-            self?.refreshSnapshots()
-        }
-
+        // The event monitor already noted this as interaction, which pauses
+        // captures; the heartbeat resumes them once the strip settles.
         scrollOffset += event.scrollingDeltaY
 
         let stride = ts.height + gap
@@ -244,24 +278,29 @@ class HeroCarouselContainer: NSView {
         repositionStrip(animated: false)
     }
 
+    /// The heartbeat that drives thumbnail capture. It ticks at the *fastest*
+    /// cadence any pane kind wants and then asks the scheduler per tile, rather
+    /// than trying to schedule each tile's next capture: a tick is a few time
+    /// comparisons, and running it unconditionally is what guarantees the
+    /// trailing refresh after a gesture can never be missed or cancelled.
     private func startSnapshotTimer() {
-        guard snapshotTimer == nil else { return }
+        guard snapshotTimer == nil, window != nil else { return }
         snapshotTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
-            guard let self = self, !self.isScrolling else { return }
-            self.refreshVisibleSnapshots()
+            self?.refreshVisibleSnapshots()
         }
     }
 
     private func stopTimers() {
         snapshotTimer?.invalidate()
         snapshotTimer = nil
-        scrollEndTimer?.invalidate()
-        scrollEndTimer = nil
     }
 
+    /// Capture every tile right now, bypassing the idle cadence and the quiet
+    /// period. Used only for tiles that have no picture yet (a fresh or rebuilt
+    /// carousel), where the alternative is showing blanks.
     private func refreshSnapshots() {
-        for tile in tiles {
-            tile.refreshSnapshot()
+        for tile in tiles where tile.refreshSnapshot(scheduler: scheduler, force: true) {
+            captureCount += 1
         }
     }
 
@@ -269,14 +308,16 @@ class HeroCarouselContainer: NSView {
         let visibleRect = bounds
         for tile in tiles {
             let tileFrameInSelf = strip.convert(tile.frame, to: self)
-            if tileFrameInSelf.intersects(visibleRect) {
-                tile.refreshSnapshot()
+            if tileFrameInSelf.intersects(visibleRect),
+               tile.refreshSnapshot(scheduler: scheduler, force: false) {
+                captureCount += 1
             }
         }
     }
 
     deinit {
         stopTimers()
+        removeEventMonitor()
     }
 }
 
@@ -290,9 +331,26 @@ private class CarouselTile: NSView {
     private let imageView = NSImageView()
     private let borderLayer = CAShapeLayer()
 
-    /// True while an async WKWebView snapshot is being taken (viewer panes),
-    /// so the repeating snapshot timer doesn't pile up overlapping captures.
-    private var snapshotInFlight = false
+    /// When an async WKWebView snapshot (viewer panes) started, so the repeating
+    /// snapshot timer doesn't pile up overlapping captures — and so one that
+    /// never calls back cannot freeze this thumbnail forever. See
+    /// `HeroSnapshotScheduler.staleCaptureTimeout`.
+    private var snapshotInFlightSince: TimeInterval?
+
+    /// Bumped for every capture started, so a completion that arrives after its
+    /// capture was presumed lost cannot overwrite a newer picture.
+    private var snapshotGeneration = 0
+
+    /// When this tile last captured, so the scheduler can hold it to its pane
+    /// kind's idle cadence.
+    private var lastCapture: TimeInterval?
+
+    private var paneKind: HeroSnapshotScheduler.PaneKind {
+        switch pane.content {
+        case .terminal: return .terminal
+        case .viewer: return .viewer
+        }
+    }
 
     private let selectedColor = NSColor(red: 0.416, green: 0.416, blue: 1.0, alpha: 1.0)
     private let hoverColor = NSColor(red: 0.545, green: 0.361, blue: 0.965, alpha: 1.0)
@@ -346,25 +404,58 @@ private class CarouselTile: NSView {
         )
     }
 
-    func refreshSnapshot() {
+    /// Capture this tile's thumbnail if the scheduler allows it.
+    ///
+    /// `force` skips the quiet period and the idle cadence — but never the
+    /// in-flight guard, which exists to stop overlapping captures rather than to
+    /// pace them. It is for tiles that have nothing to show yet.
+    ///
+    /// - Returns: whether a capture was actually started.
+    @discardableResult
+    func refreshSnapshot(scheduler: HeroSnapshotScheduler, force: Bool) -> Bool {
+        if !force {
+            guard scheduler.shouldCapture(
+                kind: paneKind,
+                lastCapture: lastCapture,
+                inFlightSince: snapshotInFlightSince
+            ) else { return false }
+        } else if let snapshotInFlightSince,
+                  scheduler.now() - snapshotInFlightSince < HeroSnapshotScheduler.staleCaptureTimeout {
+            return false
+        }
+
+        let captured: Bool
         switch pane.content {
         case .terminal(let surfaceView):
-            refreshTerminalSnapshot(surfaceView)
+            captured = refreshTerminalSnapshot(surfaceView)
         case .viewer(let viewerView):
-            refreshViewerSnapshot(viewerView)
+            captured = refreshViewerSnapshot(viewerView, scheduler: scheduler)
         }
+
+        // A pane with no size yet captured nothing, so it must not start its
+        // idle interval — otherwise a tile that failed once would sit blank for
+        // a whole interval before trying again.
+        if captured { lastCapture = scheduler.now() }
+        return captured
     }
 
-    /// Terminal thumbnails render the surface's CALayer directly (in-process
-    /// Metal layer, cheap and synchronous).
-    private func refreshTerminalSnapshot(_ surfaceView: Ghostty.SurfaceView) {
-        guard let surfaceLayer = surfaceView.layer else { return }
+    /// Terminal thumbnails render the surface's CALayer directly (an
+    /// `IOSurfaceLayer`, so this is a blit: ~1.2ms at full pane resolution).
+    ///
+    /// Captured at the tile's resolution rather than the pane's: a 1200×900pt
+    /// pane on a 2× display is a 16.5MB bitmap per capture, versus 0.7MB and
+    /// ~0.05ms for the ~240pt tile it is about to be squeezed into.
+    private func refreshTerminalSnapshot(_ surfaceView: Ghostty.SurfaceView) -> Bool {
+        guard let surfaceLayer = surfaceView.layer else { return false }
         let size = surfaceView.bounds.size
-        guard size.width > 0, size.height > 0 else { return }
+        guard size.width > 0, size.height > 0 else { return false }
 
-        let scale = surfaceView.window?.backingScaleFactor ?? 2.0
-        let pixelWidth = Int(size.width * scale)
-        let pixelHeight = Int(size.height * scale)
+        let backingScale = surfaceView.window?.backingScaleFactor ?? 2.0
+        let ratio = HeroSnapshotScheduler.captureRatio(paneSize: size, tileSize: bounds.size)
+        let scale = backingScale * ratio
+        let pixelWidth = Int((size.width * scale).rounded())
+        let pixelHeight = Int((size.height * scale).rounded())
+        guard pixelWidth > 0, pixelHeight > 0 else { return false }
 
         guard let bitmapRep = NSBitmapImageRep(
             bitmapDataPlanes: nil,
@@ -377,10 +468,10 @@ private class CarouselTile: NSView {
             colorSpaceName: .deviceRGB,
             bytesPerRow: 0,
             bitsPerPixel: 0
-        ) else { return }
+        ) else { return false }
 
         let ctx = NSGraphicsContext(bitmapImageRep: bitmapRep)
-        guard let cgCtx = ctx?.cgContext else { return }
+        guard let cgCtx = ctx?.cgContext else { return false }
 
         cgCtx.scaleBy(x: scale, y: scale)
         surfaceLayer.render(in: cgCtx)
@@ -388,26 +479,44 @@ private class CarouselTile: NSView {
         let image = NSImage(size: size)
         image.addRepresentation(bitmapRep)
         imageView.image = image
+        return true
     }
 
     /// Viewer thumbnails must go through WKWebView.takeSnapshot: web content
     /// renders out-of-process, so rendering the view's layer (the terminal
-    /// path above) would capture a blank rectangle. The call is async; an
-    /// in-flight guard keeps the repeating snapshot timer from stacking
-    /// captures, and the previous image stays up until the new one lands.
-    private func refreshViewerSnapshot(_ viewerView: ViewerView) {
-        guard !snapshotInFlight else { return }
+    /// path above) would capture a blank rectangle. The call is async, so the
+    /// previous image stays up until the new one lands; `refreshSnapshot` is
+    /// what keeps the repeating timer from stacking captures.
+    ///
+    /// The snapshot is requested at the tile's width. WebKit's cost here is a
+    /// full out-of-band paint in the web process — ~30ms at a 1200pt pane
+    /// versus ~3ms at a 240pt tile — and it comes out of the very frame budget
+    /// the user is scrolling with, so asking for pixels we immediately throw
+    /// away is the expensive kind of waste. The returned image is at the
+    /// display's backing scale, so it is no less sharp.
+    private func refreshViewerSnapshot(_ viewerView: ViewerView, scheduler: HeroSnapshotScheduler) -> Bool {
         let webView = viewerView.webView!
-        guard webView.bounds.width > 0, webView.bounds.height > 0 else { return }
+        guard webView.bounds.width > 0, webView.bounds.height > 0 else { return false }
 
-        snapshotInFlight = true
-        webView.takeSnapshot(with: nil) { [weak self] image, _ in
-            guard let self else { return }
-            self.snapshotInFlight = false
+        let config = WKSnapshotConfiguration()
+        if let width = HeroSnapshotScheduler.snapshotWidth(
+            paneSize: webView.bounds.size,
+            tileSize: bounds.size
+        ) {
+            config.snapshotWidth = NSNumber(value: Double(width))
+        }
+
+        snapshotInFlightSince = scheduler.now()
+        snapshotGeneration += 1
+        let generation = snapshotGeneration
+        webView.takeSnapshot(with: config) { [weak self] image, _ in
+            guard let self, generation == self.snapshotGeneration else { return }
+            self.snapshotInFlightSince = nil
             if let image {
                 self.imageView.image = image
             }
         }
+        return true
     }
 
     override func mouseDown(with event: NSEvent) {}
