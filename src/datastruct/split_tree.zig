@@ -195,6 +195,77 @@ pub fn SplitTree(comptime V: type) type {
             view: *View,
         };
 
+        /// An iterator over the views in SCREEN order: the tree walked
+        /// structurally, left subtree before right, so the views come out
+        /// top-to-bottom / left-to-right the way they are laid out.
+        ///
+        /// `iterator()` walks the `nodes` ARRAY instead, which is storage
+        /// order — an artifact of how the splits were allocated, not of how
+        /// they are arranged. `split()` appends the inserted tree before the
+        /// copy of the node it displaced, so a `down` split yields the NEW
+        /// view first even though it sits below the old one. Anything whose
+        /// meaning is "the panes, in the order a person sees them" — a
+        /// carousel strip, an index into that strip, `+list`'s leaves — wants
+        /// this one; anything that just needs to visit every view (counting,
+        /// ref-counting, hiding) can use either.
+        pub fn leafIterator(self: *const Self) LeafIterator {
+            return .{
+                .nodes = self.nodes,
+                .pending = if (self.nodes.len == 0) null else descendLeft(self.nodes, .root),
+            };
+        }
+
+        /// Walk down the left spine from `handle` to the first leaf under it.
+        fn descendLeft(nodes: []const Node, handle: Node.Handle) Node.Handle {
+            var h = handle;
+            while (true) switch (nodes[h.idx()]) {
+                .leaf => return h,
+                .split => |s| h = s.left,
+            };
+        }
+
+        /// The split node that has `handle` as a child, if any. Found by
+        /// scanning: nodes carry no parent link, and a tree has one node per
+        /// pane, so the scan is cheaper than the bookkeeping would be.
+        fn parentOfIn(nodes: []const Node, handle: Node.Handle) ?Node.Handle {
+            for (nodes, 0..) |node, i| switch (node) {
+                .leaf => {},
+                .split => |s| if (s.left == handle or s.right == handle) {
+                    return @enumFromInt(@as(Node.Handle.Backing, @intCast(i)));
+                },
+            };
+            return null;
+        }
+
+        pub const LeafIterator = struct {
+            nodes: []const Node,
+            /// The next leaf to hand out; null once the walk is done.
+            pending: ?Node.Handle,
+
+            pub fn next(self: *LeafIterator) ?ViewEntry {
+                const handle = self.pending orelse return null;
+                const view = switch (self.nodes[handle.idx()]) {
+                    .leaf => |v| v,
+                    // `pending` only ever holds a leaf.
+                    .split => unreachable,
+                };
+
+                // Successor: climb until we come up out of a LEFT child,
+                // then take the left spine of that split's right subtree.
+                self.pending = successor: {
+                    var h = handle;
+                    while (parentOfIn(self.nodes, h)) |ph| {
+                        const s = self.nodes[ph.idx()].split;
+                        if (s.left == h) break :successor descendLeft(self.nodes, s.right);
+                        h = ph;
+                    }
+                    break :successor null;
+                };
+
+                return .{ .handle = handle, .view = view };
+            }
+        };
+
         pub const Iterator = struct {
             i: Node.Handle = .root,
             nodes: []const Node,
@@ -325,13 +396,7 @@ pub fn SplitTree(comptime V: type) type {
         /// The split node that has `handle` as a child, or null for the root
         /// (or a handle that is not in this tree).
         fn parentOf(self: *const Self, handle: Node.Handle) ?Node.Handle {
-            for (self.nodes, 0..) |node, i| switch (node) {
-                .leaf => {},
-                .split => |s| if (s.left == handle or s.right == handle) {
-                    return @enumFromInt(@as(Node.Handle.Backing, @intCast(i)));
-                },
-            };
-            return null;
+            return parentOfIn(self.nodes, handle);
         }
 
         /// The first leaf under `handle` matching `pred`, descending the
@@ -1526,6 +1591,69 @@ const TestView = struct {
         return self.label;
     }
 };
+
+test "SplitTree: leafIterator walks screen order, not storage order (T560)" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A single view is its own leaf order.
+    var va: TestView = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &va);
+    defer t1.deinit();
+    {
+        var it = t1.leafIterator();
+        try testing.expectEqualStrings("A", it.next().?.view.label);
+        try testing.expect(it.next() == null);
+    }
+
+    // Split A downward with B: B is BELOW A on screen, but `split` stores
+    // the inserted tree first, so the node array reads [_, B, A].
+    var vb: TestView = .{ .label = "B" };
+    var tb: TestTree = try .init(alloc, &vb);
+    defer tb.deinit();
+    var t2: TestTree = try t1.split(alloc, .root, .down, 0.5, &tb);
+    defer t2.deinit();
+
+    // Split B to the right with C.
+    const b_handle: TestTree.Node.Handle = handle: {
+        for (t2.nodes, 0..) |node, i| switch (node) {
+            .leaf => |v| if (std.mem.eql(u8, v.label, "B")) break :handle @enumFromInt(i),
+            .split => {},
+        };
+        return error.TestUnexpectedResult;
+    };
+    var vc: TestView = .{ .label = "C" };
+    var tc: TestTree = try .init(alloc, &vc);
+    defer tc.deinit();
+    var t3: TestTree = try t2.split(alloc, b_handle, .right, 0.5, &tc);
+    defer t3.deinit();
+
+    // Screen order: A on top, then B and C left-to-right beneath it.
+    {
+        var order: std.ArrayList(u8) = .empty;
+        defer order.deinit(alloc);
+        var it = t3.leafIterator();
+        while (it.next()) |entry| try order.appendSlice(alloc, entry.view.label);
+        try testing.expectEqualStrings("ABC", order.items);
+    }
+
+    // Storage order disagrees - which is the whole reason leafIterator
+    // exists. Both still visit every leaf exactly once.
+    {
+        var order: std.ArrayList(u8) = .empty;
+        defer order.deinit(alloc);
+        var it = t3.iterator();
+        while (it.next()) |entry| try order.appendSlice(alloc, entry.view.label);
+        try testing.expectEqual(@as(usize, 3), order.items.len);
+        try testing.expect(!std.mem.eql(u8, "ABC", order.items));
+    }
+
+    // An empty tree yields nothing.
+    var empty: TestTree = .empty;
+    defer empty.deinit();
+    var it_empty = empty.leafIterator();
+    try testing.expect(it_empty.next() == null);
+}
 
 test "SplitTree: isSplit" {
     const testing = std.testing;

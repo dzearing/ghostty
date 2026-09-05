@@ -2408,26 +2408,33 @@ pub fn tabIndexOfPane(self: *Window, pane: *PaneView) ?usize {
 /// Number of leaves in a tab's tree.
 fn leafCount(self: *Window, tab: usize) usize {
     var n: usize = 0;
-    var it = self.tab_trees[tab].iterator();
+    var it = self.tab_trees[tab].leafIterator();
     while (it.next()) |_| n += 1;
     return n;
 }
 
-/// The tree-iteration-order index of `pane` in a tab, if present.
+/// The SCREEN-order index of `pane` in a tab, if present.
+///
+/// Screen order (T560), not the tree's storage order: this index addresses
+/// the hero carousel's strip, which reads top-to-bottom, and `+list --json`'s
+/// leaves, which are emitted structurally. The two used to disagree - a
+/// `down` split stores its new leaf ahead of the pane it split off, so the
+/// preview of the pane you just made appeared ABOVE the original and the
+/// arrow keys walked the strip backwards.
 fn leafIndexOf(self: *Window, tab: usize, pane: *PaneView) ?usize {
     var i: usize = 0;
-    var it = self.tab_trees[tab].iterator();
+    var it = self.tab_trees[tab].leafIterator();
     while (it.next()) |entry| : (i += 1) {
         if (entry.view == pane) return i;
     }
     return null;
 }
 
-/// The leaf at a tree-iteration-order index, if in range. Pub: the
-/// hero slide painter resolves its outgoing/incoming snapshots by index.
+/// The leaf at a screen-order index, if in range. Pub: the hero slide
+/// painter resolves its outgoing/incoming snapshots by index.
 pub fn leafAt(self: *Window, tab: usize, index: usize) ?*PaneView {
     var i: usize = 0;
-    var it = self.tab_trees[tab].iterator();
+    var it = self.tab_trees[tab].leafIterator();
     while (it.next()) |entry| : (i += 1) {
         if (i == index) return entry.view;
     }
@@ -2950,7 +2957,9 @@ fn layoutHero(self: *Window, rect: w32.RECT) void {
     // rect and flips which one is shown, and doing that a window at a time
     // shows background between the hide and the show (T1031).
     var hdwp = beginPaneBatch(n);
-    var it = self.tab_trees[tab].iterator();
+    // Screen order (T560), so `leaf_i` means the same thing here as it does
+    // in the carousel strip and in `leafAt`.
+    var it = self.tab_trees[tab].leafIterator();
     var leaf_i: usize = 0;
     while (it.next()) |entry| : (leaf_i += 1) {
         // Renderer stays awake even for hidden leaves (thumbnail source).

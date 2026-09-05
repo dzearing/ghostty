@@ -1,11 +1,10 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-05T10:10:12-07:00",
-    "commit":  "aafd3f832",
+    "generated":  "2026-09-05T10:55:49-07:00",
+    "commit":  "4232fcb3e",
     "uncommitted":  [
-                        "test/win32/daily-publish.ps1",
-                        "test/win32/go-loop-guard.ps1"
+                        "test/win32/hero-nav.ps1"
                     ],
     "files":  {
                   "src/cli/ghostty.zig":  "ef54b501298cfda9306cfb958c1094db24ee30f355b25865656b3e2bc713bcd7",
@@ -114,7 +113,7 @@
                   "test/win32/harness-exitcode-audit.ps1":  "9568a9718f2cfba7d2bc2b8f9813a74ba8767a062a20dea8f236fc56fa3ee4e5",
                   "test/win32/harness-process-leak.ps1":  "c62a0f43277632a1bd8506273912a0f73b13ed311d3f84e6a3763b425a9d14a9",
                   "test/win32/hero-mode.ps1":  "bc202bf5cc920c3949969f8dc8576092bc6ac692ea10718257827b3e04fd7a83",
-                  "test/win32/hero-nav.ps1":  "85da993c3289f39ca5ec6174dfdd6bf375abccf6a115c2e3aa105a75541ff487",
+                  "test/win32/hero-nav.ps1":  "98d4e384d4a7472af20bddbe1ce244c7ec7e34f90178288c475a1f68a398776a",
                   "test/win32/hero-viewer-tile.ps1":  "93872c39191a45aca2e453ed936d9f2aa08c2032b2745d8b8613693b1e299006",
                   "test/win32/history-guard-flavor.ps1":  "764859c2785f580a4c58e5e8af65e1d4c1fedfc15d81f0281f54d518fb91cf73",
                   "test/win32/holder-adopt.ps1":  "d635bd7fa24d0818bf3160338f15415b28af2a7065221ab6670d01b17569107b",

@@ -91,7 +91,15 @@ function Get-Leaves([IntPtr]$top) {
     $all = @()
     foreach ($cls in @('GhozttyTerminal', 'GhozttyViewer')) {
         $all += @(Get-TestChildWindows -Window $top -Class $cls | ForEach-Object {
-            [pscustomobject]@{ Hwnd = [int64]$_.Hwnd; Kind = $cls; Visible = $_.Visible }
+            # The RECT rides along (T560): screen order - top to bottom, then
+            # left to right - is what the carousel strip has to match, and
+            # child enumeration is z-order, so the rect is the only source for
+            # it. A projection that dropped these left `Sort-Object Top, Left`
+            # sorting on $null, which is a silent no-op sort.
+            [pscustomobject]@{
+                Hwnd = [int64]$_.Hwnd; Kind = $cls; Visible = $_.Visible
+                Left = $_.Left; Top = $_.Top; Right = $_.Right; Bottom = $_.Bottom
+            }
         })
     }
     return , @($all)
@@ -270,6 +278,12 @@ try {
     if ($leaves.Count -ne 4) { Write-Host 'ABORT: 4-pane fixture not built'; exit 1 }
     $allA = @($leaves | ForEach-Object { "$($_.Hwnd)" })
 
+    # SCREEN order (T560), read from the panes as laid out BEFORE hero mode
+    # hides all but one: top-to-bottom, then left-to-right. Child-window
+    # enumeration is z-order (see arm D), so the rects are the only honest
+    # source for "the order a person sees them in".
+    $screenA = @($leaves | Sort-Object Top, Left | ForEach-Object { "$($_.Hwnd)" })
+
     # POSITIVE CONTROL: a chord posted at a terminal reaches binding dispatch,
     # so a dead nav below cannot be blamed on injection (T157's lesson).
     $focus0 = [IntPtr]$leaves[0].Hwnd
@@ -306,6 +320,13 @@ try {
     } else {
         Assert $covered "A: 3 presses from the top visit all 4 leaves, none twice (visited $($distinct.Count) of 4)"
     }
+    # T560: covering every leaf is not enough - the strip has to read in the
+    # SAME order as the panes on screen. The tree's node array is storage
+    # order, and `split` files a new leaf ahead of the pane it displaced, so
+    # this walk used to come out with the panes shuffled.
+    Assert (($walk.Seen -join ',') -eq ($screenA -join ',')) `
+        "A: the walk visits the leaves in screen order, top to bottom (T560)"
+
     if ($script:haveLog) {
         $single = @($walk.Lines | Where-Object { $_ -ne 1 }).Count -eq 0
         Assert $single "A: each press produced exactly ONE heroSelect (got $($walk.Lines -join ',')) - no double-step"
@@ -495,6 +516,54 @@ try {
             Skip 'E: re-enter from the viewer (it never left, so there is nothing to re-enter)'
         }
         Assert (-not ($appA.Process -and $appA.Process.HasExited)) 'E: no crash toggling hero from a viewer'
+    }
+
+    # --- Arm F: a two-dimensional layout reads in screen order (T560) --------
+    # Arm A's fixture is a vertical stack, where "screen order" and "the order
+    # the panes were made" happen to coincide once storage order is fixed.
+    # This one is the shape that separates them: split DOWN, then split the
+    # bottom pane to the RIGHT, so the strip is A on top, then B and C side by
+    # side beneath it. Before this task the strip read them in the order the
+    # nodes were allocated - the new pane's preview above the pane it came out
+    # of - and ctrl+alt+Down walked the strip upwards.
+    $topsBeforeF = @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyWindow' | ForEach-Object { [int64]$_.Hwnd })
+    & $exe +new-window --target=heronav3 | Out-Null
+    Start-Sleep -Seconds 2
+    $topC = [IntPtr]::Zero
+    for ($t = 0; $t -lt 25 -and $topC -eq [IntPtr]::Zero; $t++) {
+        foreach ($w in @(Get-TestWindows -ProcessId $appPid -Class 'GhozttyWindow')) {
+            if ($topsBeforeF -notcontains [int64]$w.Hwnd) { $topC = [IntPtr][int64]$w.Hwnd }
+        }
+        if ($topC -eq [IntPtr]::Zero) { Start-Sleep -Milliseconds 200 }
+    }
+    Assert ($topC -ne [IntPtr]::Zero) 'F: third window created'
+    if ($topC -ne [IntPtr]::Zero) {
+        Set-TestWindowSize -Window $topC -Width 1200 -Height 800 | Out-Null
+        Start-Sleep -Milliseconds 400
+        & $exe +split --target=heronav3 --direction=down --name=heron_f2 | Out-Null
+        Start-Sleep -Milliseconds 900
+        & $exe +split --target=heronav3 --direction=right --name=heron_f3 | Out-Null
+        Start-Sleep -Milliseconds 900
+
+        $leavesF = Get-Leaves $topC
+        Assert ($leavesF.Count -eq 3) "F: the down+right fixture has 3 leaves (got $($leavesF.Count))"
+        if ($leavesF.Count -eq 3) {
+            # Read the layout while every pane is still visible.
+            $screenF = @($leavesF | Sort-Object Top, Left | ForEach-Object { "$($_.Hwnd)" })
+            $rowTops = @($leavesF | Sort-Object Top | ForEach-Object { $_.Top })
+            Assert ($rowTops[0] -lt $rowTops[1]) 'F: the fixture really is two rows (the down split took)'
+            $bottom = @($leavesF | Sort-Object Top | Select-Object -Last 2)
+            Assert ($bottom[0].Left -ne $bottom[1].Left) 'F: ...with two panes side by side in the lower row (the right split took)'
+
+            Assert (Send-TestKeys -Window $topC -Target ([IntPtr]$leavesF[0].Hwnd) -Modifiers ctrl, shift -Key Space) `
+                'F: hero toggle delivered to window C'
+            Start-Sleep -Milliseconds 1200
+            Assert ((Get-HeroId $topC) -ne '') 'F: hero on in window C (exactly one visible leaf)'
+
+            $walkF = Walk-Strip $topC 3
+            Assert (($walkF.Seen -join ',') -eq ($screenF -join ',')) `
+                'F: ctrl+alt+Down walks the strip DOWN the screen - top pane, then lower-left, then lower-right (T560)'
+        }
     }
 }
 finally {

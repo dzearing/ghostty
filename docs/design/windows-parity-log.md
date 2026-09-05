@@ -22705,3 +22705,42 @@ launched from the Bash tool crashes `zig.exe` in all four lanes at the same
 address in five seconds and reports a considered `FLOOR NOT GREEN` over a tree
 that is green from PowerShell, which is a false red articulate enough to be
 believed.
+## 2026-09-05 - The hero carousel strip now reads in the order the panes are on screen (T560)
+
+Blow one pane up big and the others become small previews down the right-hand
+side. Split a pane downward and the new pane's preview appeared ABOVE the pane
+it came out of - so the strip disagreed with the window it was describing, and
+ctrl+alt+down walked the selection UP it.
+
+The strip was built from `SplitTree.iterator()`, which walks the tree's `nodes`
+ARRAY. That array is storage order, and storage order is an artifact of how the
+splits were allocated rather than of how they are arranged: `split()` memcpys
+the inserted subtree at `self.nodes.len` and copies the node it displaced to
+the END, so a `down` split files the new leaf ahead of the pane it split off.
+Everything in hero mode that means "the i-th pane" read that order -
+`HeroCarousel.geometry`/`paint`, `Window.leafAt`/`leafIndexOf`/`leafCount`, and
+`layoutHero` - while `+list --json` walks the same tree structurally through
+`buildNode`. Two orders for one tree, and the one on the glass was the wrong
+one.
+
+`SplitTree.leafIterator()` is the second walk: left subtree before right, so
+the views come out top-to-bottom / left-to-right the way they are laid out. It
+allocates nothing and has no depth cap - the successor climbs using the
+`parentOf` scan the spatial-navigation code already had, which is cheaper than
+parent bookkeeping on a tree with one node per pane. `iterator()` itself is
+untouched, so nothing the Mac or GTK frontends do moves; the win32 hero paths
+are the only callers switched, and the visit-every-leaf loops (hiding,
+counting, ref-counting) can keep using either.
+
+Validation: a `none`-lane test over a two-level tree pins `A B C` for the
+screen walk and asserts that the storage walk DISAGREES, so it cannot pass by
+the two orders being accidentally the same. `test\win32\hero-nav.ps1` grew the
+end-to-end half: arm A now compares its four-pane walk to the panes' RECTS
+(read while they are all still visible - child enumeration is z-order, so the
+rect is the only honest source for screen order), and a new arm F builds the
+shape that separates screen order from allocation order - split down, then
+split the bottom pane right - and walks it. With the hero paths pointed back at
+`iterator()` and the app rebuilt, those two assertions are the only ones that
+go red (2 FAILED / 46 passed); both are green on the fix. All four floor lanes
+PASS, P1 25 / P2 20 / P3 16 ALL PASS, hero-mode 72 and hero-viewer-tile 18 ALL
+PASS, and the nine guards the edits made due were re-run green.

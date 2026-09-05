@@ -93,7 +93,7 @@ pub fn geometry(win: *Window) ?Geometry {
     if (!win.tab_hero_active[tab]) return null;
 
     var count: usize = 0;
-    var it = win.tab_trees[tab].iterator();
+    var it = win.tab_trees[tab].leafIterator();
     while (it.next()) |_| count += 1;
     if (count == 0) return null;
 
@@ -208,8 +208,11 @@ pub fn paint(win: *Window, hdc_screen: w32.HDC) void {
         _ = w32.DeleteObject(@ptrCast(brush));
     }
 
-    // Tiles.
-    var it = win.tab_trees[win.active_tab].iterator();
+    // Tiles. SCREEN order (T560): the strip reads top-to-bottom, so tile i
+    // has to be the i-th leaf as laid out, not the i-th slot in the tree's
+    // storage array - a `down` split allocates its new leaf first, so the
+    // strip used to show the new pane ABOVE the one it split off.
+    var it = win.tab_trees[win.active_tab].leafIterator();
     var i: usize = 0;
     while (it.next()) |entry| : (i += 1) {
         const tr = hero_math.tileRect(geo.split.carousel, geo.layout, geo.top0, i);
