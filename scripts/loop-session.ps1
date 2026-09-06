@@ -210,6 +210,11 @@ function Resolve-LoopStallVerdict {
         [int]$StaleMinutes = 180,
         [int]$SuspectMinutes = 45,
         [AllowEmptyString()][string]$ComposerText = '',
+        # The bar for the composer arm when the pane also reports IDLE. Far
+        # lower than $SuspectMinutes because idle removes the one innocent
+        # explanation (a message queued against a running turn). Generous
+        # enough that a turn boundary in flight is never mistaken for a wedge.
+        [int]$ComposerIdleMinutes = 15,
         # 'working' | 'idle' | 'unknown' from Get-PaneWorkingState. The default
         # is the blind one: a caller that cannot say must not be read as having
         # said 'idle'.
@@ -225,6 +230,30 @@ function Resolve-LoopStallVerdict {
     }
     $pending = Get-LoopComposerText $ComposerText
     if ($pending.Length -gt 60) { $pending = $pending.Substring(0, 60) + '...' }
+    # AN IDLE SESSION WITH UNSENT TEXT IS NEVER LEGITIMATE (user, 2026-09-06).
+    #
+    # The 45m bar exists because the composer arm alone cannot tell a wedge from
+    # a message QUEUED against a running turn - and queuing is fine, so the arm
+    # waits long enough that queuing has stopped being a believable story. But
+    # when the pane also reports IDLE, there is no turn to have queued against:
+    # text is sitting in the composer with nothing running to consume it, and
+    # more waiting cannot make that any more true.
+    #
+    # Measured 2026-09-06: four wedges, all `composer=pending session=idle`,
+    # caught at 58.8, 59.3, 60.0 and 61.6 minutes - every one of them sat there
+    # from about the five-minute mark, so the 45m bar was pure latency. ~3.7
+    # hours of loop time in one day. Source of the text still unidentified (it
+    # matches no script, no nudge, and no transcript), so this shortens the
+    # rescue rather than claiming a cure.
+    #
+    # 'unknown' deliberately does NOT qualify: a probe that could not classify
+    # the pane must not be read as having said idle (T1370).
+    if ($pending -and $PaneState -eq 'idle' -and $TurnAgeMinutes -gt $ComposerIdleMinutes) {
+        return @{ Stalled = $true; Clock = 'composer-idle'
+                  Why = ("the composer holds unsent text with the session IDLE after $age " +
+                         "and no completed turn - nothing is running to consume it: '" +
+                         $pending + "'") }
+    }
     if ($TurnAgeMinutes -gt $SuspectMinutes -and $pending) {
         return @{ Stalled = $true; Clock = 'composer'
                   Why = ("the composer holds unsent text after $age with no completed turn: '" +

@@ -2213,6 +2213,62 @@ $bbUnknown = Resolve-LoopStallVerdict -TurnAgeMinutes ([double]::PositiveInfinit
 Assert 'BB15 a lock that cannot say when its turn started reads as stalled, not as fine' `
     ($bbUnknown.Stalled -and $bbUnknown.Why -match 'unknown time')
 
+# --- AG. an IDLE session with unsent text needs no 45-minute wait ------------
+# WHY (user, 2026-09-06). Four wedges in one day, every one of them
+# `composer=pending session=idle`, every one caught by the 45m bar at 58.8,
+# 59.3, 60.0 and 61.6 minutes - and every one of them had been sitting there
+# since about the five-minute mark. ~3.7 hours of loop time spent waiting for a
+# bar that exists to rule out an explanation ('a message queued against a
+# running turn') that IDLE has already ruled out: there is no turn to have
+# queued against, and nothing running to consume the text.
+#
+# The source of the text is still unidentified - it matches no script, no
+# watchdog nudge, and no transcript - so this shortens the rescue. It does not
+# claim a cure, and the arm must not be read as one.
+$agIdle = Resolve-LoopStallVerdict -TurnAgeMinutes 20 -StaleMinutes 180 -SuspectMinutes 45 `
+    -ComposerText 'run the due guards and commit' -PaneState 'idle'
+Assert 'AG1 unsent text on an IDLE session is stalled well before the 45m bar' `
+    ($agIdle.Stalled -and $agIdle.Clock -eq 'composer-idle')
+Assert 'AG2 and the verdict says idle is why, and quotes the text' `
+    ($agIdle.Why -match 'IDLE' -and $agIdle.Why -match "'run the due guards and commit'")
+
+# The innocent explanation the 45m bar exists for: text queued against a turn
+# that IS running. Idle is what removes it, so working must keep it.
+$agWorking = Resolve-LoopStallVerdict -TurnAgeMinutes 20 -StaleMinutes 180 -SuspectMinutes 45 `
+    -ComposerText 'a queued follow-up' -PaneState 'working'
+Assert 'AG3 the same text on a WORKING session is queuing, and is left alone' (-not $agWorking.Stalled)
+
+# T1370's rule: a probe that could not classify the pane has not said 'idle'.
+$agUnknown = Resolve-LoopStallVerdict -TurnAgeMinutes 20 -StaleMinutes 180 -SuspectMinutes 45 `
+    -ComposerText 'a queued follow-up' -PaneState 'unknown'
+Assert 'AG4 an unreadable pane does not qualify as idle' (-not $agUnknown.Stalled)
+
+# Under the idle bar, even idle is a turn boundary in flight, not a wedge.
+$agFresh = Resolve-LoopStallVerdict -TurnAgeMinutes 3 -StaleMinutes 180 -SuspectMinutes 45 `
+    -ComposerText 'just typed' -PaneState 'idle'
+Assert 'AG5 a turn boundary in flight is not a wedge' (-not $agFresh.Stalled)
+
+# The old arm still owns the case idle cannot reach, and keeps its own clock
+# name so a log written before today still reads the same way.
+$agLate = Resolve-LoopStallVerdict -TurnAgeMinutes 60 -StaleMinutes 180 -SuspectMinutes 45 `
+    -ComposerText 'still here' -PaneState 'unknown'
+Assert 'AG6 past 45m the original composer arm still fires, under its own name' `
+    ($agLate.Stalled -and $agLate.Clock -eq 'composer')
+
+# The four measured cases, at the age they were ACTUALLY caught and at the age
+# they would now be caught. Both must be stalled, or the change saves nothing.
+$agSaved = 0
+foreach ($t in @('/reset-context read go.md and go', 'commit and push it',
+                 'finish the turn: commit, push, then /reset-context',
+                 'run the due guards and commit')) {
+    $early = Resolve-LoopStallVerdict -TurnAgeMinutes 16 -StaleMinutes 180 -SuspectMinutes 45 `
+        -ComposerText $t -PaneState 'idle'
+    $late = Resolve-LoopStallVerdict -TurnAgeMinutes 59 -StaleMinutes 180 -SuspectMinutes 45 `
+        -ComposerText $t -PaneState 'idle'
+    if ($early.Stalled -and $late.Stalled) { $agSaved++ }
+}
+Assert 'AG7 all four measured wedges are caught at 16m, not 59m' ($agSaved -eq 4)
+
 # --- the watchdog acts on it ---
 Remove-Item $lock, $state -Force -ErrorAction SilentlyContinue
 $bbProc = Start-Sleeper; $sleepers += $bbProc
