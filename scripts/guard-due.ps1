@@ -1597,6 +1597,20 @@ $GuardTable = @(
             'test\win32\menu-bar.ps1'
         )
     },
+    # Who owns the F10 key (T575): the menu claims it, unless the user has bound
+    # it. The rule itself is a pure predicate with unit tests; what this harness
+    # measures is the half that only a real app can answer - that a bound F10
+    # dispatches AND that an unbound one still opens the menu. Covers the
+    # predicate, the one call site that consults it, and the harness.
+    [pscustomobject]@{
+        Name   = 'menu-f10-binding'
+        Script = 'test\win32\menu-f10-binding.ps1'
+        Stamp  = 'test\win32\menu-f10-binding.stamp.json'
+        Covers = @(
+            'src\apprt\win32\menu_activation.zig',
+            'test\win32\menu-f10-binding.ps1'
+        )
+    },
     # Crash evidence is the other thing whose failure nothing else catches: a
     # capture path that has quietly stopped working looks exactly like a lane
     # that did not crash, and is only ever exercised on a day already going

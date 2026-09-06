@@ -546,6 +546,10 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/window_chord.zig");
 
+    // Pure win32 rule for who owns the F10 key — the menu bar by default, the
+    // user's keybind when they have stated one (T575). Same no-OS-imports deal.
+    _ = @import("apprt/win32/menu_activation.zig");
+
     // Pure win32 remote connection pill — the caption-band affordance's
     // wording, geometry and contrast floors (T367). Its only non-std imports
     // are sibling pure modules and the reconnect policy, so it builds and tests

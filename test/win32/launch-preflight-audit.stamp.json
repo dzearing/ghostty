@@ -1,10 +1,10 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-09-05T21:58:06-07:00",
-    "commit":  "276011152",
+    "generated":  "2026-09-05T23:07:33-07:00",
+    "commit":  "ecc65036c",
     "uncommitted":  [
-                        "test/win32/readonly-badge.ps1"
+                        "test/win32/menu-f10-binding.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "944e54bda392aa61007ee23280c6bb9767ed2e661f77f5157ca035dbe9b6e4ea",
@@ -201,6 +201,7 @@
                   "test/win32/log-append.ps1":  "959f1a2a1a0d7d0ef3fa7aba7ed59c240d2d0cace3de6317dbb530eecd747423",
                   "test/win32/machine-chooser.ps1":  "c69e331b19e83e300b5f0c22860220ea1d2de144d587db1ee4ae4e797ce6b79e",
                   "test/win32/menu-bar.ps1":  "f7d997e96194fc3ce9f65b61fa7af77add347166cab9bac5e31473faa0409c4e",
+                  "test/win32/menu-f10-binding.ps1":  "8c77c7eb953af10168b12742133c673281299ca715870a69d3a17864f5ea687c",
                   "test/win32/merge-terminology.ps1":  "c6e28d4f5dac63e423b492c7e854a11ae24e754ddf56587a8dd6cbeeb5efa6eb",
                   "test/win32/mouse-nc-routing.ps1":  "0e9c09958e46b3444898c47fdcadfbd1c509854b6c07e5bb8c5086abd2f80969",
                   "test/win32/msi-upgrade.ps1":  "596f855376fa9af1f3ed137c55c060c10e872f2c6555b20b774688f0ca28e425",

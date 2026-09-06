@@ -40,6 +40,7 @@ const translate_policy = @import("translate_policy.zig");
 const window_chord = @import("window_chord.zig");
 const banner_layout = @import("banner_layout.zig");
 const context_menu = @import("context_menu.zig");
+const menu_activation = @import("menu_activation.zig");
 const commands = @import("commands.zig");
 const menu_label = @import("menu_label.zig");
 const pane_id_mod = @import("pane_id.zig");
@@ -3895,6 +3896,11 @@ fn showContextMenu(self: *Surface, lparam: isize) void {
 ///     So F10 opens the menu on the primary screen only, and is passed
 ///     through untouched on the alternate one. That is a measurable
 ///     discriminator rather than a guess about what the child wants.
+///   - **F10 yields to a user binding** (T575). A `keybind = f10=…`, a key
+///     table whose trigger is F10, or the second half of a sequence all beat
+///     the menu: the user stated an intent and the platform default is only a
+///     default. Alt is untouched by that rule — see `menu_activation.zig`,
+///     which holds the F10 predicate and its tests.
 ///
 /// The menu itself is opened by POSTING to the window (WM_APP_OPEN_MENU),
 /// never by tracking a modal popup nested inside this key WndProc.
@@ -3933,14 +3939,33 @@ fn trackMenuActivation(
     // Any other key ends the "lone" part of a lone Alt.
     self.alt_menu_armed = false;
 
-    if (action != .press or repeat or vk != w32.VK_F10) return false;
-    const ctrl = w32.GetKeyState(@as(i32, w32.VK_CONTROL)) < 0;
-    const shift = w32.GetKeyState(@as(i32, w32.VK_SHIFT)) < 0;
-    const alt = w32.GetKeyState(@as(i32, w32.VK_MENU)) < 0;
-    const winkey = w32.GetKeyState(@as(i32, w32.VK_LWIN)) < 0 or
-        w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0;
-    if (ctrl or shift or alt or winkey) return false;
-    if (self.onAlternateScreen()) return false;
+    if (action != .press or vk != w32.VK_F10) return false;
+
+    const mods = getModifiers();
+
+    // The alternate-screen probe takes the renderer lock and the binding
+    // lookup walks the keybind state, so ask the cheap questions first: a
+    // modified or repeating F10 is not a menu request and needs neither.
+    if (!menu_activation.f10OpensMenu(.{ .mods = mods, .repeat = repeat })) return false;
+
+    if (!menu_activation.f10OpensMenu(.{
+        .mods = mods,
+        .repeat = repeat,
+        .on_alternate_screen = self.onAlternateScreen(),
+        // A user binding on F10 wins over the menu (T575). `keyEventIsBinding`
+        // is the same lookup `keyCallback` is about to do — the in-flight
+        // sequence first, then the active key tables inner-to-outer, then the
+        // root set — so an F10 that is the second half of a chord, or a table's
+        // trigger, keeps the menu shut exactly as a root binding does.
+        .has_binding = self.core_surface.keyEventIsBinding(.{
+            .action = .press,
+            .key = .f10,
+            .mods = mods,
+            .consumed_mods = .{},
+            .utf8 = "",
+            .unshifted_codepoint = 0,
+        }) != null,
+    })) return false;
 
     self.postOpenMenu();
     return true;
