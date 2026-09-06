@@ -32,6 +32,7 @@ const markdown = @import("banner_markdown.zig");
 const card = @import("banner_card.zig");
 const banner_layout = @import("banner_layout.zig");
 const banner_link = @import("banner_link.zig");
+const type_ramp = @import("type_ramp.zig");
 const Surface = @import("Surface.zig");
 const color_math = @import("color_math.zig");
 const icon_button = @import("icon_button.zig");
@@ -55,11 +56,17 @@ const STRIP_ALPHA: u8 = 255;
 const MARGIN: f32 = card.MARGIN;
 
 /// Unscaled layout metrics. The Mac banner is a 12pt system font with
-/// 12pt padding; our base font is 15px (T35), so px metrics scale by
-/// 15/12 where they mirror a Mac point value.
+/// 12pt padding; the px metrics that mirror a Mac point value scale by
+/// `FONT_H / 12`.
+///
+/// The base font is the type ramp's BODY as of T583 — it used to be a flat
+/// 15 px, the eighth and last copy of the number T313 retired from every
+/// dialog, which left the banner the one piece of Ghoztty text still set at
+/// the size the rest of the app had moved off (`banner_layout`'s type
+/// section has the full story).
 const PAD: f32 = card.PADDING;
-const FONT_H: f32 = 15.0;
-const LINE_H: f32 = 20.0;
+const FONT_H: f32 = banner_layout.body_dip;
+const LINE_H: f32 = banner_layout.line_dip;
 /// Vertical gap between blocks (Mac: VStack spacing 8).
 const BLOCK_GAP: f32 = 8.0;
 /// Vertical gap between list rows / table rows (Mac: Grid spacing 4).
@@ -68,8 +75,9 @@ const ROW_GAP: f32 = 4.0;
 const GUTTER_GAP: f32 = 6.0;
 /// Horizontal gap between table columns (Mac: 18).
 const COL_GAP: f32 = 18.0;
-/// Native checkbox side (Mac: 12 at 12pt → 15 at our 15px base).
-const CHECK_SIDE: f32 = 15.0;
+/// Native checkbox side (Mac: 12 at 12pt → the base font size at ours, so
+/// a task-list box is exactly as tall as the text beside it).
+const CHECK_SIDE: f32 = FONT_H;
 /// Tail-truncation glyph for a cell that runs past `MAX_CELL_LINES`.
 const ELLIPSIS = "…";
 /// Negative-control switch (kept, deliberately): true restores the
@@ -107,8 +115,8 @@ fn wrapWidth(content_w: i32) i32 {
     return if (T377_NEUTERED) 0 else content_w;
 }
 /// Collapsed content height: first line fully visible plus a sliver that
-/// fades out (Mac: 24 at 12pt → 30 at 15px).
-const COLLAPSED_H: f32 = 30.0;
+/// fades out (Mac: 24 at 12pt → one and a half of our line boxes).
+const COLLAPSED_H: f32 = LINE_H * 1.5;
 /// Timer id for the collapse/expand animation heartbeat (T149). The only
 /// timer this window class owns.
 const COLLAPSE_TIMER_ID: usize = 1;
@@ -146,9 +154,15 @@ const T1344_NEUTERED = false;
 const CHEV_W: f32 = 5.0;
 const CHEV_H: f32 = 3.5;
 
-/// Heading text px per level (Mac: 17/16/15/14/13/12pt over a 12pt base,
-/// scaled by 15/12).
-const heading_px = [6]f32{ 21.25, 20.0, 18.75, 17.5, 16.25, 15.0 };
+/// Heading text DIP per level, anchored to the type ramp (T583): h1 is the
+/// ramp's subtitle, h6 is its body, and the four between step evenly. Mac
+/// runs 17/16/15/14/13/12pt over a 12pt base; the shape is the same six-step
+/// scale, sized from OUR ramp instead of a second set of numbers.
+const heading_px = blk: {
+    var out: [6]f32 = undefined;
+    for (&out, 0..) |*h, i| h.* = banner_layout.headingDip(i + 1);
+    break :blk out;
+};
 /// Number of cached font size classes: base + 6 heading levels.
 const size_classes = 7;
 
@@ -620,7 +634,7 @@ pub const BannerOverlay = struct {
         const face = if (style.code)
             std.unicode.utf8ToUtf16LeStringLiteral("Consolas")
         else
-            std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI");
+            std.unicode.utf8ToUtf16LeStringLiteral(type_ramp.face);
         const height = if (size_class == 0) FONT_H else heading_px[size_class - 1];
         self.fonts[idx] = w32.CreateFontW(
             -self.px(height),

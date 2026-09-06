@@ -13,6 +13,52 @@
 
 const std = @import("std");
 const hero_math = @import("hero_math.zig");
+const type_ramp = @import("type_ramp.zig");
+
+// ---------------------------------------------------------------------
+// Type (T583)
+// ---------------------------------------------------------------------
+//
+// The banner used to carry its own base size — a flat 15 px, the last
+// survivor of the seven `px(15, scale)` copies T310 counted and T313
+// retired everywhere else. That left the surface directly above the
+// terminal, the most-looked-at text in the app, set one step off every
+// dialog: open the banner editor over a banner and the editor's text and
+// the banner's text were different sizes.
+//
+// So the banner's body IS `type_ramp.body`, and its line box IS the ramp's
+// line box. The numbers live here rather than in `BannerOverlay` because
+// they are geometry — `banner_layout` is the module every other banner
+// measurement is asserted in, in every app-runtime lane.
+
+/// The banner's body text, in DIP. Markdown `code` spans keep Consolas at
+/// this same size — a deliberate face choice, like the Activity Monitor's
+/// numeric columns — but nothing in a banner is set at a size the ramp does
+/// not name.
+pub const body_dip: f32 = type_ramp.body_dip;
+
+/// One line of banner body text, in DIP: the ramp's line box, so a banner
+/// line and a dialog label row breathe the same amount.
+pub const line_dip: f32 = type_ramp.body_dip + type_ramp.leading_dip;
+
+/// The banner's markdown HEADING scale, in DIP, for level 1–6.
+///
+/// A banner renders markdown and markdown has six heading levels, while the
+/// ramp has three sizes and says so on purpose ("the divergence bought three
+/// sizes, not a licence to invent more"). The scale is therefore ANCHORED to
+/// the ramp rather than declared a second one: `h1` is `subtitle`, `h6` is
+/// `body`, and the four in between step evenly across that span. Six steps,
+/// zero new numbers — the banner's headings move when the ramp moves, which a
+/// second named ramp would not do, and which is the whole reason this task
+/// existed.
+///
+/// Reasoning recorded in `docs/design/win32-design-system.md` §2.4.
+pub fn headingDip(level: usize) f32 {
+    const clamped = std.math.clamp(level, 1, 6);
+    const steps: f32 = @floatFromInt(clamped - 1);
+    return type_ramp.subtitle_dip -
+        steps * (type_ramp.subtitle_dip - type_ramp.body_dip) / 5.0;
+}
 
 /// Height reserved above the terminal for a banner strip of `strip_h` px
 /// in a pane slot `slot_h` px tall. The full strip height when it fits;
@@ -303,6 +349,90 @@ const TestChrome = struct {
 };
 
 const TEST_SCALES = [_]f32{ 1.0, 1.25, 1.5, 2.0 };
+
+fn scaledPx(v: f32, scale: f32) i32 {
+    return @intFromFloat(@round(v * scale));
+}
+
+test "T583: the banner's body text is the ramp's body, at every scale" {
+    try std.testing.expectEqual(type_ramp.body_dip, body_dip);
+    for (TEST_SCALES) |s| {
+        try std.testing.expectEqual(
+            type_ramp.body(s).height,
+            scaledPx(body_dip, s),
+        );
+    }
+}
+
+test "T583: a banner line is the ramp's line box, at every scale" {
+    for (TEST_SCALES) |s| {
+        try std.testing.expectEqual(
+            type_ramp.lineBox(type_ramp.body(s), s),
+            scaledPx(line_dip, s),
+        );
+        // A line box always clears the text it holds — the banner's own
+        // restatement of the assertion the ramp makes about dialogs.
+        try std.testing.expect(scaledPx(line_dip, s) > type_ramp.body(s).height);
+    }
+}
+
+test "T583: the heading scale spans the ramp, h1 subtitle down to h6 body" {
+    try std.testing.expectEqual(type_ramp.subtitle_dip, headingDip(1));
+    try std.testing.expectEqual(type_ramp.body_dip, headingDip(6));
+
+    // Six steps, monotonically decreasing, none outside the ramp's own span.
+    // A heading bigger than the app's biggest text — or smaller than its
+    // body — is the divergence the anchoring exists to make impossible.
+    var prev = headingDip(1);
+    for (2..7) |level| {
+        const h = headingDip(level);
+        try std.testing.expect(h < prev);
+        try std.testing.expect(h >= type_ramp.body_dip);
+        try std.testing.expect(h <= type_ramp.subtitle_dip);
+        prev = h;
+    }
+
+    // Evenly stepped: every gap is the same, so the scale reads as one
+    // progression rather than a list of tuned numbers.
+    const step = headingDip(1) - headingDip(2);
+    for (2..6) |level| {
+        try std.testing.expectApproxEqAbs(
+            step,
+            headingDip(level) - headingDip(level + 1),
+            0.0001,
+        );
+    }
+
+    // Out-of-range levels clamp rather than run off the scale — markdown
+    // has six, and a `#######` line must not produce a seventh size.
+    try std.testing.expectEqual(headingDip(1), headingDip(0));
+    try std.testing.expectEqual(headingDip(6), headingDip(9));
+}
+
+test "T583: headings order and stay on the ramp at every scale" {
+    for (TEST_SCALES) |s| {
+        try std.testing.expectEqual(
+            type_ramp.subtitle(s).height,
+            scaledPx(headingDip(1), s),
+        );
+        try std.testing.expectEqual(
+            type_ramp.body(s).height,
+            scaledPx(headingDip(6), s),
+        );
+        // The ordering must survive rounding at 1.25 — an inverted step is
+        // exactly the defect the design system calls out.
+        var prev = scaledPx(headingDip(1), s);
+        for (2..7) |level| {
+            const h = scaledPx(headingDip(level), s);
+            try std.testing.expect(h <= prev);
+            prev = h;
+        }
+        // And the smallest heading is never smaller than the body it sits over.
+        try std.testing.expect(
+            scaledPx(headingDip(6), s) >= scaledPx(body_dip, s),
+        );
+    }
+}
 
 test "contentWidth: no chevron — symmetric inner margins at every scale" {
     for (TEST_SCALES) |s| {

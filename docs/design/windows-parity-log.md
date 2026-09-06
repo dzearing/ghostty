@@ -23233,3 +23233,51 @@ the person it was written for has their hands on the keyboard. Mac has the same
 limitation, so it is a gap in the feature rather than a parity gap - and the
 same card is invisible to a screen reader, which is the T446 defect over again
 for a user who cannot see it.
+
+## 2026-09-06 - The pane banner is set in the same type as the rest of the app (T583)
+
+T310 counted seven copies of `px(15, scale)` and T313 retired them all, and the
+count was wrong: the pane banner carried an eighth, spelled `const FONT_H: f32
+= 15.0`, so the sweep walked past it. That left the surface directly above the
+terminal - the most-looked-at text in Ghoztty - as the one piece of it still set
+at the size every dialog had just moved off. Open the banner editor over a
+banner and the editor's text and the banner's text were different sizes.
+
+The banner's body, its line box and its face now come from `type_ramp`, through
+a new type section in `banner_layout.zig` (the module every other banner
+measurement is already asserted in). Body is `type_ramp.body_dip`, a banner line
+is the ramp's own line box - body plus one `sm` of leading, so a banner line and
+a dialog label row breathe the same amount - and the face literal is
+`type_ramp.face`. The knock-ons were re-derived rather than left at their old
+15-px ratios: the task-list checkbox is one body height so it is exactly as tall
+as the text beside it, and the collapsed sliver is one and a half line boxes.
+`code` spans keep Consolas, which is a face choice like the Activity Monitor's
+numeric columns, not a size.
+
+The heading scale was the real question and it is answered ANCHORED rather than
+declared. A banner renders markdown, markdown has six heading levels, the ramp
+has three sizes on purpose - so h1 is the ramp's subtitle, h6 is its body, and
+the four between step evenly across that span (`banner_layout.headingDip`). Six
+steps, zero new numbers, and the banner's headings move when the ramp moves. The
+alternative - a second named ramp with its own module, the way the terminal font
+is legitimately not the UI font - was rejected because nothing about a heading is
+a different KIND of text: it is the app's own text, larger, and a second ramp
+would drift from the first the day one of them moved. That reasoning is written
+into `win32-design-system.md` §2.4, along with the note that seven was an
+undercount and why the eighth hid.
+
+Four new tests in `banner_layout` at 1.0/1.25/1.5/2.0: the body IS the ramp's
+body, a banner line IS the ramp's line box, the heading scale spans exactly
+subtitle-to-body with an even step and clamps outside 1-6, and the six levels
+stay ordered after rounding at every scale. Floor: `floor-lane.ps1 -Lane all`
+lib/none/win32/agent ALL LANES PASS; `pane-banner.ps1` ALL PASS (132),
+`banner-resize-repaint.ps1` ALL PASS (15), P1/P2/P3 ALL PASS (25/20/16).
+
+Filed two out of it. T1388: the heading SIZES are on the ramp now but the
+heading WEIGHT is still a bare 700 while `type_ramp.weight_semibold` is 600, so
+a banner heading and a dialog title are the same size and different weights -
+the same divergence one field over. T1389 is the one that matters more: the
+count was a one-time grep, and nothing today would notice a ninth. A source
+scan in the none lane, with an allowlist so a deliberate exception has to be
+declared rather than merely exist, is what closes the class instead of the
+instance.

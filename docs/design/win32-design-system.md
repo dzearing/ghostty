@@ -236,6 +236,28 @@ chooser surface; T313 the rest) — including the SIZE, the WEIGHT and the FACE,
 because a dialog that takes its size from the ramp and hardcodes `600` beside
 it has only moved where the divergence hides.
 
+**Seven was an undercount: the pane banner was the eighth** (T583). It spelled
+the same number differently — `const FONT_H: f32 = 15.0` — so the sweep that
+found the seven `px(15, scale)` copies walked straight past it, and for three
+weeks after T313 the banner was the ONE piece of Ghoztty text still set at the
+retired size, on the surface that sits directly above the terminal. Open the
+banner editor over a banner and the editor's text and the banner's text were
+different sizes. The banner's body, its line box and its face now come from the
+ramp like everything else (`banner_layout.zig`'s type section).
+
+**A markdown heading scale is ANCHORED to the ramp, not declared beside it.**
+The banner renders markdown, markdown has six heading levels, and the ramp has
+three sizes on purpose. The rule that resolves that: **h1 is `subtitle`, h6 is
+`body`, and the four levels between step evenly across the span**
+(`banner_layout.headingDip`). Six steps, zero new numbers. The alternative —
+naming a second ramp with its own module and its own reasoning, the way the
+terminal font is legitimately not the UI font — was rejected because nothing
+about a heading is a different KIND of text: it is the app's own text, larger.
+A second ramp would drift from the first the day one of them moved, which is
+the exact failure mode this section exists to prevent, and the anchored scale
+cannot: it moves when the ramp moves. Any future six-step scale over the same
+three sizes follows this rule rather than inventing its own numbers.
+
 ### 2.5 Build-mode marking (T43)
 
 A build that is **not the shipped release** — `Debug` or `ReleaseSafe`, the
