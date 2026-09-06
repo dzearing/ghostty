@@ -191,19 +191,84 @@ function Get-PaneComposerText {
     return ''
 }
 
-# Read the pane and return what its composer is holding. Any IPC failure is ''
-# - "could not see the composer" must never be reported as "the composer is
-# full", because that answer nudges a session.
-function Read-PaneComposer {
+# --- is the session WORKING? (T1370) ----------------------------------------
+#
+# The composer arm above answers "is there text nobody sent". On 2026-09-05 the
+# honest answer was NO and the loop was still dead: an API transport error
+# truncated turn 136 at 15:45, so nothing was ever typed. The stall ran 1h07m
+# and a human recovered it.
+#
+# The incident report read the `/rc` at the right-hand end of the status line as
+# that unsent text. It is not: every pane on this box carries a right-aligned
+# slash-command indicator naming the LAST command it ran - measured 2026-09-05
+# on two live panes at once, `/rc` on this loop's own pane while it was
+# demonstrably mid-turn, `/rc failed` on the other window. Reading it as pending
+# input would nudge every working session that ran past the suspect bar, which
+# is why go-loop-guard's BB3d already refuses it.
+#
+# So the question that shape needs asking is not "is there text" but "is Claude
+# working". A Claude Code TUI with a request in flight renders a spinner line
+# carrying the elapsed time - `Whirlpooling... (3m 1s . 6.3k tokens ...)`,
+# `Herding... (7s . esc to interrupt)` - directly above the composer; an idle
+# one renders nothing there. Idle, with a turn clock that has not moved, is a
+# stalled turn whatever the composer holds.
+#
+# Three answers, never two. `unknown` is what a pane with no recognisable Claude
+# composer reads as, and it is NOT idle: idle is the answer that types into
+# somebody's session, so it is only ever returned about a TUI we can actually
+# see. Same safe direction as the composer classifier above.
+$script:WorkingSpinnerPattern = '\((?:\d+h\s+)?(?:\d+m\s+)?\d+s\b'
+
+# Pure: 'working' | 'idle' | 'unknown' for a pane tail.
+function Get-PaneWorkingState {
+    param([AllowEmptyString()][string]$Tail)
+
+    if ([string]::IsNullOrWhiteSpace($Tail)) { return 'unknown' }
+    $flat = ($Tail -replace '[^\x20-\x7E\r\n]', ' ')
+    $lines = @($flat -split "`r?`n")
+    if ($lines.Count -gt $script:ComposerWindowLines) {
+        $lines = @($lines | Select-Object -Last $script:ComposerWindowLines)
+    }
+    # The composer marker is the proof there is a Claude TUI here at all. Same
+    # indent rule as Get-PaneComposerText - a border sits to its left in both
+    # chromes - except that an EMPTY composer counts, which is the whole point.
+    $sawComposer = $false
+    foreach ($l in $lines) {
+        if ($l.TrimEnd() -match '^\s+>\s*(\S.*)?$') { $sawComposer = $true; break }
+    }
+    if (-not $sawComposer) { return 'unknown' }
+    # The spinner only counts where it lives, in the same bottom window. A
+    # transcript line that happens to carry an elapsed time reads as working,
+    # which is the harmless direction: it declines to nudge.
+    foreach ($l in $lines) {
+        if ($l -match $script:WorkingSpinnerPattern) { return 'working' }
+    }
+    return 'idle'
+}
+
+# Read the pane ONCE and answer both questions about it. Any IPC failure is the
+# blind answer to both - "could not see the pane" must never be reported as
+# "the composer is full" or as "the session is idle", because both of those
+# answers type into a session.
+function Read-PaneState {
     param([string]$PaneId, [string]$GhozttyExe, [int]$Lines = 20)
 
-    if (-not $PaneId) { return '' }
+    $blind = @{ Composer = ''; Working = 'unknown' }
+    if (-not $PaneId) { return $blind }
     $out = ''
     # T663: the console twin, and `2>$null` rather than `2>&1` - a merged stderr
     # line becomes part of the text this classifies.
-    try { $out = (& (Resolve-GhozttyCliExe $GhozttyExe) +read "--name=$PaneId" "--lines=$Lines" 2>$null | Out-String) } catch { return '' }
-    if ($LASTEXITCODE -ne 0) { return '' }
-    return (Get-PaneComposerText -Tail $out)
+    try { $out = (& (Resolve-GhozttyCliExe $GhozttyExe) +read "--name=$PaneId" "--lines=$Lines" 2>$null | Out-String) } catch { return $blind }
+    if ($LASTEXITCODE -ne 0) { return $blind }
+    return @{ Composer = (Get-PaneComposerText -Tail $out)
+              Working  = (Get-PaneWorkingState -Tail $out) }
+}
+
+# The composer alone, for callers that want nothing else.
+function Read-PaneComposer {
+    param([string]$PaneId, [string]$GhozttyExe, [int]$Lines = 20)
+
+    return (Read-PaneState -PaneId $PaneId -GhozttyExe $GhozttyExe -Lines $Lines).Composer
 }
 
 # The backslash escaper that used to live here moved to loop-session.ps1 with

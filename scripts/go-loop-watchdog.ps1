@@ -28,7 +28,9 @@
 #      turn has not completed inside -TurnStaleMinutes is re-entered anyway. A
 #      pane holding UNSENT composer text trips the same wire at the lower
 #      -TurnSuspectMinutes, because that is the exact shape that hid a 2h32m
-#      stall behind a 31-minute transcript on 2026-09-04.
+#      stall behind a 31-minute transcript on 2026-09-04 - and since T1370 so
+#      does an IDLE Claude TUI, which is what a turn truncated mid-sentence
+#      leaves behind and what the composer arm cannot see.
 #   3. Otherwise re-enter, choosing the cheapest action that fits:
 #        a claude is alive IN THE PANE, pane not producing output
 #                              -> send-keys the resume prompt + Enter
@@ -119,11 +121,11 @@ param(
     # Defaults match go-loop-health.ps1's -TurnStaleMinutes so the observer and
     # the actor cannot disagree about what a stalled loop is.
     #
-    # -TurnSuspectMinutes is the lower bar that a non-empty composer unlocks:
-    # unsent text plus no completed turn is a stalled turn however fresh the
-    # transcript looks. Everything downstream still applies - a pane that is
-    # producing output is never nudged - so these decide when to LOOK, not when
-    # to type.
+    # -TurnSuspectMinutes is the lower bar that the PANE unlocks: unsent text,
+    # or a session with nothing in flight, plus no completed turn is a stalled
+    # turn however fresh the transcript looks. Everything downstream still
+    # applies - a pane that is producing output is never nudged - so these decide
+    # when to LOOK, not when to type.
     [int]$TurnStaleMinutes = 180,
     [int]$TurnSuspectMinutes = 45,
     # The still-producing backstop's sample (T253). It was 5 lines over 8s, which
@@ -545,22 +547,30 @@ function Invoke-Tick {
                "turn_age=$turnText(limit=${TurnStaleMinutes}m)")
 
     if ($state -eq 'held' -and -not $Force) {
-        # A composer is only read once the turn clock is already elevated: the
-        # probe costs an IPC round trip per tick, and unsent text in a session
-        # that finished a turn ten minutes ago is a user typing, not a stall.
-        $composer = ''
+        # The pane is only read once the turn clock is already elevated: the
+        # probe costs an IPC round trip per tick, and unsent text - or an idle
+        # session - ten minutes after a turn completed is a user typing or the
+        # gap between turns, not a stall. One read answers both questions
+        # (T1370).
+        $pane = @{ Composer = ''; Working = 'unknown' }
         if ($turnAge -gt $TurnSuspectMinutes -and $lock.pane_id) {
-            $composer = Read-PaneComposer -PaneId $lock.pane_id -GhozttyExe $GhozttyExe
+            $pane = Read-PaneState -PaneId $lock.pane_id -GhozttyExe $GhozttyExe
         }
+        # And SAY what it saw. T1319's arm was diagnosed off `limit=180m` alone -
+        # the log named the bar it chose but never the observation behind it, so
+        # "the composer looked empty" and "the composer was never read" were the
+        # same line. Both now appear on every decision (T1370).
+        $seen = ("composer=$(if ($pane.Composer) { 'pending' } else { 'none' }) " +
+                 "session=$($pane.Working)")
         $verdict = Resolve-LoopStallVerdict -TurnAgeMinutes $turnAge `
             -StaleMinutes $TurnStaleMinutes -SuspectMinutes $TurnSuspectMinutes `
-            -ComposerText $composer
+            -ComposerText $pane.Composer -PaneState $pane.Working
         if (-not $verdict.Stalled) {
-            Log "healthy: pane=$($lock.pane_id) pid=$($lock.claude_pid) $clocks remaining=$remaining"
+            Log "healthy: pane=$($lock.pane_id) pid=$($lock.claude_pid) $clocks $seen remaining=$remaining"
             return 'none'
         }
         Log ("STALLED(by=$($verdict.Clock)): the lock reads held but $($verdict.Why) - " +
-             "deciding by the turn clock, not the pane pulse ($clocks; T1319)")
+             "deciding by the turn clock, not the pane pulse ($clocks $seen; T1319)")
     }
     if ($Force) { Log "forced: re-entry requested despite state=$state (caller knows the loop is broken; T439)" }
 

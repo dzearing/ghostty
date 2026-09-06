@@ -181,6 +181,12 @@ function Resolve-LoopResumeAction {
 #     working one. That is what makes the 2026-09-04 shape catchable in tens of
 #     minutes rather than hours - a half-typed command is perfect camouflage
 #     precisely because typing it refreshes the signal the watchdog trusted.
+#   - $SuspectMinutes + an IDLE pane (T1370): a Claude Code TUI with nothing in
+#     flight, with no turn completed since, is a stalled turn too - and it is
+#     the commoner shape, because a truncated turn leaves the composer EMPTY.
+#     On 2026-09-05 an API transport error ended turn 136 mid-sentence; the
+#     composer arm looked, correctly found nothing, and the loop sat dead for
+#     1h07m under the 180m backstop until a human noticed.
 #
 # Returns @{ Stalled; Clock; Why } - Clock names WHICH arm decided, so a wrong
 # call is readable in the log afterwards instead of being one word, `healthy`.
@@ -189,7 +195,11 @@ function Resolve-LoopStallVerdict {
         [double]$TurnAgeMinutes = 0,
         [int]$StaleMinutes = 180,
         [int]$SuspectMinutes = 45,
-        [AllowEmptyString()][string]$ComposerText = ''
+        [AllowEmptyString()][string]$ComposerText = '',
+        # 'working' | 'idle' | 'unknown' from Get-PaneWorkingState. The default
+        # is the blind one: a caller that cannot say must not be read as having
+        # said 'idle'.
+        [ValidateSet('working', 'idle', 'unknown')][string]$PaneState = 'unknown'
     )
     $age = if ([double]::IsInfinity($TurnAgeMinutes) -or [double]::IsNaN($TurnAgeMinutes)) {
         'an unknown time'
@@ -205,6 +215,11 @@ function Resolve-LoopStallVerdict {
         return @{ Stalled = $true; Clock = 'composer'
                   Why = ("the composer holds unsent text after $age with no completed turn: '" +
                          $pending + "'") }
+    }
+    if ($TurnAgeMinutes -gt $SuspectMinutes -and $PaneState -eq 'idle') {
+        return @{ Stalled = $true; Clock = 'idle'
+                  Why = ("the session is idle - nothing in flight - after $age " +
+                         'with no completed turn') }
     }
     return @{ Stalled = $false; Clock = 'none'; Why = '' }
 }

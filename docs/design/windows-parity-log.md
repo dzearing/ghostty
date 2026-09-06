@@ -22968,3 +22968,50 @@ moving between two real top-level windows - ALL PASS (65). Floor:
 `floor-lane.ps1 -Lane all` plus the six audit harnesses the library edit made
 due (isolation-meta, launch-preflight, verdict-exit, cleanslate, stderr-capture,
 desktop-launch), all ALL PASS.
+
+## 2026-09-05 - The watchdog notices a session that has stopped working, not just one with text waiting (T1370)
+
+The supervisor now asks whether Claude is doing anything, and pokes a loop that
+is not. Before this it could only ask whether text was sitting unsent in the
+composer - and on 2026-09-05 an API transport error truncated turn 136
+mid-sentence, so nothing was ever typed. The composer looked empty because it
+WAS empty; the loop sat dead for 1h07m under the 180-minute backstop until a
+human noticed.
+
+The card that filed this had a different theory, and checking it first is what
+made the fix right. It read the `/rc` at the right-hand end of the status line
+as the unsent text. It is not: that is Claude Code's last-slash-command
+indicator, and it is on every pane all the time - measured on two live panes at
+once, `/rc` on this loop's own pane *while it was demonstrably mid-turn*, and
+`/rc failed` on the other window. Implementing what the card asked would have
+nudged every working session that ran past 45 minutes, which is exactly the
+false positive `go-loop-guard.ps1` BB3d was already written to refuse.
+
+So the third arm asks a better question. `Get-PaneWorkingState`
+(`scripts\go-loop-pane-probe.ps1`) reads the elapsed-time spinner a Claude Code
+TUI renders directly above the composer - `Whirlpooling... (3m 1s . 6.3k
+tokens)`, `Herding... (7s . esc to interrupt)` - and answers `working`, `idle`
+or `unknown`. `unknown` is a third answer rather than a synonym for idle on
+purpose: idle is the answer that types into somebody's session, so it is only
+ever returned about a composer the probe can actually see. `Resolve-LoopStallVerdict`
+gains the arm, and `Read-PaneState` answers both questions off one IPC read.
+
+And the decision line now says what it saw. `composer=none session=working`
+rides on every healthy and every STALLED line, because the 2026-09-05 miss was
+diagnosable only from `limit=180m` - the log named the bar it chose and never
+the observation behind it, so "the composer read empty" and "the composer was
+never read" were the same line.
+
+Validation: `test\win32\go-loop-guard.ps1` gains BB22b and BB23-BB34 - the
+2026-09-05 pane as a fixture (idle, empty composer, `/rc` on the status line),
+today's working pane as its control, a spinner left up the scrollback, a
+non-Claude pane, and the three verdict arms in both directions. Demonstrated red
+before the fix: that run reported `FAIL BB30`, `FAIL BB31` and
+`Get-PaneWorkingState is not recognized`. ALL PASS after. Live check on the box:
+`Read-PaneState` through the watchdog's own exe default, against this loop's own
+pane mid-turn, answered `working` - so the 180-minute bar still protects a slow
+build. Floor: `floor-lane.ps1 -Lane all` ALL LANES PASS, plus the seven
+harnesses the edit made due (upgrade-no-fork, isolation-meta, launch-preflight,
+verdict-exit, cleanslate, stderr-capture, desktop-launch), all ALL PASS. Filed
+T1379: the health line decides on `turn_age` alone and should read the same
+pane state, so the observer and the actor report the same reason.

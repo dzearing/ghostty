@@ -2137,6 +2137,83 @@ Assert 'BB21 and the healthy line carries both clocks, not just the pulse' `
 $r = Dog-Run @('-DryRun', '-TurnStaleMinutes', '100000', '-TurnSuspectMinutes', '45')
 Assert 'BB22 an unreadable composer does not count as unsent text' `
     ($r.Out -match 'ACTION none' -and $r.Out -match 'healthy:')
+# And the log SAYS what it saw, so the next miss is readable in the log rather
+# than only in the limit it chose (T1370). On 2026-09-05 `limit=180m` was the
+# only evidence that the composer had been read as empty.
+Assert 'BB22b and the healthy line names the observation, not just the clocks' `
+    ($r.Out -match 'healthy:.*composer=none session=unknown')
+
+# --- BB23-BB34. is the session WORKING, or merely present? (T1370) ---------
+#
+# BB3d already refused the status line's `/rc` as pending text, and it was
+# right: on this box EVERY pane carries a right-aligned slash-command
+# indicator - `/rc` on a healthy pane mid-turn, `/rc failed` on another - so it
+# is a record of the last command, not input waiting to be sent. That is also
+# why the composer arm did not fire on 2026-09-05: the composer really WAS
+# empty. An API transport error truncated the turn before anything was typed.
+#
+# So the discriminator that shape needs is not "is there text" but "is Claude
+# working". A Claude Code TUI in flight renders a spinner with the elapsed time
+# directly above the composer; an idle one renders nothing there. Idle plus a
+# turn clock that has not moved is a stalled turn, whatever the composer holds.
+$bbSpin = '  ' + ([string][char]0x2733) + ' Whirlpooling' + ([string][char]0x2026) +
+          ' (3m 1s ' + ([string][char]0x00B7) + ' ' + ([string][char]0x2193) +
+          ' 6.3k tokens ' + ([string][char]0x00B7) + ' thought for 25s)'
+$bbStatus = 'ctx: 117k/1000k (12%) | files: 1 changed | v2.1.251 (Opus 5 (1M context))                  /rc'
+function BBLivePane([string[]]$Body) {
+    return ((@('* Read(go.md)', '') + $Body + @(
+        "$bbRule> ",
+        "$bbRule  $bbStatus",
+        '  users/dzearing/windows-amd64 | D:\git\ghoztty',
+        '  ' + ([string][char]0x23F5) + ' bypass permissions on - 7 shells'
+    )) -join "`r`n")
+}
+# Measured off the loop's own pane 2026-09-05 17:20 while this task was being
+# worked - a turn demonstrably in flight.
+$bbWorking = BBLivePane @($bbSpin, '  Tip: Use /btw to ask a quick side question')
+# And the 2026-09-05 15:45 stall: same chrome, same status-line `/rc`, no
+# spinner, and the transport error that ended the turn still on screen.
+$bbIdle = BBLivePane @(
+    '  The response stopped arriving. The response above may be incomplete.',
+    '')
+Assert 'BB23 a pane with the elapsed-time spinner is working' `
+    ((Get-PaneWorkingState -Tail $bbWorking) -eq 'working')
+Assert 'BB24 the 2026-09-05 pane - same chrome, no spinner - is idle' `
+    ((Get-PaneWorkingState -Tail $bbIdle) -eq 'idle')
+# The composer arm's own reading of that pane, which is what made the miss
+# invisible: it is empty, and correctly so.
+Assert 'BB25 and its composer really is empty, so the composer arm was right' `
+    ((Get-PaneComposerText -Tail $bbIdle) -eq '')
+# Safe direction everywhere else: "I cannot see a Claude composer" is never
+# "the session is idle", because idle is the answer that types into a pane.
+Assert 'BB26 a pane with no composer at all is unknown, not idle' `
+    ((Get-PaneWorkingState -Tail "D:\git\ghoztty>") -eq 'unknown')
+Assert 'BB27 an empty read is unknown, not idle' ((Get-PaneWorkingState -Tail '') -eq 'unknown')
+# The spinner only counts where it lives - just above the composer. One left
+# behind in the scrollback must not report a dead session as working.
+Assert 'BB28 a spinner far up the scrollback is out of the window' `
+    ((Get-PaneWorkingState -Tail (BBLivePane (@($bbSpin) + (1..14 | ForEach-Object { "  line $_" })))) -eq 'idle')
+# The other spinner shape, early in a turn before any tokens have arrived.
+Assert 'BB29 the early-turn spinner counts too' `
+    ((Get-PaneWorkingState -Tail (BBLivePane @('  ' + ([string][char]0x2733) + ' Herding' + ([string][char]0x2026) + ' (7s ' + ([string][char]0x00B7) + ' esc to interrupt)'))) -eq 'working')
+
+# --- the verdict's third arm ---
+$bbStuck = Resolve-LoopStallVerdict -TurnAgeMinutes 67 -StaleMinutes 180 -SuspectMinutes 45 `
+    -ComposerText '' -PaneState 'idle'
+Assert 'BB30 the 2026-09-05 shape - idle session, empty composer, turn unmoved - is stalled' `
+    ($bbStuck.Stalled -and $bbStuck.Clock -eq 'idle')
+Assert 'BB31 and it names the 67 minutes it decided on' ($bbStuck.Why -match '67')
+# The gate that protects a slow build: working is working, however long it runs.
+$bbBusy = Resolve-LoopStallVerdict -TurnAgeMinutes 152 -StaleMinutes 180 -SuspectMinutes 45 `
+    -ComposerText '' -PaneState 'working'
+Assert 'BB32 a long turn that is still working is left alone' (-not $bbBusy.Stalled)
+$bbIdleEarly = Resolve-LoopStallVerdict -TurnAgeMinutes 10 -StaleMinutes 180 -SuspectMinutes 45 `
+    -ComposerText '' -PaneState 'idle'
+Assert 'BB33 an idle pane early in a turn is between turns, not a stall' (-not $bbIdleEarly.Stalled)
+$bbBlind = Resolve-LoopStallVerdict -TurnAgeMinutes 152 -StaleMinutes 180 -SuspectMinutes 45 `
+    -ComposerText '' -PaneState 'unknown'
+Assert 'BB34 a pane the probe could not classify is not nudged' (-not $bbBlind.Stalled)
+
 Remove-Item $lock, $state -Force -ErrorAction SilentlyContinue
 
 # --- cleanup --------------------------------------------------------------
