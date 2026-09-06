@@ -3200,11 +3200,21 @@ function Send-TestControlText {
 }
 
 # A navigation key (Enter / Escape / arrows / Tab) for a standard control.
-# NOTE: -Modifiers does NOT reliably reach a standard control. The app runs
-# TranslateMessage over dialog messages, and translation reads the queue's own
-# key state rather than the state set around a posted message, so e.g. ctrl+a
-# arrives as a literal 'a' instead of select-all. Drive dialogs with plain
-# keys and text; modifier chords belong on terminal surfaces (Send-TestKeys).
+# NOTE: -Modifiers does NOT reach a standard control from here, and the reason
+# is one line of this function rather than anything about controls: it fakes the
+# modifier with SetKeyboardState on the WORKER thread and never attaches that
+# thread's input queue to the app's, so the app's own GetKeyState answers for a
+# queue where nothing is held down. Translation is the second half of the same
+# story - the app runs TranslateMessage over dialog messages and translation
+# reads the queue state too, so e.g. ctrl+a arrives as a literal 'a'.
+#
+# WHAT TO USE INSTEAD, measured 2026-09-05 (T569): Send-TestKeys carries a
+# modifier to a dialog/panel CHILD control perfectly well - it attaches the two
+# input queues first, which is the whole difference. Shift+Tab through the
+# Activity Monitor's focus ring (activity-monitor.ps1 section L2b) walks
+# backwards through it and lands on the FORWARD neighbour through this helper.
+# So: plain keys and text here; anything with a modifier goes through
+# Send-TestKeys, whether the target is a terminal surface or a control.
 function Send-TestControlKey {
     param(
         [Parameter(Mandatory = $true)][IntPtr]$Control,

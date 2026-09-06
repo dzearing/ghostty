@@ -36,7 +36,9 @@
 #      resume clears the trend history rather than stitching a gap across it;
 #   L. (T289) keyboard focus is VISIBLE and it ROUTES: Tab walks filter ->
 #      "Show all" -> [Kill] -> "New Process..." -> table and steps over a Kill
-#      that is not on screen, the row keys reach the table only while the TABLE
+#      that is not on screen, (T569) Shift+Tab walks the same ring backwards -
+#      the one-step route from the filter to the table - the row keys reach the
+#      table only while the TABLE
 #      holds focus, and the table - an owner-drawn region no theme rings for us
 #      - paints design system 2.2's ring on its caret row exactly while it has
 #      the keyboard; (T568) including when the PANEL loses the keyboard rather
@@ -1192,6 +1194,60 @@ try {
         Close-TestWindowPixels -Shot $shotL
     }
 
+    # L2b. Shift+Tab walks the SAME ring backwards (T569). That is the one-step
+    # route from the filter to the far end of the cycle - forward Tab costs four
+    # - and it is decided by handleKey reading GetKeyState(VK_SHIFT), which is
+    # why it needed ESTABLISHING before it could be asserted: the harness fakes
+    # modifier state with SetKeyboardState, a mechanism this repo has already
+    # recorded as unreliable for a GetKeyState read in another process.
+    #
+    # Send-TestControlKey is the helper that cannot carry it, and says so in its
+    # own doc comment: it pokes the worker thread's key-state table and nothing
+    # shares that table with the app. So the chord goes through Send-TestKeys,
+    # which ATTACHES the two input queues first (AttachThreadInput) and is the
+    # same path every terminal chord in this suite already takes.
+    #
+    # BOTH halves of that were measured on the box, 2026-09-05, and this is the
+    # evidence T569 asked for rather than a preference: through Send-TestKeys
+    # all four steps below land on the backwards neighbour, and the same four
+    # steps re-run through Send-TestControlKey -Modifiers shift land on the
+    # FORWARD one ("focus landed on Show all - the Shift never reached the app").
+    # So the mechanism is the attachment, and the product's backwards walk is
+    # not in question.
+    #
+    # And the failure is self-diagnosing, which is what makes this an assertion
+    # rather than a recorded limit. nextFocus's backwards cycle is unit tested,
+    # so a Shift the app never saw does not land focus somewhere random - it
+    # lands on the FORWARD neighbour. Each step below names that neighbour, so a
+    # red line says which half broke: the forward stop means the modifier was
+    # lost in the harness, anything else means the walk itself is wrong.
+    $focusNames = @{
+        "$filterEdit"                 = 'the filter field'
+        "$([IntPtr]$showAll.Hwnd)"    = '"Show all"'
+        "$([IntPtr]$newProc.Hwnd)"    = '"New Process..."'
+        "$panel"                      = 'the table'
+    }
+    if ($killBtn) { $focusNames["$([IntPtr]$killBtn.Hwnd)"] = '"Kill"' }
+    function Assert-BackTab([IntPtr]$From, [IntPtr]$Want, [IntPtr]$Forward, [string]$Label) {
+        Send-TestKeys -Window $panel -Target $From -Modifiers shift -Key Tab | Out-Null
+        Start-Sleep -Milliseconds 250
+        $got = Get-TestFocusedWindow -Window $panel
+        $name = $focusNames["$got"]
+        if (-not $name) { $name = "an unknown window ($got)" }
+        $why = if ($got -eq $Forward) { ' - the FORWARD neighbour, i.e. the Shift never reached the app' } else { '' }
+        Assert ($got -eq $Want) "$Label (focus landed on $name$why)"
+        return $got
+    }
+
+    Assert-BackTab $filterEdit $panel ([IntPtr]$showAll.Hwnd) `
+        'L2b Shift+Tab from the filter reaches the TABLE in one step, stepping back over the absent carousel' | Out-Null
+    Assert-BackTab $panel ([IntPtr]$newProc.Hwnd) $filterEdit `
+        'L2b Shift+Tab from the table reaches "New Process..."' | Out-Null
+    Assert-BackTab ([IntPtr]$newProc.Hwnd) ([IntPtr]$showAll.Hwnd) $panel `
+        'L2b Shift+Tab STEPS BACK OVER the hidden Kill to "Show all"' | Out-Null
+    Assert-BackTab ([IntPtr]$showAll.Hwnd) $filterEdit ([IntPtr]$newProc.Hwnd) `
+        'L2b Shift+Tab from "Show all" returns to the filter, closing the ring' | Out-Null
+
     # L2. Tab walks the cycle, stepping OVER the hidden Kill stop.
     Send-TestControlKey -Control $filterEdit -Key Tab | Out-Null
     Start-Sleep -Milliseconds 250
@@ -1466,6 +1522,37 @@ try {
     $hc = Get-HeaderCursor
     Assert ($hc -eq 'none') "N5 Down puts the header cursor away (cursor=$hc)"
     Assert ($st.Selected -eq 1) "N5 ...and selects a row in the same press (selected=$($st.Selected))"
+
+    # M below clicks rows BY POSITION, and the sort it would inherit is % CPU -
+    # which for three live `ping` processes is a number that moves on every
+    # 1.5s sample, so the three victims can swap places between one click and
+    # the next. Found while adding L2b (T569): the accumulate probe's second
+    # ctrl-click landed on the row the first had just selected and TOGGLED IT
+    # OFF, which reads as "ctrl-click does not accumulate" and is nothing of the
+    # kind. The section passed before only because the extra keystrokes above it
+    # had not yet moved the run's phase against the sampler; a race that is lost
+    # by 2 seconds of harness is a race, not a schedule.
+    #
+    # So pin the order to something that CANNOT reorder: PID ascending, three
+    # distinct pids. The table still holds focus from N5, so this is the header
+    # route N has just finished asserting - the first Left lands the cursor on
+    # the sorted column, two more walk it to PID, Space commits, and Down puts
+    # the cursor away again so M starts from the same state it always did.
+    foreach ($step in 1..3) {
+        Send-TestControlKey -Control $panel -Key Left | Out-Null
+        Start-Sleep -Milliseconds 120
+    }
+    $hc = Get-HeaderCursor
+    Assert ($hc -eq 'pid') "M (setup) the header cursor walked to PID (cursor=$hc)"
+    $before = Count-PanelLines
+    Send-TestControlKey -Control $panel -Key Space | Out-Null
+    $st = Wait-PanelState $before
+    Assert ($st.SortKey -eq 'pid' -and $st.SortDir -eq 'asc') `
+        "M (setup) the rows are on a STABLE sort for the by-position clicks (got $($st.SortKey)/$($st.SortDir))"
+    Send-TestControlKey -Control $panel -Key Down | Out-Null
+    Start-Sleep -Milliseconds 200
+    $hc = Get-HeaderCursor
+    Assert ($hc -eq 'none') "M (setup) the header cursor is away again (cursor=$hc)"
 
     # --- M. The MULTI-ROW kill: what only a batch can show (T293) -------------
     # T286 asserted every WORD of an N > 1 kill in the pure lane and every ACT of

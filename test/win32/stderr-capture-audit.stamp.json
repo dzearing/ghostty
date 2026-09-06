@@ -1,14 +1,15 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-05T17:57:17-07:00",
-    "commit":  "a7b611604",
+    "generated":  "2026-09-05T18:48:58-07:00",
+    "commit":  "ef1a649b1",
     "uncommitted":  [
-                        "test/win32/go-loop-guard.ps1"
+                        "test/win32/activity-monitor.ps1",
+                        "test/win32/lib/TestDesktop.ps1"
                     ],
     "files":  {
                   "docs/claude/testing.md":  "ec2a58df8d8c30fe5ae586331be5ec26b1a84a3ea71358a44ac6b823a720d970",
-                  "test/win32/activity-monitor.ps1":  "569d09fe9ffd52baa94baf79247ed9af90e29260f567d43d45bba6116e7aa41e",
+                  "test/win32/activity-monitor.ps1":  "ba27bb2aac6346bdfead99ca8a5be20d0e33ff81440ad35e05d707b3b1d2c53f",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
                   "test/win32/activity-monitor-probe-fail.ps1":  "3ca33b2b1d163db1fe2b2f8d0cb573c0f9d7decd435f61d64bb5906e71dc6aa4",
                   "test/win32/activity-monitor-remote.ps1":  "8781b626fe4f079486cfd17951eed12ca681a276129cf44f6c0f7bf1a8f7bec7",
@@ -193,7 +194,7 @@
                   "test/win32/lib/SkipAudit.ps1":  "1f144bf0f762eebc385656df1fa39d7629363d44164393de241248c4a231eade",
                   "test/win32/lib/StderrCaptureAudit.ps1":  "69d0a25615d35acc06bf6c1471016186163ae1881ae70a12461425546ac4b7d8",
                   "test/win32/lib/TestClient.ps1":  "98b5449096d7103ec31d8eb19b2d0d84985c48fddc88a5871eeb641ec43091f8",
-                  "test/win32/lib/TestDesktop.ps1":  "533e142a4cd6683fd3d346b9c83b7afd854874ebadc10adabf5a2556f3e82722",
+                  "test/win32/lib/TestDesktop.ps1":  "5ce05c3f49df0c018ea2dc0ee9c9c71712fcf3f2279b7d94e16ab8ab3e507e8d",
                   "test/win32/lib/TestReachAudit.ps1":  "3b2fb64aee74f3451127f4f9776141f5781dd210a6fdf0019410485664f0a840",
                   "test/win32/lib/TestScore.ps1":  "1bc571121b1b60ce5d9b63a0e1c8ebf23f6da575f8e9f7dab1a410cbc2888acc",
                   "test/win32/lib/ThrowawayProduct.ps1":  "d0754fbb3791ee3d5fec2369a523df0c23ccb6d4738bad21dd37c25cf86c82fd",
