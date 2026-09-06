@@ -1,10 +1,10 @@
 {
     "guard":  "cleanslate",
     "script":  "test/win32/cleanslate-audit.ps1",
-    "generated":  "2026-09-05T19:25:29-07:00",
-    "commit":  "adbe98e25",
+    "generated":  "2026-09-05T20:05:42-07:00",
+    "commit":  "9de196d47",
     "uncommitted":  [
-                        "test/win32/activity-monitor.ps1"
+                        "test/win32/pane-banner.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "944e54bda392aa61007ee23280c6bb9767ed2e661f77f5157ca035dbe9b6e4ea",
@@ -211,7 +211,7 @@
                   "test/win32/overlay-zorder.ps1":  "48f8bcc2f312e6031dede6f4c19fa50a961804fdbe81de80b2ed27247f92c6aa",
                   "test/win32/palette-close-crash.ps1":  "e6046113e0de2c089224b358bac4ef12ed298e86983c3bf68bd48588a34c964d",
                   "test/win32/palette-jump.ps1":  "1745b9a557417e11bdfceaf4db1997de31bc457f7f9919664fa01b592f5b6ac7",
-                  "test/win32/pane-banner.ps1":  "08858e8b436dd61b5d8cc9a5052061234787e016cd60baafcf5d43edf702c080",
+                  "test/win32/pane-banner.ps1":  "585671bd04f8e963eff275b669bf618856b60528d234386cb7adb578e115a7ff",
                   "test/win32/pane-capture.ps1":  "bafa49ecb514b76f8cafb16cb2a6172c04188e0081f28c759d939f1c378b8a4c",
                   "test/win32/pane-hwnd-reap.ps1":  "93f787edbf5abb1a9841dfd3b52f05a076871ab29cb4dccde3c51489828d9dba",
                   "test/win32/pane-id.ps1":  "0c722d4f0cb52d3567b2d070362fa2cf825aafc952a81b1bcf01768203181161",

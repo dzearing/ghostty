@@ -749,6 +749,16 @@ try {
         # A second probe of the SAME square from a capture hovered elsewhere on
         # the card is what says the fill followed the hover rather than being
         # there all along.
+        #
+        # T571: the same rule is also asserted WITHOUT a desktop, in the zig
+        # lane - `banner overlay: the chevron's fill lights on hover and is
+        # rounded` in BannerOverlay.zig paints one overlay twice into a memory
+        # DC with only `hover_chevron` different, so the color and the rounded
+        # corner are arithmetic there. What is left here is the half only a
+        # real window can answer: that a POINTER over the real chevron reaches
+        # that paint. If these probes ever go red, read the zig test first - a
+        # green one there and a red one here means the pixels are right and the
+        # hit test or the capture is not.
         $inset = Get-TestChromeDip -Dip 2.0 -Scale $bScale
         $chTop = $chCy - [int][Math]::Truncate($side / 2)
         function Probe-Chev($shot) {

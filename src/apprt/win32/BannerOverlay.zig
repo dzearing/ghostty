@@ -2858,3 +2858,151 @@ test "banner overlay: a link's underline is dotted at rest and solid on hover" {
         try std.testing.expect(hot.ink > rest.ink);
     }
 }
+
+// T571: the chevron's hovered FILL, proved by arithmetic rather than by a
+// photograph of a desktop.
+//
+// `pane-banner.ps1` 6g can photograph the hovered chevron today — T282/T845
+// moved the capture onto the app's own GUI-thread stack, so the posted
+// WM_MOUSELEAVE can no longer be drained between the move and the paint — but
+// what that section is really checking is a rule about colors and a rounded
+// region, and neither needs a window manager to be true. Before T845 the same
+// section spent months printing `SKIP T209 chevron fill` on every run, because
+// on a background test desktop there is no real pointer to hold a hover with.
+//
+// So the rule gets an oracle in this lane too, the one T165 built for the link
+// underline: paint the identical overlay twice into a memory DC with only
+// `hover_chevron` different, and read the two frames. No pointer, no desktop,
+// no timing. The three things asserted are the three the user's report asked
+// for ("why doesn't the chevron in the banner have a similar hover?") — a fill
+// that is NOT there at rest, that is lit off the CARD's own color, and whose
+// corner is rounded away.
+//
+// Its negative control is `icon_button.T204_NEUTERED`: flip that to `true` and
+// `lightsFill(.chevron_up)` answers false, the chevron paints no fill at all,
+// and the hover assertion below must go red.
+test "banner overlay: the chevron's fill lights on hover and is rounded" {
+    const hinst = w32.GetModuleHandleW(null) orelse return error.SkipZigTest;
+    registerClassOnce(hinst) catch return error.SkipZigTest;
+
+    const owner = w32.CreateWindowExW(
+        w32.WS_EX_LAYERED | w32.WS_EX_NOACTIVATE | w32.WS_EX_TOOLWINDOW,
+        WINDOW_CLASS_NAME,
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_POPUP,
+        0,
+        300,
+        600,
+        120,
+        null,
+        null,
+        hinst,
+        null,
+    ) orelse return error.SkipZigTest;
+    defer _ = w32.DestroyWindow(owner);
+    _ = w32.SetLayeredWindowAttributes(owner, 0, 0, w32.LWA_ALPHA);
+    _ = w32.ShowWindow(owner, w32.SW_SHOWNOACTIVATE);
+
+    const overlay = BannerOverlay.create(std.testing.allocator, null, owner, hinst) catch
+        return error.SkipZigTest;
+    defer overlay.destroy();
+    _ = w32.SetLayeredWindowAttributes(overlay.hwnd, 0, 0, w32.LWA_ALPHA);
+    overlay.alpha_set = true;
+
+    // Multi-line: only a collapsible banner HAS a chevron, so a single-line
+    // text would make every assertion below vacuous.
+    overlay.setText("chev1\nchev2\nchev3");
+    try std.testing.expect(overlay.collapsible);
+
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        overlay.inset = @intFromFloat(80.0 * scale);
+        overlay.updatePosition(scale);
+
+        var client: w32.RECT = undefined;
+        if (w32.GetClientRect(overlay.hwnd, &client) == 0) return error.SkipZigTest;
+        const w = @max(client.right - client.left, 1);
+        const h = @max(client.bottom - client.top, 1);
+
+        // Top-down 32bpp, so a pixel is one index rather than a row flip.
+        var bmi = std.mem.zeroes(w32.BITMAPINFO);
+        bmi.bmiHeader.biSize = @sizeOf(w32.BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = w;
+        bmi.bmiHeader.biHeight = -@as(i32, h);
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+
+        const wnd_dc = w32.GetDC(overlay.hwnd) orelse return error.SkipZigTest;
+        defer _ = w32.ReleaseDC(overlay.hwnd, wnd_dc);
+        const mem_dc = w32.CreateCompatibleDC(wnd_dc) orelse return error.SkipZigTest;
+        defer _ = w32.DeleteDC(mem_dc);
+        var bits: ?*anyopaque = null;
+        const bmp = w32.CreateDIBSection(mem_dc, &bmi, w32.DIB_RGB_COLORS, &bits, null, 0) orelse
+            return error.SkipZigTest;
+        defer _ = w32.DeleteObject(bmp);
+        _ = w32.SelectObject(mem_dc, bmp);
+        const pixels = @as([*]u32, @ptrCast(@alignCast(bits orelse return error.SkipZigTest)));
+
+        // The same two probes 6g takes, from the same geometry the paint uses:
+        // the fill's top edge at its horizontal center (lit), and the corner
+        // pixel the rounding cuts away (never lit). Asking `fillRegion` rather
+        // than re-deriving the inset is the point — a test that recomputed the
+        // geometry could agree with itself while disagreeing with the paint.
+        const ib = icon_button.Metrics.init(overlay.scale);
+        const f = icon_button.fillRegion(ib, overlay.chevronBox(client.right));
+        const edge_x = @divTrunc(f.left + f.right, 2);
+        const edge_y = f.top + 1;
+        // A witness well away from the button, on the same row: the card's own
+        // surface, which the chevron's hover has no business touching.
+        const far_x = @divTrunc(f.left, 2);
+        if (f.left <= 2 or edge_x >= w or edge_y < 0 or edge_y >= h) return error.SkipZigTest;
+
+        const at = struct {
+            fn run(px: [*]const u32, width: i32, x: i32, y: i32) i32 {
+                return @intCast((px[@intCast(y * width + x)] >> 16) & 0xFF);
+            }
+        }.run;
+
+        overlay.hover_chevron = false;
+        overlay.paint(mem_dc);
+        const rest_edge = at(pixels, w, edge_x, edge_y);
+        const rest_corner = at(pixels, w, f.left, f.top);
+        const rest_far = at(pixels, w, far_x, edge_y);
+
+        overlay.hover_chevron = true;
+        overlay.paint(mem_dc);
+        const hot_edge = at(pixels, w, edge_x, edge_y);
+        const hot_corner = at(pixels, w, f.left, f.top);
+        const hot_far = at(pixels, w, far_x, edge_y);
+        overlay.hover_chevron = false;
+
+        // Lit off the CARD's fill, not the pane background — the whole reason
+        // `paintChevron` shades `card.fillColor` and not `pane_bg_rgb`. The
+        // expected value is exact because a `FillRgn` with a solid brush is,
+        // so this pins the color rather than merely noticing a change.
+        const base = card.fillColor(overlay.pane_bg_rgb);
+        const delta = icon_button.fillDelta(.hover, !color_math.isLight(overlay.pane_bg_rgb));
+        try std.testing.expectEqual(
+            @as(i32, icon_button.shadeChannel(base.r, delta)),
+            hot_edge,
+        );
+
+        // ...and it was NOT there at rest. Signed by the same rule the paint
+        // uses, so a light theme (which darkens on hover) reads correctly
+        // instead of needing the assertion inverted by hand.
+        if (delta > 0) {
+            try std.testing.expect(hot_edge >= rest_edge + 6);
+        } else {
+            try std.testing.expect(hot_edge <= rest_edge - 6);
+        }
+
+        // ROUNDED: the corner pixel is outside the region, so the hover leaves
+        // it exactly as it was while the edge beside it moved. Stated as an
+        // equality rather than as "the corner is darker" — that is the version
+        // a square fill cannot pass by accident.
+        try std.testing.expectEqual(rest_corner, hot_corner);
+        try std.testing.expect(@abs(hot_edge - hot_corner) > 4);
+
+        // And the fill is the CHEVRON's: nothing else on that row changed.
+        try std.testing.expectEqual(rest_far, hot_far);
+    }
+}
