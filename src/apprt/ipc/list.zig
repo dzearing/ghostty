@@ -56,6 +56,13 @@ pub const List = struct {
         /// `background_tint`: null omits the field, keeping the golden Mac
         /// shape unchanged for bannerless panes.
         banner: ?[]const u8 = null,
+        /// Whether the pane is in read-only mode (T574): the machine-readable
+        /// half of the badge T445 paints, so an automation that finds
+        /// `+send-keys` silently swallowed can ASK why instead of guessing.
+        /// Additive and optional on both servers — null (the off state, and
+        /// every viewer pane) omits the field, so an older client sees the
+        /// shape it always saw.
+        readonly: ?bool = null,
         /// The session-persistence agent session this pane is bound to
         /// (T332): the join key against `+sessions --json`. Absent for a
         /// plain local ConPTY pane and for viewers; present for local-agent
@@ -378,6 +385,10 @@ pub const List = struct {
             try jws.objectField("banner");
             try jws.write(banner);
         }
+        if (term.readonly) |ro| {
+            try jws.objectField("readonly");
+            try jws.write(ro);
+        }
         if (term.session_id) |sid| {
             try jws.objectField("session_id");
             try jws.write(sid);
@@ -428,6 +439,60 @@ test "List: banner is additive (T35)" {
             "\"banner\":\"**PR #1**\\nline2\"}}}]}]}}",
         json,
     );
+}
+
+test "List: readonly is additive (T574)" {
+    const testing = std.testing;
+
+    // A pane with read-only ON carries the flag; the same pane with it OFF
+    // must serialize byte-for-byte the way it did before the field existed,
+    // which is the whole promise an additive field makes to older clients.
+    const base: List.Terminal = .{
+        .id = "11",
+        .title = "pwsh",
+        .working_directory = "",
+        .pid = 0,
+        .tty = "",
+        .name = "11",
+        .focused = true,
+        .exit_code = null,
+    };
+
+    const prefix = "{\"success\":true,\"data\":{\"windows\":[" ++
+        "{\"id\":\"1\",\"title\":\"pwsh\",\"target\":null,\"focused\":true,\"tabs\":[" ++
+        "{\"id\":\"0\",\"title\":\"pwsh\",\"index\":0,\"selected\":true,\"splits\":" ++
+        "{\"type\":\"leaf\",\"terminal\":{\"id\":\"11\",\"title\":\"pwsh\"," ++
+        "\"working_directory\":\"\",\"pid\":0,\"tty\":\"\",\"name\":\"11\"," ++
+        "\"focused\":true,\"exit_code\":null,\"type\":\"terminal\",\"url\":null";
+    const suffix = "}}}]}]}}";
+
+    for ([_]struct { ro: ?bool, want: []const u8 }{
+        .{ .ro = true, .want = prefix ++ ",\"readonly\":true" ++ suffix },
+        .{ .ro = false, .want = prefix ++ ",\"readonly\":false" ++ suffix },
+        .{ .ro = null, .want = prefix ++ suffix },
+    }) |case| {
+        var term = base;
+        term.readonly = case.ro;
+        const leaf: List.Node = .{ .leaf = term };
+        const tabs = [_]List.Tab{.{
+            .id = "0",
+            .title = "pwsh",
+            .index = 0,
+            .selected = true,
+            .splits = &leaf,
+        }};
+        const windows = [_]List.Window{.{
+            .id = "1",
+            .title = "pwsh",
+            .target = null,
+            .focused = true,
+            .tabs = &tabs,
+        }};
+
+        const json = try (List{ .windows = &windows }).serializeResponse(testing.allocator);
+        defer testing.allocator.free(json);
+        try testing.expectEqualStrings(case.want, json);
+    }
 }
 
 test "List: build provenance is additive (T52)" {
@@ -1109,6 +1174,7 @@ test "List: the JSON shape still matches the Mac Swift encoder (T370)" {
         .url = "file:///x.md",
         .background_tint = "#112233",
         .banner = "**PR #1**",
+        .readonly = true,
         .session_id = "s1",
     } };
     const leaf_right: List.Node = .{ .leaf = List.empty_terminal };

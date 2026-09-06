@@ -82,12 +82,16 @@ enum IPCData: Encodable {
         var url: String? = nil
         /// The pane's sticky banner text (terminal panes only; nil when none).
         var banner: String? = nil
+        /// Whether the pane is in read-only mode (T574). Additive: nil (the
+        /// off state, and every viewer pane) omits the key entirely.
+        var readonly: Bool? = nil
 
         private enum CodingKeys: String, CodingKey {
             case id, title, working_directory, pid, tty, name, focused, exit_code
             case pane_type = "type"
             case url
             case banner
+            case readonly
         }
 
         func encode(to encoder: Encoder) throws {
@@ -103,6 +107,7 @@ enum IPCData: Encodable {
             try container.encode(pane_type, forKey: .pane_type)
             try container.encode(url, forKey: .url)
             try container.encodeIfPresent(banner, forKey: .banner)
+            try container.encodeIfPresent(readonly, forKey: .readonly)
         }
     }
 

@@ -2008,6 +2008,10 @@ fn buildNode(
                         try arena.dupe(u8, t)
                     else
                         null,
+                    // T574: read-only mode, the machine-readable half of the
+                    // badge T445 paints. Absent when off (and for viewers),
+                    // so it is additive for every existing caller.
+                    .readonly = if (surface.core_surface.readonly) true else null,
                     // T332: the agent session this pane is bound to — the join
                     // key against `+sessions --json`. Lock-free read (the
                     // backend publishes the id atomically), duped because the

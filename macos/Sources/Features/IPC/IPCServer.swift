@@ -1890,7 +1890,11 @@ class IPCServer {
                 name: paneName,
                 focused: view === focusedSurface,
                 exit_code: view.exitCode.map { Int($0) },
-                banner: view.paneBanner
+                banner: view.paneBanner,
+                // T574: read-only mode, the machine-readable half of the
+                // badge the pane already shows. Absent when off, so the
+                // field is additive for every existing caller.
+                readonly: view.readonly ? true : nil
             ))
         case .split(let split):
             let direction: String = switch split.direction {

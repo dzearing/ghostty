@@ -1,14 +1,10 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-09-05T20:58:54-07:00",
-    "commit":  "fa5647156",
+    "generated":  "2026-09-05T21:58:06-07:00",
+    "commit":  "276011152",
     "uncommitted":  [
-                        "test/win32/lib/DesktopCapability.ps1",
-                        "test/win32/lib/TestDesktop.ps1",
-                        "test/win32/notification-click-focus.ps1",
-                        "test/win32/notification-click-real.ps1",
-                        "test/win32/test-desktop-harness.ps1"
+                        "test/win32/readonly-badge.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "944e54bda392aa61007ee23280c6bb9767ed2e661f77f5157ca035dbe9b6e4ea",
@@ -233,7 +229,7 @@
                   "test/win32/pty-holder.ps1":  "ac9811305a50f2a86dca0af16b2725c8414ed78ebe26c84572ca6599326af88e",
                   "test/win32/pty-host.ps1":  "0f55c91a5950ac27a78bf29b90e3ea613948a586da2ca66dba17a5d8aa220333",
                   "test/win32/rdp-session.ps1":  "563a3fc256c9cb7b7164dee5ee28b1292fadb79ec6283fcc05018c02bf627e86",
-                  "test/win32/readonly-badge.ps1":  "b35e31283126676ccaafc9253a6816fe4b21dc454a27b1e8eea999316f27c12c",
+                  "test/win32/readonly-badge.ps1":  "723aa09aab0eeabe724a1ac188bf08975c1bdd95ac40211dcb4e213904c874ba",
                   "test/win32/rearrange-session-drop.ps1":  "88994a4062d36266517b4b8fe6de0301ddb204b051e19e6cd94d446fe2128c34",
                   "test/win32/registration-sites.ps1":  "c634ca739f7e0afdff7a0ea269d9f27d300ed7f095b5585ec909b7f76eebaea3",
                   "test/win32/relaunch-guard.ps1":  "784140b66081be866d4cae5cb2858ef00c9979cdce73dc6f0e4fd5a95aa1628f",

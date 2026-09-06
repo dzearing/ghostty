@@ -182,6 +182,15 @@ a completely healthy product. Consumers ask
 now only for asserting that something is PAINTED, never for finding a click
 target. (win32 server since T231; the Mac server half is T735.)
 
+`--json` terminal panes carry a **`readonly`** field when the pane is in
+read-only mode (T574) — the machine-readable half of the badge the pane wears.
+This is the question an automation asks when `+send-keys` reported success and
+nothing happened: read-only drops every keystroke on the floor, so a read-only
+pane and a wedged pane look identical from the outside unless the wire says
+which one it is. The field is **additive** — absent, not `false`, when the mode
+is off, and absent from viewer panes — so an older client sees exactly the
+shape it always saw. (Both servers since T574.)
+
 `--json` terminal panes carry a `session_id` field when the pane is bound to a
 session-persistence agent session — the join key against `+sessions --json`,
 so a script can answer "which pane is this session open in" (and vice versa)

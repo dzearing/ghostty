@@ -23111,3 +23111,45 @@ Floor: `floor-lane.ps1 -Lane all` ALL LANES PASS; P1/P2/P3 ALL PASS (25/20/16).
 Filed T1383: `profile-latency.ps1`
 was masked by the same broken probe and now refuses on a stale July
 `zig-out-prof` build that no documented command produces.
+
+## 2026-09-05 - A script can ask whether a pane is read-only, instead of guessing (T574)
+
+Read-only mode drops every keystroke a pane is sent. A human can see that the
+mode is on - the pane has worn a badge since T445 - but nothing on the wire said
+so, and that is the one case where `+send-keys` reports success and nothing
+happens. From the outside a read-only pane and a wedged pane were identical, so
+an automation that hit one had no question it could ask. `+list --json` now
+answers it: terminal panes carry a `readonly` field.
+
+The field is ADDITIVE in the strict sense both servers already use for `banner`
+and `session_id` - present only when the mode is ON, absent (not `false`) when
+it is off and absent from viewer panes - so every client that has ever parsed
+this payload sees the shape it always saw. Both servers report it: the win32
+handler reads `surface.core_surface.readonly`, and the Swift encoder plus
+`IPCServer` report `view.readonly`, which is what keeps the T370 drift detector
+happy. That detector earned its keep here - the first build had the Zig half
+only, and the lane failed with "the Mac encoder emits 'readonly', this encoder
+does not" before any of it could ship half-landed.
+
+Acceptance went into `test\win32\readonly-badge.ps1` rather than ipc-p1/p3, and
+that is a decision rather than a shortcut: entering read-only takes a real chord
+on a real GUI, which the ipc scripts have no way to do, while the badge script
+already toggles the mode per pane on the background desktop. Its five new
+oracles now read the wire beside the badge - the key is absent before the mode
+is ever turned on, `true` on the pane that was toggled (and it is the focused
+one), `true` on BOTH panes when both are read-only, gone again on the one pane
+that left the mode, and gone everywhere once it is off. That script also got the
+guard row and stamp it never had, so a future edit to the badge or to this
+plumbing is tied to the only harness that can prove either half.
+
+Validation: `readonly-badge.ps1` ALL PASS (37, up from 32) with the wire
+oracles. Golden test `List: readonly is additive (T574)` pins the exact bytes
+for true / false / absent. Floor: `floor-lane.ps1 -Lane all` ALL LANES PASS;
+P1/P2/P3 ALL PASS (25/20/16). Guards run after the change: ipc-relay, hook-json,
+printclient, isolation-meta, launch-preflight, verdict-exit, cleanslate,
+stderr-capture, docs-routing, test-reach, body-complete and desktop-launch, all
+ALL PASS, and `guard-due.ps1 check` is clean but for the three standing
+advisories. One thing the vendor-drift check caught: the win32 asset copies of
+the ghoztty SKILL.md are a pristine mirror of tip-of-main and must not be edited
+here, so the new field is documented in `macos/Resources`' copy and in
+`docs/claude/cli.md`, and the mirror re-vendors when main moves.

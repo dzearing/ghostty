@@ -1796,6 +1796,22 @@ $GuardTable = @(
     # can see it. The row was held back while that script was one-run-in-three
     # red; T835 found the flake was in the CAPTURE, not the banner, and with a
     # synchronous capture the script is deterministic enough to gate on.
+    # T574 put read-only mode on the WIRE as well as on the badge, and this is
+    # the one script that can prove either: it really toggles the mode on a
+    # live GUI and then reads both the badge and `+list --json` back. Without a
+    # row here an edit to the badge or to the pane's read-only plumbing had
+    # nothing tying it to the harness that already covers it - the same gap the
+    # go-loop guard sat in for a day.
+    [pscustomobject]@{
+        Name   = 'readonly-badge'
+        Script = 'test\win32\readonly-badge.ps1'
+        Stamp  = 'test\win32\readonly-badge.stamp.json'
+        Covers = @(
+            'src\apprt\win32\ReadonlyBadge.zig',
+            'src\apprt\win32\readonly_badge.zig',
+            'test\win32\readonly-badge.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'pane-banner'
         Script = 'test\win32\pane-banner.ps1'

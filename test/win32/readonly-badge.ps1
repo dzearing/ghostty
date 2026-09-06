@@ -112,6 +112,61 @@ function Wait-BadgeCount([int]$procId, [int]$want) {
     return (Get-VisibleBadges $procId)
 }
 
+# T574: the machine-readable half of the badge. Every terminal leaf `+list
+# --json` reports, as objects with `.name` and `.readonly` — the field is
+# ADDITIVE, so a pane that is not read-only has no `readonly` key at all and
+# `.readonly` reads as $null there rather than $false.
+function Get-PaneReadonly {
+    $json = & $exe +list --json 2>$null | Out-String
+    if (-not $json -or $json.Trim().Length -eq 0) { return @() }
+    try { $tree = $json | ConvertFrom-Json } catch { return @() }
+    if ($null -eq $tree) { return @() }
+    $root = if ($tree.PSObject.Properties.Name -contains 'data') { $tree.data } else { $tree }
+    $out = @()
+    foreach ($w in @($root.windows)) {
+        foreach ($t in @($w.tabs)) {
+            $stack = New-Object System.Collections.Stack
+            $stack.Push($t.splits)
+            while ($stack.Count -gt 0) {
+                $n = $stack.Pop()
+                if ($null -eq $n) { continue }
+                if ($n.type -eq 'leaf') {
+                    $term = $n.terminal
+                    if ($term) {
+                        $has = @($term.PSObject.Properties.Name) -contains 'readonly'
+                        $out += [pscustomobject]@{
+                            Name     = $term.name
+                            Focused  = [bool]$term.focused
+                            Present  = $has
+                            Readonly = if ($has) { [bool]$term.readonly } else { $false }
+                        }
+                    }
+                } else {
+                    if ($n.right) { $stack.Push($n.right) }
+                    if ($n.left) { $stack.Push($n.left) }
+                }
+            }
+        }
+    }
+    # Plain `return`: `return ,$out` counts an EMPTY array as one element at an
+    # `@()` call site (the PS 5.1 trap PaneIdle.ps1 names).
+    return $out
+}
+
+# Poll `+list --json` until the number of panes reporting read-only settles on
+# $want. The badge and the wire field are driven from the same core state, but
+# they are published on different paths, so this waits rather than assuming
+# the badge's settle already covered it.
+function Wait-ReadonlyCount([int]$want) {
+    for ($t = 0; $t -lt 30; $t++) {
+        $leaves = @(Get-PaneReadonly)
+        $on = @($leaves | Where-Object { $_.Readonly })
+        if ($on.Count -eq $want) { return $leaves }
+        Start-Sleep -Milliseconds 100
+    }
+    return @(Get-PaneReadonly)
+}
+
 # Is $inner entirely inside $outer?
 function Inside($inner, $outer) {
     return ($inner.Left -ge $outer.Left) -and ($inner.Top -ge $outer.Top) -and
@@ -196,6 +251,12 @@ try {
     $badges = @(Get-VisibleBadges $app.Pid)
     Assert ($badges.Count -eq 0) "A: no badge before read-only is turned on ($($badges.Count))"
 
+    # T574: and the wire says so too — additively, i.e. by omitting the key.
+    $leaves = @(Get-PaneReadonly)
+    Assert ($leaves.Count -eq 1) "A: +list --json reports one pane ($($leaves.Count))"
+    Assert (@($leaves | Where-Object { $_.Present }).Count -eq 0) `
+        'A: +list --json omits `readonly` entirely while the mode is off'
+
     # -----------------------------------------------------------------------
     # B. Toggling read-only marks the pane, immediately.
     # -----------------------------------------------------------------------
@@ -206,6 +267,14 @@ try {
     if ($badges.Count -ne 1) { throw 'no badge to measure' }
     $badge = $badges[0]
     Assert (Inside $badge $paneA) 'B: the badge is inside the pane it marks'
+
+    # T574: an automation that finds +send-keys swallowed can now ASK why.
+    $leaves = @(Wait-ReadonlyCount 1)
+    $on = @($leaves | Where-Object { $_.Readonly })
+    Assert ($on.Count -eq 1) "B: +list --json reports exactly one read-only pane ($($on.Count))"
+    if ($on.Count -eq 1) {
+        Assert ($on[0].Focused) 'B: the pane reported read-only is the one that was toggled'
+    }
 
     # -----------------------------------------------------------------------
     # C. The anchor: top-right of the pane, at the computed inset.
@@ -263,6 +332,13 @@ try {
             $onB = @($badges | Where-Object { Inside $_ $paneB })
             Assert ($onA.Count -eq 1 -and $onB.Count -eq 1) 'F: one badge on each pane'
 
+            # T574: two badges, two panes on the wire — this is the assertion
+            # a single global flag could not have passed.
+            $leaves = @(Wait-ReadonlyCount 2)
+            Assert ((@($leaves | Where-Object { $_.Readonly })).Count -eq 2) `
+                "F: +list --json reports both panes read-only ($((@($leaves | Where-Object { $_.Readonly })).Count))"
+            Assert ($leaves.Count -eq 2) "F: +list --json still reports two panes ($($leaves.Count))"
+
             # ---------------------------------------------------------------
             # G. Clicking a badge leaves read-only - the mark is the way out.
             # ---------------------------------------------------------------
@@ -278,6 +354,12 @@ try {
                 if ($badges.Count -eq 1) {
                     Assert (Inside $badges[0] $paneA) "G: the OTHER pane's badge is untouched"
                 }
+                # T574: leaving the mode drops the key again, on that pane only.
+                $leaves = @(Wait-ReadonlyCount 1)
+                Assert ((@($leaves | Where-Object { $_.Readonly })).Count -eq 1) `
+                    "G: +list --json reports one read-only pane after the click ($((@($leaves | Where-Object { $_.Readonly })).Count))"
+                Assert ((@($leaves | Where-Object { -not $_.Present })).Count -eq 1) `
+                    'G: the pane that left read-only has no `readonly` key at all'
             }
         }
     }
@@ -289,6 +371,11 @@ try {
     Assert $r 'H: toggle_readonly off chord delivered'
     $badges = @(Wait-BadgeCount $app.Pid 0)
     Assert ($badges.Count -eq 0) "H: no visible badge once read-only is off ($($badges.Count))"
+
+    # T574: and the field is gone from every pane, not merely false.
+    $leaves = @(Wait-ReadonlyCount 0)
+    Assert ((@($leaves | Where-Object { $_.Present })).Count -eq 0) `
+        'H: +list --json omits `readonly` on every pane once the mode is off'
 
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'no crash'
 } catch {
@@ -313,6 +400,19 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
 # nothing, and would otherwise report a clean pass.
 if ($NegativeControl -and -not $script:negReached) {
     Assert $false 'NEGATIVE CONTROL never reached its inverted assertion'
+}
+
+# --- stamp (T783, row added by T574) --------------------------------------
+# A green run RECORDS the content of the badge sources and this script, so
+# scripts\guard-due.ps1 can answer "has anything run this harness against the
+# code as it now stands?". This is the only script that can enter read-only
+# mode at all - it drives the real chord on a real GUI - so it is the only
+# thing that can prove either half of the mode: the badge a human sees and the
+# `readonly` field `+list --json` reports. A red run leaves the stamp alone on
+# purpose, and a -NegativeControl run never stamps.
+if ($script:fail -eq 0 -and -not $NegativeControl) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard readonly-badge -Repo $repo 2>&1 | ForEach-Object { Write-Host "  $_" }
 }
 
 Write-Host ''

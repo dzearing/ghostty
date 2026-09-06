@@ -410,6 +410,7 @@ Window: "~/docs"
 - **`splits`**: Recursive tree — `"type":"leaf"` contains a `terminal` object, `"type":"split"` contains `direction` (`horizontal`/`vertical`), `ratio`, `left`, `right`
 - **`focused`**: On windows = frontmost window. On terminals = focused pane in its tab.
 - **`exit_code`**: `null` if the process is still running, or the exit code (e.g. `0`, `1`) if it has exited. Human-readable output shows `running` or `exited(N)`.
+- **`readonly`** (on terminals): `true` when the pane is in read-only mode and dropping every keystroke. **Absent** — not `false` — when the mode is off, and absent from viewer panes. Ask for it when `+send-keys` reported success and nothing happened: a read-only pane and a wedged pane look identical without it.
 
 **Side effect:** `+list` auto-registers all discovered windows and panes in the target registry, so names from the output can immediately be used with `+close --target=<name>` or `+split --target=<name>`.
 
