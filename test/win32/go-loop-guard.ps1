@@ -1976,8 +1976,13 @@ function AAWriteLock([object]$turnStarted, [datetime]$heartbeat) {
 }
 
 function AAHealth([switch]$AsJson, [int]$TurnStaleMinutes = 0) {
+    # -NoPaneProbe: this fixture's pane id is invented, so the composer/idle
+    # arms would read a pane that does not exist and add a "could not read the
+    # pane" note - a standing complaint that would let a broken turn gate pass
+    # AA1b. The arms have their own coverage below (AF).
     $a = @('-Repo', $aaRepo, '-LockPath', $aaLock, '-DigestAsOf', $aaNow.ToString('o'),
-           '-PublishAsOf', $aaNow.ToString('o'), '-PublishWatermark', $aaWatermark)
+           '-PublishAsOf', $aaNow.ToString('o'), '-PublishWatermark', $aaWatermark,
+           '-NoPaneProbe')
     if ($AsJson) { $a += '-Json' }
     if ($TurnStaleMinutes -gt 0) { $a += @('-TurnStaleMinutes', "$TurnStaleMinutes") }
     return (& powershell -NoProfile -ExecutionPolicy Bypass -File $aaHealth @a 2>&1 |
@@ -2044,6 +2049,61 @@ try { $aaJson = $aa | ConvertFrom-Json } catch { }
 Assert 'AA8 -Json carries turn_age_minutes and turn_stalled for the dashboard' `
     ($null -ne $aaJson -and $aaJson.turn_age_minutes -ge 3 -and $aaJson.turn_age_minutes -le 6 -and
      $aaJson.turn_stalled -eq $false)
+
+# --- AF. health asks the pane the same question the watchdog does ----------
+# WHY (user, 2026-09-06). Twice in one morning the watchdog logged
+# STALLED(by=composer) over a composer holding unsent text while the health
+# line, reading the same loop, printed HEALTHY - once for 76 minutes with the
+# turn's work uncommitted. The controller checks health, so health said all was
+# well while the loop was wedged. The 180m backstop was its only turn arm; the
+# suspect+composer and suspect+idle arms lived in the watchdog alone.
+#
+# Health now runs the SAME Resolve-LoopStallVerdict, and blindness is a note in
+# its own right - T1370's lesson being that "the composer looked empty" and
+# "the composer was never read" must never print the same.
+""
+"AF. health and the watchdog cannot disagree"
+
+# The fixture's pane id is invented, so the probe genuinely cannot read it -
+# which is exactly the blind case, and it needs no live Ghoztty to produce.
+AAWriteLock $aaNow.AddHours(-2) $aaNow.AddHours(-2)
+function AFHealth([switch]$NoProbe, [int]$Suspect = 0) {
+    $a = @('-Repo', $aaRepo, '-LockPath', $aaLock, '-DigestAsOf', $aaNow.ToString('o'),
+           '-PublishAsOf', $aaNow.ToString('o'), '-PublishWatermark', $aaWatermark, '-Json')
+    if ($NoProbe) { $a += '-NoPaneProbe' }
+    if ($Suspect -gt 0) { $a += @('-TurnSuspectMinutes', "$Suspect") }
+    return (& powershell -NoProfile -ExecutionPolicy Bypass -File $aaHealth @a 2>&1 |
+        ForEach-Object { $_.ToString() } | Out-String | ConvertFrom-Json)
+}
+
+# A 2h turn is past the 45m suspect bar but well under the 180m backstop -
+# precisely the window in which the two supervisors used to disagree.
+$afBlind = AFHealth
+$afQuiet = AFHealth -NoProbe
+$afBlindNotes = @($afBlind.notes)
+$afQuietNotes = @($afQuiet.notes)
+Assert 'AF1 an unreadable pane on a 2h-quiet turn is a note, not a silent pass' `
+    (@($afBlindNotes | Where-Object { $_ -match 'pane could not be read' }).Count -eq 1)
+Assert 'AF2 and it is that note alone that separates the two runs' `
+    ($afBlindNotes.Count -eq ($afQuietNotes.Count + 1))
+Assert 'AF3 -NoPaneProbe restores the pre-2026-09-06 silence for the harness' `
+    (@($afQuietNotes | Where-Object { $_ -match 'pane could not be read' }).Count -eq 0)
+# Under the suspect bar there is nothing to ask about, so no probe and no note -
+# health must not read a pane on every tick of a healthy loop.
+Assert 'AF4 a turn under the suspect bar is not probed at all' `
+    (@(@((AFHealth -Suspect 600).notes) | Where-Object { $_ -match 'pane could not be read' }).Count -eq 0)
+# The backstop still owns the 180m case by itself, with its own richer note, and
+# must not be doubled up by the new arm.
+AAWriteLock $aaNow.AddHours(-14.5) $aaNow.AddHours(-14.5)
+$afStale = @((AFHealth).notes)
+Assert 'AF5 past the backstop the turn note stands alone, not doubled' `
+    (@($afStale | Where-Object { $_ -match 'no turn has completed' }).Count -eq 1 -and
+     @($afStale | Where-Object { $_ -match 'stalled\(by=' }).Count -eq 0)
+# And the wiring itself: health must go through the shared verdict, or every
+# assertion above is about a copy that can drift from the watchdog's.
+$afHealthSrc = Get-Content $aaHealth -Raw
+Assert 'AF6 health calls the same verdict function the watchdog does' `
+    ($afHealthSrc -match 'Resolve-LoopStallVerdict')
 
 Remove-Item -LiteralPath $aaRoot -Recurse -Force -ErrorAction SilentlyContinue
 

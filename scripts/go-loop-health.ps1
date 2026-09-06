@@ -61,6 +61,16 @@ param(
     # build-and-test task with a long acceptance sweep genuinely runs over an
     # hour, and the shape this exists to catch was FOURTEEN AND A HALF hours.
     [int]$TurnStaleMinutes = 180,
+    # Past this, a quiet turn is worth ASKING the pane about (T1319's arms, and
+    # the watchdog's own threshold). The 180m backstop above is the last
+    # resort; these two arms are what catch a wedge in tens of minutes.
+    [int]$TurnSuspectMinutes = 45,
+    # Skip the pane read. The harness sets it so a health run needs no live
+    # Ghoztty, and it is the only way to get the pre-2026-09-06 behavior back.
+    [switch]$NoPaneProbe,
+    # The ghoztty the pane probe reads through. Same default as the watchdog's,
+    # so both supervisors question the same binary.
+    [string]$GhozttyExe = "$env:LOCALAPPDATA\Programs\Ghoztty\ghoztty.exe",
     # The instant the daily-digest window is judged against. Defaults to now;
     # the harness passes an explicit one so "before 05:00" and "after 05:00"
     # are both reachable without waiting for a particular hour of the day.
@@ -351,6 +361,60 @@ if ($alive -and $turnAgeMin -gt $TurnStaleMinutes) {
         "$(if ($turnStarted) { $turnStarted } else { 'before this field existed' })) - the pane may be " +
         'moving without the loop working; read it with `ghoztty +read --name=<pane>` before theorising ' +
         '(an API 529 sits there looking exactly like a live session)')
+}
+# HEALTH AND THE WATCHDOG MUST NOT DISAGREE (user, 2026-09-06).
+#
+# The 180m backstop above was this line's only turn arm, so twice in one
+# morning the watchdog logged STALLED(by=composer) over a composer holding
+# unsent text while this line, six feet away, printed HEALTHY - once for 76
+# minutes with the turn's work uncommitted. Two supervisors reading the same
+# pane and reaching opposite verdicts is worse than either being wrong alone:
+# the controller checks THIS one, and it said everything was fine.
+#
+# So ask the same question through the same function the watchdog uses, rather
+# than growing a second opinion here. `Resolve-LoopStallVerdict` carries all
+# three arms (180m backstop, suspect+composer, suspect+idle) and is unit
+# tested; only the backstop is re-stated above, with its own richer note.
+if (-not $turnStalled -and $alive -and -not $NoPaneProbe -and $pane -and
+    $turnAgeMin -gt $TurnSuspectMinutes) {
+    # A probe that THROWS must not read as a quiet pass. The first cut called
+    # Resolve-GhozttyCliExe with no -Exe; PowerShell wrote two red blocks to
+    # stderr, the arm was skipped, and the line still printed HEALTHY - a
+    # broken supervisor reporting health, which is the failure this whole block
+    # exists to end. So the probe is wrapped, and being unable to look is
+    # itself a note.
+    $paneState = $null
+    try {
+        . (Join-Path $PSScriptRoot 'go-loop-pane-probe.ps1')
+        $paneState = Read-PaneState -PaneId $pane `
+            -GhozttyExe (Resolve-GhozttyCliExe -Exe $GhozttyExe)
+    } catch {
+        $notes += ("the pane probe failed after $(Format-Age $turnAgeMin) of quiet turn, " +
+            "so the composer and idle arms could not be asked: $($_.Exception.Message)")
+    }
+    $verdict = if ($paneState) {
+        Resolve-LoopStallVerdict -TurnAgeMinutes $turnAgeMin `
+            -StaleMinutes $TurnStaleMinutes -SuspectMinutes $TurnSuspectMinutes `
+            -ComposerText ([string]$paneState.Composer) `
+            -PaneState $(if ($paneState.Working) { [string]$paneState.Working } else { 'unknown' })
+    } else { @{ Stalled = $false; Clock = 'none'; Why = '' } }
+    # T1370's lesson, re-learned here: "the composer looked empty" and "the
+    # composer was never read" must never be the same line. Read-PaneState
+    # answers a failed probe with a BLIND record rather than an exception, so
+    # without this a ghoztty that cannot be reached reads as a quiet, healthy
+    # pane - measured with -GhozttyExe pointed at a path that does not exist,
+    # which printed HEALTHY.
+    if ($paneState -and [string]$paneState.Working -eq 'unknown') {
+        $notes += ("the pane could not be read after $(Format-Age $turnAgeMin) of quiet turn, " +
+            'so a wedged composer would be invisible here - check the pane by hand with ' +
+            '`ghoztty +read --name=<pane>`')
+    }
+    if ($verdict.Stalled) {
+        $turnStalled = $true
+        $notes += ("stalled(by=$($verdict.Clock)): $($verdict.Why) - the watchdog " +
+            'sees this too and will nudge; if it keeps recurring, the turn is ending ' +
+            'without submitting its own continuation, which is a go.md step 7 failure')
+    }
 }
 if (-not $watchdog) { $notes += 'watchdog is not running' }
 if (-not $dashboard) { $notes += "dashboard is not listening on $Port" }
