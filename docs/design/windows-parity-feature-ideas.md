@@ -229,3 +229,14 @@ as the digest that showed them.
 - The tab knows which branch you are on (git branch and dirty-state chip in the tab)
 - Send a colleague your layout (export/import a named layout as a file)
 - Rewind what a pane printed (scrubber replay over the last few minutes of output)
+
+## 2026-09-06
+
+- Put the release you are missing in front of you (About card names the version gap and its headline changes)
+- Undo the pane you just closed (Ctrl+Shift+T for panes and windows, geometry and cwd restored)
+- Name a window and get back to it from anywhere (global fuzzy jump across every window and pane)
+- Type once into several panes (broadcast input toggle with marked receivers)
+- A quiet mode for a demo (one switch: no tab strip, no notifications, bigger font, high contrast)
+- Publish on a clock the loop cannot miss (daily release trigger on the supervisor tick, not the turn)
+- A red harness counts as due (guard-due treats a failing last run as unrun)
+- Warm the first frame (measure and cut double-click to first usable prompt)
