@@ -55,6 +55,13 @@
 #      confirmation counts the batch instead of naming a pid, a clean sweep
 #      reports killed=3 failed=0 with no banner, and a batch in which one row is
 #      already gone takes the AGGREGATED "Killed 2 of 3 (1 failed: ...)" branch.
+#   O. (T570) Kill answers the KEYBOARD, end to end and with no mouse in it: a
+#      row selected with Down, three Tabs onto Kill, Space to open the
+#      confirmation - which opens with CANCEL holding the keyboard, so a bare
+#      Enter kills NOTHING - then Space, Tab onto the "Kill" affirmative and
+#      Enter, which terminates the process. D29 kept the remote script's
+#      negative control off Kill because that panel samples a live machine;
+#      this is the same claim made where the victim is one the script spawned.
 #
 # NOTHING THE BOX NEEDS IS EVER A TARGET. H spawns `cmd.exe /C pause` - a
 # throwaway that blocks forever with no child process - and I only ever kills
@@ -1762,6 +1769,166 @@ try {
     # Release the pinned pid only now: the app's kill had to meet it as a
     # terminated-but-open process, which is what the whole arm turns on.
     if ($doomed) { $doomed.Dispose() }
+
+    # --- O. Kill answers the KEYBOARD, on a process this script made (T570) ---
+    # D29 left T300's negative control on the harmless "Show all" button rather
+    # than on Kill, because the REMOTE panel samples a live machine and pressing
+    # Kill there would terminate somebody else's process to prove a keyboard
+    # point. The con it recorded is that Kill's OWN key path then went unasserted
+    # ANYWHERE: L5 proves Kill BECOMES a Tab stop once a row is selected, and I
+    # proves a kill works when the button is CLICKED, but until this section
+    # nothing had ever pressed Kill from the keyboard - so a keyboard-only user's
+    # whole route to the panel's one destructive action was untested. That is
+    # this script's to cover rather than the remote one's, because the fixture
+    # M built makes it safe by construction instead of by care: the target is a
+    # `ping` this section spawned through the panel itself, isolated by the same
+    # needle, so every row on screen is one of ours.
+    $victimO = 0
+    $spO = New-PanelSpawn $panel 'ping -n 600 127.0.0.1'
+    if ($spO -gt 0) {
+        $script:extraPids += $spO
+        $victimO = Get-TestChildPid $spO 'PING.EXE'
+        if ($victimO -gt 0) { $script:extraPids += $victimO }
+    }
+    Assert ($victimO -gt 0) "O one throwaway victim is running (pid: $(Get-TestPidLabel $victimO))"
+
+    $stO = Wait-PanelShown 1
+    Assert ($null -ne $stO -and $stO.Shown -eq 1 -and -not $stO.ShowAll) `
+        "O the needle isolates exactly the one victim (shown=$($stO.Shown), show_all=$($stO.ShowAll))"
+    $safeO = ($victimO -gt 0 -and $null -ne $stO -and $stO.Shown -eq 1 -and -not $stO.ShowAll)
+
+    if ($safeO) {
+        # O1. Reach the table and select the row with NO mouse. The cycle L
+        # asserts is filter -> "Show all" -> (Kill, hidden with nothing selected)
+        # -> "New Process..." -> table, so three Tabs from the filter land on the
+        # rows. The one click here puts the caret in the filter field to start
+        # from a known stop - the same thing M's teardown does for F - and
+        # nothing after it touches the mouse.
+        $frO = Get-TestWindowRect -Window $filterEdit
+        Send-TestMouse -Window $panel -Target $filterEdit `
+            -X ([int](($frO.Left + $frO.Right) / 2)) -Y ([int](($frO.Top + $frO.Bottom) / 2)) `
+            -Button left -Action click | Out-Null
+        Start-Sleep -Milliseconds 300
+        Assert ((Get-TestFocusedWindow -Window $panel) -eq $filterEdit) 'O1 (setup) the keyboard starts in the filter field'
+
+        foreach ($i in 1..3) {
+            $ctlO = Get-TestFocusedWindow -Window $panel
+            if ($ctlO -eq [IntPtr]::Zero) { break }
+            Send-TestControlKey -Control $ctlO -Key Tab | Out-Null
+            Start-Sleep -Milliseconds 250
+        }
+        Assert ((Get-TestFocusedWindow -Window $panel) -eq $panel) 'O1 three Tabs from the filter reach the table'
+
+        $before = Count-PanelLines
+        Send-TestControlKey -Control $panel -Key Down | Out-Null
+        $stO = Wait-PanelState $before
+        Assert ($stO.Selected -eq 1) "O1 Down selects the victim row from the keyboard (selected=$($stO.Selected))"
+    }
+
+    # O2. Tab on to Kill, which the selection has just put back into the cycle.
+    $killBtnO = $null
+    if ($safeO -and $stO.Selected -eq 1) {
+        foreach ($i in 1..3) {
+            $ctlO = Get-TestFocusedWindow -Window $panel
+            if ($ctlO -eq [IntPtr]::Zero) { break }
+            Send-TestControlKey -Control $ctlO -Key Tab | Out-Null
+            Start-Sleep -Milliseconds 250
+        }
+        $killBtnO = Get-PanelButton $panel 'Kill*'
+        Assert ($null -ne $killBtnO -and (Get-TestFocusedWindow -Window $panel) -eq ([IntPtr]$killBtnO.Hwnd)) `
+            'O2 three more Tabs put the keyboard ON the Kill button'
+    }
+    $onKillO = ($null -ne $killBtnO -and (Get-TestFocusedWindow -Window $panel) -eq ([IntPtr]$killBtnO.Hwnd))
+
+    # O3. NEGATIVE CONTROL, and the reason this arm is worth the victim: Space on
+    # the focused Kill must open the confirmation and NOTHING else, and the
+    # confirmation must open with CANCEL holding the keyboard. `onKill` asks for
+    # MB_DEFBUTTON2 precisely so that "an accidental Enter must never kill
+    # anything" - a comment that was, until here, only a comment. So the first
+    # keyboard press of Kill is followed by a bare Enter, and the victim lives.
+    if ($onKillO) {
+        Send-TestControlKey -Control ([IntPtr]$killBtnO.Hwnd) -Key Space | Out-Null
+        $confirmO = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyConfirmDialog' -TimeoutMs 8000
+        Assert ($confirmO -ne [IntPtr]::Zero) 'O3 Space on the focused Kill opens the confirmation'
+        if ($confirmO -ne [IntPtr]::Zero) {
+            $ctitleO = Get-TestWindowText -Window $confirmO
+            Assert ($ctitleO -like "*(PID $victimO)*") "O3 the confirmation names the victim this section spawned (got '$ctitleO')"
+            $cbtnsO = @(Get-TestChildWindows -Window $confirmO -Class 'Button')
+            $cancelO = $cbtnsO | Where-Object { (Get-TestControlText -Control ([IntPtr]$_.Hwnd)) -eq 'Cancel' } | Select-Object -First 1
+            Assert ($null -ne $cancelO -and (Get-TestFocusedWindow -Window $confirmO) -eq ([IntPtr]$cancelO.Hwnd)) `
+                'O3 the confirmation opens with CANCEL holding the keyboard (MB_DEFBUTTON2)'
+            $focusedO = Get-TestFocusedWindow -Window $confirmO
+            if ($focusedO -ne [IntPtr]::Zero) { Send-TestControlKey -Control $focusedO -Key Enter | Out-Null }
+            else { Send-TestWindowClose -Window $confirmO | Out-Null }
+            Start-Sleep -Milliseconds 700
+        }
+        Assert ($null -ne (Wait-LogMatch 'activity monitor: kill dialog n=1 choice=cancel' 5000)) `
+            'O3 a bare Enter on the fresh confirmation is a CANCEL'
+        Assert (Test-PidAliveCim $victimO) "O3 AN ACCIDENTAL ENTER KILLED NOTHING ($(Get-TestPidLabel $victimO))"
+    }
+
+    # O4. And the whole route through: Space on Kill, Tab across to the
+    # affirmative - which carries the Kill verb, not "OK" - and Enter, which
+    # follows the FOCUS rather than the default. No mouse anywhere in it, and it
+    # ends with the process gone.
+    if ($onKillO -and (Test-PidAliveCim $victimO)) {
+        # The dialog handed the keyboard back; re-establish the stop rather than
+        # assuming where, so a focus that came back elsewhere fails HERE with a
+        # readable message instead of pressing something else four lines on.
+        foreach ($i in 1..5) {
+            if ((Get-TestFocusedWindow -Window $panel) -eq ([IntPtr]$killBtnO.Hwnd)) { break }
+            $ctlO = Get-TestFocusedWindow -Window $panel
+            if ($ctlO -eq [IntPtr]::Zero) { break }
+            Send-TestControlKey -Control $ctlO -Key Tab | Out-Null
+            Start-Sleep -Milliseconds 250
+        }
+        Assert ((Get-TestFocusedWindow -Window $panel) -eq ([IntPtr]$killBtnO.Hwnd)) 'O4 the keyboard is back on Kill after the cancelled dialog'
+
+        if ((Get-TestFocusedWindow -Window $panel) -eq ([IntPtr]$killBtnO.Hwnd)) {
+            Send-TestControlKey -Control ([IntPtr]$killBtnO.Hwnd) -Key Space | Out-Null
+            $confirmO = Wait-TestWindow -ProcessId $app.Pid -Class 'GhozttyConfirmDialog' -TimeoutMs 8000
+            Assert ($confirmO -ne [IntPtr]::Zero) 'O4 Kill opens the confirmation a second time from the keyboard'
+            $killedByKeyboard = $false
+            if ($confirmO -ne [IntPtr]::Zero) {
+                $ctitleO = Get-TestWindowText -Window $confirmO
+                $cbtnsO = @(Get-TestChildWindows -Window $confirmO -Class 'Button')
+                $okO = $cbtnsO | Where-Object { (Get-TestControlText -Control ([IntPtr]$_.Hwnd)) -eq 'Kill' } | Select-Object -First 1
+                $focusedO = Get-TestFocusedWindow -Window $confirmO
+                if ($focusedO -ne [IntPtr]::Zero) {
+                    Send-TestControlKey -Control $focusedO -Key Tab | Out-Null
+                    Start-Sleep -Milliseconds 300
+                }
+                Assert ($null -ne $okO -and (Get-TestFocusedWindow -Window $confirmO) -eq ([IntPtr]$okO.Hwnd)) `
+                    'O4 Tab moves the keyboard from Cancel onto the "Kill" affirmative'
+                # Same rule I.2 works to: confirm ONLY against the pid the dialog
+                # itself named, so a mis-targeted row can never make this script
+                # kill something else.
+                if ($okO -and $ctitleO -like "*(PID $victimO)*" -and
+                    (Get-TestFocusedWindow -Window $confirmO) -eq ([IntPtr]$okO.Hwnd)) {
+                    Send-TestControlKey -Control ([IntPtr]$okO.Hwnd) -Key Enter | Out-Null
+                    $killedByKeyboard = $true
+                } else {
+                    Send-TestWindowClose -Window $confirmO | Out-Null
+                }
+                Start-Sleep -Milliseconds 900
+            }
+            if ($killedByKeyboard) {
+                Assert ($null -ne (Wait-LogMatch 'activity monitor: kill result total=1 killed=1 failed=0' 6000)) `
+                    'O4 the keyboard-driven kill reported one killed, none failed'
+                $goneO = $false
+                $deadlineO = (Get-Date).AddSeconds(5)
+                while ((Get-Date) -lt $deadlineO) {
+                    if (-not (Test-PidAliveCim $victimO)) { $goneO = $true; break }
+                    Start-Sleep -Milliseconds 200
+                }
+                Assert $goneO "O4 THE KEYBOARD REALLY TERMINATED THE PROCESS ($(Get-TestPidLabel $victimO))"
+            }
+        }
+    }
+    # Whatever the arms above concluded, the victim does not outlive the section.
+    if ($victimO -gt 0 -and (Test-PidAliveCim $victimO)) {
+        Stop-Process -Id $victimO -Force -ErrorAction SilentlyContinue
+    }
 
     # Hand the keyboard back to the filter field, where L left it - F's Escape
     # goes to the control that has the focus, not to a coordinate.
