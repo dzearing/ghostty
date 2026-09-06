@@ -1,8 +1,8 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-09-06T07:08:13-07:00",
-    "commit":  "34e44db54",
+    "generated":  "2026-09-06T08:49:40-07:00",
+    "commit":  "5999aee0a",
     "uncommitted":  [
 
                     ],
@@ -105,7 +105,7 @@
                   "test/win32/fork-identity.ps1":  "2a83e77b4f6fc5127e583e44175dc00a350ef16cacf5b9404c9e6e8fb388ab71",
                   "test/win32/gate-negatives.ps1":  "5942dfa85a157a5b884d7c3c35dec86b0d10ee2a5d3c5aca2996465bd97b34f3",
                   "test/win32/ghoztty-cleanup.ps1":  "81bfcb6cb5b018195e1056d6ce7203f18235763916bcec4cffcdafa811e73f76",
-                  "test/win32/go-loop-guard.ps1":  "5044a3ba697b375627cff48ccd86b55754584562486c55819f438a00480b4359",
+                  "test/win32/go-loop-guard.ps1":  "692715ec2c09642b77bdc30d2a0233371d59058cad297b26f0c3694a36ac95f2",
                   "test/win32/go-loop-uptime.ps1":  "2f3b0ddd2008e43ce3901790fe41aaba7fb18051b1b328feb5b8493780e8d56a",
                   "test/win32/guard-due.ps1":  "306e120c7282b5c4c50c75ac9d7a30a8db84e94e92745cc79caa6ea4eb437d01",
                   "test/win32/gui-launch-command.ps1":  "92343e0db67fea906f08a1a8ef37ec38c4bd2ca90b859269451d543e33ec6202",
@@ -243,7 +243,7 @@
                   "test/win32/remote-reconnect-relay.ps1":  "b185af19d8563f4151f1b5ec11e5e1084eb755773c208abe4b01a3b1f7cf2c32",
                   "test/win32/reset-context.ps1":  "fea3d6af59f82fe015cbe5ce4fd85fa7c431da0267ecf98e1d33a361c07761ac",
                   "test/win32/reset-window-size.ps1":  "163ab9bfcf216a224adcd886da9787dc33e5d1d3ed078a541028e3116918526c",
-                  "test/win32/resize-flicker.ps1":  "8d0d9d900dcd249a42f0aabde5790bae5bc5e4beec46a9f27d4bff5a2d2d72f7",
+                  "test/win32/resize-flicker.ps1":  "c37fb69d16053dc531e111a00b9165502858711521006b61c42379a1b2d0ec6c",
                   "test/win32/restore-late-agent.ps1":  "c4c66e059613f345e285d2f4d82ed42188a1bcbc6632867d2f01792771ff69e8",
                   "test/win32/scrollback-narrow.ps1":  "213e10d81e04ba6a098ccf8d5891f8f05f43edc9c098d7b201c5ae9c77e17662",
                   "test/win32/send-keys-bracketed.ps1":  "3f04c907b40d40409069ee8fe9369820cd96c2c6644567ddfd70d8fdb41bec10",
