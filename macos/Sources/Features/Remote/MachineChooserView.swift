@@ -74,6 +74,9 @@ struct MachineChooserView: View {
     @State private var query: String = ""
     /// True while the browser sign-in flow is running (shows the spinner row).
     @State private var isSigningIn = false
+    /// True while the sign-out flow is in flight (it awaits a network round
+    /// trip to revoke this machine, so the link must not be clickable twice).
+    @State private var isSigningOut = false
     /// Index into `targets` of the highlighted row. Bound to `List(selection:)`
     /// so the native selection highlight + focus ring track the keyboard.
     @State private var selectedIndex: Int = 0
@@ -1282,9 +1285,13 @@ struct MachineChooserView: View {
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: 240, alignment: .trailing)
                         .help("Signed in as \(email)")
-                    Button("Sign Out") { account.signOut() }
+                    // "Signing Out…" is not decoration: sign-out now awaits a
+                    // relay round trip to revoke this machine, so the click has
+                    // a visible duration and must not be repeatable.
+                    Button(isSigningOut ? "Signing Out…" : "Sign Out") { startSignOut() }
                         .buttonStyle(.ghosttyLink)
                         .font(.caption)
+                        .disabled(isSigningOut)
                 }
                 avatar(for: email, size: 34)
             }
@@ -1362,6 +1369,55 @@ struct MachineChooserView: View {
                 showError(title: "Google sign-in failed", error: error)
             }
         }
+    }
+
+    /// Sign out, which FIRST revokes this machine's own relay enrollment (see
+    /// `RelayAccount.signOut(force:)`). When that revocation can't reach the
+    /// relay the account stays signed IN and the user gets the choice, because
+    /// the alternative — reporting "signed out" while every other client on the
+    /// account can still reach and watch this machine — is the bug this whole
+    /// path exists to close.
+    private func startSignOut() {
+        isSigningOut = true
+        Task { @MainActor in
+            defer { isSigningOut = false }
+            do {
+                try await account.signOut()
+            } catch let error as RelayAccount.AccountError {
+                guard case .machineRevocationFailed = error else {
+                    showError(title: "Sign out failed", error: error)
+                    return
+                }
+                guard confirmSignOutWithoutRevoking(error) else { return }
+                do {
+                    try await account.signOut(force: true)
+                } catch {
+                    showError(title: "Sign out failed", error: error)
+                }
+            } catch {
+                showError(title: "Sign out failed", error: error)
+            }
+        }
+    }
+
+    /// The "we couldn't revoke this machine" fork. Cancelling (and retrying) is
+    /// the default; signing out anyway is offered but named for what it costs.
+    private func confirmSignOutWithoutRevoking(_ error: Error) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "This machine is still connected to your account"
+        alert.informativeText =
+            error.localizedDescription
+            + "\n\nUntil it is removed, other devices signed in to this account"
+            + " can still open sessions on this machine and watch the ones"
+            + " already running. Signing out anyway will keep trying to remove"
+            + " it in the background."
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Sign Out Anyway")
+        if #available(macOS 11.0, *) {
+            alert.buttons.last?.hasDestructiveAction = true
+        }
+        return alert.runModal() == .alertSecondButtonReturn
     }
 
     /// Fixed width of the leading status-indicator column. Reserved in EVERY

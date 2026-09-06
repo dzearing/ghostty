@@ -341,6 +341,13 @@ class AppDelegate: NSObject,
                 await MachineRegistry.shared.refreshFromRelay(quiet: true)
             }
 
+            // A sign-out that couldn't reach the relay left THIS machine still
+            // enrolled and reachable by every other client on the account. That
+            // is never allowed to be silent: retry it now, and again on every
+            // network-came-back transition, until the relay confirms it (see
+            // `MachineEnrollmentRevoking`). A no-op when nothing is pending.
+            LocalMachineEnrollment.shared.startPendingRevocationRetries()
+
             // Test seam: exercise the local-agent find-or-spawn path without
             // any window plumbing (session persistence is not wired to
             // surfaces yet). Logs the outcome; the orchestrator asserts via

@@ -33,6 +33,8 @@ struct RelayDirectoryClient {
         case unauthorized
         /// The device id is unknown or not owned by this account (HTTP 404).
         case notFound
+        /// The account is already at its device limit (HTTP 409).
+        case quotaExceeded
         /// Any other non-2xx status.
         case http(Int)
         /// The response body couldn't be parsed.
@@ -46,6 +48,8 @@ struct RelayDirectoryClient {
                 return "The relay rejected the session token (401). Sign in again."
             case .notFound:
                 return "The relay doesn't know this device (404). It may already have been removed."
+            case .quotaExceeded:
+                return "This account is already at its machine limit — remove a machine and try again."
             case .http(let code):
                 return "The relay returned an unexpected HTTP \(code)."
             case .badResponse:
@@ -56,6 +60,9 @@ struct RelayDirectoryClient {
 
     let base: URL
     let token: String
+    /// Injectable for tests (a `URLProtocol`-stubbed session); production uses
+    /// the shared session, exactly as before.
+    var urlSession: URLSession = .shared
 
     /// Resolve the CURRENT directory client: base from `GHOSTTY_RELAY_BASE`
     /// (defaulting to the dev relay) and the CLIENT bearer from the
@@ -92,6 +99,28 @@ struct RelayDirectoryClient {
         return dev
     }
 
+    /// POST /v1/client/devices — enroll a NEW device owned by this account.
+    /// The relay returns the raw device token EXACTLY ONCE (it stores only the
+    /// hash), so the caller must persist it or lose it. Used to restore this
+    /// machine's own enrollment after a sign-out revoked it
+    /// (`LocalMachineEnrollment.restoreForSignIn`).
+    func enroll(name: String) async throws -> Enrolled {
+        let body = try JSONEncoder().encode(["name": name])
+        let data = try await perform(request("POST", path: "v1/client/devices", body: body))
+        guard let out = try? JSONDecoder().decode(Enrolled.self, from: data) else {
+            throw DirectoryError.badResponse
+        }
+        return out
+    }
+
+    /// The one-time enrollment response: the new device's id/name plus its raw
+    /// bearer token.
+    struct Enrolled: Decodable, Equatable {
+        let id: String
+        let name: String
+        let token: String
+    }
+
     /// DELETE /v1/client/devices/{id} — remove an owned device and revoke its
     /// credential (204 on success).
     func delete(deviceID: String) async throws {
@@ -114,12 +143,13 @@ struct RelayDirectoryClient {
 
     /// Run the request and map status codes onto `DirectoryError`.
     private func perform(_ req: URLRequest) async throws -> Data {
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let (data, resp) = try await urlSession.data(for: req)
         guard let http = resp as? HTTPURLResponse else { throw DirectoryError.badResponse }
         switch http.statusCode {
         case 200..<300: return data
         case 401: throw DirectoryError.unauthorized
         case 404: throw DirectoryError.notFound
+        case 409: throw DirectoryError.quotaExceeded
         default: throw DirectoryError.http(http.statusCode)
         }
     }

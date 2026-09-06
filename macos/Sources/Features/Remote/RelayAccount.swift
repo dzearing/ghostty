@@ -40,6 +40,10 @@ final class RelayAccount: ObservableObject {
         case browserFailed
         /// A Keychain read/write failed.
         case keychain(OSStatus)
+        /// Sign-out could not revoke THIS machine's relay enrollment, so the
+        /// machine is still reachable by every other client on the account.
+        /// The account is deliberately left signed IN — see `signOut(force:)`.
+        case machineRevocationFailed(String)
 
         var errorDescription: String? {
             switch self {
@@ -51,6 +55,8 @@ final class RelayAccount: ObservableObject {
                 return "Couldn't open the browser for Google sign-in."
             case .keychain(let status):
                 return "Keychain error \(status) while storing the account."
+            case .machineRevocationFailed(let detail):
+                return "This machine couldn't be removed from your account: \(detail)"
             }
         }
     }
@@ -74,8 +80,13 @@ final class RelayAccount: ObservableObject {
     let clientID: String
 
     private let endpoints: GoogleOAuth.Endpoints
-    private let keychain: RelayAccountKeychain
+    private let keychain: RelayAccountStorage
     private let openURL: (URL) -> Bool
+
+    /// THIS machine's relay enrollment. Sign-out hard-revokes it and sign-in
+    /// restores it — see `MachineEnrollmentRevoking` for the rule and why the
+    /// two credentials are separate. Injectable for tests.
+    private let enrollment: MachineEnrollmentRevoking
 
     /// In-memory copy of the stored session (token + expiry), so the hot path
     /// avoids a Keychain read. Renewed via `/oauth/renew` near expiry.
@@ -113,14 +124,16 @@ final class RelayAccount: ObservableObject {
     init(
         clientID: String = RelayAccount.bundledClientID(),
         endpoints: GoogleOAuth.Endpoints = .relay(base: RelayAccount.defaultRelayBase),
-        keychain: RelayAccountKeychain =
+        keychain: RelayAccountStorage =
             RelayAccountKeychain(service: "com.dzearing.ghoztty.relay-account"),
-        openURL: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) }
+        openURL: @escaping (URL) -> Bool = { NSWorkspace.shared.open($0) },
+        enrollment: MachineEnrollmentRevoking = LocalMachineEnrollment.shared
     ) {
         self.clientID = clientID
         self.endpoints = endpoints
         self.keychain = keychain
         self.openURL = openURL
+        self.enrollment = enrollment
         // Restore the signed-in identity across launches (the session token
         // outlives the app until it expires; the first relay call renews it) —
         // but NEVER on the main thread. `SecItemCopyMatching` can stall for a
@@ -151,7 +164,7 @@ final class RelayAccount: ObservableObject {
     /// (see `init`); the whole purpose of this hop is to keep the main actor
     /// responsive. A slow read (> 0.5s) is logged.
     nonisolated static func loadStoredOffMain(
-        _ keychain: RelayAccountKeychain
+        _ keychain: RelayAccountStorage
     ) async -> RelayAccountKeychain.Stored? {
         await Task.detached(priority: .userInitiated) {
             let start = Date()
@@ -212,6 +225,13 @@ final class RelayAccount: ObservableObject {
         refreshTask = nil
         self.email = session.email
         self.pictureURL = session.picture.flatMap(URL.init(string:))
+        // Give this machine its enrollment back, if THIS account is the one
+        // whose sign-out revoked it: the machine rejoins the account under a
+        // fresh credential and a running agent adopts it within one watcher
+        // tick. A different account signing in never inherits it — see
+        // `MachineEnrollmentRevoking`.
+        await enrollment.restoreForSignIn(
+            accountEmail: session.email, sessionToken: session.sessionToken)
         // Recover the remote windows suspended at sign-out: replay their
         // preserved manifest entries through the launch-restore path. Only the
         // real app account drives app-level window state (test instances with
@@ -221,21 +241,56 @@ final class RelayAccount: ObservableObject {
         }
     }
 
-    /// Forget the account: revoke the session server-side (best-effort), delete
-    /// the Keychain item, and drop the in-memory session. Relay calls have no
-    /// token afterwards (there is no dev fallback).
+    /// Forget the account. In order:
     ///
-    /// Also clears the account's machine list from the shared registry —
-    /// machines are per-account resources, so a signed-out chooser must not
-    /// keep showing them.
+    /// 1. **Hard-revoke THIS machine's relay enrollment** when it belongs to
+    ///    this account (`MachineEnrollmentRevoking`): the device row is deleted
+    ///    server-side and every live connection — control and in-flight bridged
+    ///    data — is severed, so no other client on the account can reach or
+    ///    observe this machine afterwards. This is the security half of
+    ///    sign-out and it is why the method is `async throws`: revoking a
+    ///    machine needs the network, and a revocation that silently failed is
+    ///    exactly the hole this closes.
+    /// 2. Revoke the user SESSION server-side (`/oauth/signout`).
+    /// 3. Delete the Keychain item and drop the in-memory session. Relay calls
+    ///    have no token afterwards (there is no dev fallback).
+    /// 4. Clear the account's machine list from the shared registry — machines
+    ///    are per-account resources, so a signed-out chooser must not keep
+    ///    showing them.
+    /// 5. Close every open account-backed (relay) remote window via
+    ///    `AppDelegate.relayAccountDidSignOut()`, preserving each window's
+    ///    `RemoteSessionManifest` entry so `signIn()` can restore them.
     ///
-    /// And closes every open account-backed (relay) remote window via
-    /// `AppDelegate.relayAccountDidSignOut()`, preserving each window's
-    /// `RemoteSessionManifest` entry so `signIn()` can restore them.
-    func signOut() {
+    /// **Throws `AccountError.machineRevocationFailed` and stays SIGNED IN**
+    /// when step 1 could not reach the relay: the machine is still reachable,
+    /// so reporting "signed out" would be a lie. The caller offers a retry, and
+    /// `force: true` signs out anyway — arming a pending revocation that is
+    /// retried at every launch and on every network-came-back transition until
+    /// the relay confirms it. Nothing about a failed step 1 is silent.
+    ///
+    /// Steps 2–5 are unconditional once step 1 is settled. `/oauth/signout` is
+    /// awaited but not fatal: the session token is destroyed locally and the
+    /// relay-side row expires on its own, which is a far smaller exposure than
+    /// a live machine — and failing sign-out for it would strand an offline
+    /// user on a Mac that has no enrollment to revoke in the first place.
+    @discardableResult
+    func signOut(force: Bool = false) async throws -> MachineEnrollmentRevocation {
+        await waitForInitialLoad()
+
+        // 1. The machine, first and blocking.
+        var revocation: MachineEnrollmentRevocation = .nothingEnrolled
+        if let email {
+            revocation = await enrollment.revokeForSignOut(accountEmail: email)
+            if case .unreachable(let detail) = revocation {
+                guard force else { throw AccountError.machineRevocationFailed(detail) }
+                enrollment.armPendingRevocation(accountEmail: email)
+            }
+        }
+
+        // 2. The session.
         if let token = cachedSession?.sessionToken {
             let client = GoogleOAuth.RelaySessionClient(endpoints: endpoints)
-            Task { await client.signOut(sessionToken: token) }
+            await client.signOut(sessionToken: token)
         }
         keychain.delete()
         cachedSession = nil
@@ -253,6 +308,7 @@ final class RelayAccount: ObservableObject {
             // alive — detach ≠ terminate).
             (NSApp.delegate as? AppDelegate)?.relayAccountDidSignOut()
         }
+        return revocation
     }
 
     // MARK: - Tokens
@@ -317,10 +373,24 @@ extension RelayAccount {
 
 // MARK: - Keychain storage
 
+/// Where the relay session is persisted. `RelayAccountKeychain` is the only
+/// production conformance; the protocol exists so tests can drive
+/// `RelayAccount` (sign-out in particular) without touching the real Keychain —
+/// which, on an ad-hoc-signed debug build, would prompt for a password on every
+/// rebuild (see `RelayAccountKeychain.isDisabled`).
+///
+/// `Sendable` because the load runs on a detached task (see
+/// `RelayAccount.loadStoredOffMain`).
+protocol RelayAccountStorage: Sendable {
+    func load() -> RelayAccountKeychain.Stored?
+    func save(_ stored: RelayAccountKeychain.Stored) throws
+    func delete()
+}
+
 /// Generic-password storage for the relay account (session token + expiry +
 /// display fields). One item per `service`; the payload is a small JSON blob so
 /// future fields don't need a Keychain schema change.
-struct RelayAccountKeychain {
+struct RelayAccountKeychain: RelayAccountStorage {
     let service: String
     private let account = "google-account"
 

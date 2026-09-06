@@ -32,6 +32,8 @@ architecture, §5 security).
 |--------|-----------------------------------|--------------|---------|
 | GET    | `/v1/agent/control`               | device token | Agent registers online; relay sends `{"type":"open","session":...}` commands; ping/pong heartbeat. An optional `X-Ghoztty-Hostname` request header upserts the device's `hostname` (older agents omit it). |
 | GET    | `/v1/agent/data?session=<uuid>`   | device token | Agent dials back in response to `open`; matched to the session and bridged. |
+| GET    | `/v1/agent/whoami`                | device token | Which account this device is bound to: `{email, device_id, name, hostname}`. Lets an agent's tray — and the macOS app, deciding whether the machine it runs on belongs to the account signing out — learn the identity behind an opaque token. |
+| POST   | `/v1/agent/deenroll`              | device token | **Self** de-enroll: delete the device the token belongs to and sever every live connection. `204`; a token that no longer maps to a device gets `401`, which callers treat as "already revoked" so retries terminate. The relay side of the agent tray's *Sign out* AND of the macOS app's sign-out (see Revocation below). |
 | GET    | `/v1/client/devices`              | OIDC         | List the caller's devices with online status and `hostname` (see below). |
 | POST   | `/v1/client/devices`              | OIDC         | Enroll a device (`{"name":"..."}`); returns the raw device token **once**. |
 | PATCH  | `/v1/client/devices/{id}`         | OIDC         | Rename an owned device (`{"name":"..."}`); changes the display name **only** (never `hostname`); returns the updated device view. |
@@ -241,7 +243,20 @@ both accepted until `DEV_AUTH` is turned off.
   `404` (not enumerable).
 - **Revocation:** deleting a device removes its token hash (the token can never
   authenticate again) and immediately closes its live control connection and
-  any bridged sessions.
+  any bridged sessions — control *and* in-flight bridged data, so a client
+  watching that machine's sessions loses the stream at the same instant
+  (`TestDeenrollRevokesAndKicksLiveBridge`). Both revocation paths do this: the
+  owner-scoped `DELETE /v1/client/devices/{id}` and the device's own
+  `POST /v1/agent/deenroll`.
+- **Sessions and devices are revoked separately, on purpose.** `POST
+  /oauth/signout` revokes a USER SESSION only; every device the account owns
+  stays enrolled, because an account may own headless hosts that no app is
+  signed in on. `TestSignoutAloneLeavesMachineReachable` pins that down. The
+  consequence is a client obligation, not a relay one: **signing out in an app
+  running ON an enrolled machine must also de-enroll that machine**, or the
+  machine stays listed, online, and bridgeable from every other client on the
+  account. The macOS app does exactly that (`MachineEnrollment.swift`) — it is
+  the fix for a real reported bug, not a hypothetical.
 - **Fail-closed:** any auth failure → HTTP 401 (or WS close 1008) and **no
   bridge**.
 - **Abuse bounds:** pending sessions are capped, session setup times out (~15s),
