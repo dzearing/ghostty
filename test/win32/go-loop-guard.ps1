@@ -949,6 +949,53 @@ Assert 'S12 and wipes the composer before typing over it' ($dogSrc -match "'C-u'
 $upSrc = Get-Content (Join-Path $Repo 'scripts\upgrade-ghoztty-windows.ps1') -Raw
 Assert 'S13 the upgrade reuse path runs through the same gate' ($upSrc -match 'Wait-LoopSubmitted')
 
+# --- S14-S20: a background shell falsifies MOTION, so the composer decides ---
+# THE LIVE FAILURE (user, 2026-09-06). The loop left `floor-lane.ps1` streaming
+# into its pane, so the pane repainted every second regardless of the composer.
+# The gate read that as "the pane moved on its own", logged NUDGE SUBMITTED at
+# 08:21:37, and the composer sat holding 'commit and push, then reset context'
+# through the 08:26, 08:31 and 08:36 ticks - a 76-minute dead turn with the
+# T1393 work uncommitted, cleared in the end by one human Enter. Motion is a
+# proxy; the composer is the thing itself, so when a caller can read it, it wins.
+$presses = 0
+$tick = 0
+$g = Wait-LoopSubmitted -Text $P562 -SettleSeconds 0 -WatchSeconds 2 -MaxSubmits 2 `
+    -Read { $script:tick++; "lane output line $script:tick" } `
+    -Composer { 'commit and push, then reset context' } `
+    -Submit { $script:presses++ }
+Assert 'S14 a noisy pane with a full composer is NOT reported as submitted' (-not $g.Submitted)
+Assert 'S15 and it says the prompt was typed but not submitted' ($g.Why -match 'TYPED BUT NOT SUBMITTED')
+Assert 'S16 and it actually spent its presses trying' ($presses -eq 2 -and $g.Attempts -eq 2)
+
+# The same noisy pane, but a press empties the composer: that is a real submit,
+# and it is found even though the pane was moving the whole time for other
+# reasons.
+$presses = 0
+$g = Wait-LoopSubmitted -Text $P562 -SettleSeconds 0 -WatchSeconds 2 -MaxSubmits 2 `
+    -Read { 'lane output, always changing' } `
+    -Composer { if ($script:presses -ge 1) { '' } else { 'commit and push' } } `
+    -Submit { $script:presses++ }
+Assert 'S17 a composer that empties after a press is submitted' ($g.Submitted)
+Assert 'S18 and it took exactly the one press' ($g.Attempts -eq 1 -and $presses -eq 1)
+Assert 'S19 and it names the composer, not the pixels' ($g.Why -match 'composer emptied')
+
+# A composer holding only whitespace is empty - the same normalization the
+# stall verdict uses, so the watchdog cannot nudge a composer the gate called
+# sent.
+$presses = 0
+$g = Wait-LoopSubmitted -Text $P562 -SettleSeconds 0 -WatchSeconds 1 `
+    -Read { 'static' } -Composer { "  `r`n  " } -Submit { $script:presses++ }
+Assert 'S20 a whitespace-only composer counts as empty' ($g.Submitted -and $presses -eq 0)
+
+# Back-compat: a caller with no composer reader keeps the motion rule, because
+# upgrade-ghoztty-windows.ps1 has no pane probe to hand it.
+$g = Wait-LoopSubmitted -Text $P562 -SettleSeconds 0 -WatchSeconds 2 `
+    -Read { "moving $(Get-Random)" } -Submit { }
+Assert 'S21 without a composer reader the motion rule still applies' ($g.Submitted)
+
+# And the watchdog must actually pass one, or every assertion above is theory.
+Assert 'S22 the watchdog hands the gate a composer reader' ($dogSrc -match '-Composer\s*\{')
+
 # --- P. the supervisor's own liveness is observable (T440) ----------------
 # The watchdog died at 09:14 on 2026-08-03 and nothing noticed for thirteen
 # hours, because the only evidence it was gone was a log that stopped. It now

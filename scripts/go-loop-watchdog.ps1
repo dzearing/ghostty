@@ -633,9 +633,16 @@ function Invoke-Tick {
         # bytes reached the pane; only motion says the session took them. A
         # backstop that leaves the loop at a full composer has not backstopped
         # anything - that is the exact state it was woken up to clear.
+        #
+        # The watchdog can read the composer, so it hands the gate the direct
+        # question rather than the motion proxy (user, 2026-09-06): this pane
+        # routinely has a background lane run streaming into it, and motion
+        # alone called that "submitted" over a composer that sat unsent for 76
+        # minutes.
         $gate = Wait-LoopSubmitted `
             -Read { (Invoke-Ghoztty @('+read', "--name=$paneId", '--lines=60')).Out } `
             -Submit { Invoke-Ghoztty (@('+send-keys', "--target=$paneId") + (Get-LoopSubmitArgs)) | Out-Null } `
+            -Composer { (Read-PaneState -PaneId $paneId -GhozttyExe $GhozttyExe).Composer } `
             -Text $ResumePrompt
         if ($gate.Submitted) { Log "  NUDGE SUBMITTED: $($gate.Why)" }
         else { Log "  NUDGE UNSUBMITTED: $($gate.Why)" }

@@ -188,6 +188,20 @@ function Resolve-LoopResumeAction {
 #     composer arm looked, correctly found nothing, and the loop sat dead for
 #     1h07m under the 180m backstop until a human noticed.
 #
+# What the composer is holding, whitespace-normalized; '' when it holds nothing.
+#
+# One definition, used by both the stall verdict and the submit gate, so the
+# two can never disagree about whether a composer is empty - a disagreement
+# would mean the watchdog nudging a composer the gate had already called sent.
+function Get-LoopComposerText([AllowEmptyString()][string]$Text) {
+    if (-not $Text) { return '' }
+    return ($Text -replace '\s+', ' ').Trim()
+}
+
+function Test-LoopComposerPending([AllowEmptyString()][string]$Text) {
+    return [bool](Get-LoopComposerText $Text)
+}
+
 # Returns @{ Stalled; Clock; Why } - Clock names WHICH arm decided, so a wrong
 # call is readable in the log afterwards instead of being one word, `healthy`.
 function Resolve-LoopStallVerdict {
@@ -209,7 +223,7 @@ function Resolve-LoopStallVerdict {
         return @{ Stalled = $true; Clock = 'turn'
                   Why = "no turn has completed for $age (limit ${StaleMinutes}m)" }
     }
-    $pending = ($ComposerText -replace '\s+', ' ').Trim()
+    $pending = Get-LoopComposerText $ComposerText
     if ($pending.Length -gt 60) { $pending = $pending.Substring(0, 60) + '...' }
     if ($TurnAgeMinutes -gt $SuspectMinutes -and $pending) {
         return @{ Stalled = $true; Clock = 'composer'
@@ -435,6 +449,26 @@ function Get-LoopSubmitArgs {
 #
 # I/O is injected so the decision is testable without a pane: -Read returns the
 # pane tail, -Submit presses the submit again.
+# MOTION IS A PROXY, AND A BACKGROUND SHELL FALSIFIES IT (user, 2026-09-06).
+#
+# The motion rule above assumes the only thing that can repaint the pane is a
+# session answering the prompt. That is false whenever the loop left a
+# background shell running - a build, a lane run, a watch. Such a pane repaints
+# every second no matter what the composer holds, so the FIRST tick of the
+# watch window reads as "the pane moved on its own" and the gate reports
+# NUDGE SUBMITTED over a composer that was never submitted.
+#
+# Measured: 2026-09-06 08:21:37 logged "NUDGE SUBMITTED: the pane moved on its
+# own" while `floor-lane.ps1` streamed output; at 08:26, 08:31 and 08:36 the
+# watchdog still read `composer=pending` holding the same unsent text, and the
+# turn had been dead for 76 minutes with the T1393 work uncommitted. A human
+# pressed one Enter and it went. Exactly the failure T562 was written to catch,
+# arriving through the one door T562's oracle does not watch.
+#
+# So when the caller can read the composer, the composer decides: empty is
+# PROOF the prompt went, and text still sitting there is proof it did not,
+# whatever the pixels are doing. Motion stays the rule only for callers with no
+# composer reader, which is what `upgrade-ghoztty-windows.ps1` has.
 function Wait-LoopSubmitted {
     param(
         [Parameter(Mandatory = $true)][scriptblock]$Read,
@@ -442,7 +476,11 @@ function Wait-LoopSubmitted {
         [AllowEmptyString()][string]$Text = '',
         [int]$SettleSeconds = 2,
         [int]$WatchSeconds = 6,
-        [int]$MaxSubmits = 2
+        [int]$MaxSubmits = 2,
+        # Returns the pane's composer text, '' when empty. Optional: without it
+        # the gate falls back to motion alone, which is the pre-2026-09-06
+        # behavior.
+        [scriptblock]$Composer = $null
     )
     if ($SettleSeconds -gt 0) { Start-Sleep -Seconds $SettleSeconds }
     $base = [string](& $Read)
@@ -453,10 +491,32 @@ function Wait-LoopSubmitted {
             Start-Sleep -Seconds 1
             $cur = [string](& $Read)
             if (-not $onscreen) { $onscreen = (Test-LoopPromptArrived -Tail $cur -Text $Text) }
+            if ($Composer) {
+                # The direct question, asked before the proxy one.
+                if (-not (Test-LoopComposerPending (& $Composer))) {
+                    $why = if ($attempts) { "the composer emptied after $attempts extra submit(s)" } else { 'the composer emptied' }
+                    return @{ Submitted = $true; Attempts = $attempts; Why = $why }
+                }
+                # Composer still holding text: whatever moved on screen was not
+                # this prompt going in. Keep waiting, and keep pressing.
+                continue
+            }
             if ($cur -ne $base) {
                 $why = if ($attempts) { "the pane moved after $attempts extra submit(s)" } else { 'the pane moved on its own' }
                 return @{ Submitted = $true; Attempts = $attempts; Why = $why }
             }
+        }
+        # A composer-reading caller has already had its question answered every
+        # second above; reaching here means the text is still sitting there.
+        # "Nothing on screen" cannot excuse it - the prompt demonstrably landed,
+        # it just never went - so go straight to pressing again.
+        if ($Composer) {
+            if ($attempts -ge $MaxSubmits) {
+                return @{ Submitted = $false; Attempts = $attempts; Why = "the composer still holds the prompt after $attempts extra submit(s) - it is TYPED BUT NOT SUBMITTED" }
+            }
+            $attempts++
+            & $Submit
+            continue
         }
         # Nothing on screen and nothing moving means nothing landed - another
         # Enter cannot submit a prompt that was never typed, and pressing one
