@@ -15,6 +15,7 @@
 
 const std = @import("std");
 const icon_button = @import("icon_button.zig");
+const banner_card = @import("banner_card.zig");
 
 pub const Rect = icon_button.Rect;
 
@@ -432,6 +433,35 @@ fn centeredIn(x: i32, top: i32, w: i32, h: i32, row_h: i32) Rect {
     return .{ .left = x, .top = y, .right = x + w, .bottom = y + h };
 }
 
+/// The rounded silhouette the CARD WINDOW is clipped to (T1391).
+///
+/// The card is painted by compositing onto a backdrop of the pane's
+/// background, which means the four corners carry that ASSUMED colour rather
+/// than the pixels actually behind them. Clipping the window to this shape is
+/// what makes the corners genuinely not-there: they are never painted, so any
+/// content shows through unchanged. The radius is `banner_card.RADIUS` — the
+/// number the card surface itself is drawn with — so the clip cannot drift
+/// away from the paint.
+pub const CornerRegion = struct {
+    /// `CreateRoundRectRgn` takes an EXCLUSIVE right/bottom, so these are the
+    /// card's size plus one, not its size.
+    right: i32,
+    bottom: i32,
+    /// And ELLIPSE DIAMETERS, not a radius — hence twice the corner radius,
+    /// never more than the card's shortest side.
+    ellipse: i32,
+};
+
+/// The clip for a card of `w` x `h` physical pixels at `scale`.
+pub fn cornerRegion(w: i32, h: i32, scale: f32) CornerRegion {
+    const shortest = @max(@min(w, h), 0);
+    return .{
+        .right = w + 1,
+        .bottom = h + 1,
+        .ellipse = @min(2 * px(banner_card.RADIUS, scale), shortest),
+    };
+}
+
 fn px(dip: f32, scale: f32) i32 {
     return @intFromFloat(@round(dip * scale));
 }
@@ -441,6 +471,38 @@ fn px(dip: f32, scale: f32) i32 {
 // -------------------------------------------------------------------------
 
 const testing = std.testing;
+
+test "the card's clip rounds at the radius the card is drawn with" {
+    // 1.0 and 1.5 scale: the ellipse is twice the scaled card radius, and the
+    // region's edges are exclusive, so they sit one past the card.
+    const one = cornerRegion(300, 44, 1.0);
+    try testing.expectEqual(@as(i32, 301), one.right);
+    try testing.expectEqual(@as(i32, 45), one.bottom);
+    try testing.expectEqual(@as(i32, 28), one.ellipse);
+
+    const hidpi = cornerRegion(450, 66, 1.5);
+    try testing.expectEqual(@as(i32, 451), hidpi.right);
+    try testing.expectEqual(@as(i32, 67), hidpi.bottom);
+    try testing.expectEqual(@as(i32, 42), hidpi.ellipse);
+}
+
+test "a card shorter than the corner never rounds past its own edge" {
+    // GDI would clamp for us, but then the clip and the paint would disagree
+    // about the shape silently. A card this small cannot happen today; the
+    // point is that it degrades to a stadium rather than to nonsense.
+    const tiny = cornerRegion(200, 10, 1.0);
+    try testing.expectEqual(@as(i32, 10), tiny.ellipse);
+}
+
+test "the clip's radius is the card's radius, at any scale" {
+    // The one property worth stating outright: no second copy of the number.
+    var scale: f32 = 1.0;
+    while (scale <= 3.0) : (scale += 0.25) {
+        // Tall enough that the shortest-side clamp never enters into it.
+        const r = cornerRegion(600, 200, scale);
+        try testing.expectEqual(2 * px(banner_card.RADIUS, scale), r.ellipse);
+    }
+}
 
 test "the count reads the way a browser's does" {
     var buf: [Result.label_cap]u8 = undefined;

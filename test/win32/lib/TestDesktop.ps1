@@ -368,6 +368,9 @@ public class GhozttyTestDesktop {
     [DllImport("gdi32.dll")] static extern bool DeleteDC(IntPtr hdc);
     [DllImport("gdi32.dll")] static extern uint GetPixel(IntPtr hdc, int x, int y);
     [DllImport("gdi32.dll")] static extern IntPtr CreateSolidBrush(uint color);
+    [DllImport("gdi32.dll")] static extern IntPtr CreateRectRgn(int l, int t, int r, int b);
+    [DllImport("gdi32.dll")] static extern bool PtInRegion(IntPtr rgn, int x, int y);
+    [DllImport("user32.dll")] static extern int GetWindowRgn(IntPtr h, IntPtr rgn);
     [DllImport("user32.dll")] static extern int FillRect(IntPtr hdc, ref RECT r, IntPtr brush);
 
     [StructLayout(LayoutKind.Sequential)] public struct RECT { public int left, top, right, bottom; }
@@ -748,6 +751,34 @@ public class GhozttyTestDesktop {
     // its modal dialog is up, and re-enabled when the dialog closes.
     public bool Enabled(IntPtr h) { return (bool)Run(delegate() { return IsWindowEnabled(h); }); }
     public int CtrlId(IntPtr h) { return (int)Run(delegate() { return GetDlgCtrlID(h); }); }
+
+    // Which of `points` (x,y pairs, in WINDOW coordinates) fall inside the
+    // window's region - the shape the window manager actually lets the window
+    // paint through. Returns null when the window carries no region at all,
+    // which is what a square-cornered window answers.
+    //
+    // This is the oracle for rounded chrome (T1391): a PrintWindow capture
+    // shows what a card DRAWS, and a card draws its corners whether or not
+    // they reach the screen. The region is what decides whether the content
+    // behind a corner survives, and on the background desktop there is no
+    // screenshot that could answer it. `GetWindowRgn` copies the shape into a
+    // region this process owns, so it has to run on the desktop-bound worker
+    // like every other user32 call here.
+    public int[] WindowRegionHits(IntPtr h, int[] points) {
+        return (int[])Run(delegate() {
+            IntPtr rgn = CreateRectRgn(0, 0, 1, 1);
+            if (rgn == IntPtr.Zero) return null;
+            try {
+                // 0 is ERROR, which is also the answer for "no region".
+                if (GetWindowRgn(h, rgn) == 0) return null;
+                var hits = new int[points.Length / 2];
+                for (int i = 0; i < hits.Length; i++) {
+                    hits[i] = PtInRegion(rgn, points[2 * i], points[2 * i + 1]) ? 1 : 0;
+                }
+                return hits;
+            } finally { DeleteObject(rgn); }
+        });
+    }
 
     public int[] Rect(IntPtr h) {
         return (int[])Run(delegate() {
@@ -2627,6 +2658,21 @@ function Get-TestWindowRect {
         Left = $r[0]; Top = $r[1]; Right = $r[2]; Bottom = $r[3]
         Width = $r[2] - $r[0]; Height = $r[3] - $r[1]
     }
+}
+
+# Ask the window manager which points a window actually paints through
+# (T1391). -Points is x,y pairs in window coordinates; the result is an array
+# of booleans in the same order, or `$null` when the window has NO region -
+# i.e. square corners, which for a floating card is the defect itself.
+function Get-TestWindowRegionHits {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        [Parameter(Mandatory = $true)][int[]]$Points,
+        $Desktop
+    )
+    $hits = (Resolve-TestDesktop $Desktop).WindowRegionHits($Window, $Points)
+    if ($null -eq $hits) { return $null }
+    return @($hits | ForEach-Object { [bool]$_ })
 }
 
 function Test-TestWindowVisible {

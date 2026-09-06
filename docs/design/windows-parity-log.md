@@ -23341,3 +23341,56 @@ Floor: `floor-lane.ps1 -Lane all` lib/none/win32/agent ALL LANES PASS;
 `tab-color.ps1` ALL PASS (17), P1/P2/P3 ALL PASS (25/20/16); guards run clean -
 test-reach (14), printclient (8), viewer-close (44), and the six static audits
 plus go-loop-guard that the other window's commit had left due.
+
+## 2026-09-06 - The find bar's corners show the page behind them instead of a guessed colour (T1391)
+
+The floating find card in a viewer pane had four square dark blocks at its
+corners. It was drawn rounded, but the corner pixels were painted: the card
+surface is composited onto a backdrop of `pane.bg` and then blitted over the
+whole window rect, so what shipped in each corner was the colour the card
+ASSUMED was behind it. Over a document, a light page, a selection - anything
+that is not exactly the pane background - the rounding stopped reading as
+rounding and you saw a square plate with a lighter rounded inset instead. The
+user reported it with a screenshot.
+
+The fix is to stop guessing and make the corners genuinely not-there:
+`place` now clips the card WINDOW with `SetWindowRgn` to a round rect at the
+card's own radius, so those pixels are never painted and whatever is behind
+shows through unmodified, at any colour. It is the treatment `ViewerTOCPanel`'s
+compact card has had since it started floating over live text; the find card
+was the one floating card that never got it. The geometry is a pure function -
+`viewer_find.cornerRegion`, which reads `banner_card.RADIUS` rather than
+introducing a second copy of the number - and it is applied from `place`, which
+runs on every bounds sync, so a resize or a scale change re-cuts the region
+instead of leaving one shaped for the old card.
+
+The other `banner_card` consumers were checked rather than assumed: the banner
+overlay, the nav bar and the feedback composer all paint RESERVED bands
+(`ViewerPane.contentTop` adds each one's height, so the page sits below them
+and `pane.bg` really is what is behind), so none of them share the defect. Mac
+composites its card - `GlassCard` fills a `RoundedRectangle` - so this is
+win-only and no mac half is owed.
+
+The oracle is the WINDOW REGION, not a screenshot, and that is the part worth
+keeping. This suite runs on the background test desktop where `CopyFromScreen`
+is dead, and even with a screen to read, a `PrintWindow` capture shows what the
+card DRAWS - which it still does in the clipped corners. What decides whether
+the content behind a corner survives is the region, so `lib\TestDesktop.ps1`
+grew `Get-TestWindowRegionHits`, a desktop-bound `GetWindowRgn` + `PtInRegion`
+that any rounded chrome can now be held to. `viewer-find.ps1` section B2 asserts
+a region exists at all (a square-cornered window carries none, which is the
+defect itself), that the four corners are outside it and the middle inside,
+that the arc starts where the radius the pane logged says it should, and that
+all of it is still true after the window is grown by 160 px.
+
+Filed T1399: `win32-design-system.md` 3.1 lists 8 DIP for cards and overlays
+while `banner_card` renders 14 (Mac's `GlassCard.cornerRadius`), and every card
+on screen is the 14. The table is what a future change gets checked against, so
+the two have to be reconciled - most likely the table is stale, but making it
+win would move every card, which is a visible change and not a doc edit.
+
+Floor: `floor-lane.ps1 -Lane all` lib/none/win32/agent ALL LANES PASS;
+`viewer-find.ps1` ALL PASS (42) with its negative control scoring exactly the
+two failures it promises; P1/P2/P3 ALL PASS (25/20/16); guards run clean -
+test-desktop (68), go-loop-guard, and the eight static audits the test edits
+made due.

@@ -207,6 +207,31 @@ function Get-FindEdit([IntPtr]$card) {
     return [IntPtr]::Zero
 }
 
+# --- the card's SHAPE (T1391) ------------------------------------------------
+#
+# What the pane says it clipped the card to:
+#
+#     viewer find card pane=<id> card=<w>x<h> ellipse=<diameter>
+#
+# emitted once per card-size change, so the radius the region is cut at is
+# readable rather than inferred. The region itself is read back with
+# Get-TestWindowRegionHits, which runs on the desktop-bound worker.
+function Get-FindCardShape($errlog, $paneId) {
+    if (-not (Test-Path $errlog)) { return $null }
+    $esc = [regex]::Escape($paneId)
+    $shape = $null
+    foreach ($line in (Get-Content $errlog -ErrorAction SilentlyContinue)) {
+        if ($line -match "viewer find card pane=$esc card=(\d+)x(\d+) ellipse=(\d+)") {
+            $shape = [pscustomobject]@{
+                Width   = [int]$Matches[1]
+                Height  = [int]$Matches[2]
+                Ellipse = [int]$Matches[3]
+            }
+        }
+    }
+    return $shape
+}
+
 # The Chromium input child under a viewer host — the only window in WebView2's
 # chain whose message loop turns a posted WM_KEYDOWN into an
 # AcceleratorKeyPressed event (viewer-panes.ps1 section T394 probed this).
@@ -334,6 +359,88 @@ try {
                 Assert ($colors -ge 3) "the card paints real chrome, not a flat fill ($colors distinct colors)"
             } finally { Close-TestWindowPixels -Shot $shot }
         }
+    }
+
+    # --- B2. the card's corners are not there (T1391) -----------------------
+    #
+    # The card is composited onto a backdrop of the pane's background and then
+    # blitted over the whole window rect, so its four corner pixels carried an
+    # ASSUMED colour: over anything that was not exactly `pane.bg` the rounding
+    # stopped reading as rounding and you saw a square dark plate with a
+    # lighter rounded inset. The fix clips the WINDOW to the card's rounded
+    # silhouette, so those pixels are never painted at all.
+    #
+    # The oracle is the WINDOW REGION, not a screenshot. This runs on the
+    # background test desktop where CopyFromScreen is dead (T233) - and even
+    # with a screen to read, a PrintWindow capture shows what the card DRAWS,
+    # which it does whether or not those pixels reach the glass. The region is
+    # the thing that decides whether the content behind a corner survives, and
+    # `Get-TestWindowRegionHits` asks the window manager for it directly.
+    if ($card -ne [IntPtr]::Zero) {
+        $cardRect = Get-TestWindowRect -Window $card
+        $cw = $cardRect.Width
+        $ch = $cardRect.Height
+        $shape = Get-FindCardShape $errlog $paneId
+        Assert ($null -ne $shape) 'the pane reported the corner clip it applied'
+        Assert ($null -ne $shape -and $shape.Ellipse -gt 0) `
+            "the clip has a real radius (ellipse=$(if ($shape) { $shape.Ellipse } else { 'none' }))"
+
+        # Four corners, then the middle. A card with square corners carries no
+        # region at all, which is $null here - the defect, not a skip.
+        $pts = @(0, 0, ($cw - 1), 0, 0, ($ch - 1), ($cw - 1), ($ch - 1),
+            [int]($cw / 2), [int]($ch / 2))
+        $hit = Get-TestWindowRegionHits -Window $card -Points $pts
+        Assert ($null -ne $hit) 'the card window is clipped to a region (square corners would carry none)'
+        if ($null -ne $hit) {
+            Assert (-not $hit[0]) `
+                'the top-left corner pixel is outside the card, so the content behind it shows through'
+            Assert (-not $hit[1]) 'the top-right corner pixel is outside the card'
+            Assert (-not $hit[2]) 'the bottom-left corner pixel is outside the card'
+            Assert (-not $hit[3]) 'the bottom-right corner pixel is outside the card'
+            Assert ($hit[4]) 'the middle of the card is still painted'
+        }
+
+        # The clip rounds at the radius the pane REPORTED, which is the radius
+        # the card surface was drawn with - so the shape the window manager
+        # enforces cannot drift from the shape the paint assumes. Along the top
+        # edge the region starts at the corner arc: short of it is out, past it
+        # is in.
+        if ($null -ne $shape -and $shape.Ellipse -gt 8) {
+            $r = [int]($shape.Ellipse / 2)
+            $arc = Get-TestWindowRegionHits -Window $card -Points @(($r - 3), 0, ($r + 2), 0)
+            if ($null -eq $arc) {
+                Assert $false 'the corner arc could be probed'
+            } else {
+                Assert (-not $arc[0]) "the top edge is still cut away just inside the corner arc (r=$r)"
+                Assert ($arc[1]) "the top edge is painted just past the corner arc (r=$r)"
+            }
+        }
+
+        # And it survives a resize: the region is cut in `place`, which runs on
+        # every bounds sync, so a wider pane gets a region for the new width
+        # rather than one stale at the old one. A stale region would leave the
+        # card's new trailing corners square, or clip live chrome away.
+        $topRect = Get-TestWindowRect -Window $mdTop
+        Set-TestWindowSize -Window $mdTop -Width 160 -Height 0 -Grow | Out-Null
+        Start-Sleep -Milliseconds 800
+        $card2 = Get-FindCard $mdTop
+        if ($card2 -eq [IntPtr]::Zero) {
+            Skip 'the corner clip survives a resize (the card went away)'
+        } else {
+            $r2 = Get-TestWindowRect -Window $card2
+            $hit2 = Get-TestWindowRegionHits -Window $card2 -Points @(
+                ($r2.Width - 1), 0, [int]($r2.Width / 2), [int]($r2.Height / 2))
+            if ($null -eq $hit2) {
+                Assert $false 'the resized card still carries a region'
+            } else {
+                Assert (-not $hit2[0]) `
+                    "the resized card's trailing top corner is still cut away ($($r2.Width) x $($r2.Height))"
+                Assert ($hit2[1]) 'the resized card still paints its middle'
+            }
+        }
+        Set-TestWindowSize -Window $mdTop -Width $topRect.Width -Height $topRect.Height | Out-Null
+        Start-Sleep -Milliseconds 600
+        $card = Wait-FindCard $mdTop
     }
 
     # --- C. typing counts ---------------------------------------------------

@@ -1,16 +1,18 @@
 {
     "guard":  "viewer-find",
     "script":  "test/win32/viewer-find.ps1",
-    "generated":  "2026-09-01T23:24:13-07:00",
-    "commit":  "ee910c4bb",
+    "generated":  "2026-09-06T11:01:30-07:00",
+    "commit":  "ac89e2b59",
     "uncommitted":  [
+                        "src/apprt/win32/viewer_find.zig",
+                        "src/apprt/win32/ViewerFindBar.zig",
                         "test/win32/viewer-find.ps1"
                     ],
     "files":  {
                   "src/apprt/win32/viewer_accel.zig":  "3c827cb3f9e626e8540629ce457aa6b75bb2edf32c28a7ea7ff6b38ead04f1b4",
-                  "src/apprt/win32/viewer_find.zig":  "ca5c9ca6433db9e8598aa4e2b276cc34c84c414b71f893da187f14e48e33794b",
-                  "src/apprt/win32/ViewerFindBar.zig":  "033b9b43436b62b93aa3038953dcdc3b7b782f007e33ae14b3a6228640d6b517",
+                  "src/apprt/win32/viewer_find.zig":  "879f2840c7634bd357205039185d400323d3f44b46143bff9a3905267a3d27f7",
+                  "src/apprt/win32/ViewerFindBar.zig":  "bbe597fc55042550299dcec29a3855cd6f2d4c8e4c42d01c1d2a2f0dd957fe59",
                   "src/viewer/find.js":  "59dffe968a2a082a728d0e46549dea1a66f6fe059464d69833a4a9ed68eacbc3",
-                  "test/win32/viewer-find.ps1":  "74a7b442cf836c478727fe882fa7aedcabf58e962d9f7a77cd1083a0096dbf6d"
+                  "test/win32/viewer-find.ps1":  "1c91b74ae75373354a59c2c35607ba444781de367929bc0fbe758f95d7260c75"
               }
 }

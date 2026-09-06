@@ -101,6 +101,13 @@ card_h: i32 = 0,
 card_bg: color_math.Rgb = .{ .r = 0, .g = 0, .b = 0 },
 card_scale: f32 = 0,
 
+/// The card box the metrics line last reported. `place` runs on every bounds
+/// sync, so a line per call would be noise; a line per CHANGE is the rule the
+/// TOC card's `logCardMetrics` already follows, and it is what an acceptance
+/// script reads to see the corner clip that was applied.
+logged_card_w: i32 = -1,
+logged_card_h: i32 = -1,
+
 // Theme, derived from the pane's background in `applyTheme`.
 doc_rgb: color_math.Rgb = .{ .r = 0x20, .g = 0x20, .b = 0x20 },
 card_rgb: color_math.Rgb = .{ .r = 0x28, .g = 0x28, .b = 0x28 },
@@ -325,7 +332,42 @@ pub fn place(self: *ViewerFindBar, content_top: i32, content_w: i32, scale: f32)
         l.field.height(),
         1,
     );
+    self.applyCornerRegion(l.card.width(), l.card.height());
     return true;
+}
+
+/// Clip the card window to its rounded silhouette (T1391).
+///
+/// The card surface is composited onto a backdrop of `doc_rgb` — the pane's
+/// background — and then blitted over the whole window rect, corners included.
+/// So before this the four corners shipped an ASSUMED colour on top of whatever
+/// was really there, and over anything that is not exactly `pane.bg` (a
+/// document, a light page, a selection) the rounding stopped reading as
+/// rounding: you saw a square plate with a lighter rounded inset. Clipping the
+/// WINDOW means those pixels are never painted at all, which is correct over
+/// any content — the same treatment the TOC card's compact mode already gets,
+/// for the same reason.
+///
+/// This runs from `place`, so it re-applies on every resize and every DPI
+/// change rather than leaving a region cut for the old size or the old scale.
+fn applyCornerRegion(self: *ViewerFindBar, w: i32, h: i32) void {
+    const r = find.cornerRegion(w, h, self.scale);
+    // The system owns the region on success. On failure `CreateRoundRectRgn`
+    // hands us null, `SetWindowRgn` reads that as "no region", and the card
+    // keeps the square corners it had before this existed — a worse card, not
+    // a broken one.
+    const rgn = w32.CreateRoundRectRgn(0, 0, r.right, r.bottom, r.ellipse, r.ellipse);
+    _ = w32.SetWindowRgn(self.hwnd, rgn, 1);
+
+    if (w == self.logged_card_w and h == self.logged_card_h) return;
+    self.logged_card_w = w;
+    self.logged_card_h = h;
+    log.info("viewer find card pane={s} card={d}x{d} ellipse={d}", .{
+        self.pane.paneId(),
+        w,
+        h,
+        r.ellipse,
+    });
 }
 
 /// Show the card, raising it above the WebView2 sibling so it floats over the
