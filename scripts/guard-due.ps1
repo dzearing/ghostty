@@ -1856,6 +1856,22 @@ $GuardTable = @(
             'test\win32\pane-banner.ps1'
         )
     },
+    # The divider's painted color is decided by two files and proven by one
+    # harness, and until T581 nothing joined them. That task changed the
+    # fallback from a fixed gray to a color DERIVED from the terminal
+    # background, which moved the exact pixel `split-divider.ps1` run 2
+    # asserts - an edit to the same arithmetic that forgot the harness would
+    # ship a divider nobody had photographed. The unit tests own the formula;
+    # this row owns the claim that the formula reaches the screen.
+    [pscustomobject]@{
+        Name   = 'split-divider'
+        Script = 'test\win32\split-divider.ps1'
+        Stamp  = 'test\win32\split-divider.stamp.json'
+        Covers = @(
+            'src\apprt\win32\split_geometry.zig',
+            'test\win32\split-divider.ps1'
+        )
+    },
     # The hovered-frame capture is the ONLY way any script can photograph a
     # hover fill off the background desktop (T282), and it is a seam nothing
     # else exercises: four scripts consume it, none of them would fail

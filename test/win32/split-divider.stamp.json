@@ -1,0 +1,14 @@
+{
+    "guard":  "split-divider",
+    "script":  "test/win32/split-divider.ps1",
+    "generated":  "2026-09-06T01:03:22-07:00",
+    "commit":  "8948c0830",
+    "uncommitted":  [
+                        "src/apprt/win32/split_geometry.zig",
+                        "test/win32/split-divider.ps1"
+                    ],
+    "files":  {
+                  "src/apprt/win32/split_geometry.zig":  "f49efe6bb0a6342d0d2d346a294a96cd59f6c91600570837beae36a4cba55163",
+                  "test/win32/split-divider.ps1":  "c647338dd6cf52f0cab945c2c4d3edd279702cf1d2879b05a1a8ae4263e94914"
+              }
+}

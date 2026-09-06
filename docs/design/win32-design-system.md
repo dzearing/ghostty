@@ -625,6 +625,17 @@ implementable rather than aspirational:
   otherwise shade to itself. Legibility of the control outranks the
   §5 direction convention in that corner, and only there.
 
+**The default color is DERIVED from the terminal background, not named**
+(T581). With no `split-divider-color` set, the divider is the background
+darkened — 8% of its brightness on a light background, 40% on a dark one —
+which is Mac's `splitDividerColor` formula and is why a themed terminal gets a
+divider that belongs to it. win32 used to answer a fixed `#808080` here, so one
+config produced two different lines across the seats. The derivation can
+legitimately return the background itself (darkening black is black); it is
+safe only because the fallback reaches a pixel through `dividerPaint` like
+every other divider color, and the 3:1 floor above lifts it back off the
+background.
+
 **Every divider in the window obeys the width and the color** — including the
 hero-mode divider between the hero pane and its carousel, which is the same
 2 DIP mark, reads the same `split-divider-color` (via `Window

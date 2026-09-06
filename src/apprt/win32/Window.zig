@@ -3464,7 +3464,8 @@ fn layoutNode(self: *Window, tree: SplitTree(PaneView), handle: SplitTree(PaneVi
     }
 }
 
-/// The user's `split-divider-color`, or the design system's fallback gray.
+/// The user's `split-divider-color`, or the fallback derived from the
+/// terminal background.
 ///
 /// Public because EVERY divider in the window reads it (T250): the split
 /// dividers below and the hero/carousel divider in `HeroCarousel.paint`. Two
@@ -3473,11 +3474,16 @@ fn layoutNode(self: *Window, tree: SplitTree(PaneView), handle: SplitTree(PaneVi
 /// honored it. The contrast floor is NOT applied here — that is
 /// `split_geometry.dividerPaint`'s job, against whichever background the
 /// particular divider has to read against.
+///
+/// T581: the fallback is `split_geometry.fallbackColor(background)`, Mac's
+/// formula, not a fixed gray. It is derived from the CONFIGURED terminal
+/// background — the same input Mac's `splitDividerColor` reads — so both
+/// dividers still get one answer even though the hero divider goes on to floor
+/// it against its own band.
 pub fn dividerConfiguredColor(self: *Window) color_math.Rgb {
-    return if (self.app.config.@"split-divider-color") |c|
-        .{ .r = c.r, .g = c.g, .b = c.b }
-    else
-        split_geometry.FALLBACK_COLOR;
+    if (self.app.config.@"split-divider-color") |c| return .{ .r = c.r, .g = c.g, .b = c.b };
+    const bg = self.app.config.background;
+    return split_geometry.fallbackColor(.{ .r = bg.r, .g = bg.g, .b = bg.b });
 }
 
 /// Paint divider lines between split panes in the active tab.

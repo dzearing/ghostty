@@ -33,12 +33,47 @@ pub fn bandPx(scale: f32) i32 {
     return @max(@as(i32, @intFromFloat(@round(2.0 * scale))), 2);
 }
 
-/// What a divider is painted with when the user set no `split-divider-color`
-/// (Mac's `Ghostty.Config.swift` fallback, mid-gray). Lives here rather than at
-/// a paint site because more than one divider reads it — the split dividers and
-/// the hero/carousel divider — and a fallback that differs between them is the
-/// same defect as ignoring the config outright.
-pub const FALLBACK_COLOR: color_math.Rgb = .{ .r = 0x80, .g = 0x80, .b = 0x80 };
+/// How far the fallback divider darkens the terminal background, per Mac's
+/// `Ghostty.Config.swift` `splitDividerColor`: a light background gives up 8%
+/// of its brightness, a dark one 40%. The asymmetry is Mac's and is the point
+/// — a light theme wants a whisper of a line, a dark theme needs a visible one.
+pub const FALLBACK_DARKEN_LIGHT: f64 = 0.08;
+pub const FALLBACK_DARKEN_DARK: f64 = 0.4;
+
+/// What a divider is painted with when the user set no `split-divider-color`:
+/// the terminal background, darkened (T581).
+///
+/// Mac derives its default divider from the background rather than naming a
+/// color, so one config produced two different lines across the seats — win32
+/// drew a fixed mid-gray. Mac's `darken(by:)` scales HSB *brightness*, which
+/// with hue and saturation held is exactly a per-channel multiply, so this is
+/// the same formula and not an approximation of it.
+///
+/// It can absolutely return an invisible color — `darken` on a black
+/// background is still black — which is why the ONLY way this reaches a pixel
+/// is through `dividerPaint`, where the 3:1 chrome floor (T251) lifts it back
+/// off the background. The fallback states the intent; the floor keeps it a
+/// control.
+///
+/// Lives here rather than at a paint site because more than one divider reads
+/// it — the split dividers and the hero/carousel divider — and a fallback that
+/// differs between them is the same defect as ignoring the config outright.
+pub fn fallbackColor(bg: color_math.Rgb) color_math.Rgb {
+    const amount: f64 = if (color_math.isLight(bg))
+        FALLBACK_DARKEN_LIGHT
+    else
+        FALLBACK_DARKEN_DARK;
+    return .{
+        .r = darkenChannel(bg.r, amount),
+        .g = darkenChannel(bg.g, amount),
+        .b = darkenChannel(bg.b, amount),
+    };
+}
+
+fn darkenChannel(v: u8, amount: f64) u8 {
+    const scaled = @as(f64, @floatFromInt(v)) * (1.0 - amount);
+    return @intFromFloat(@round(std.math.clamp(scaled, 0.0, 255.0)));
+}
 
 /// Per-channel shade applied to the divider while its grab band is hovered
 /// or being dragged (design system §5).
@@ -427,6 +462,54 @@ test "dividerColor: rest AND hover clear the 3:1 chrome floor on both themes" {
         try testing.expect(!rest.eql(hot));
         const delta = @abs(@as(i32, hot.r) - @as(i32, rest.r));
         try testing.expect(delta >= 20);
+    }
+}
+
+test "fallbackColor: Mac's formula - 8% off a light background, 40% off a dark one" {
+    // T581. Mac's `splitDividerColor` darkens the terminal background rather
+    // than naming a color; `darken(by:)` scales HSB brightness, which with
+    // hue and saturation fixed is a per-channel multiply.
+    const white: color_math.Rgb = .{ .r = 255, .g = 255, .b = 255 };
+    try testing.expectEqual(@as(u8, 235), fallbackColor(white).r); // 255 * 0.92
+
+    // A dark background loses 40%, and the HUE survives it: a per-channel
+    // multiply is exactly what "same hue, same saturation, less brightness"
+    // means, so a blue-tinted terminal gets a blue-tinted divider.
+    const navy: color_math.Rgb = .{ .r = 10, .g = 20, .b = 60 };
+    const dim = fallbackColor(navy);
+    try testing.expectEqual(@as(u8, 6), dim.r); // 10 * 0.6
+    try testing.expectEqual(@as(u8, 12), dim.g);
+    try testing.expectEqual(@as(u8, 36), dim.b);
+
+    // The light/dark split is `isLight`, Mac's Rec.601 > 0.5 - the same test
+    // the hover direction already uses, so the fallback and its hover shade
+    // can never disagree about which theme they are in.
+    try testing.expect(fallbackColor(.{ .r = 0, .g = 0, .b = 0 }).r == 0);
+}
+
+test "fallbackColor: derived from black or white, the PAINTED divider still clears 3:1" {
+    // The formula's honest failure mode: darkening a black background is a
+    // no-op, so the fallback IS the background. That is only safe because it
+    // reaches a pixel through `dividerPaint`, which floors it - the shape of
+    // the bug T251 fixed, kept fixed for the derived fallback.
+    inline for (.{
+        [_]u8{ 0, 0, 0 },
+        [_]u8{ 255, 255, 255 },
+        [_]u8{ 30, 30, 46 },
+        [_]u8{ 250, 244, 237 },
+    }) |ch| {
+        const bg: color_math.Rgb = .{ .r = ch[0], .g = ch[1], .b = ch[2] };
+        const bg_lum = color_math.wcagLuminance(bg);
+        const configured = fallbackColor(bg);
+        for ([_]bool{ false, true }) |hot| {
+            const c = dividerPaint(configured, bg, hot);
+            const ratio = color_math.wcagContrastRatio(color_math.wcagLuminance(c), bg_lum);
+            try testing.expect(ratio >= CONTRAST_FLOOR);
+        }
+        // And the hover still reads as a state change on top of the floor.
+        const rest = dividerPaint(configured, bg, false);
+        const hot = dividerPaint(configured, bg, true);
+        try testing.expect(channelDelta(rest, hot) >= HOVER_DELTA_MIN);
     }
 }
 

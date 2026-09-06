@@ -23,8 +23,9 @@
 # subject removed.
 #
 # paintDividerNode previously hardcoded a 0x808080 pen; it now uses the
-# config color (COLORREF from Config.Color RGB) with the same gray as the
-# fallback, and Window.onConfigChange invalidates the divider bands so a config
+# config color (COLORREF from Config.Color RGB), falling back to a color
+# DERIVED from the terminal background when none is set (T581), and
+# Window.onConfigChange invalidates the divider bands so a config
 # reload re-colors live (T252: invalidate + WM_PAINT, not the GetDC shortcut -
 # a color change goes through the paint cycle, see win32-design-system.md 5b).
 #
@@ -33,7 +34,11 @@
 #         split -> a red divider pixel exists in the gap between panes;
 #         then rewrite the config file to 0000ff and send ctrl+shift+,
 #         (reload_config) -> the divider re-colors blue live.
-#   run 2 (no color set): divider is the fallback gray 128,128,128.
+#   run 2 (no color set): divider is the DERIVED fallback (T581) - the
+#         terminal background darkened per Mac's formula, then lifted to the
+#         3:1 chrome floor. On this harness's black terminal that lands at
+#         90,89,89 (rest) and 115,114,114 (hovered); both numbers are pinned by
+#         the split_geometry.zig unit tests, which own the arithmetic.
 #
 # T218 (batch 3): runs on a BACKGROUND Win32 desktop
 # (test/win32/lib/TestDesktop.ps1), so it never takes the user's foreground -
@@ -208,7 +213,7 @@ function Get-TestStrips {
 # top) at 3 x-positions; true if any pixel matches the target color. The line
 # is 1-2 px wide inside a ~5-7 px never-erased gap, so we look for ANY matching
 # pixel, not all.
-function Divider-HasColor([IntPtr]$top, $A, $B, [int]$tr, [int]$tg, [int]$tb) {
+function Divider-HasColor([IntPtr]$top, $A, $B, [int]$tr, [int]$tg, [int]$tb, [int]$tol = 40) {
     $y0 = $A.Bottom - 2
     $y1 = $B.Top + 2
     foreach ($fx in @(0.3, 0.5, 0.7)) {
@@ -216,7 +221,7 @@ function Divider-HasColor([IntPtr]$top, $A, $B, [int]$tr, [int]$tg, [int]$tb) {
         $strip = Get-TestStrip -Window $top -Fixed $x -A $y0 -B $y1
         if ($null -eq $strip) { continue }
         foreach ($px in $strip) {
-            if (Pixel-Matches $px $tr $tg $tb) { return $true }
+            if (Pixel-Matches $px $tr $tg $tb $tol) { return $true }
         }
     }
     return $false
@@ -420,7 +425,14 @@ Assert (-not ($app.Process -and $app.Process.HasExited)) 'red: no crash'
 Stop-Process -Id $app.Pid -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------
-# Run 2: no color set -> fallback gray 128,128,128.
+# Run 2: no color set -> the fallback DERIVED from the terminal background
+# (T581), not a fixed gray. Mac's `splitDividerColor` darkens the background
+# (40% on a dark one), and on this harness's `--background=#000000` that is
+# still black - so what reaches the pixel is the 3:1 floor lifting it off the
+# background, 90,89,89. The exact value is asserted in the unit tests
+# ("fallbackColor: derived from black or white, the PAINTED divider still
+# clears 3:1"); here it is the observable proof that the derivation, not the
+# old 0x808080 literal, is what the window paints.
 #
 # Captures stderr ($true) so the T233 section below can read the divider-hover
 # debug oracle - a posted hover cannot survive to a pixel capture here.
@@ -431,8 +443,12 @@ $app = $g.App; $top = $g.Top
 $A = $g.Panes | Sort-Object Top | Select-Object -First 1
 $B = $g.Panes | Sort-Object Top | Select-Object -Last 1
 
-Assert (Divider-HasColor $top $A $B 128 128 128) 'default: divider gap has the fallback gray pixel'
-if (-not (Divider-HasColor $top $A $B 128 128 128)) { Dump-Strip $top $A $B 'default' }
+# Tolerance 6, not the default 40: the retired 0x808080 literal is 38 away
+# from the derived value, so a loose match would pass on a build that never
+# changed.
+Assert (Divider-HasColor $top $A $B 90 89 89 6) 'default: divider gap has the derived fallback pixel'
+if (-not (Divider-HasColor $top $A $B 90 89 89 6)) { Dump-Strip $top $A $B 'default' }
+Assert (-not (Divider-HasColor $top $A $B 128 128 128 6)) 'default: the fixed 0x808080 fallback is gone (T581)'
 
 # ---------------------------------------------------------------------------
 # T94: grab-band hit target. The band is ~9 DIP total (4.5 DIP each side of
@@ -517,8 +533,8 @@ Assert ($d.Y -lt $before - 40) "T94: drag from -4 DIP resized (line $before -> $
 # 25/channel apart by design, so a loose tolerance would call them equal and
 # pass on a build with no hover at all.
 # ---------------------------------------------------------------------------
-$REST_G = 128           # fallback divider gray (no split-divider-color set)
-$HOT_G = 153            # + HOVER_DELTA (25), the dark-theme direction: --background=#000000
+$REST_G = 90            # derived fallback, floored to 3:1 on --background=#000000 (T581)
+$HOT_G = 115            # + HOVER_DELTA (25), the dark-theme direction
 $TOL = 6
 
 # True if any pixel of the parent-visible gap matches; $null if the capture
@@ -1147,6 +1163,15 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
     Assert ($fgSeen.Count -gt 0) 'the foreground watcher actually sampled (negative control)'
     $leaked = @($launched | Where-Object { $fgSeen -contains $_ })
     Assert ($leaked.Count -eq 0) 'no test-desktop app ever became foreground on the interactive desktop'
+}
+
+# A green run stamps the covered files (T783/T581) so guard-due can answer "has
+# this harness been run against the code as it now stands?" - the divider's
+# color arithmetic lives in split_geometry.zig and this is the only thing that
+# photographs it. Red leaves the stamp alone: red stays due.
+if ($script:fail -eq 0 -and -not $NegativeControl) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard split-divider -Repo $repo 2>&1 | ForEach-Object { "  $_" }
 }
 
 Write-Host ''
