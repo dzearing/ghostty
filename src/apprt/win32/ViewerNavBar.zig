@@ -29,6 +29,7 @@ const w32 = @import("win32.zig");
 // scope so its own positive and negative controls are queued into the win32
 // test lane along with the class test below.
 const class_redraw = @import("class_redraw.zig");
+const chrome_reposition = @import("chrome_reposition.zig");
 const color_math = @import("color_math.zig");
 const chrome_theme = @import("chrome_theme.zig");
 const banner_card = @import("banner_card.zig");
@@ -132,9 +133,10 @@ fn registerClass(hinstance: ?w32.HINSTANCE) void {
         // `Layout.init(scale, width, shown)` - the buttons are anchored to the
         // right edge and the address field stretches between them - so a width
         // change makes every pixel stale, not just the strip the resize
-        // uncovers. `place()` resizes with `MoveWindow(.., TRUE)`, which paints
-        // the update region but does not widen it; the class style is what
-        // makes that region the whole client.
+        // uncovers. `place()` resizes through `chrome_reposition.place`
+        // (T1392), which paints the update region in THIS frame; the class
+        // style is what makes that region the whole client rather than the
+        // sliver the widen uncovered.
         .style = w32.CS_HREDRAW | w32.CS_VREDRAW,
         .lpfnWndProc = &wndProc,
         .cbClsExtra = 0,
@@ -323,15 +325,23 @@ pub fn shown(self: *const ViewerNavBar) layout_mod.Shown {
 /// bar is visible.
 pub fn place(self: *ViewerNavBar, width: i32, scale: f32) void {
     const l = layout_mod.Layout.init(scale, width, self.shown());
-    _ = w32.MoveWindow(self.hwnd, 0, 0, width, l.bar_h, 1);
+    // Resize-aware reposition, not `MoveWindow(.., TRUE)` (T1392). A divider
+    // drag re-runs this per mouse-move, and `MoveWindow`'s repaint is deferred
+    // to the next idle — with the loop busy pumping sizing messages that lands
+    // a frame late, over a stretched blit of the old layout. That is the
+    // address bar visibly painting into the width the drag just revealed.
+    _ = chrome_reposition.place(self.hwnd, 0, 0, width, l.bar_h, 0);
     const field_w = @max(l.address.right - l.address.left, 0);
-    _ = w32.MoveWindow(
+    // The field goes the same way: it is the widest thing in the band and it
+    // stretches with it, so a bar that repaints in-frame around a field that
+    // does not still reads as a lagging address bar.
+    _ = chrome_reposition.place(
         self.edit,
         l.address.left,
         l.address.top,
         field_w,
         l.address.bottom - l.address.top,
-        1,
+        0,
     );
     // In the minimum band the field is not painted at all (T1159), and an EDIT
     // moved to zero width is still a focusable control that draws a caret at
@@ -912,9 +922,9 @@ fn activate(self: *ViewerNavBar, b: layout_mod.Button) void {
 
 // T467: the bar's buttons are anchored to its right edge and the address field
 // spans what is left, so a pane width change re-lays out every one of them.
-// `place()` resizes with `MoveWindow(.., TRUE)`, which paints the update
-// region — the class is what decides that the region is the whole bar and not
-// the sliver the widen uncovered.
+// `place()` resizes through `chrome_reposition.place` (T1392), which paints
+// the update region synchronously — the class is what decides that the region
+// is the whole bar and not the sliver the widen uncovered.
 test "viewer nav class: a resize invalidates the whole bar" {
     const hinst = w32.GetModuleHandleW(null) orelse return error.SkipZigTest;
     registerClass(hinst);

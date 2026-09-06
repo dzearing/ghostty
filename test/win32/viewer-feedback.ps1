@@ -328,7 +328,20 @@ try {
     Assert ($null -ne $view) 'the viewer host window was found'
     if (-not $view) { throw 'no viewer host window' }
 
-    $contentBefore = Get-ContentTop $view.Pane
+    # The WebView2 widget is created ASYNCHRONOUSLY, after the pane host window
+    # it hangs off exists - so this is a wait, like every other window lookup in
+    # this script, and not a single sample. It was the one lookup here without
+    # one, and the cost was two bugs at once: it went red on a box where the
+    # widget simply took longer to arrive (measured: reproducible in the main
+    # repo, green in a fresh worktree, on IDENTICAL code), and its null then
+    # made the "page moved down" comparison below pass VACUOUSLY, since
+    # `<int> -gt $null` is `<int> -gt 0`.
+    $contentBefore = $null
+    for ($t = 0; $t -lt 40; $t++) {
+        $contentBefore = Get-ContentTop $view.Pane
+        if ($null -ne $contentBefore) { break }
+        Start-Sleep -Milliseconds 250
+    }
     Assert ($null -ne $contentBefore) "the WebView2 widget was found (page top $contentBefore)"
 
     # --- A. the button opens the composer ------------------------------------
@@ -359,7 +372,7 @@ try {
 
     # --- C. the page is inset by the band ------------------------------------
     $contentOpen = Get-ContentTop $view.Pane
-    Assert ($null -ne $contentOpen -and $contentOpen -gt $contentBefore) `
+    Assert ($null -ne $contentBefore -and $null -ne $contentOpen -and $contentOpen -gt $contentBefore) `
         "the page moved down for the composer ($contentBefore -> $contentOpen)"
 
     # --- C2. the editing surface is a real text control (T635) ---------------

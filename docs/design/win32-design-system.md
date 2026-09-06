@@ -804,6 +804,62 @@ that the probe can tell them apart.
 
 ---
 
+## 5d. Floating chrome is repositioned through `chrome_reposition.place` (T1392)
+
+Section 5c settles **what** a resize invalidates. This settles **when** it is
+painted, which is the other half of the same defect and was solved separately
+for one window and nowhere else.
+
+`MoveWindow(hwnd, .., TRUE)` invalidates and lets the repaint fall out to the
+next idle. That is fine at rest and wrong during a live drag: the pane's bounds
+sync runs on every `WM_MOUSEMOVE`, the message loop is busy pumping sizing
+messages, and the paint therefore lands a frame or more behind the edge the user
+is dragging. Because these classes invalidate the *whole* client (5c), that late
+frame is a full redraw of the bar — which is exactly what makes it visible.
+The user's report is the clearest statement of it: *"I see it painting rather
+than a smooth transition, whereas I don't see this with the banner anymore."*
+
+The banner did not do this because T456 had already hand-written the fix into
+`BannerOverlay.updatePosition`. **`src/apprt/win32/chrome_reposition.zig` is
+that fix extracted**, and every piece of floating chrome now goes through it:
+
+```zig
+_ = chrome_reposition.place(hwnd, x, y, w, h, base_flags);
+```
+
+It compares the window's current extents with the new ones and, **on a resize
+only**:
+
+- adds `SWP_NOCOPYBITS`, since the class already invalidates every pixel and the
+  blit of the old bits buys nothing;
+- follows with `UpdateWindow`, so the `WM_PAINT` is in *this* frame.
+
+A pure **move** keeps neither — nothing about the pixels changed, so discarding
+a valid blit and forcing a synchronous repaint would be a new flicker traded for
+the old one. That fork is a pure function (`decide`) with unit tests, including
+a negative control that fails if the two branches ever agree.
+
+| Window | Repositioned by | Since |
+|---|---|---|
+| `BannerOverlay` | `chrome_reposition.place` | T456, moved onto the shared path by T1392 |
+| `GhozttyViewerNav` (bar + address `EDIT`) | `chrome_reposition.place` | T1392 |
+| `GhozttyViewerFind` (card + query `EDIT`) | `chrome_reposition.place` | T1392 |
+| `GhozttyViewerFeedback` (bar + body `EDIT`) | `chrome_reposition.place` | T1392 |
+| `GhozttyViewerTOC` | `chrome_reposition.place` | T1392 |
+
+The child `EDIT`s go through it too, deliberately: a bar that repaints in-frame
+around a field that does not still reads as a lagging address bar.
+
+Dialogs and the activity monitor's child controls are **not** on this path and
+should not be — they are not resized inside a drag loop, so a deferred repaint
+costs nothing there and `MoveWindow` stays the simpler call.
+
+`SWP_NOCOPYBITS` is a single switch here rather than five copies, which is what
+makes **T1348** — the open question of whether that flag is right at all —
+a one-line change to settle instead of an audit.
+
+---
+
 ## 6. Vertical space is expensive
 
 A terminal's vertical space belongs to the terminal. Chrome that is always

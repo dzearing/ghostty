@@ -80,6 +80,7 @@ const w32 = @import("win32.zig");
 // scope so its own positive and negative controls are queued into the win32
 // test lane along with the class test below.
 const class_redraw = @import("class_redraw.zig");
+const chrome_reposition = @import("chrome_reposition.zig");
 const color_math = @import("color_math.zig");
 const chrome_theme = @import("chrome_theme.zig");
 const banner_card = @import("banner_card.zig");
@@ -248,10 +249,10 @@ fn registerClass(hinstance: ?w32.HINSTANCE) void {
         // CS_HREDRAW | CS_VREDRAW (T467): `paint` fills the client and then
         // lays the pill, the carousel and the send row out from
         // `Layout.init(layoutInput(width, scale))`, so the bar's content is a
-        // function of its own bounds. The pane resizes it with
-        // `MoveWindow(.., TRUE)` on every bounds sync - that paints whatever is
-        // invalid, and without this style the only invalid part is the strip
-        // the widen uncovered.
+        // function of its own bounds. The pane resizes it through
+        // `chrome_reposition.place` on every bounds sync (T1392) - that paints
+        // whatever is invalid, in the same frame, and without this style the
+        // only invalid part is the strip the widen uncovered.
         .style = w32.CS_HREDRAW | w32.CS_VREDRAW,
         .lpfnWndProc = &wndProc,
         .cbClsExtra = 0,
@@ -980,7 +981,8 @@ pub fn barHeight(self: *const ViewerFeedbackBar, width: i32, scale: f32) i32 {
 /// composer is open.
 pub fn place(self: *ViewerFeedbackBar, top: i32, width: i32, scale: f32) void {
     const l = layout_mod.Layout.init(self.layoutInput(width, scale));
-    _ = w32.MoveWindow(self.hwnd, 0, top, width, l.bar_h, 1);
+    // Resize-aware, in-frame reposition (T1392) — see `chrome_reposition`.
+    _ = chrome_reposition.place(self.hwnd, 0, top, width, l.bar_h, 0);
     if (self.scale != scale) {
         self.scale = scale;
         if (self.body_font) |f| _ = w32.DeleteObject(@ptrCast(f));
@@ -996,13 +998,13 @@ pub fn place(self: *ViewerFeedbackBar, top: i32, width: i32, scale: f32) void {
     // The control fills the text rect exactly, which is what makes the pill's
     // 12 DIP lead and the gap to the buttons the control's OWN margins — no
     // second inset to keep in step with the layout module.
-    _ = w32.MoveWindow(
+    _ = chrome_reposition.place(
         self.edit,
         l.text.left,
         l.text.top,
         @max(l.text.width(), 0),
         @max(l.text.height(), 0),
-        1,
+        0,
     );
     // The web surface fills the same rect, in the same coordinates: the
     // controller is parented to this band, so `Layout`'s own client-space

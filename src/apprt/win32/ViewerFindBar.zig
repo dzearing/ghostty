@@ -30,6 +30,7 @@ const Allocator = std.mem.Allocator;
 
 const w32 = @import("win32.zig");
 const class_redraw = @import("class_redraw.zig");
+const chrome_reposition = @import("chrome_reposition.zig");
 const color_math = @import("color_math.zig");
 const chrome_theme = @import("chrome_theme.zig");
 const banner_card = @import("banner_card.zig");
@@ -316,21 +317,25 @@ pub fn place(self: *ViewerFindBar, content_top: i32, content_w: i32, scale: f32)
         _ = w32.ShowWindow(self.hwnd, w32.SW_HIDE);
         return false;
     }
-    _ = w32.MoveWindow(
+    // Resize-aware, in-frame reposition (T1392) — see `chrome_reposition`.
+    // The card is anchored to the content's right edge, so a divider drag
+    // moves AND resizes it on every mouse-move; `MoveWindow`'s deferred
+    // repaint is what makes floating chrome trail the edge being dragged.
+    _ = chrome_reposition.place(
         self.hwnd,
         l.card.left,
         content_top + l.card.top,
         l.card.width(),
         l.card.height(),
-        1,
+        0,
     );
-    _ = w32.MoveWindow(
+    _ = chrome_reposition.place(
         self.edit,
         l.field.left,
         l.field.top,
         @max(l.field.width(), 0),
         l.field.height(),
-        1,
+        0,
     );
     self.applyCornerRegion(l.card.width(), l.card.height());
     return true;

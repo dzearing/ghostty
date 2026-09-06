@@ -36,6 +36,7 @@ const w32 = @import("win32.zig");
 // scope so its own positive and negative controls are queued into the win32
 // test lane along with the class test below.
 const class_redraw = @import("class_redraw.zig");
+const chrome_reposition = @import("chrome_reposition.zig");
 const color_math = @import("color_math.zig");
 const chrome_theme = @import("chrome_theme.zig");
 const system_colors = @import("system_colors.zig");
@@ -677,13 +678,16 @@ pub fn place(
     self.slide_w = @max(l.window.width(), 1);
     self.slide_h = @max(l.window.height(), 1);
 
-    _ = w32.MoveWindow(
+    // Resize-aware, in-frame reposition (T1392) — see `chrome_reposition`.
+    // The gutter card is as wide as the pane's reserved column, so a divider
+    // drag resizes it on every mouse-move.
+    _ = chrome_reposition.place(
         self.hwnd,
         self.windowX(),
         self.slide_y,
         self.slide_w,
         self.slide_h,
-        1,
+        0,
     );
 
     // The compact card floats over live document text, so the WINDOW is

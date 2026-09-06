@@ -27,6 +27,7 @@
 const std = @import("std");
 const w32 = @import("win32.zig");
 const chrome_fanout = @import("chrome_fanout.zig");
+const chrome_reposition = @import("chrome_reposition.zig");
 const App = @import("App.zig");
 const markdown = @import("banner_markdown.zig");
 const card = @import("banner_card.zig");
@@ -464,33 +465,25 @@ pub const BannerOverlay = struct {
         const new_w = @max(rect.right - rect.left, 1);
         const new_h = @max(height, 1);
 
-        // Is this a RESIZE or just a move? (T456) A resize restyles every
-        // pixel of the card; a move restyles none of them.
-        var old: w32.RECT = undefined;
-        const resized = w32.GetWindowRect(self.hwnd, &old) == 0 or
-            (old.right - old.left) != new_w or (old.bottom - old.top) != new_h;
-
-        // SWP_NOCOPYBITS on a resize: the class already invalidates the whole
-        // client (CS_HREDRAW|CS_VREDRAW), so blitting the old bits into the
-        // new rect only buys a frame of stretched, stale card before the
-        // repaint lands over it.
-        var flags: u32 = w32.SWP_NOACTIVATE | w32.SWP_NOZORDER | w32.SWP_SHOWWINDOW;
-        if (resized) flags |= w32.SWP_NOCOPYBITS;
-
         // Cheap enough to ask every pass (one flag read), and it is what
         // decides whether this reposition owes a z-order heal (T1345).
         const was_shown = w32.IsWindowVisible_(self.hwnd) != 0;
         chrome_fanout.noteMove(.banner);
-        _ = w32.SetWindowPos(self.hwnd, null, rect.left, top, new_w, new_h, flags);
 
-        // Repaint NOW, not on the next pumped WM_PAINT (T456). This runs
-        // inside the layout pass that just moved the owner pane, and a
-        // divider drag re-runs that pass per mouse-move — so a deferred
-        // paint puts the card a whole drag frame behind the pane it is
-        // glued to, which is what "the overlay lags the drag" describes.
-        // Painting synchronously costs nothing extra overall: it is the
-        // same card render, moved earlier in the same frame.
-        if (resized) _ = w32.UpdateWindow(self.hwnd);
+        // Is this a RESIZE or just a move? (T456) A resize restyles every
+        // pixel of the card; a move restyles none of them — so a resize drops
+        // the stale blit (SWP_NOCOPYBITS) and repaints NOW rather than on the
+        // next pumped WM_PAINT, and a move keeps both. That decision, and the
+        // reason for it, now lives in `chrome_reposition` so the viewer's
+        // chrome shares it instead of relearning it one bar at a time (T1392).
+        _ = chrome_reposition.place(
+            self.hwnd,
+            rect.left,
+            top,
+            new_w,
+            new_h,
+            w32.SWP_SHOWWINDOW,
+        );
         // Every reposition re-checks the z-order instead of leaving it to
         // whatever last touched it (T142) — except inside a live layout pass,
         // where an already-shown popup cannot have moved in the z-order and
