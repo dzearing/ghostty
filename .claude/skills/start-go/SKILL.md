@@ -75,8 +75,14 @@ cause, then restart:
 
 1. **Read the ledger.** `temp\go-loop-history.jsonl` is append-only: one row per
    acquire / heartbeat / release, each with `at`, `turn`, `reason` and
-   `uptime_m`. A `reason` of `dead-owner` or `stale-heartbeat` with `turn` back
-   at 1 means the loop was killed and revived, not that it stopped by itself.
+   `uptime_m`. A `reason` of `dead-owner`, `stale-heartbeat` or `rebooted` with
+   `turn` back at 1 means the loop was killed and revived, not that it stopped
+   by itself. `rebooted` specifically means the machine booted after the run
+   started - the pane id survived a Ghoztty session restore, but the run did
+   not, and the uptime clock restarts because it genuinely should. Cross-check
+   the boot against `Get-WinEvent -LogName System -Id 1074,41`: a planned
+   Windows Update restart is expected and only the *recovery* is in scope,
+   while a Kernel-Power 41 with no 1074 beside it is a hard crash worth chasing.
 2. **Was it a hanging decision?** `decisions_open` in the health line. A loop
    that filed a decision and stopped has broken go.md step 5b, which says file
    it and *keep going*. Fix the loop's behavior (and the wording in go.md if it

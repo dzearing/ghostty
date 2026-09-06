@@ -89,6 +89,58 @@ foreach ($mins in @(1, 61, 599, 1439, 1440, 2174, 4321, 10079)) {
 Assert 'every rendering re-reads as the minutes it was given' ($bad -eq 0)
 
 ""
+"E. a reboot breaks the run, whatever the pane id says"
+# WHY (user, 2026-09-06): `Test-Mine` matches on pane id, and a Ghoztty session
+# restore rebuilds the pane with the SAME id. The box rebooted at 02:21 for a
+# Windows Update, the loop died with it, a new claude took the restored pane at
+# 06:20 - and because the pane id matched, the acquire was scored `own-lock`,
+# carried `acquired` from six days earlier, and the health line announced
+# "uptime=5d 23h" across a four-and-a-half-hour hole. The one number the line
+# exists to report was the one number that was wrong.
+$mParse = [regex]::Match($src, '(?s)function Parse-Iso.*?\n\}')
+$mCarry = [regex]::Match($src, '(?s)function Resolve-CarriedAcquired.*?\n\}')
+if (-not ($mParse.Success -and $mCarry.Success)) {
+    Assert 'Parse-Iso and Resolve-CarriedAcquired both lift out of the script' $false
+} else {
+    Invoke-Expression $mParse.Value
+    Invoke-Expression $mCarry.Value
+
+    $fmt = 'yyyy-MM-ddTHH:mm:ss.fffffffK'
+    $acq = (Get-Date '2026-08-31T07:10:40-07:00').ToString($fmt)
+    $lock = [pscustomobject]@{ acquired = $acq }
+
+    # The live case: boot AFTER acquired, so the run is broken.
+    $bootAfter = (Get-Date '2026-09-06T02:21:01-07:00').ToString($fmt)
+    Assert 'a boot after acquired breaks the run' `
+        ((Resolve-CarriedAcquired $lock $bootAfter) -eq '')
+
+    # The ordinary case: the box has been up longer than the loop, so every
+    # re-acquire (including /reset-context, which replaces the PROCESS but not
+    # the run) carries the original start.
+    $bootBefore = (Get-Date '2026-08-30T22:00:00-07:00').ToString($fmt)
+    Assert 'a boot before acquired carries the original start' `
+        ((Resolve-CarriedAcquired $lock $bootBefore) -eq $acq)
+
+    # Degrade toward the old behavior, never toward a false reset: an
+    # unreadable boot time must not turn every re-acquire into a reboot.
+    Assert 'an unreadable boot time carries rather than resets' `
+        ((Resolve-CarriedAcquired $lock '') -eq $acq)
+    Assert 'an unparseable boot time carries rather than resets' `
+        ((Resolve-CarriedAcquired $lock 'not-a-date') -eq $acq)
+
+    # No lock, or a lock with no acquired, has nothing to carry - the caller
+    # starts a fresh run, which is already what '' means.
+    Assert 'a lock with no acquired carries nothing' `
+        ((Resolve-CarriedAcquired ([pscustomobject]@{}) $bootBefore) -eq '')
+    Assert 'no lock at all carries nothing' `
+        ((Resolve-CarriedAcquired $null $bootBefore) -eq '')
+
+    # The boundary: a boot at exactly `acquired` is not proof the run broke.
+    Assert 'a boot at exactly acquired still carries' `
+        ((Resolve-CarriedAcquired $lock $acq) -eq $acq)
+}
+
+""
 if ($script:failures -eq 0) {
     "ALL PASS ($($script:asserted) assertions$(if ($script:skipped) { ", $script:skipped SKIPPED" }))"
     exit 0

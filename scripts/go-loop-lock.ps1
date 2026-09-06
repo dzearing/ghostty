@@ -254,13 +254,55 @@ function Test-Mine($lock) {
     return $false
 }
 
+# The machine's last boot as an ISO string, or '' if it cannot be read.
+#
+# Only ever used to decide whether a carried-over `acquired` predates the
+# current boot. Best-effort by design: a CIM query that fails must never fail
+# an acquire, and the cost of not knowing is the old behavior, not a crash.
+function Get-BootIso() {
+    try {
+        $b = (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).LastBootUpTime
+        if ($b) { return ([datetime]$b).ToString($IsoFmt) }
+    } catch { }
+    return ''
+}
+
+# The `acquired` an own-lock re-acquire should carry, or '' when the run was
+# broken and the caller must start a fresh one.
+#
+# WHY THIS EXISTS (user, 2026-09-06). `Test-Mine` matches on PANE ID, and a
+# Ghoztty session restore rebuilds the pane with the SAME id. So after the box
+# rebooted overnight, a brand-new claude process in the restored pane took the
+# lock as `own-lock`, carried `acquired` across the gap, and the health line
+# reported "uptime=5d 23h" for a loop that had been dead for four and a half
+# hours - the one number the line exists to provide, and the one thing `alive`
+# alone cannot tell you. A reboot is proof the run was broken no matter what
+# the pane id says, so it wins over the own-lock inference.
+#
+# Deliberately narrow: only a boot AFTER `acquired` resets. A pid change on its
+# own does NOT, because /reset-context legitimately replaces the process within
+# one continuous run, and treating that as a break would zero the uptime
+# several times a day.
+function Resolve-CarriedAcquired($lock, [string]$BootIso) {
+    if (-not $lock -or -not $lock.acquired) { return '' }
+    $a = Parse-Iso $lock.acquired
+    if (-not $a) { return '' }
+    $b = Parse-Iso $BootIso
+    # Unreadable boot time: keep the old carry-over rather than falsely
+    # declaring every re-acquire a reboot.
+    if (-not $b) { return [string]$lock.acquired }
+    if ($b -gt $a) { return '' }
+    return [string]$lock.acquired
+}
+
 # How long this loop has been running UNBROKEN, in minutes.
 #
 # `acquired` is carried over on an own-lock re-acquire and reset on every
 # takeover, so it already means "the start of the current continuous run" -
 # /reset-context keeps it, a crash-and-revive does not. Nothing reported it,
 # which is why "is the loop up?" could be answered but "how long has it been
-# up?" could not (user, 2026-08-11).
+# up?" could not (user, 2026-08-11). `Resolve-CarriedAcquired` above is what
+# makes the "a crash-and-revive does not" half true across a reboot.
 function Get-UptimeMinutes($lock) {
     if (-not $lock) { return 0 }
     $a = Parse-Iso $lock.acquired
@@ -339,8 +381,17 @@ switch ($Action) {
         $turn = 1
         $acquired = Now-Iso
         if ($lock -and $reason -eq 'own-lock') {
-            if ($lock.turn) { $turn = [int]$lock.turn + 1 }
-            if ($lock.acquired) { $acquired = $lock.acquired }
+            $carried = Resolve-CarriedAcquired $lock (Get-BootIso)
+            if ($carried) {
+                if ($lock.turn) { $turn = [int]$lock.turn + 1 }
+                $acquired = $carried
+            } else {
+                # The box rebooted under us. Same pane id, new run: start the
+                # uptime clock and the turn count over, and say so in the
+                # ledger, so a postmortem sees the break instead of a number
+                # that quietly spans it.
+                $reason = 'rebooted'
+            }
         }
 
         $startIso = ''
