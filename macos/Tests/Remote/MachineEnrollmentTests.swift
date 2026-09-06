@@ -337,7 +337,7 @@ struct MachineEnrollmentRevocationTests {
     /// the machine is still enrolled. The outcome says so, the credential is
     /// deliberately LEFT in place (it is the retry's own record), and nothing
     /// was suspended.
-    @Test func unreachableRelayReportsTheMachineStillEnrolled() async throws {
+    @Test func anUnreachableRelayReportsTheMachineStillEnrolled() async throws {
         let fx = EnrollmentFixture()
         defer { fx.teardown() }
         try fx.seedCredential()
@@ -346,8 +346,8 @@ struct MachineEnrollmentRevocationTests {
 
         let outcome = await fx.makeSubject().revokeForSignOut(accountEmail: "owner@example.com")
 
-        guard case .unreachable = outcome else {
-            Issue.record("expected .unreachable, got \(outcome)")
+        guard case .notRevoked = outcome else {
+            Issue.record("expected .notRevoked, got \(outcome)")
             return
         }
         #expect(!outcome.isSecured)
@@ -355,9 +355,97 @@ struct MachineEnrollmentRevocationTests {
         #expect(fx.store.suspended == nil)
     }
 
+    /// A revocation whose POST landed but whose RESPONSE was lost must not
+    /// lose the machine: the retry sees a bare 401 with no name to recover,
+    /// so the suspension is recorded BEFORE the POST and the 401 branch leaves
+    /// it alone. Without this the user signs back in and their machine is
+    /// simply gone.
+    @Test func aRevocationWhoseResponseWasLostStillSuspendsTheMachine() async throws {
+        let fx = EnrollmentFixture()
+        defer { fx.teardown() }
+        try fx.seedCredential(token: "device-tok")
+        fx.whoami(email: "owner@example.com", deviceID: "dev-5", name: "lostbox")
+        // The relay processed the de-enroll; the reply never arrived.
+        fx.reply("POST", "/v1/agent/deenroll", .init(
+            status: 0, failure: URLError(.networkConnectionLost)))
+        let subject = fx.makeSubject()
+
+        let first = await subject.revokeForSignOut(accountEmail: "owner@example.com")
+        guard case .notRevoked = first else {
+            Issue.record("expected .notRevoked, got \(first)")
+            return
+        }
+        // The machine's identity was captured before the POST went out.
+        #expect(fx.store.suspended?.machineName == "lostbox")
+
+        // The retry now finds the credential dead — and must NOT discard the
+        // record the first attempt saved.
+        fx.reply("GET", "/v1/agent/whoami", .init(status: 401))
+        let second = await subject.revokeForSignOut(accountEmail: "owner@example.com")
+
+        #expect(second == .alreadyRevoked)
+        #expect(fx.envFile.load()?.credential == nil)
+        #expect(fx.store.suspended?.machineName == "lostbox")
+    }
+
+    /// A `RELAY_BASE` that isn't a usable URL must NOT be treated as "already
+    /// revoked": the agent dials the base it was STARTED with and only ever
+    /// compares this field, so the machine can be perfectly reachable with a
+    /// broken line in the file. The app falls back to its own relay rather than
+    /// deleting the only credential that could revoke the machine.
+    @Test func unusableRelayBaseFallsBackInsteadOfDeletingTheCredential() async throws {
+        let fx = EnrollmentFixture()
+        defer { fx.teardown() }
+        try fx.seedCredential(token: "device-tok", base: "relay.example.com")  // no scheme
+        fx.whoami(email: "owner@example.com", deviceID: "dev-6")
+        fx.reply("POST", "/v1/agent/deenroll", .init(status: 204))
+
+        let outcome = await fx.makeSubject().revokeForSignOut(accountEmail: "owner@example.com")
+
+        #expect(outcome == .revoked(deviceID: "dev-6", machineName: "thisbox"))
+        #expect(fx.count("POST", "/v1/agent/deenroll") == 1)
+        #expect(fx.envFile.load()?.credential == nil)
+    }
+
+    /// relay.env legitimately carries a `wss://` spelling (the agent's own base
+    /// is a ws URL and `relay_creds.baseMatches` strips all four schemes). It
+    /// must reach the relay, not fail every request with `unsupportedURL`
+    /// forever.
+    @Test func websocketSchemeInRelayEnvIsNormalized() async throws {
+        let fx = EnrollmentFixture()
+        defer { fx.teardown() }
+        try fx.seedCredential(token: "device-tok", base: "wss://\(fx.host)")
+        fx.whoami(email: "owner@example.com", deviceID: "dev-8")
+        fx.reply("POST", "/v1/agent/deenroll", .init(status: 204))
+
+        let outcome = await fx.makeSubject().revokeForSignOut(accountEmail: "owner@example.com")
+
+        #expect(outcome == .revoked(deviceID: "dev-8", machineName: "thisbox"))
+        #expect(fx.envFile.load()?.credential == nil)
+    }
+
+    /// A relay that answers but REFUSES is still "not revoked" — the machine is
+    /// reachable — and the detail names the status so the user isn't told a
+    /// permanent 500 is a connectivity blip.
+    @Test func aRefusingRelayIsNotRevokedAndSaysWhy() async throws {
+        let fx = EnrollmentFixture()
+        defer { fx.teardown() }
+        try fx.seedCredential()
+        fx.reply("GET", "/v1/agent/whoami", .init(status: 500))
+
+        let outcome = await fx.makeSubject().revokeForSignOut(accountEmail: "owner@example.com")
+
+        guard case .notRevoked(let detail) = outcome else {
+            Issue.record("expected .notRevoked, got \(outcome)")
+            return
+        }
+        #expect(detail.contains("500"))
+        #expect(fx.envFile.load()?.credential?.deviceToken == "dev-token")
+    }
+
     /// A de-enroll that itself fails (whoami succeeded, the POST didn't) is
     /// equally not silent — the machine is still enrolled.
-    @Test func failedDeenrollIsUnreachableNotSuccess() async throws {
+    @Test func aFailedDeenrollIsNotRevokedNotSuccess() async throws {
         let fx = EnrollmentFixture()
         defer { fx.teardown() }
         try fx.seedCredential()
@@ -366,8 +454,8 @@ struct MachineEnrollmentRevocationTests {
 
         let outcome = await fx.makeSubject().revokeForSignOut(accountEmail: "owner@example.com")
 
-        guard case .unreachable = outcome else {
-            Issue.record("expected .unreachable, got \(outcome)")
+        guard case .notRevoked = outcome else {
+            Issue.record("expected .notRevoked, got \(outcome)")
             return
         }
         #expect(fx.envFile.load()?.credential?.deviceToken == "dev-token")
@@ -499,7 +587,7 @@ struct MachineEnrollmentRestoreTests {
         fx.reply("POST", "/v1/client/devices", .init(
             status: 201, body: #"{"id":"dev-new","name":"thisbox","token":"fresh-tok"}"#))
 
-        await fx.makeSubject().restoreForSignIn(
+        await fx.makeSubject().restoreEnrollment(
             accountEmail: "owner@example.com", sessionToken: "session-tok")
 
         #expect(fx.store.suspended == nil)
@@ -519,7 +607,7 @@ struct MachineEnrollmentRestoreTests {
         fx.store.suspended = SuspendedEnrollment(
             relayBase: fx.relayBase, machineName: "thisbox", ownerEmail: "owner@example.com")
 
-        await fx.makeSubject().restoreForSignIn(
+        await fx.makeSubject().restoreEnrollment(
             accountEmail: "someone@else.com", sessionToken: "session-tok")
 
         #expect(fx.count("POST", "/v1/client/devices") == 0)
@@ -537,7 +625,7 @@ struct MachineEnrollmentRestoreTests {
             relayBase: "https://other-relay.test", machineName: "thisbox",
             ownerEmail: "owner@example.com")
 
-        await fx.makeSubject().restoreForSignIn(
+        await fx.makeSubject().restoreEnrollment(
             accountEmail: "owner@example.com", sessionToken: "session-tok")
 
         #expect(fx.count("POST", "/v1/client/devices") == 0)
@@ -555,7 +643,7 @@ struct MachineEnrollmentRestoreTests {
         fx.store.suspended = SuspendedEnrollment(
             relayBase: fx.relayBase, machineName: "thisbox", ownerEmail: "owner@example.com")
 
-        await fx.makeSubject().restoreForSignIn(
+        await fx.makeSubject().restoreEnrollment(
             accountEmail: "owner@example.com", sessionToken: "session-tok")
 
         #expect(fx.count("POST", "/v1/client/devices") == 0)
@@ -572,28 +660,117 @@ struct MachineEnrollmentRestoreTests {
             relayBase: fx.relayBase, machineName: "thisbox", ownerEmail: "owner@example.com")
         fx.reply("POST", "/v1/client/devices", .init(status: 409))
 
-        await fx.makeSubject().restoreForSignIn(
+        await fx.makeSubject().restoreEnrollment(
             accountEmail: "owner@example.com", sessionToken: "session-tok")
 
         #expect(fx.envFile.load()?.credential == nil)
         #expect(fx.store.suspended != nil)
     }
 
-    /// Signing back in on a machine whose revocation never landed CANCELS it:
-    /// the account that walked away came back to the same machine, and the
-    /// credential it left behind never left this Mac.
-    @Test func signingBackInCancelsAPendingRevocation() async throws {
+    /// Signing back in on a machine whose revocation never landed CANCELS it —
+    /// but only once the credential is CONFIRMED still alive and still ours.
+    /// The account that walked away came back to the same machine.
+    @Test func signingBackInCancelsAPendingRevocationOnceTheCredentialChecksOut() async throws {
         let fx = EnrollmentFixture()
         defer { fx.teardown() }
         try fx.seedCredential(token: "device-tok")
         fx.store.pendingRevocationEmail = "owner@example.com"
+        fx.whoami(email: "owner@example.com")
 
-        await fx.makeSubject().restoreForSignIn(
+        await fx.makeSubject().restoreEnrollment(
             accountEmail: "owner@example.com", sessionToken: "session-tok")
 
         #expect(fx.store.pendingRevocationEmail == nil)
         #expect(fx.envFile.load()?.credential?.deviceToken == "device-tok")
-        #expect(fx.requests.isEmpty)
+        // No re-enroll: the machine never left the account.
+        #expect(fx.count("POST", "/v1/client/devices") == 0)
+    }
+
+    /// ...and when the credential turns out to be DEAD, the deferred
+    /// revocation had in fact landed (its response was merely lost). Cancelling
+    /// on the email alone would strand a dead token in relay.env with the
+    /// machine unenrolled and nothing left to notice. Instead the dead file is
+    /// dropped and the machine is re-enrolled.
+    @Test func signingBackInAfterARevocationThatSecretlyLandedReEnrolls() async throws {
+        let fx = EnrollmentFixture()
+        defer { fx.teardown() }
+        try fx.seedCredential(token: "dead-tok")
+        fx.store.pendingRevocationEmail = "owner@example.com"
+        fx.store.suspended = SuspendedEnrollment(
+            relayBase: fx.relayBase, machineName: "thisbox", ownerEmail: "owner@example.com")
+        fx.reply("GET", "/v1/agent/whoami", .init(status: 401))
+        fx.reply("POST", "/v1/client/devices", .init(
+            status: 201, body: #"{"id":"dev-new","name":"thisbox","token":"fresh-tok"}"#))
+
+        await fx.makeSubject().restoreEnrollment(
+            accountEmail: "owner@example.com", sessionToken: "session-tok")
+
+        #expect(fx.store.pendingRevocationEmail == nil)
+        #expect(fx.store.suspended == nil)
+        #expect(fx.envFile.load()?.credential?.deviceToken == "fresh-tok")
+    }
+
+    /// When the relay can't answer, the pending revocation STAYS armed. Guessing
+    /// "probably still fine" is how a dead credential and an unrevoked machine
+    /// both get silently blessed.
+    @Test func signingBackInKeepsThePendingRevocationWhenTheRelayCannotAnswer() async throws {
+        let fx = EnrollmentFixture()
+        defer { fx.teardown() }
+        try fx.seedCredential(token: "device-tok")
+        fx.store.pendingRevocationEmail = "owner@example.com"
+        fx.reply("GET", "/v1/agent/whoami", .init(
+            status: 0, failure: URLError(.notConnectedToInternet)))
+
+        await fx.makeSubject().restoreEnrollment(
+            accountEmail: "owner@example.com", sessionToken: "session-tok")
+
+        #expect(fx.store.pendingRevocationEmail == "owner@example.com")
+        #expect(fx.envFile.load()?.credential?.deviceToken == "device-tok")
+    }
+
+    /// A re-enroll that failed at sign-in is retried the next time the app
+    /// asks — which `AppDelegate` now does at every launch while signed in,
+    /// because nobody would think to fix a missing machine by signing out and
+    /// back in.
+    @Test func aFailedReEnrollIsRetriedOnTheNextAttempt() async {
+        let fx = EnrollmentFixture()
+        defer { fx.teardown() }
+        fx.store.suspended = SuspendedEnrollment(
+            relayBase: fx.relayBase, machineName: "thisbox", ownerEmail: "owner@example.com")
+        fx.reply("POST", "/v1/client/devices", .init(status: 500))
+        let subject = fx.makeSubject()
+
+        await subject.restoreEnrollment(
+            accountEmail: "owner@example.com", sessionToken: "session-tok")
+        #expect(fx.store.suspended != nil)
+        #expect(fx.envFile.load()?.credential == nil)
+
+        // Next launch: the relay is healthy again.
+        fx.reply("POST", "/v1/client/devices", .init(
+            status: 201, body: #"{"id":"dev-new","name":"thisbox","token":"fresh-tok"}"#))
+        await subject.restoreEnrollment(
+            accountEmail: "owner@example.com", sessionToken: "session-tok")
+
+        #expect(fx.store.suspended == nil)
+        #expect(fx.envFile.load()?.credential?.deviceToken == "fresh-tok")
+    }
+
+    /// A suspension left behind by a revocation that never landed (the user
+    /// cancelled the sign-out) is self-healing: the machine is still enrolled,
+    /// so the stale record is dropped rather than minting a second device.
+    @Test func aStaleSuspensionWithALiveCredentialIsDropped() async throws {
+        let fx = EnrollmentFixture()
+        defer { fx.teardown() }
+        try fx.seedCredential(token: "device-tok")
+        fx.store.suspended = SuspendedEnrollment(
+            relayBase: fx.relayBase, machineName: "thisbox", ownerEmail: "owner@example.com")
+
+        await fx.makeSubject().restoreEnrollment(
+            accountEmail: "owner@example.com", sessionToken: "session-tok")
+
+        #expect(fx.store.suspended == nil)
+        #expect(fx.count("POST", "/v1/client/devices") == 0)
+        #expect(fx.envFile.load()?.credential?.deviceToken == "device-tok")
     }
 
     /// ...but a DIFFERENT account signing in must not take over a host whose
@@ -607,7 +784,7 @@ struct MachineEnrollmentRestoreTests {
         fx.whoami(email: "owner@example.com")
         fx.reply("POST", "/v1/agent/deenroll", .init(status: 204))
 
-        await fx.makeSubject().restoreForSignIn(
+        await fx.makeSubject().restoreEnrollment(
             accountEmail: "someone@else.com", sessionToken: "session-tok")
 
         #expect(fx.count("POST", "/v1/agent/deenroll") == 1)

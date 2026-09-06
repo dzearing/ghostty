@@ -42,7 +42,7 @@ final class RelayAccount: ObservableObject {
         case keychain(OSStatus)
         /// Sign-out could not revoke THIS machine's relay enrollment, so the
         /// machine is still reachable by every other client on the account.
-        /// The account is deliberately left signed IN — see `signOut(force:)`.
+        /// The account is deliberately left signed IN — see `signOut(_:)`.
         case machineRevocationFailed(String)
 
         var errorDescription: String? {
@@ -59,6 +59,14 @@ final class RelayAccount: ObservableObject {
                 return "This machine couldn't be removed from your account: \(detail)"
             }
         }
+    }
+
+    /// Whether `signOut` should attempt this machine's revocation, or skip
+    /// straight to queueing it because the caller already saw it fail and the
+    /// user chose to sign out regardless.
+    enum SignOutMode {
+        case revokingMachine
+        case deferringMachineRevocation
     }
 
     /// The signed-in account's email, or nil when signed out. Drives the
@@ -230,7 +238,7 @@ final class RelayAccount: ObservableObject {
         // fresh credential and a running agent adopts it within one watcher
         // tick. A different account signing in never inherits it — see
         // `MachineEnrollmentRevoking`.
-        await enrollment.restoreForSignIn(
+        await enrollment.restoreEnrollment(
             accountEmail: session.email, sessionToken: session.sessionToken)
         // Recover the remote windows suspended at sign-out: replay their
         // preserved manifest entries through the launch-restore path. Only the
@@ -262,35 +270,48 @@ final class RelayAccount: ObservableObject {
     ///    `RemoteSessionManifest` entry so `signIn()` can restore them.
     ///
     /// **Throws `AccountError.machineRevocationFailed` and stays SIGNED IN**
-    /// when step 1 could not reach the relay: the machine is still reachable,
-    /// so reporting "signed out" would be a lie. The caller offers a retry, and
-    /// `force: true` signs out anyway — arming a pending revocation that is
-    /// retried at every launch and on every network-came-back transition until
-    /// the relay confirms it. Nothing about a failed step 1 is silent.
+    /// when step 1 did not revoke the machine: it is still reachable, so
+    /// reporting "signed out" would be a lie. The caller offers a retry, and
+    /// `.deferringMachineRevocation` signs out anyway — arming a pending
+    /// revocation that is retried at every launch and on every
+    /// network-came-back transition until the relay confirms it. Nothing about
+    /// a failed step 1 is silent.
     ///
     /// Steps 2–5 are unconditional once step 1 is settled. `/oauth/signout` is
-    /// awaited but not fatal: the session token is destroyed locally and the
-    /// relay-side row expires on its own, which is a far smaller exposure than
-    /// a live machine — and failing sign-out for it would strand an offline
-    /// user on a Mac that has no enrollment to revoke in the first place.
+    /// deliberately fire-and-forget: its failure is ignored either way (the
+    /// session token is destroyed locally and the relay-side row expires on its
+    /// own), so awaiting it would only make a signed-out-while-offline user
+    /// stare at a disabled button for the request timeout, buying nothing.
     @discardableResult
-    func signOut(force: Bool = false) async throws -> MachineEnrollmentRevocation {
+    func signOut(_ mode: SignOutMode = .revokingMachine) async throws
+        -> MachineEnrollmentRevocation
+    {
         await waitForInitialLoad()
 
         // 1. The machine, first and blocking.
         var revocation: MachineEnrollmentRevocation = .nothingEnrolled
         if let email {
-            revocation = await enrollment.revokeForSignOut(accountEmail: email)
-            if case .unreachable(let detail) = revocation {
-                guard force else { throw AccountError.machineRevocationFailed(detail) }
+            switch mode {
+            case .revokingMachine:
+                revocation = await enrollment.revokeForSignOut(accountEmail: email)
+                if case .notRevoked(let detail) = revocation {
+                    throw AccountError.machineRevocationFailed(detail)
+                }
+            case .deferringMachineRevocation:
+                // The caller already watched the revocation fail and the user
+                // chose to proceed. Attempting it a second time would make
+                // them wait out the same timeouts again — and a retry that
+                // happened to succeed on a half-landed revocation is what the
+                // pending queue is for anyway.
                 enrollment.armPendingRevocation(accountEmail: email)
+                revocation = .notRevoked(detail: "deferred by the user")
             }
         }
 
         // 2. The session.
         if let token = cachedSession?.sessionToken {
             let client = GoogleOAuth.RelaySessionClient(endpoints: endpoints)
-            await client.signOut(sessionToken: token)
+            Task { await client.signOut(sessionToken: token) }
         }
         keychain.delete()
         cachedSession = nil

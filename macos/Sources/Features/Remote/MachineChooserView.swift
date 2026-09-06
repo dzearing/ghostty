@@ -1304,7 +1304,19 @@ struct MachineChooserView: View {
             }
             .font(.caption)
         } else if RelayAccount.isConfigured {
-            Button("Sign In with Google") { startSignIn() }
+            VStack(alignment: .trailing, spacing: 4) {
+                Button("Sign In with Google") { startSignIn() }
+                // A sign-out the user was warned about but chose anyway leaves
+                // this machine enrolled until the queued revocation lands.
+                // Saying so beats letting them assume it completed.
+                if let owner = LocalMachineEnrollment.shared.outstandingRevocationAccount {
+                    Text("This machine is still connected to \(owner) — still removing it.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.trailing)
+                        .frame(maxWidth: 280, alignment: .trailing)
+                }
+            }
         } else {
             Text("Google client not configured — see docs/design/relay-oidc-setup.md")
                 .font(.caption)
@@ -1372,7 +1384,7 @@ struct MachineChooserView: View {
     }
 
     /// Sign out, which FIRST revokes this machine's own relay enrollment (see
-    /// `RelayAccount.signOut(force:)`). When that revocation can't reach the
+    /// `RelayAccount.signOut(_:)`). When that revocation doesn't land the
     /// relay the account stays signed IN and the user gets the choice, because
     /// the alternative — reporting "signed out" while every other client on the
     /// account can still reach and watch this machine — is the bug this whole
@@ -1390,7 +1402,9 @@ struct MachineChooserView: View {
                 }
                 guard confirmSignOutWithoutRevoking(error) else { return }
                 do {
-                    try await account.signOut(force: true)
+                    // Skips the revocation attempt: the user just waited out
+                    // its failure and said go ahead. It is queued instead.
+                    try await account.signOut(.deferringMachineRevocation)
                 } catch {
                     showError(title: "Sign out failed", error: error)
                 }

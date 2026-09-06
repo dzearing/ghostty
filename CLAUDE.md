@@ -374,14 +374,30 @@ launch and on every network-came-back transition until the relay confirms it.
 The retry authenticates as the DEVICE, so it needs no account session.
 
 **Sign-out suspends rather than discards.** The machine's name and relay are
-remembered (no secret — the credential is dead), and signing back in with the
-**same** account re-enrolls the machine (`POST /v1/client/devices`) and writes
-the fresh credential to `relay.env`, which a running agent adopts within one
-watcher tick and reconnects with (`relay_creds.zig`). A different account
-signing in never inherits it, and restore is refused across relays (a session
-on relay A can't mint a device on relay B). This mirrors what sign-out/sign-in
-already do to the account's remote *windows*, and is what makes signing out
-safe rather than a one-way door.
+remembered — recorded **before** the de-enroll POST, because the relay is about
+to delete the only record of that name and a lost response would otherwise lose
+the machine for good — and signing back in with the **same** account re-enrolls
+it (`POST /v1/client/devices`) and writes the fresh credential to `relay.env`,
+which a running agent adopts within one watcher tick and reconnects with
+(`relay_creds.zig`). A different account signing in never inherits it, and
+restore is refused across relays (a session on relay A can't mint a device on
+relay B). This mirrors what sign-out/sign-in already do to the account's remote
+*windows*, and is what makes signing out safe rather than a one-way door. The
+restore is retried at **every launch while signed in**, not just at sign-in: a
+re-enroll can fail transiently (relay 5xx, device quota), and nobody would think
+to fix a missing machine by signing out and back in.
+
+**The two failure paths that look alike are kept apart.** A revocation whose
+POST landed but whose response was lost is indistinguishable from one that
+failed, so neither side guesses: the retry treats a later 401 as "already
+revoked" *without* discarding the suspension the first attempt recorded, and a
+sign-in that would cancel a pending revocation first re-checks the credential —
+cancelling only when it is confirmed alive, dropping it and re-enrolling when it
+is confirmed dead, and staying armed when the relay can't say. An unparseable
+`RELAY_BASE` is likewise not treated as "already revoked": the agent dials the
+base it was *started* with and only ever compares that field, so the machine can
+be perfectly reachable with a broken line in the file — the app falls back to its
+own relay rather than deleting the one credential that could revoke it.
 
 Client: `macos/Sources/Features/Remote/MachineEnrollment.swift`. Tests:
 `MachineEnrollmentTests`, `RelayAccountSignOutTests`, and

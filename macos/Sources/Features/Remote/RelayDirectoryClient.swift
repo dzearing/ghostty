@@ -103,7 +103,7 @@ struct RelayDirectoryClient {
     /// The relay returns the raw device token EXACTLY ONCE (it stores only the
     /// hash), so the caller must persist it or lose it. Used to restore this
     /// machine's own enrollment after a sign-out revoked it
-    /// (`LocalMachineEnrollment.restoreForSignIn`).
+    /// (`LocalMachineEnrollment.restoreEnrollment`).
     func enroll(name: String) async throws -> Enrolled {
         let body = try JSONEncoder().encode(["name": name])
         let data = try await perform(request("POST", path: "v1/client/devices", body: body))

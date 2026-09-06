@@ -54,7 +54,7 @@ final class SpyMachineEnrollment: MachineEnrollmentRevoking {
         retryCount += 1
     }
 
-    func restoreForSignIn(accountEmail: String, sessionToken: String) async {
+    func restoreEnrollment(accountEmail: String, sessionToken: String) async {
         restoredFor.append((accountEmail, sessionToken))
     }
 }
@@ -109,7 +109,7 @@ struct RelayAccountSignOutTests {
     /// account can still reach this machine is precisely the lie being fixed.
     @Test func signOutRefusesWhenTheMachineCannotBeRevoked() async {
         let spy = SpyMachineEnrollment()
-        spy.outcome = .unreachable(detail: "offline")
+        spy.outcome = .notRevoked(detail: "offline")
         let storage = FakeAccountStorage(signedInSession)
         let account = makeAccount(spy, storage: storage)
         await account.waitForInitialLoad()
@@ -128,20 +128,25 @@ struct RelayAccountSignOutTests {
     /// Signing out anyway is allowed, but it is never silent: the revocation is
     /// armed so it is retried at every launch and network-came-back until the
     /// relay confirms it.
-    @Test func forcedSignOutArmsAPendingRevocation() async throws {
+    ///
+    /// It also does NOT attempt the revocation a second time. The user just
+    /// waited out its failure and said go ahead; repeating it makes them wait
+    /// out the same timeouts again.
+    @Test func deferredSignOutArmsAPendingRevocationWithoutRetryingInline() async throws {
         let spy = SpyMachineEnrollment()
-        spy.outcome = .unreachable(detail: "offline")
+        spy.outcome = .notRevoked(detail: "offline")
         let storage = FakeAccountStorage(signedInSession)
         let account = makeAccount(spy, storage: storage)
         await account.waitForInitialLoad()
 
-        let outcome = try await account.signOut(force: true)
+        let outcome = try await account.signOut(.deferringMachineRevocation)
 
-        guard case .unreachable = outcome else {
-            Issue.record("expected .unreachable, got \(outcome)")
+        guard case .notRevoked = outcome else {
+            Issue.record("expected .notRevoked, got \(outcome)")
             return
         }
         #expect(spy.armedFor == ["owner@example.com"])
+        #expect(spy.revokedFor.isEmpty)
         #expect(!account.isSignedIn)
         #expect(storage.deleteCount == 1)
     }
