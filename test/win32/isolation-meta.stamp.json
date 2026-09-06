@@ -1,10 +1,10 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-09-05T23:07:30-07:00",
-    "commit":  "ecc65036c",
+    "generated":  "2026-09-06T00:11:07-07:00",
+    "commit":  "81b05a13b",
     "uncommitted":  [
-                        "test/win32/menu-f10-binding.ps1"
+                        "test/win32/key-state-pill.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "944e54bda392aa61007ee23280c6bb9767ed2e661f77f5157ca035dbe9b6e4ea",
@@ -153,7 +153,7 @@
                   "test/win32/job-escape-startup.ps1":  "7606d07132d3ff0958a650b0b16ba231e40f738dc8b4c25fefecce22432a4d85",
                   "test/win32/kb-actions.ps1":  "a589bfdeeec3f9f956c9770d4b11854eca51cde7f4ba5da225983686ac956786",
                   "test/win32/keybinds-t01.ps1":  "ac1e277c3a4f77d58bb8dc615487d11438843d5143f1f75cfb079f883755176a",
-                  "test/win32/key-state-pill.ps1":  "4e35a671e910c2db77160bee21414e5c5f6ff5bac230069054972cb1de5b928d",
+                  "test/win32/key-state-pill.ps1":  "a056a02beff362ab460424d9002aeef76cf852bd0fb5da162b92110ee5d764dd",
                   "test/win32/launch-preflight-audit.ps1":  "474a31cc4abb0fc92c75e577bb81e1b5a6e9ff9e6548f2438d6b0fd5eead2178",
                   "test/win32/layout-blob-cross-lineage.ps1":  "87f15d32d375a5262334a59d3e8a0f7f37f8d8647c2000686f532c7df1417324",
                   "test/win32/layout-blobs.ps1":  "d91f5b4afad56f13d8fba4d6f00abf44539b9a5e93afadd26acaec53c5413b75",

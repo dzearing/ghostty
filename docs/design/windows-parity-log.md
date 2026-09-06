@@ -23161,3 +23161,66 @@ advisories. One thing the vendor-drift check caught: the win32 asset copies of
 the ghoztty SKILL.md are a pristine mirror of tip-of-main and must not be edited
 here, so the new field is documented in `macos/Resources`' copy and in
 `docs/claude/cli.md`, and the mirror re-vendors when main moves.
+
+## 2026-09-06 - The key-table card explains what a key table is, when you hover it (T576)
+
+When a key table is active, the pane wears a small card naming it. On a Mac you
+can click that card and read a sentence explaining what a key table actually IS,
+which matters because the likeliest way to end up in one is by ACCIDENT and the
+name alone ("resize", "vim") does not tell you what has happened to your
+keyboard. On Windows there was nothing to click. Now resting the pointer on the
+card shows the explanation - Mac's heading and Mac's sentence, word for word -
+in the control the Windows shell already uses to answer "what is this thing", a
+native tooltip with a bold title. A click shows it immediately, which is the
+gesture Mac uses; hover is the one that reaches the accidental case, because
+somebody who did not mean to be in a key table has no reason to suspect the card
+is clickable.
+
+The obstacle was never the popover, it was the trigger. The pill is
+click-through on purpose: it floats over live terminal content at the bottom of
+the pane, which is where a selection drag ends, so it must not eat mouse input.
+`WS_EX_TRANSPARENT` buys that, and it is all or nothing - it would have made the
+card unhoverable too. So the pill drops the style and answers `WM_NCHITTEST`
+per point instead: `HTTRANSPARENT` everywhere `key_state_pill.hitsCard` says no,
+which is the whole shadow allowance around the card. The card takes the pointer;
+the decoration around it still falls through to the terminal.
+
+Three things here were measured rather than assumed, and each was wrong on the
+first cut. `TTF_SUBCLASS` - letting comctl32 watch the tool window's own mouse
+messages, which is how the viewer nav bar does it - never showed anything: a
+pointer that arrives on the card and rests, which is what a hover IS, produces
+exactly ONE `WM_MOUSEMOVE`, and the control's relay wants more. It is track mode
+now, this file owning the hover timer, the tab strip's arrangement. Then the
+placement: the pill hugs the pane's bottom edge, so the default position hangs
+the bubble off the pane, and track mode places by the top-left corner, so the
+height is needed first - `TTM_GETBUBBLESIZE` reported 81x27 for a bubble that
+drew 332x69, so it is shown, measured with `GetWindowRect`, then placed centered
+above the card. And `TTM_TRACKACTIVATE FALSE` did NOT take the bubble off the
+screen when its tool window is a layered popup hiding in the same breath - the
+explanation stayed floating over the terminal after the key table ended, which
+is exactly the stray-box failure this path exists to avoid, so both the
+control's state and the window's are set on the way out.
+
+Validation: `key-state-pill.ps1` ALL PASS (76, up from 63). Its new section G2
+asks the window the same `WM_NCHITTEST` question Windows asks before it delivers
+a click, at the exact boundary pixel on each of the card's four edges, computed
+from the window's real DPI; then it clicks the card and asserts the bubble
+reaches the screen, centered on the card, above it, wider than the pill, and
+that deactivating the table takes it away again. Section D's old assertion is
+INVERTED rather than deleted - re-adding `WS_EX_TRANSPARENT` would silently take
+the explainer away, so it stays a test. The hover path itself needs a pointer
+the background test desktop does not have (T233), so it was verified by hand on
+the interactive desktop: bubble visible, 332x69, centered just above the card.
+`hitsCard` and the explainer text are asserted at 1.0/1.25/1.5/2.0 in the none
+lane. That script also got the `guard-due` row and stamp it never had, covering
+`KeyStateIndicator.zig`, `key_state_pill.zig`, `key_state.zig` and itself -
+before this, an edit to the pill was tied to nothing. Floor: `floor-lane.ps1`
+lib/none/win32/agent ALL LANES PASS; P1/P2/P3 ALL PASS (25/20/16); every guard
+that went due was re-run green and `guard-due.ps1 check` is clean but for the
+three standing advisories.
+
+Filed T1387 out of it: both routes to the explanation are mouse gestures, and
+the person it was written for has their hands on the keyboard. Mac has the same
+limitation, so it is a gap in the feature rather than a parity gap - and the
+same card is invisible to a screen reader, which is the T446 defect over again
+for a user who cannot see it.

@@ -2013,12 +2013,22 @@ pub const TTF_SUBCLASS: u32 = 0x0001;
 pub const TTF_TRACK: u32 = 0x0020;
 pub const TTF_ABSOLUTE: u32 = 0x0080;
 
+/// Enable/disable a whole tooltip control. The key-state pill's explainer
+/// (T576) switches it off with the pill, so a tip that was up when the key
+/// table went away cannot outlive the card it points at.
+pub const TTM_ACTIVATE: u32 = WM_USER + 1;
 pub const TTM_TRACKACTIVATE: u32 = WM_USER + 17;
 pub const TTM_TRACKPOSITION: u32 = WM_USER + 18;
 /// Without a max width a tooltip renders on ONE line and `\n` in its text is
 /// ignored — setting it is what turns newlines into line breaks (the T556
 /// two-line title+cwd tip).
 pub const TTM_SETMAXTIPWIDTH: u32 = WM_USER + 24;
+/// A bold heading line above the tip text, optionally with a standard icon.
+/// The Windows shell's own "what is this" tooltips carry one, and it is what
+/// carries Mac's popover TITLE across (T576).
+pub const TTM_SETTITLEW: u32 = WM_USER + 33;
+/// No icon beside the title — the pill already shows the keyboard glyph.
+pub const TTI_NONE: usize = 0;
 pub const TTM_ADDTOOLW: u32 = WM_USER + 50;
 pub const TTM_DELTOOLW: u32 = WM_USER + 51;
 pub const TTM_NEWTOOLRECTW: u32 = WM_USER + 52;

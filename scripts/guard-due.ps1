@@ -1826,6 +1826,22 @@ $GuardTable = @(
             'test\win32\readonly-badge.ps1'
         )
     },
+    # The key-state pill (T446) and its explainer (T576). `key-state-pill.ps1`
+    # is the only thing that drives a real key table on a live GUI and reads
+    # the pill's anchor, its content deltas, its per-point click-through and
+    # the explainer bubble back - and until T576 nothing tied an edit to any of
+    # that code to the harness that already covered it.
+    [pscustomobject]@{
+        Name   = 'key-state-pill'
+        Script = 'test\win32\key-state-pill.ps1'
+        Stamp  = 'test\win32\key-state-pill.stamp.json'
+        Covers = @(
+            'src\apprt\win32\KeyStateIndicator.zig',
+            'src\apprt\win32\key_state_pill.zig',
+            'src\apprt\win32\key_state.zig',
+            'test\win32\key-state-pill.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'pane-banner'
         Script = 'test\win32\pane-banner.ps1'

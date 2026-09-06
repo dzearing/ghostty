@@ -1,0 +1,17 @@
+{
+    "guard":  "key-state-pill",
+    "script":  "test/win32/key-state-pill.ps1",
+    "generated":  "2026-09-06T00:10:00-07:00",
+    "commit":  "81b05a13b",
+    "uncommitted":  [
+                        "src/apprt/win32/key_state_pill.zig",
+                        "src/apprt/win32/KeyStateIndicator.zig",
+                        "test/win32/key-state-pill.ps1"
+                    ],
+    "files":  {
+                  "src/apprt/win32/key_state.zig":  "3424ddd3b0ead545111fed3f0360e70f030d27d7910a323253313a4193cd2921",
+                  "src/apprt/win32/key_state_pill.zig":  "4f0a8df09557b1d0a08f23570654a66ad22a48d406288bc2f66be9959cf4bd50",
+                  "src/apprt/win32/KeyStateIndicator.zig":  "4d807700a3bb74521d05a3f6342cb89a168367f0d5063b6f47a8cb70f764886a",
+                  "test/win32/key-state-pill.ps1":  "a056a02beff362ab460424d9002aeef76cf852bd0fb5da162b92110ee5d764dd"
+              }
+}

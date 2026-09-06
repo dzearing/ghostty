@@ -13,10 +13,26 @@
 //! owned by its surface HWND, which is what puts it above the pane's OpenGL
 //! content, and it takes the read-only badge's `UpdateLayeredWindow`
 //! per-pixel-alpha path because it floats over live terminal content rather
-//! than over a reserved band whose backdrop it knows. Unlike the badge it IS
-//! `WS_EX_TRANSPARENT`: the pill is pure information with nothing to click,
-//! and a chip sitting over the middle-bottom of the terminal must never eat a
-//! selection drag.
+//! than over a reserved band whose backdrop it knows.
+//!
+//! **Click-through everywhere except the card** (T576). The window is the card
+//! plus a shadow allowance, and it sits over the middle-bottom of the terminal
+//! where a selection drag ends, so it must not eat mouse input — but the card
+//! itself has something to say, so it takes the pointer and answers a hover
+//! with the explainer tooltip. That is `WM_NCHITTEST` returning `HTTRANSPARENT`
+//! outside `pill.hitsCard`, rather than the `WS_EX_TRANSPARENT` the whole
+//! window used to carry: the ex-style is all or nothing and would have made the
+//! card unhoverable too.
+//!
+//! **The explainer** is Mac's popover, translated. Mac hangs a popover with a
+//! "Key Table" heading and one sentence off the indicator, opened by clicking
+//! it; Windows says the same two things through the hover tooltip its own shell
+//! uses for "what is this thing", title and all (comctl32 in TRACK mode: the
+//! system draws and themes it, this file decides when and where). It matters
+//! because the likeliest way into a key table is by ACCIDENT, and someone who
+//! did not mean to be there does not know the card is explainable — a hover
+//! finds that out, a click has to be guessed at. The words are
+//! `key_state_pill.EXPLAINER_TITLE` / `EXPLAINER_BODY`, verbatim from Mac.
 //!
 //! The waiting dots animate off a `WM_TIMER`, alive only while a sequence is
 //! actually pending — which is a fraction of a second at a time. A static mark
@@ -66,6 +82,11 @@ const ui_face = std.unicode.utf8ToUtf16LeStringLiteral("Segoe UI");
 /// to press the second key of a chord.
 const TIMER_ID: usize = 1;
 const TIMER_MS: u32 = 100;
+
+/// The explainer's show delay timer (T576). The system's own double-click time
+/// is what every native tooltip waits, and reading it rather than hard-coding
+/// one means a user who has slowed their pointer down gets the slower tip too.
+const TIP_TIMER_ID: usize = 2;
 const PERIOD_FRAMES: u32 = 12;
 
 /// One measured, UTF-16 label. Capacity matches the model's byte cap: UTF-8
@@ -124,6 +145,23 @@ pub const KeyStateIndicator = struct {
     bgr: []u32 = &.{},
     mask: []u8 = &.{},
 
+    /// The explainer tooltip (T576), created on the first pill that shows and
+    /// kept for the pane's life. `tip_rect` is the card rect the control was
+    /// last told about, so a re-layout that does not move the card sends no
+    /// message at all.
+    tip: ?w32.HWND = null,
+    tip_added: bool = false,
+    /// Whether the tip is on screen, and whether a `WM_MOUSELEAVE` request is
+    /// armed to take it back off again.
+    tip_shown: bool = false,
+    tip_tracking: bool = false,
+    tip_rect: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+    tip_dark: bool = false,
+    /// UTF-16 tip body. The control keeps the pointer, not a copy, so this
+    /// lives as long as the indicator does.
+    tip_text: [pill.EXPLAINER_BODY.len + 1]u16 = undefined,
+    tip_title: [pill.EXPLAINER_TITLE.len + 1]u16 = undefined,
+
     pub fn create(
         alloc: std.mem.Allocator,
         owner: w32.HWND,
@@ -141,11 +179,13 @@ pub const KeyStateIndicator = struct {
         };
 
         // WS_EX_LAYERED — DWM-composited above OpenGL content, per-pixel alpha.
-        // WS_EX_TRANSPARENT — click-through; the pill has nothing to click and
-        //   sits where a selection drag ends.
         // WS_EX_NOACTIVATE / WS_EX_TOOLWINDOW — never takes activation, never
         //   appears in the taskbar or Alt-Tab.
-        const ex_style: u32 = w32.WS_EX_LAYERED | w32.WS_EX_TRANSPARENT |
+        // Deliberately NOT WS_EX_TRANSPARENT (T576): click-through is decided
+        //   per-point in WM_NCHITTEST instead, so the shadow allowance falls
+        //   through to the terminal while the card can be hovered for its
+        //   explainer.
+        const ex_style: u32 = w32.WS_EX_LAYERED |
             w32.WS_EX_NOACTIVATE | w32.WS_EX_TOOLWINDOW;
 
         const hwnd = w32.CreateWindowExW(
@@ -170,6 +210,7 @@ pub const KeyStateIndicator = struct {
 
     pub fn destroy(self: *KeyStateIndicator) void {
         self.stopAnimation();
+        if (self.tip) |t| _ = w32.DestroyWindow(t);
         _ = w32.SetWindowLongPtrW(self.hwnd, w32.GWLP_USERDATA, 0);
         _ = w32.DestroyWindow(self.hwnd);
         if (self.font) |f| _ = w32.DeleteObject(f);
@@ -267,6 +308,9 @@ pub const KeyStateIndicator = struct {
 
         if (moved or bg_changed or relaid) self.repaint();
 
+        // The explainer's hit box is the card, so it follows every re-layout.
+        self.syncTip(bg_changed);
+
         // A pending sequence is what the dots are FOR; a bare key table is a
         // steady state with nothing to animate.
         if (model.visibleKeys() > 0) self.startAnimation() else self.stopAnimation();
@@ -281,9 +325,223 @@ pub const KeyStateIndicator = struct {
 
     pub fn hide(self: *KeyStateIndicator) void {
         self.stopAnimation();
+        // Before the ShowWindow, and outside the early return: a tip that is
+        // up when the key table ends must go with the card, and `hide` is
+        // called on every empty model whether or not the pill was showing.
+        self.tipHide();
         if (!self.visible) return;
         _ = w32.ShowWindow(self.hwnd, w32.SW_HIDE);
         self.visible = false;
+    }
+
+    // --- The explainer tooltip (T576) --------------------------------------
+    //
+    // A comctl32 tooltip in TRACK mode (`TTF_TRACK | TTF_ABSOLUTE`), the tab
+    // strip's arrangement (`Window.tabTip*`): the SYSTEM draws and themes the
+    // bubble, this file decides when it appears and where. Subclass mode —
+    // where comctl32 watches the tool window's own mouse messages — is the
+    // shorter code and does not work here: a pill that sees ONE WM_MOUSEMOVE
+    // and then a resting pointer (which is exactly what a hover IS) never
+    // trips the control's internal relay, and nothing ever shows. Measured,
+    // not assumed: the first cut of this was subclass mode, and the hover
+    // check found it silent.
+    //
+    // The placement is the other reason to own the timing: the pill hugs the
+    // pane's BOTTOM edge, so a bubble left where the control would put it
+    // hangs off the pane. It goes centered ABOVE the card instead, which is
+    // also where a popover anchored to the same control sits on the Mac.
+
+    /// Tool id. One tool on this control, for the card.
+    const TIP_ID: usize = 1;
+
+    /// Max tip width in DIP before comctl32 wraps the sentence. Wide enough to
+    /// read as prose, narrow enough not to stripe across a monitor.
+    const TIP_WIDTH_DIP: f32 = 280.0;
+
+    /// Gap between the card and the bubble above it, in DIP — the design
+    /// system's 4 DIP clearance, the same one the tab tooltip takes off the
+    /// strip.
+    const TIP_GAP_DIP: f32 = 4.0;
+
+    fn tipToolInfo(self: *KeyStateIndicator) w32.TOOLINFOW {
+        return .{
+            .cbSize = @sizeOf(w32.TOOLINFOW),
+            .uFlags = w32.TTF_TRACK | w32.TTF_ABSOLUTE,
+            .hwnd = self.hwnd,
+            .uId = TIP_ID,
+            .rect = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
+            .hinst = null,
+            .lpszText = @ptrCast(&self.tip_text),
+            .lParam = 0,
+            .lpReserved = null,
+        };
+    }
+
+    /// Create the control on first use, themed for the pane it floats over —
+    /// the same background the card's own fill is washed from, so the tip and
+    /// the thing it explains are never one light and one dark.
+    fn tipEnsure(self: *KeyStateIndicator, dark: bool) ?w32.HWND {
+        if (self.tip) |t| {
+            // A pane background that crossed the light/dark line takes the
+            // control with it: the theme is applied at creation, so the only
+            // way to re-theme is to build a new one (the tab tooltip's T557
+            // reasoning, same fix).
+            if (dark == self.tip_dark) return t;
+            self.tipHide();
+            self.tip = null;
+            self.tip_added = false;
+            _ = w32.DestroyWindow(t);
+        }
+
+        var icc = w32.INITCOMMONCONTROLSEX{
+            .dwSize = @sizeOf(w32.INITCOMMONCONTROLSEX),
+            .dwICC = w32.ICC_TAB_CLASSES,
+        };
+        _ = w32.InitCommonControlsEx(&icc);
+
+        const tip = w32.CreateWindowExW(
+            w32.WS_EX_TOPMOST | w32.WS_EX_TOOLWINDOW | w32.WS_EX_NOACTIVATE,
+            w32.TOOLTIPS_CLASS,
+            std.unicode.utf8ToUtf16LeStringLiteral(""),
+            w32.WS_POPUP | w32.TTS_ALWAYSTIP | w32.TTS_NOPREFIX,
+            w32.CW_USEDEFAULT,
+            w32.CW_USEDEFAULT,
+            w32.CW_USEDEFAULT,
+            w32.CW_USEDEFAULT,
+            self.hwnd,
+            null,
+            null,
+            null,
+        ) orelse return null;
+
+        if (dark) {
+            _ = w32.SetWindowTheme(
+                tip,
+                std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"),
+                null,
+            );
+        }
+
+        const body = std.unicode.utf8ToUtf16Le(
+            self.tip_text[0 .. self.tip_text.len - 1],
+            pill.EXPLAINER_BODY,
+        ) catch 0;
+        self.tip_text[body] = 0;
+        const title = std.unicode.utf8ToUtf16Le(
+            self.tip_title[0 .. self.tip_title.len - 1],
+            pill.EXPLAINER_TITLE,
+        ) catch 0;
+        self.tip_title[title] = 0;
+        _ = w32.SendMessageW(
+            tip,
+            w32.TTM_SETTITLEW,
+            w32.TTI_NONE,
+            @bitCast(@intFromPtr(&self.tip_title)),
+        );
+        // Without a max width the control lays the whole sentence out on ONE
+        // line; with one it wraps, which is what makes it a paragraph.
+        const wrap: isize = @intFromFloat(@round(TIP_WIDTH_DIP * @max(self.scale, 0.1)));
+        _ = w32.SendMessageW(tip, w32.TTM_SETMAXTIPWIDTH, 0, wrap);
+
+        self.tip = tip;
+        self.tip_dark = dark;
+        return tip;
+    }
+
+    /// Register the tool, so the explainer is ready the moment the pill shows.
+    /// `theme_changed` forces the light/dark re-check.
+    fn syncTip(self: *KeyStateIndicator, theme_changed: bool) void {
+        const dark = !color_math.isLight(self.pane_bg orelse return);
+        if (!theme_changed and self.tip_added) return;
+
+        const tip = self.tipEnsure(dark) orelse return;
+        if (self.tip_added) return;
+        var ti = self.tipToolInfo();
+        if (w32.SendMessageW(tip, w32.TTM_ADDTOOLW, 0, @bitCast(@intFromPtr(&ti))) == 0) return;
+        self.tip_added = true;
+        const card = toRect(self.layout.card);
+        log.debug(
+            "key state explainer armed rect={d},{d},{d},{d} title=\"{s}\"",
+            .{ card.left, card.top, card.right, card.bottom, pill.EXPLAINER_TITLE },
+        );
+    }
+
+    /// The pointer is over the card: arm the show delay, once. It is re-armed
+    /// only after a leave, so resting on the card does not restart the wait —
+    /// which is the bug that killed the subclass version.
+    fn tipHover(self: *KeyStateIndicator) void {
+        if (self.tip_tracking) return;
+        var tme = w32.TRACKMOUSEEVENT{
+            .cbSize = @sizeOf(w32.TRACKMOUSEEVENT),
+            .dwFlags = w32.TME_LEAVE,
+            .hwndTrack = self.hwnd,
+            .dwHoverTime = 0,
+        };
+        if (w32.TrackMouseEvent(&tme) != 0) self.tip_tracking = true;
+        if (!self.tip_shown)
+            _ = w32.SetTimer(self.hwnd, TIP_TIMER_ID, w32.GetDoubleClickTime(), null);
+    }
+
+    /// The delay elapsed with the pointer still on the card: show the bubble,
+    /// centered above the card.
+    ///
+    /// Shown first and placed second, on purpose. Track mode positions a
+    /// bubble by its TOP-LEFT corner, so putting one above something needs its
+    /// height — and `TTM_GETBUBBLESIZE` answers for a bubble that has not been
+    /// laid out with this control's title and wrap width yet (measured: it
+    /// reported 81x27 for a bubble that drew 332x69). The control's own window
+    /// rect, once it is up, is the size that is actually on screen.
+    fn tipShow(self: *KeyStateIndicator) void {
+        _ = w32.KillTimer(self.hwnd, TIP_TIMER_ID);
+        if (!self.visible or self.layout.hidden or self.tip_shown) return;
+        if (!self.tip_added) return;
+        const tip = self.tip orelse return;
+
+        // The card in SCREEN coordinates. `placed` is the pill window's own
+        // screen rect, so this needs no round trip through the window.
+        const card = toRect(self.layout.card);
+        const cl = self.placed.left + card.left;
+        const cr = self.placed.left + card.right;
+        const ct = self.placed.top + card.top;
+        const gap: i32 = @intFromFloat(@round(TIP_GAP_DIP * @max(self.scale, 0.1)));
+
+        var ti = self.tipToolInfo();
+        trackPosition(tip, cl, ct - gap);
+        _ = w32.SendMessageW(tip, w32.TTM_TRACKACTIVATE, 1, @bitCast(@intFromPtr(&ti)));
+        self.tip_shown = true;
+
+        var r: w32.RECT = undefined;
+        if (w32.GetWindowRect(tip, &r) != 0) {
+            const bw = r.right - r.left;
+            const bh = r.bottom - r.top;
+            trackPosition(tip, @divTrunc(cl + cr - bw, 2), ct - gap - bh);
+            log.debug(
+                "key state explainer shown card={d},{d} size={d}x{d}",
+                .{ cl, ct, bw, bh },
+            );
+        }
+    }
+
+    /// Take the explainer off the screen and cancel any pending show. Safe
+    /// from any state — "no tip and none scheduled" is the postcondition — and
+    /// it is called on every hide, so a tip can never outlive the card it
+    /// points at.
+    fn tipHide(self: *KeyStateIndicator) void {
+        _ = w32.KillTimer(self.hwnd, TIP_TIMER_ID);
+        self.tip_tracking = false;
+        if (!self.tip_shown) return;
+        self.tip_shown = false;
+        const tip = self.tip orelse return;
+        var ti = self.tipToolInfo();
+        _ = w32.SendMessageW(tip, w32.TTM_TRACKACTIVATE, 0, @bitCast(@intFromPtr(&ti)));
+        // And take it off the screen, which the deactivate alone does NOT do
+        // here: measured, TTM_TRACKACTIVATE FALSE leaves the bubble window
+        // WS_VISIBLE when its tool window is a click-through layered popup
+        // that is hiding in the same breath. A stray explainer floating over
+        // the terminal after the key table ended is the exact failure this
+        // whole path exists to avoid, so the state is set BOTH ways: the
+        // control's, so its next show is a clean one, and the window's.
+        _ = w32.ShowWindow(tip, w32.SW_HIDE);
     }
 
     fn startAnimation(self: *KeyStateIndicator) void {
@@ -577,6 +835,14 @@ pub const KeyStateIndicator = struct {
     }
 };
 
+/// `TTM_TRACKPOSITION` takes its screen point packed into one lparam, as two
+/// signed 16-bit halves.
+fn trackPosition(tip: w32.HWND, x: i32, y: i32) void {
+    const pos: isize = @bitCast(@as(usize, @as(u16, @bitCast(@as(i16, @truncate(x))))) |
+        (@as(usize, @as(u16, @bitCast(@as(i16, @truncate(y))))) << 16));
+    _ = w32.SendMessageW(tip, w32.TTM_TRACKPOSITION, 0, pos);
+}
+
 fn toRect(r: pill.Rect) w32.RECT {
     return .{ .left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom };
 }
@@ -594,8 +860,10 @@ fn registerClassOnce(hinstance: w32.HINSTANCE) !void {
         .cbWndExtra = 0,
         .hInstance = hinstance,
         .hIcon = null,
-        // Click-through, so the cursor is whatever the pane underneath says.
-        .hCursor = null,
+        // The arrow, and only over the card: everywhere else the hit test
+        // falls through, so the pane's own I-beam is never replaced. A card
+        // that stops being text is what says "this is chrome, not content".
+        .hCursor = w32.LoadCursorW(null, w32.IDC_ARROW),
         .hbrBackground = null, // painted via UpdateLayeredWindow
         .lpszMenuName = null,
         .lpszClassName = WINDOW_CLASS_NAME,
@@ -620,9 +888,48 @@ fn wndProc(
         // Never take activation from the pane underneath.
         w32.WM_MOUSEACTIVATE => return w32.MA_NOACTIVATE,
 
+        // T576: click-through everywhere but the card. The shadow allowance
+        // around it is decoration over live terminal content, and a hit there
+        // belongs to the terminal — WS_EX_TRANSPARENT could not make that
+        // distinction, which is why this window no longer carries it.
+        // The pointer is on the card (nothing else hit-tests as ours), which
+        // is the whole trigger for the explainer.
+        w32.WM_MOUSEMOVE => {
+            self.tipHover();
+            return 0;
+        },
+
+        w32.WM_MOUSELEAVE => {
+            self.tipHide();
+            return 0;
+        },
+
+        // A click on the card shows the explainer immediately, which is the
+        // gesture Mac uses for the same popover — someone who does reach for
+        // it should not have to also wait out the hover delay.
+        w32.WM_LBUTTONUP => {
+            self.tipShow();
+            return 0;
+        },
+
+        w32.WM_NCHITTEST => {
+            var pt: w32.POINT = .{
+                .x = @as(i16, @truncate(lparam & 0xFFFF)),
+                .y = @as(i16, @truncate((lparam >> 16) & 0xFFFF)),
+            };
+            _ = w32.ScreenToClient(hwnd, &pt);
+            if (!self.visible or !pill.hitsCard(self.layout, pt.x, pt.y))
+                return w32.HTTRANSPARENT;
+            return w32.HTCLIENT;
+        },
+
         w32.WM_TIMER => {
             if (wparam == TIMER_ID) {
                 self.tick();
+                return 0;
+            }
+            if (wparam == TIP_TIMER_ID) {
+                self.tipShow();
                 return 0;
             }
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);

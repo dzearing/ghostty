@@ -431,6 +431,42 @@ pub fn layout(m: Metrics, pane_w: i32, pane_h: i32, c: Content) Layout {
     return l;
 }
 
+// ---------------------------------------------------------------------------
+// The explainer (T576)
+// ---------------------------------------------------------------------------
+//
+// The pill NAMES the table you are in; it does not say what a key table is.
+// That is the half that matters to the person this feature is for, because the
+// likeliest way to end up in one is by accident and "resize" alone does not
+// tell you what happened to your keyboard. Mac answers it with a popover on
+// the indicator; Windows answers it with the hover tooltip its own shell uses
+// for exactly this ("what is this thing"), same words either way.
+//
+// The trigger is the reason this is here rather than in the window file: the
+// pill's popup is click-through by construction (it floats over live terminal
+// content, where a selection drag ends), so only the CARD may take the
+// pointer, and the card rect is a layout answer.
+
+/// The explainer's heading. Mac's popover title, verbatim.
+pub const EXPLAINER_TITLE = "Key Table";
+
+/// The explainer's sentence. Mac's popover body, verbatim — the two platforms
+/// telling a user the same thing in different words would be a worse
+/// divergence than the missing control was.
+pub const EXPLAINER_BODY =
+    "A key table is a named set of keybindings, activated by some other " ++
+    "key. Keys are interpreted using this table until it is deactivated.";
+
+/// True when the popup-window-local point `(x, y)` lands on the CARD, which is
+/// the only part of the pill that may take the pointer. Everything else the
+/// window covers — the shadow allowance on all four sides — stays
+/// click-through, so a click that looks like it landed on the terminal DOES
+/// land on the terminal.
+pub fn hitsCard(l: Layout, x: i32, y: i32) bool {
+    if (l.hidden or l.card.isEmpty()) return false;
+    return l.card.containsPoint(x, y);
+}
+
 fn offsetRect(r: Rect, dx: i32, dy: i32) Rect {
     return .{
         .left = r.left + dx,
@@ -1200,4 +1236,63 @@ test "render: a hidden layout and undersized buffers paint nothing" {
     // overrunning them.
     render(&bgr, &mask, m, layout(m, 1200, 800, sample(m)), DARK, 0.0);
     try testing.expectEqual(@as(u32, 0), bgr[0]);
+}
+
+test "the explainer's hit area is the card and nothing else" {
+    for (scales) |scale| {
+        const m = Metrics.init(scale);
+        const l = layout(m, 1200, 800, sample(m));
+        try testing.expect(!l.hidden);
+
+        // Dead center of the card takes the pointer.
+        try testing.expect(hitsCard(
+            l,
+            @divTrunc(l.card.left + l.card.right, 2),
+            @divTrunc(l.card.top + l.card.bottom, 2),
+        ));
+        // Every corner of the card is inside it (half-open on the far edges,
+        // the way `containsPoint` reads every other hit box in this app).
+        try testing.expect(hitsCard(l, l.card.left, l.card.top));
+        try testing.expect(hitsCard(l, l.card.right - 1, l.card.bottom - 1));
+
+        // The shadow allowance is NOT the card: the window's own corner, and
+        // one pixel outside each card edge, all fall through to the terminal.
+        try testing.expect(!hitsCard(l, 0, 0));
+        try testing.expect(!hitsCard(l, l.card.left - 1, l.card.top));
+        try testing.expect(!hitsCard(l, l.card.left, l.card.top - 1));
+        try testing.expect(!hitsCard(l, l.card.right, l.card.bottom - 1));
+        try testing.expect(!hitsCard(l, l.card.right - 1, l.card.bottom));
+
+        // The allowance is real at every scale — otherwise the two assertions
+        // above would be testing an empty region.
+        try testing.expect(l.card.left > 0);
+        try testing.expect(l.card.top > 0);
+    }
+}
+
+test "a hidden pill takes no pointer anywhere" {
+    const m = Metrics.init(1.0);
+    // Too small for even the keys: `layout` hides, and a hidden layout must
+    // not claim a hit at a rect it never placed.
+    const l = layout(m, 20, 20, sample(m));
+    try testing.expect(l.hidden);
+    try testing.expect(!hitsCard(l, 0, 0));
+    try testing.expect(!hitsCard(l, 10, 10));
+    // The default (never laid out) is hidden too.
+    try testing.expect(!hitsCard(.{}, 0, 0));
+}
+
+test "the explainer says what a key table is, in Mac's words" {
+    // The heading names the thing on screen and the body answers the question
+    // the name raises. A tooltip title is capped at 99 characters by comctl32.
+    try testing.expect(EXPLAINER_TITLE.len > 0);
+    try testing.expect(EXPLAINER_TITLE.len < 99);
+    try testing.expect(std.mem.indexOf(u8, EXPLAINER_BODY, "keybindings") != null);
+    try testing.expect(std.mem.indexOf(u8, EXPLAINER_BODY, "deactivated") != null);
+    // Plain ASCII prose: the tooltip is measured and drawn by comctl32 with no
+    // mnemonic processing (TTS_NOPREFIX), and an `&` would still read oddly.
+    for (EXPLAINER_TITLE ++ EXPLAINER_BODY) |c| {
+        try testing.expect(c >= 0x20 and c < 0x7F);
+        try testing.expect(c != '&');
+    }
 }

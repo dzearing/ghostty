@@ -240,13 +240,22 @@ try {
 
     # -----------------------------------------------------------------------
     # D. Window style: layered (so it composites over the pane's OpenGL
-    #    content) and click-through (it is pure information, and it sits where
-    #    a selection drag ends).
+    #    content), never activating, and NOT WS_EX_TRANSPARENT.
+    #
+    #    That last one inverted with T576. Click-through is still the rule -
+    #    the pill sits where a selection drag ends - but the CARD now answers
+    #    a hover with the key-table explainer, and an ex-style that says
+    #    "click through this window" is all or nothing: it would have made the
+    #    card unhoverable too. The rule moved into WM_NCHITTEST, which decides
+    #    it per point, and section G2 asserts it there. Keeping this assertion
+    #    inverted rather than deleting it is deliberate: re-adding the style
+    #    would silently take the explainer away again.
     # -----------------------------------------------------------------------
     $ex = Get-TestWindowStyle -Window ([IntPtr]$pill.Hwnd) -ExStyle
     Assert (($ex -band 0x80000) -ne 0) 'D: pill is WS_EX_LAYERED'
     Assert (($ex -band 0x8000000) -ne 0) 'D: pill is WS_EX_NOACTIVATE'
-    Assert (($ex -band 0x20) -ne 0) 'D: pill IS WS_EX_TRANSPARENT (click-through)'
+    Assert (($ex -band 0x20) -eq 0) `
+        'D: pill is NOT WS_EX_TRANSPARENT - click-through is per-point now (T576)'
 
     # -----------------------------------------------------------------------
     # E. Completing the sequence clears the pill - and runs the action.
@@ -284,6 +293,131 @@ try {
     Assert (Inside $pills[0] $paneA) 'G: the key-table pill is inside its pane'
     Assert (($paneA.Bottom - $pills[0].Bottom) -eq $wantGap) `
         'G: the key-table pill uses the same anchor as the sequence pill'
+
+    # -----------------------------------------------------------------------
+    # G2 (T576). The card EXPLAINS itself, and only the card takes the
+    #     pointer.
+    #
+    #     Two halves, both asserted against the window's own routing answer
+    #     (WM_NCHITTEST is the question Windows itself asks before it delivers
+    #     a click, so this is the mechanism rather than a proxy for it):
+    #
+    #       - the card hit-tests as ours, which is what lets the pointer rest
+    #         on it long enough for the explainer tooltip to show, and
+    #       - everything else the pill's window covers - the shadow allowance
+    #         on all four sides - answers HTTRANSPARENT and falls through to
+    #         the terminal underneath. That is the regression the pill's
+    #         click-through rule exists to prevent, and it is now decided per
+    #         point instead of by WS_EX_TRANSPARENT, so it needs a test.
+    #
+    #     The boundary is asserted at the exact pixel on each edge, computed
+    #     from the window's real DPI, not eyeballed inside a margin.
+    # -----------------------------------------------------------------------
+    $pad = (Px 4 $scale) + (Px 2 $scale)
+    $pillW = $pills[0]
+    $cx = [int](($pillW.Left + $pillW.Right) / 2)
+    $cy = [int](($pillW.Top + $pillW.Bottom) / 2)
+    $hp = [IntPtr]$pillW.Hwnd
+
+    function Route([int]$x, [int]$y) {
+        return (Get-TestMouseRoute -Window $top -Target $hp -X $x -Y $y).Code
+    }
+
+    Assert ((Route $cx $cy) -eq 1) 'G2: the card itself takes the pointer (HTCLIENT)'
+    Assert ((Route ($pillW.Left) ($pillW.Top)) -eq -1) `
+        'G2: the window corner falls through to the terminal (HTTRANSPARENT)'
+    Assert ((Route $cx ($pillW.Bottom - 1)) -eq -1) `
+        'G2: the shadow band below the card falls through'
+    Assert ((Route $cx ($pillW.Top + $pad - 1)) -eq -1) `
+        'G2: one pixel above the card is still the terminal'
+    Assert ((Route $cx ($pillW.Top + $pad)) -eq 1) `
+        'G2: the card top edge is the first row that is ours'
+    Assert ((Route ($pillW.Left + $pad - 1) $cy) -eq -1) `
+        'G2: one pixel left of the card is still the terminal'
+    Assert ((Route ($pillW.Left + $pad) $cy) -eq 1) `
+        'G2: the card left edge is the first column that is ours'
+    Assert ((Route ($pillW.Right - $pad) $cy) -eq -1) `
+        'G2: the card right edge is exclusive - past it is the terminal'
+
+    # The explainer itself. The tooltip is a native comctl32 control in
+    # SUBCLASS mode, so the SHOW is the system's decision on a real hover -
+    # which the background test desktop cannot hold (T233, the tab tooltip's
+    # reasoning). What IS assertable, and is the whole of what this code
+    # owns: the control exists and the tool is armed over the card with the
+    # heading the user reads.
+    if (Test-Path $errlog) {
+        $armed = @(Select-String -Path $errlog -Pattern 'key state explainer armed' |
+            Select-Object -Last 1)
+        Assert ($armed.Count -eq 1) 'G2: the explainer is armed once the pill shows'
+        if ($armed.Count -eq 1) {
+            Write-Host "INFO  $($armed[0].Line.Trim())"
+            Assert ($armed[0].Line -match 'title="Key Table"') `
+                'G2: it is armed with the heading Mac shows'
+            Assert ($armed[0].Line -match "rect=\d+,\d+,\d+,\d+") `
+                'G2: it is armed over a real rect'
+        }
+    } else {
+        Write-Host 'OK    G2 degraded: no debug log (release build), routing asserted only'
+    }
+    # -AllowHidden: a tooltip control is a hidden popup until something asks
+    # for it, which is the point - it exists, armed, waiting.
+    $tips = @(Get-TestWindows -ProcessId $app.Pid -Class 'tooltips_class32' -AllowHidden)
+    Assert ($tips.Count -ge 1) `
+        "G2: the tooltip control exists, so a hover has something to show ($($tips.Count))"
+
+    # And it REACHES the screen. A hover cannot be held on the background test
+    # desktop (T233: no pointer lives there), but a CLICK on the card shows the
+    # same bubble the hover delay does - which is also Mac's gesture for the
+    # same popover - so the click path is the one that can be asserted here.
+    # The hover path is the same `tipShow`, one timer earlier.
+    $r = Send-TestMouse -Window $top -Target $hp -X $cx -Y $cy -Action click
+    Assert $r 'G2: click on the card delivered'
+    $shown = @()
+    for ($t = 0; $t -lt 30; $t++) {
+        $shown = @(Get-TestWindows -ProcessId $app.Pid -Class 'tooltips_class32' -AllowHidden |
+            Where-Object Visible)
+        if ($shown.Count -ge 1) { break }
+        Start-Sleep -Milliseconds 100
+    }
+    Assert ($shown.Count -ge 1) `
+        "G2: the explainer is on screen after the card is clicked ($($shown.Count))"
+    if ($shown.Count -ge 1) {
+        $b = $shown[0]
+        Write-Host "INFO  explainer rect $($b.Left),$($b.Top),$($b.Right),$($b.Bottom)"
+        # ABOVE the card, not over it: the pill hugs the pane's bottom edge, so
+        # a bubble placed where the control would put it by default covers the
+        # thing it is explaining (or falls off the pane).
+        Assert ($b.Bottom -le ($pillW.Top + $pad)) `
+            'G2: the explainer sits above the card, not over it'
+        # Centered on the card, within a pixel of rounding.
+        $bc = [int](($b.Left + $b.Right) / 2)
+        Assert ([math]::Abs($bc - $cx) -le 2) `
+            "G2: the explainer is centered on the card (bubble $bc vs card $cx)"
+        Assert (($b.Right - $b.Left) -gt ($pillW.Right - $pillW.Left)) `
+            'G2: it is a paragraph, wider than the pill it explains'
+    }
+    if (Test-Path $errlog) {
+        Assert ((Select-String -Path $errlog -Pattern 'key state explainer shown' -Quiet) -eq $true) `
+            'G2: the app logged the explainer show'
+    }
+
+    # Leaving the key table takes the explainer with it: a bubble that outlived
+    # the card would be a stray box floating over the terminal.
+    $r = Send-TestKeys -Window $top -Target ([IntPtr]$paneA.Hwnd) -Key f8
+    Assert $r 'G2: f8 (deactivate) delivered'
+    $gone = @(Wait-PillCount $app.Pid 0)
+    Assert ($gone.Count -eq 0) 'G2: the pill went away with the table'
+    $still = @(Get-TestWindows -ProcessId $app.Pid -Class 'tooltips_class32' -AllowHidden |
+        Where-Object Visible)
+    Assert ($still.Count -eq 0) `
+        "G2: the explainer went away with the pill ($($still.Count) left on screen)"
+
+    # Back into the table, for the sections below - which expect exactly the
+    # state section G left behind.
+    $r = Send-TestKeys -Window $top -Target ([IntPtr]$paneA.Hwnd) -Key f7
+    Assert $r 'G2: f7 re-entered the key table'
+    $pills = @(Wait-PillCount $app.Pid 1)
+    Assert ($pills.Count -eq 1) "G2: the pill is back ($($pills.Count))"
 
     # -----------------------------------------------------------------------
     # H. NESTED tables: the stack is a stack. A second table must make the
@@ -418,6 +552,20 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
 # nothing, and would otherwise report a clean pass.
 if ($NegativeControl -and -not $script:negReached) {
     Assert $false 'NEGATIVE CONTROL never reached its inverted assertion'
+}
+
+# --- stamp (T783, row added by T576) --------------------------------------
+# A green run RECORDS the content of the pill's sources and this script, so
+# scripts\guard-due.ps1 can answer "has anything run this harness against the
+# code as it now stands?". This is the only script that drives a real key table
+# on a real GUI, so it is the only thing that can prove any of it: the pill's
+# anchor, what it says, which pane it marks, that only its card takes the
+# pointer, and that the explainer reaches the screen and leaves with the card.
+# A red run leaves the stamp alone on purpose, and a -NegativeControl run never
+# stamps.
+if ($script:fail -eq 0 -and -not $NegativeControl) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard key-state-pill -Repo $repo 2>&1 | ForEach-Object { Write-Host "  $_" }
 }
 
 Write-Host ''
