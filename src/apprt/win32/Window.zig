@@ -885,7 +885,11 @@ fn createTabFont(self: *Window) void {
     }
     var face: [title_font.face_cap]u16 = undefined;
     title_font.faceName(self.app.config.@"window-title-font-family", &face);
-    const font_height: i32 = -@as(i32, @intFromFloat(16.0 * self.scale));
+    // Negated: CreateFontW reads a negative cHeight as a CHARACTER height,
+    // which is what the ramp deals in. The size itself lives in
+    // `title_font.em` (T584) rather than here, so the strip and everything
+    // that measures against it cannot hold two different opinions of it.
+    const font_height: i32 = -self.titleFontEm();
     self.tab_font = w32.CreateFontW(
         font_height, // cHeight (negative = character height)
         0, // cWidth
@@ -5281,8 +5285,13 @@ fn handleNcLButtonUp(self: *Window, wparam: usize) bool {
 /// `createTabFont` hands `CreateFontW`, so the spinner cell (T60) scales with
 /// the font it is measured and drawn in rather than with a constant that
 /// happens to agree at 100%.
+///
+/// The size comes from `title_font.em`, which is the type ramp's body role
+/// (T584). It used to be a bare `16.0 * self.scale` here AND a second copy of
+/// the same literal in `createTabFont` — a size that is not on the ramp,
+/// spelled twice, on the app's most-looked-at chrome.
 fn titleFontEm(self: *Window) i32 {
-    return @intFromFloat(16.0 * self.scale);
+    return title_font.em(self.scale);
 }
 
 /// Measure a title the way `drawTitleText` will paint it (T60): a leading

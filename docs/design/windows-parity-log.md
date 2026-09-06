@@ -23281,3 +23281,49 @@ count was a one-time grep, and nothing today would notice a ninth. A source
 scan in the none lane, with an allowlist so a deliberate exception has to be
 declared rather than merely exist, is what closes the class instead of the
 instance.
+
+## 2026-09-06 - The tab strip reads at a size the app actually has (T584)
+
+The tab labels and the in-strip window title were set at a bare `16.0 * scale`,
+written out twice in `Window.zig`. Unlike T313's retired 15 or T583's banner, 16
+was never on the type ramp at all - so the text a user looks at more than any
+other chrome in this app was the one piece of it set to a number nobody chose.
+
+It is the ramp's **body** role now, read through `title_font.em(scale)`, and
+both literals are gone. Two things made that a real question rather than an
+obvious sweep, and both are answered in `win32-design-system.md` 2.4 rather than
+waved past: the FACE there is partly the user's (`window-title-font-family`),
+which says nothing about whose ramp the SIZE belongs to - a face is a preference
+and a size is the system; and a tab label is primary chrome rather than dialog
+body text, but it is the same KIND of text as a list-row title, and Win11's own
+tabbed surfaces set labels at body rather than a step above. WEIGHT is
+deliberately not taken from the ramp: the strip draws active/inactive emphasis in
+color and a semibold pass would fight it. The strip's 40 DIP band is unaffected;
+what moved is the text inside it and every tab width measured from that text.
+
+Two new tests in `tab_strip_layout` at 1.0/1.25/1.5/2.0 pin the seam the old
+literal made invisible - a ramp-body line box fits inside the tab band with its
+leading, and a content-sized tab is wider than an empty one by exactly the
+measured text - plus two in `title_font` asserting the IDENTITY with the ramp
+rather than the number, so a ramp change moves the strip with it.
+
+The turn's real work was the part that produced no code. Three acceptance
+scripts were red, and each one LOOKED like this change: a tab hit-test off by one
+slot, a tooltip printing a full path, and a long-titled tab no wider than a short
+one - all plausible consequences of a font that just got smaller. Forcing
+`title_font.em` back to `16.0 * scale`, rebuilding and re-running reproduced all
+three identically. Filed as T1394 (the autohide script steps its caption probe by
+square+gap, and T496 made those slabs zero-gap, so the leftmost probe lands on
+minimize), T1395 (the tip's home lookup is `HOMEDRIVE`+`HOMEPATH` and returns
+null when they are unset, where `USERPROFILE` is what the rest of the codebase
+uses - possibly every user with those unset sees full paths), and T1396, which is
+the one that matters: the long and short tabs measure EXACTLY the same width, so
+T235's content sizing is not happening and the original "`. Fix background p...`"
+complaint is back. The assertion that caught it was not the one that failed - the
+"wider than" assertion above it passed on a 3 px margin between two identical
+tabs, which is a check that cannot fail and therefore is not one.
+
+Floor: `floor-lane.ps1 -Lane all` lib/none/win32/agent ALL LANES PASS;
+`tab-color.ps1` ALL PASS (17), P1/P2/P3 ALL PASS (25/20/16); guards run clean -
+test-reach (14), printclient (8), viewer-close (44), and the six static audits
+plus go-loop-guard that the other window's commit had left due.

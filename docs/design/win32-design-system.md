@@ -200,7 +200,7 @@ measures; a black X on it is a defect a user reports.
 | Role | Size | Weight | Where |
 |---|---|---|---|
 | Caption | **12** | 400 | sublines, subtitles, status strips, badges |
-| Body | **14** | 400 | list-row titles, buttons, input fields, labels |
+| Body | **14** | 400 | list-row titles, buttons, input fields, labels, tab labels and the in-strip window title |
 | Body strong | 14 | 600 | an emphasized body run |
 | Subtitle | **20** | 600 | a pane's subject |
 
@@ -244,6 +244,26 @@ retired size, on the surface that sits directly above the terminal. Open the
 banner editor over a banner and the editor's text and the banner's text were
 different sizes. The banner's body, its line box and its face now come from the
 ramp like everything else (`banner_layout.zig`'s type section).
+
+**The tab strip is body, and CHROME is not an exemption** (T584). The tab
+labels and the in-strip window title were set at a bare `16.0 * scale`, written
+out twice in `Window.zig` — not a retired ramp size like the banner's 15, but a
+number that has never been on the ramp at all, on the text a user looks at more
+than any other chrome in the app. Two things made it a real question rather than
+an obvious sweep: the FACE there is partly the user's
+(`window-title-font-family`), and a tab label is primary chrome rather than
+dialog body text. Neither survives contact with the ramp's own argument. A tab
+label is the same KIND of text as a list-row title — the app's own chrome text,
+not a different register — and Win11's tabbed surfaces set their labels at the
+body size, not a step above it; that the user may swap the face says nothing
+about whose ramp the size belongs to, since the face is a preference and the
+size is the system. So it is `body`, read through **`title_font.em(scale)`**
+(the size lives next to the face resolution it ships with, and the ramp is the
+only place the number exists). WEIGHT is deliberately not taken from the ramp:
+the strip draws active/inactive emphasis in color, and a semibold pass would
+fight it. The strip's own height is unaffected — it is a fixed 40 DIP band
+(`tab_strip_layout`), not a line box — so what moved is the text inside it and
+every tab width measured from that text.
 
 **A markdown heading scale is ANCHORED to the ramp, not declared beside it.**
 The banner renders markdown, markdown has six heading levels, and the ramp has

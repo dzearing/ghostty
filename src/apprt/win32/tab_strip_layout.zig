@@ -35,6 +35,11 @@
 const std = @import("std");
 const testing = std.testing;
 const icon_button = @import("icon_button.zig");
+// Test-only, and pure like this module: the strip still measures no text and
+// owns no font. What these buy is the T584 assertion that the band this module
+// lays out and the size those set the labels in cannot drift apart.
+const title_font = @import("title_font.zig");
+const type_ramp = @import("type_ramp.zig");
 
 /// Negative control for `test/win32/tab-strip.ps1` (project standard: an
 /// acceptance script has to be SHOWN to fail, or it is not evidence). Flip to
@@ -1294,4 +1299,44 @@ test "the separator is a 1px hairline inset inside the tab" {
     try testing.expectEqual(buf[0].right, sep.right);
     try testing.expect(sep.top > buf[0].top);
     try testing.expect(sep.bottom < buf[0].bottom);
+}
+
+test "T584: a tab's title band holds a ramp-body line at every layout scale" {
+    // This module owns no font and measures no text, and that is deliberate —
+    // but the strip's 40 DIP band and the size its labels are set in are two
+    // numbers that have to agree, and until T584 the second of them was a bare
+    // `16.0 * scale` in `Window.zig` that nothing here could see. The claim
+    // worth pinning across the seam is the one a ramp change would break:
+    // whatever `title_font.em` resolves to, a line of it fits inside the tab
+    // with its leading, at every scale the rest of this file is asserted at.
+    var buf: [MAX_TABS]Rect = undefined;
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m, _ = layoutN(scale, @intFromFloat(@round(1600.0 * scale)), 3, &buf);
+        const em = title_font.em(scale);
+        const line = type_ramp.lineBox(.{ .height = em, .weight = type_ramp.weight_normal }, scale);
+        const tab_h = buf[0].height();
+
+        try testing.expectEqual(m.bar_h - m.tab_top_pad, tab_h);
+        try testing.expect(line <= tab_h);
+        // And the title's own box is the full tab band, so the vertical
+        // centering `DT_VCENTER` does has the same room the assertion above
+        // measured.
+        try testing.expectEqual(tab_h, m.titleRect(buf[0]).height());
+    }
+}
+
+test "T584: a content-sized tab is wider at the ramp size than at nothing" {
+    // The em feeds every tab width through the caller's measurement, so the
+    // sanity check that survives a refactor is directional: a title measured
+    // at the title em produces a tab wider than an empty one by exactly the
+    // measured text, and `preferredWidth` stays that inverse at all four
+    // scales.
+    for ([_]f32{ 1.0, 1.25, 1.5, 2.0 }) |scale| {
+        const m = Metrics.init(scale);
+        // Stand in for a measured title: 8 ems of text, the shape a real
+        // measurement has (it grows with the em, so it grows with the ramp).
+        const text_w = title_font.em(scale) * 8;
+        try testing.expectEqual(text_w, m.preferredWidth(text_w) - m.preferredWidth(0));
+        try testing.expect(m.preferredWidth(text_w) > m.min_tab_w);
+    }
 }
