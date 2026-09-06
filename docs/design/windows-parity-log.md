@@ -23406,3 +23406,53 @@ Floor: `floor-lane.ps1 -Lane all` lib/none/win32/agent ALL LANES PASS;
 two failures it promises; P1/P2/P3 ALL PASS (25/20/16); guards run clean -
 test-desktop (68), go-loop-guard, and the eight static audits the test edits
 made due.
+
+## 2026-09-06 - A tab grows to fit the title its own shell set, not the one next door's (T1396)
+
+Section 7 of `tab-strip.ps1` had been red long enough that a turn last week
+mistook it for its own change. It launches one tab with a long shell-set title
+(`-e cmd.exe /K title <61 chars>`), opens a second on the default shell, and
+asserts the first is wider - the T235 rule that stopped titles being chopped to
+". Fix background p...". Both tabs measured exactly 171 px, then exactly 546 px:
+identical, which no content-derived width can be.
+
+Two defects were stacked, and each hid the other.
+
+The first is that the long title never reached the strip. T512 taught the
+terminal to discard any title that arrived before the shell's first OSC 7,
+because `cmd.exe` titles its console with its own image path on the way up and a
+whole strip of cmd tabs read `C:\WINDOWS\system32\cmd.exe`. But `cmd /K title
+<x>` sets a title on the way up too, and that one is somebody's intent - so the
+rule swallowed it and the tab was titled from the working directory instead.
+The discard is now keyed on the SHAPE of the string: only an absolute path to an
+`.exe` is startup noise. A cmd pane still titles itself from its directory and
+still follows a `cd`, and `title` typed at its prompt still wins - the three
+things T512 bought - and a title the launch command asked for now survives.
+
+The second is why the two tabs were then still the same width. `WM_SETFOCUS`
+wrote the focused pane into `tab_active_pane[active_tab]` - the window's ACTIVE
+tab, not the pane's own. Creating a tab is exactly the case where those differ:
+the outgoing pane sees a focus round trip after `active_tab` has already moved,
+so tab 1's slot was handed tab 0's pane, `refreshTabTitle` relabelled the new
+tab with the old shell's 61-character title, and the strip sized it for that
+string. T249's grow-only ratchet then kept the width when the real (short) title
+arrived a moment later. The fix is `findTabIndex(pv)`: a pane taking focus
+updates ITS tab.
+
+The assertion that was supposed to catch all this could pass on two identical
+tabs - it compared tab 1's SLOT (which carries the inter-tab gap) against the
+other tab's painted width, so 171 vs 171 cleared it by 6 px. It now compares
+widths with a 60 px margin, against titles that differ by ~47 characters, and
+section 7 prints every tab's title and published rect: the next failure there
+says in one line whether the title or the width is the thing that went missing.
+
+Filed T1402: a repo-built `ghoztty.exe +list` run from a shell inside a pane of
+the INSTALLED release answers about the installed release, because the pane's
+`GHOZTTY_IPC_SOCKET` outranks the debug build's own endpoint derivation. The
+override is load-bearing for instance addressability; what is missing is the
+lineage check. It cost a wrong answer in this turn's first measurement.
+
+Floor: `floor-lane.ps1 -Lane all` lib/none/win32/agent ALL LANES PASS;
+`tab-strip.ps1` ALL PASS (70) with the negative control recorded in the task -
+with the title fix in and the focus fix out, the tightened assertion scores
+exactly the failure it promises over two 546 px tabs.

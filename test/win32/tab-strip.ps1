@@ -1132,12 +1132,33 @@ try {
     $shortW = $ext2[1] - $ext2[0]
     $longSlot = $ext2[0] - $padL
     Write-Host "INFO  short title: left=$($ext2[0]) right=$($ext2[1]) w=$shortW; long slot=$longSlot"
+    # T1396: the widths alone cannot say WHY two tabs measure the same, and for
+    # six weeks the answer was "the long title never reached the strip". Name
+    # the strings the strip is actually sizing from, so the next failure here
+    # is one line of reading rather than a bisect.
+    $j7 = & $exe +list --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
+    if ($j7 -and $j7.data -and $j7.data.windows) {
+        foreach ($w7 in $j7.data.windows) {
+            foreach ($tb7 in $w7.tabs) { Write-Host "INFO  strip tab $($tb7.id): '$($tb7.title)'" }
+            $ts7 = $w7.chrome.tab_strip
+            if ($ts7) {
+                foreach ($r7 in $ts7.tabs) { Write-Host "INFO  strip rect: left=$($r7.left) right=$($r7.right) w=$($r7.right - $r7.left)" }
+            }
+        }
+    }
     Assert ($shortW -gt 0) 'two titles: the new short-titled tab is selected and measurable'
     # THE assertion. Under a fixed cap both tabs would be the same width; under
     # content sizing the long one is wider, and it is wider by roughly the
     # difference in the two titles.
-    Assert ($longSlot -gt ($shortW + $tabGap)) `
-        "T235: the long-titled tab is WIDER than the short-titled one (slot=$longSlot vs $($shortW + $tabGap))"
+    # T1396: "wider by any amount" was satisfiable by two tabs of IDENTICAL
+    # width, because the slot carries the gap - so the assertion scored a pass
+    # for six weeks over a strip where the long title never arrived at all. The
+    # margin is on the WIDTHS, and it is a real one: these two titles differ by
+    # ~47 characters, so anything under a handful of characters' worth of pixels
+    # means the long title is not reaching the strip.
+    $longWFromSlot = $longSlot - $tabGap
+    Assert ($longWFromSlot -ge ($shortW + 60)) `
+        "T235: the long-titled tab is substantially WIDER than the short-titled one (w=$longWFromSlot vs $shortW + 60)"
     Assert ([math]::Abs($longSlot - ($longW + $tabGap)) -le 3) `
         "T235: tab 2's left edge is exactly tab 1's slot ($longSlot vs $($longW + $tabGap))"
     # ... and it is allowed past the retired 200 DIP constant. Only checkable

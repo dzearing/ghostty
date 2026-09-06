@@ -1273,9 +1273,20 @@ pub const StreamHandler = struct {
         // of a second later. Shells whose integration titles the window itself
         // (bash, zsh, pwsh) re-set it on the same prompt, so this is a no-op
         // for them.
+        //
+        // T1396 narrowed it: "any title that arrived before the first OSC 7"
+        // also swallowed a title the launch command DELIBERATELY set, which is
+        // exactly what `ghoztty -e cmd.exe /K title <x>` is. Only the shell's
+        // own IMAGE PATH is startup noise, so that is the only shape discarded
+        // here — anything else that arrived first was somebody's intent and
+        // keeps the window titled.
         if (!self.seen_pwd) {
             self.seen_pwd = true;
-            self.seen_title = false;
+            if (!self.seen_title or
+                isShellImageTitle(self.terminal.getTitle() orelse ""))
+            {
+                self.seen_title = false;
+            }
         }
 
         log.debug("terminal pwd: {s}", .{path});
@@ -1657,3 +1668,40 @@ pub const StreamHandler = struct {
         }
     }
 };
+
+/// Does this title look like the shell titling its console with its own image
+/// path, rather than a title anybody chose? (T512/T1396.)
+///
+/// cmd.exe sets its console title to `C:\WINDOWS\system32\cmd.exe` on the way
+/// up, which is the noise `reportPwd` discards when the shell's first OSC 7
+/// arrives. `cmd /K title <x>` sets a title on the way up TOO, and that one is
+/// intent — so the discard is keyed on the shape of the string: an absolute
+/// path to an executable image, with a path separator and an `.exe` suffix.
+/// Anything else (including the empty title, which means "none seen") is kept.
+fn isShellImageTitle(title: []const u8) bool {
+    if (title.len < 5) return false;
+    const ext = title[title.len - 4 ..];
+    if (!std.ascii.eqlIgnoreCase(ext, ".exe")) return false;
+    // A bare "cmd.exe" is not a path and was not written by the console; only
+    // the fully-qualified image path is the shape we are dropping.
+    const stem = title[0 .. title.len - 4];
+    return std.mem.indexOfAny(u8, stem, "\\/") != null;
+}
+
+test "isShellImageTitle: cmd's startup self-title is noise" {
+    const testing = std.testing;
+    try testing.expect(isShellImageTitle("C:\\WINDOWS\\system32\\cmd.exe"));
+    try testing.expect(isShellImageTitle("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.EXE"));
+    try testing.expect(isShellImageTitle("/usr/bin/weird.exe"));
+}
+
+test "isShellImageTitle: a deliberate title survives" {
+    const testing = std.testing;
+    // The T1396 fixture's title, which used to be discarded.
+    try testing.expect(!isShellImageTitle("TabTitleLongEnoughToHaveBeenTruncatedByTheOldTwoHundredDipCap"));
+    try testing.expect(!isShellImageTitle(""));
+    try testing.expect(!isShellImageTitle("cmd.exe"));
+    try testing.expect(!isShellImageTitle("C:\\Users\\David"));
+    try testing.expect(!isShellImageTitle(".exe"));
+    try testing.expect(!isShellImageTitle("build the exe"));
+}

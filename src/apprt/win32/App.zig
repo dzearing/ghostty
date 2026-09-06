@@ -9525,7 +9525,21 @@ fn surfaceWndProc(
 
         w32.WM_SETFOCUS => {
             // Update the active surface for this tab when a split pane gains focus.
-            const tab = surface.parent_window.active_tab;
+            //
+            // T1396: the pane's OWN tab, never the window's active one. A pane
+            // can take focus while a DIFFERENT tab is active — creating a tab
+            // is exactly that, since the outgoing pane sees a focus round trip
+            // after `active_tab` has already moved — and writing it into the
+            // active tab's slot handed that tab the wrong pane. The next line
+            // then relabelled the new tab with the old shell's title, the strip
+            // sized the tab for that string, and T249's grow-only ratchet kept
+            // the width after the real (short) title arrived: two tabs the same
+            // width, with the second one's label a lie for a frame.
+            const tab = tab: {
+                const pv = surface.pane_view orelse break :tab surface.parent_window.active_tab;
+                break :tab surface.parent_window.findTabIndex(pv) orelse
+                    surface.parent_window.active_tab;
+            };
             if (surface.pane_view) |pv| surface.parent_window.tab_active_pane[tab] = pv;
             // T92: the tab label / titlebar follow the focused pane's
             // title (no-op when the tab title is user-pinned or the

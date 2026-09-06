@@ -1,10 +1,10 @@
 {
     "guard":  "cleanslate",
     "script":  "test/win32/cleanslate-audit.ps1",
-    "generated":  "2026-09-06T12:38:21-07:00",
-    "commit":  "b8bf50c45",
+    "generated":  "2026-09-06T13:46:58-07:00",
+    "commit":  "20f11044b",
     "uncommitted":  [
-                        "test/win32/viewer-feedback.ps1"
+                        "test/win32/tab-strip.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "944e54bda392aa61007ee23280c6bb9767ed2e661f77f5157ca035dbe9b6e4ea",
@@ -278,7 +278,7 @@
                   "test/win32/stderr-capture-audit.ps1":  "04424b778285df67f2eeed9c8ee354d1446c62a920ab8de56bf8b4475569cf9b",
                   "test/win32/suite-run.ps1":  "19e1384d17cd3f258b2e9c5f2339b6b3dba8a04114006a342dae98a89676dbee",
                   "test/win32/tab-color.ps1":  "af75bcd47eeb68cf93ee056b7aa4e14e147314ab8b4adc3a9c0eb27dfb43f967",
-                  "test/win32/tab-strip.ps1":  "9217c29eab658913f60ac6af494ef630c882ef913c3bfbf3987d5951f00df027",
+                  "test/win32/tab-strip.ps1":  "bebef6b697c8389c7bf92194380461b93114732f2a4b3cf26aaea6936e46377b",
                   "test/win32/tab-strip-autohide.ps1":  "53655e95850098c972752b1deee1a16488c6c1abd4b46b6734c7500b896bae50",
                   "test/win32/tab-tooltip.ps1":  "2c16b672ae68453765b7c6b86419b4e93d783c063e67985a7789e41eead227a7",
                   "test/win32/target-staleness.ps1":  "25c28c99d39716155584ecda6f7a826dae310b3adaad3ae6dbb962c38f7f7d80",
