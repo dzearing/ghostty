@@ -1157,6 +1157,85 @@ public class GhozttyTestDesktop {
         });
     }
 
+    // ================= activation (the WRITE side) =================
+    // T568. `ActiveHwnd`/`FocusedHwnd` above are the READ side of activation on
+    // a background desktop; these two are how a script MOVES it, which until
+    // now it could not do at all. That left a whole class of chrome claim -
+    // "X shows only while this window has the keyboard" - assertable in one
+    // direction only: a script could tab focus BETWEEN the controls of one
+    // window, but not take the keyboard away from the window itself.
+    //
+    // Why the obvious routes are not available here: `Send-TestMouse` POSTS
+    // WM_LBUTTONDOWN, and real activation comes from the WM_MOUSEACTIVATE that
+    // only real input generates; `SetForegroundWindow` fails off the input
+    // desktop; `SendInput` is blocked there (T207). What IS available is the
+    // same input-queue attach the focus helpers use - activation and focus are
+    // properties of a thread's input queue, and an attached thread may write
+    // them directly.
+    //
+    // ActivateWindow makes `top` the active window of its own thread's queue
+    // and gives it the keyboard. When another top-level of the SAME thread was
+    // active - the common case in this app, where every window is on the UI
+    // thread - that window gets WM_ACTIVATE(WA_INACTIVE) and its focused child
+    // gets WM_KILLFOCUS, which is exactly what a deactivated window sees from a
+    // real click on its sibling.
+    public bool ActivateWindow(IntPtr top) {
+        return (bool)Run(delegate() {
+            if (Interactive) GrabForegroundImpl(top);
+            uint pid; uint tid = GetWindowThreadProcessId(top, out pid);
+            uint cur = GetCurrentThreadId();
+            if (!AttachThreadInput(cur, tid, true)) { LastError = "AttachThreadInput failed"; return false; }
+            try {
+                SetActiveWindow(top);
+                SetFocus(top);
+                Thread.Sleep(80);
+            } finally { AttachThreadInput(cur, tid, false); }
+            // Verified from the queue rather than from the return value: an
+            // activation the queue did not take is the failure this exists to
+            // make loud.
+            var info = new GUITHREADINFO();
+            info.cbSize = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
+            if (!GetGUIThreadInfo(tid, ref info)) { LastError = "GetGUIThreadInfo failed"; return false; }
+            if (info.hwndActive != top) {
+                LastError = "active is " + info.hwndActive.ToInt64() + ", wanted " + top.ToInt64();
+                return false;
+            }
+            return true;
+        });
+    }
+
+    // The other end: NOBODY on `anyWindow`'s thread holds the keyboard. This is
+    // the state a window is in when the user clicks a window of another
+    // process, and it is the one an "only while focused" claim needs, because
+    // it is measurable without a second window to move to: `FocusedHwnd` really
+    // does read back 0 afterwards, which no arrangement of two windows on one
+    // GUI thread can produce.
+    //
+    // SetFocus(NULL) is documented to leave the queue with no focus window and
+    // to send WM_KILLFOCUS to whatever had it; the ACTIVE window is cleared the
+    // same way where the queue lets us, so a window that keys off WM_ACTIVATE
+    // rather than WM_KILLFOCUS sees it too.
+    public bool DeactivateWindow(IntPtr anyWindow) {
+        return (bool)Run(delegate() {
+            uint pid; uint tid = GetWindowThreadProcessId(anyWindow, out pid);
+            uint cur = GetCurrentThreadId();
+            if (!AttachThreadInput(cur, tid, true)) { LastError = "AttachThreadInput failed"; return false; }
+            try {
+                SetFocus(IntPtr.Zero);
+                SetActiveWindow(IntPtr.Zero);
+                Thread.Sleep(80);
+            } finally { AttachThreadInput(cur, tid, false); }
+            var info = new GUITHREADINFO();
+            info.cbSize = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
+            if (!GetGUIThreadInfo(tid, ref info)) { LastError = "GetGUIThreadInfo failed"; return false; }
+            if (info.hwndFocus != IntPtr.Zero) {
+                LastError = "focus is still " + info.hwndFocus.ToInt64();
+                return false;
+            }
+            return true;
+        });
+    }
+
     // Interactive-only: the T86-hardened grab, already-foreground guard
     // included (an unguarded Alt tap self-latches menu mode).
     static bool GrabForegroundImpl(IntPtr top) {
@@ -2944,6 +3023,51 @@ function Focus-TestWindow {
         $Desktop
     )
     return (Resolve-TestDesktop $Desktop).FocusWindow($Window, $Child)
+}
+
+<#
+Make $Window the ACTIVE top-level window of its own thread's input queue, and
+give it the keyboard (T568).
+
+    Set-TestActiveWindow -Window $terminalTop
+
+Focus-TestWindow moves the keyboard WITHIN a window (top + child); this moves
+it BETWEEN top-level windows, which posted input cannot do off the input
+desktop - real activation comes from WM_MOUSEACTIVATE on real input. A sibling
+window that was active gets WM_ACTIVATE(WA_INACTIVE) and its focused child gets
+WM_KILLFOCUS, so this is how "chrome X shows only while this window has the
+keyboard" is asserted in the direction that used to be unmeasurable.
+
+Returns $true only when the queue really took it (verified with
+GetGUIThreadInfo, not from the API's return value).
+#>
+function Set-TestActiveWindow {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        $Desktop
+    )
+    return (Resolve-TestDesktop $Desktop).ActivateWindow($Window)
+}
+
+<#
+Leave NOBODY on $Window's thread holding the keyboard (T568).
+
+    Clear-TestActiveWindow -Window $panel
+
+The state a window is in when the user clicks away to another process. Unlike
+Set-TestActiveWindow this needs no second window, and it is the arm with the
+unambiguous oracle: Get-TestFocusedWindow really reads back 0 afterwards, which
+no arrangement of two windows on ONE GUI thread can produce (they share a
+queue, so the read is thread-wide).
+
+Returns $true only when the queue's focus really went to zero.
+#>
+function Clear-TestActiveWindow {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Window,
+        $Desktop
+    )
+    return (Resolve-TestDesktop $Desktop).DeactivateWindow($Window)
 }
 
 <#

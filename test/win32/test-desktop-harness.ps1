@@ -21,6 +21,13 @@
 #               so a 0,0-based rect would turn it red.
 #   focus       Focus-TestWindow, which replaces the T86 GrabForeground that
 #               cannot work off the input desktop.
+#   activation  (T568) Set-TestActiveWindow / Clear-TestActiveWindow - the WRITE
+#               side of activation, which the harness had no form of at all: it
+#               could read who was active but never move it, so "chrome X shows
+#               only while this window has the keyboard" was assertable in one
+#               direction only. Both shapes are exercised - nobody holding it
+#               (focus really reads back 0) and a sibling top-level holding it -
+#               and both are read off the input queue, never off a return value.
 #   text        Send-TestText into a terminal -> the characters appear in
 #               +read, exactly once (posting WM_CHAR as well as WM_KEYDOWN
 #               doubles every character; the T207 spike hit that).
@@ -589,6 +596,58 @@ try {
             Assert ($wt -match [regex]::Escape($title)) `
                 "Send-TestControlText typed into a standard control (window title now '$wt')"
         }
+    }
+
+    # --- activation, the WRITE side (T568). Everything above moves focus
+    #     WITHIN one window; this moves it between windows, and takes it away
+    #     entirely. Without it a whole class of chrome claim - "X shows only
+    #     while this window has the keyboard" - is assertable in one direction
+    #     only, which is why T289 shipped the Activity Monitor's focus ring with
+    #     its disappearance half unmeasured.
+    #
+    #     Asserted by OUTCOME off the input queue, never from the call's return:
+    #     GetGUIThreadInfo is the same read Get-TestFocusedWindow/
+    #     Get-TestActiveWindow already trust.
+    Assert (Focus-TestWindow -Window $top -Child $pane) 'activation setup: the pane holds the keyboard'
+    Assert (Clear-TestActiveWindow -Window $top) 'Clear-TestActiveWindow reports the keyboard relinquished'
+    Start-Sleep -Milliseconds 300
+    $focusNone = Get-TestFocusedWindow -Window $top
+    Assert ($focusNone -eq 0) "and the window's GUI thread really holds NO focus (got $focusNone)"
+    Assert (Set-TestActiveWindow -Window $top) 'Set-TestActiveWindow reports the window activated again'
+    Start-Sleep -Milliseconds 300
+    Assert ((Get-TestActiveWindow -Window $top) -eq ([int64]$top)) 'and the queue agrees that window is ACTIVE'
+    Assert ((Get-TestFocusedWindow -Window $top) -ne 0) 'and the keyboard is back on it'
+
+    # And it MOVES between two top-level windows of the same GUI thread - the
+    # shape a user makes by clicking the window behind. Note what cannot be
+    # asserted here and why: both windows share one input queue, so
+    # Get-TestFocusedWindow reads the same value for either. ACTIVE is the
+    # per-window fact, which is exactly why Get-TestActiveWindow exists.
+    & $exe +new-window 2>&1 | Out-Null
+    $second = [IntPtr]::Zero
+    for ($t = 0; $t -lt 40 -and $second -eq [IntPtr]::Zero; $t++) {
+        Start-Sleep -Milliseconds 150
+        $second = @(Get-TestWindows -ProcessId $app.Pid -Class 'GhozttyWindow') |
+            Where-Object { [int64]$_.Hwnd -ne [int64]$top } |
+            ForEach-Object { [IntPtr]$_.Hwnd } | Select-Object -First 1
+        if ($null -eq $second) { $second = [IntPtr]::Zero }
+    }
+    Assert ($second -ne [IntPtr]::Zero) 'activation: a second top-level window exists to move to'
+    if ($second -ne [IntPtr]::Zero) {
+        Assert (Set-TestActiveWindow -Window $top) 'activation: the first window takes the keyboard'
+        Start-Sleep -Milliseconds 300
+        Assert ((Get-TestActiveWindow -Window $second) -eq ([int64]$top)) `
+            'the SECOND window agrees the first is active (one queue, one active window)'
+        Assert (Set-TestActiveWindow -Window $second) 'activation: the second window takes it'
+        Start-Sleep -Milliseconds 300
+        $activeNow = Get-TestActiveWindow -Window $top
+        Assert ($activeNow -eq ([int64]$second)) `
+            "activation really MOVED to the other top-level window (active=$activeNow)"
+        Assert ($activeNow -ne ([int64]$top)) `
+            'negative control: the first window is no longer the active one'
+        Send-TestWindowClose -Window $second | Out-Null
+        Start-Sleep -Milliseconds 700
+        [void](Focus-TestWindow -Window $top -Child $pane)
     }
 
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'app alive through the whole harness run'

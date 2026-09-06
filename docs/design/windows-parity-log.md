@@ -22916,3 +22916,55 @@ column back to itself), and Down puts it away while selecting a row. ALL PASS
 at 1.0/1.25/1.5/2.0 in the `none` lane. Floor: `floor-lane.ps1 -Lane all` ALL
 LANES PASS. Filed T1377: one of three consecutive acceptance runs flaked in M1's
 ctrl-click, which is the harness dropping a posted click, not this.
+
+## 2026-09-05 - A test can now take the keyboard away from a window (T568)
+
+The GUI acceptance scripts run on a background Win32 desktop so they never steal
+the user's screen. That desktop could always be ASKED which window held the
+keyboard - `Get-TestActiveWindow` / `Get-TestFocusedWindow` have read it since
+T224 - but nothing could MOVE it. Posted input cannot activate a window (real
+activation comes from the `WM_MOUSEACTIVATE` only real input generates),
+`SetForegroundWindow` fails off the input desktop, and `SendInput` is blocked
+there outright (T207).
+
+So every claim of the shape "this chrome shows only while the window has the
+keyboard" was assertable in one direction only: a script could tab focus between
+the controls of one window, never take it off the window. T289 hit that and
+declined to fake it - the Activity Monitor's focus ring shipped with its
+disappearance half unmeasured, and the reason was written into a comment instead
+of into a test.
+
+The harness has the write side now, as two calls, because a window loses the
+keyboard in two different shapes and they have different oracles:
+
+- `Set-TestActiveWindow -Window <top>` makes that window the ACTIVE one of its
+  own thread's input queue and gives it focus. A sibling top-level that was
+  active gets `WM_ACTIVATE(WA_INACTIVE)` and its focused child gets
+  `WM_KILLFOCUS` - what a real click on the window behind produces.
+- `Clear-TestActiveWindow -Window <any window on that thread>` leaves NOBODY
+  holding it, which is what a click into another process looks like.
+
+Both go through the same input-queue attach the focus helpers already use, and
+both are verified off `GetGUIThreadInfo` rather than from the API's return value:
+an activation the queue did not take is exactly the failure they exist to make
+loud.
+
+The second call is the one with the unambiguous oracle, and the reason is worth
+recording. Every window in this app is on the one UI thread, and focus belongs to
+a thread's input queue - so two top-level windows read back the SAME focused
+hwnd, and moving activation between them can never drive either read to zero.
+`Clear` really does produce focus 0; `Set` is asserted against ACTIVE, which is
+the per-window fact.
+
+Validation: `test\win32\activity-monitor.ps1` gains section L7, the arm T289
+could not write. With the table focused the ring measures 23 px; deactivated it
+measures 0; back with the keyboard, 23 again; and 0 while the terminal window
+holds it. The return leg is the control - a ring that vanished for any other
+reason (a repaint, a dropped caret) would not come back. ALL PASS (182
+assertions), and `-NegativeControl` now inverts three claims instead of two and
+goes red on all three, L7's included. `test\win32\test-desktop-harness.ps1`
+covers the capability itself - focus to literal 0, back again, and activation
+moving between two real top-level windows - ALL PASS (65). Floor:
+`floor-lane.ps1 -Lane all` plus the six audit harnesses the library edit made
+due (isolation-meta, launch-preflight, verdict-exit, cleanslate, stderr-capture,
+desktop-launch), all ALL PASS.

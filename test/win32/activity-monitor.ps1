@@ -39,7 +39,9 @@
 #      that is not on screen, the row keys reach the table only while the TABLE
 #      holds focus, and the table - an owner-drawn region no theme rings for us
 #      - paints design system 2.2's ring on its caret row exactly while it has
-#      the keyboard;
+#      the keyboard; (T568) including when the PANEL loses the keyboard rather
+#      than another stop inside it taking it - deactivated outright, and with a
+#      sibling window holding it - which T289 could not assert at all;
 #   N. (T567) the column headings have a KEYBOARD route to the sort: while the
 #      table holds focus Left/Right walk a cursor along the headings, that cursor
 #      draws design system 2.2's indicator on the column it is on (and the caret
@@ -77,10 +79,10 @@
 #
 # CONTROLS. A positive control (ctrl+shift+p opening the palette) runs first, so
 # a broken injection aborts instead of reading as a T285 regression. The
-# `-NegativeControl` switch inverts two load-bearing claims - D's (a needle that
-# matches nothing is asserted to still show every row) and L's (the focus ring
-# is asserted to be painted while the FILTER holds focus) - and that run MUST
-# fail.
+# `-NegativeControl` switch inverts three load-bearing claims - D's (a needle
+# that matches nothing is asserted to still show every row), L's (the focus ring
+# is asserted to be painted while the FILTER holds focus) and L7's (it is
+# asserted to survive the panel being DEACTIVATED) - and that run MUST fail.
 #
 # T211/T217: runs on a BACKGROUND Win32 desktop (test/win32/lib/TestDesktop.ps1)
 # and asserts at the end that it never took the user's foreground. The panel is
@@ -1274,10 +1276,8 @@ try {
     # rather than the keyboard's position, which is the difference between a
     # focus ring and decoration.
     #
-    # Focus moving to another STOP, not the panel being deactivated: posted
-    # input cannot activate a window off the input desktop (activation comes
-    # from WM_MOUSEACTIVATE on real input), so the deactivated case has no
-    # honest oracle here and is left unasserted rather than faked.
+    # This is focus moving to another STOP inside the panel. The other half -
+    # the panel not holding the keyboard AT ALL - is L7 below.
     Send-TestControlKey -Control $panel -Key Tab | Out-Null
     Start-Sleep -Milliseconds 400
     Assert ((Get-TestFocusedWindow -Window $panel) -eq $filterEdit) 'L6 Tab moved focus off the table'
@@ -1288,6 +1288,94 @@ try {
     } finally {
         Close-TestWindowPixels -Shot $shotL5
     }
+
+    # --- L7. ...and when the PANEL stops holding the keyboard at all (T568) --
+    # `panel_focused` is maintained from WM_SETFOCUS/WM_KILLFOCUS precisely so
+    # that a deactivated panel stops ringing a row nobody's keyboard is on. L6
+    # cannot reach that: it moves focus BETWEEN the panel's own stops, and the
+    # panel holds the keyboard throughout. T289 left the claim unasserted rather
+    # than faked, because posted input cannot activate a window off the input
+    # desktop - real activation comes from the WM_MOUSEACTIVATE only real input
+    # generates, and SendInput is blocked there (T207).
+    #
+    # T568 gave the harness the write side of activation (Set-TestActiveWindow /
+    # Clear-TestActiveWindow, an input-queue attach rather than a fake), so both
+    # ways a window loses the keyboard are exercised here:
+    #
+    #   a. nobody holds it (Clear) - the unambiguous oracle, since the panel's
+    #      GUI thread reads back focus 0. Two top-level windows of ONE thread
+    #      cannot produce that: they share an input queue, so the read is
+    #      thread-wide.
+    #   b. a SIBLING window holds it (Set on the terminal window) - the shape a
+    #      user actually produces by clicking the terminal behind the panel.
+    #
+    # Between them the panel is re-activated and the ring asserted BACK. That is
+    # the control: a ring that vanished for any other reason (a repaint, the
+    # caret being dropped) would not return with the keyboard.
+    $tabs = 0
+    while ((Get-TestFocusedWindow -Window $panel) -ne $panel -and $tabs -lt 6) {
+        Send-TestControlKey -Control (Get-TestFocusedWindow -Window $panel) -Key Tab | Out-Null
+        Start-Sleep -Milliseconds 200
+        $tabs++
+    }
+    Assert ((Get-TestFocusedWindow -Window $panel) -eq $panel) 'L7 (setup) the table holds focus again'
+    $shotL6 = Get-TestWindowPixels -Window $panel -Sync
+    try {
+        $rimL7 = Count-NonMatching $shotL6 $client.Left $ringY0 $ringX1 $ringY1 $PANEL_BG
+        Assert ($rimL7 -gt 0) "L7 (setup) the ring is painted before the panel is deactivated ($rimL7 px)"
+    } finally {
+        Close-TestWindowPixels -Shot $shotL6
+    }
+
+    # a. Nobody holds the keyboard.
+    Assert (Clear-TestActiveWindow -Window $panel) 'L7 the harness can take the keyboard off the panel'
+    Start-Sleep -Milliseconds 400
+    Assert ((Get-TestFocusedWindow -Window $panel) -eq 0) `
+        "L7 positive control: the panel's thread holds NO focus (got $(Get-TestFocusedWindow -Window $panel))"
+    $shotL7 = Get-TestWindowPixels -Window $panel -Sync
+    try {
+        $deactivated = Count-NonMatching $shotL7 $client.Left $ringY0 $ringX1 $ringY1 $PANEL_BG
+        if ($NegativeControl) {
+            Write-Host 'NEGATIVE CONTROL: asserting the focus ring survives the panel being DEACTIVATED - this run MUST fail'
+            Assert ($deactivated -gt 0) "L7 (inverted): the ring is still painted with the panel deactivated ($deactivated px)"
+        } else {
+            Assert ($deactivated -eq 0) "L7 the ring LEAVES when the panel stops holding the keyboard ($deactivated px still painted)"
+        }
+    } finally {
+        Close-TestWindowPixels -Shot $shotL7
+    }
+
+    # b. ...and it comes BACK with the keyboard, which is what makes (a) a
+    # measurement of focus rather than of a one-way repaint.
+    Assert (Set-TestActiveWindow -Window $panel) 'L7 the harness can give the keyboard back'
+    Start-Sleep -Milliseconds 400
+    Assert ((Get-TestFocusedWindow -Window $panel) -eq $panel) 'L7 the table holds the keyboard again'
+    $shotL8 = Get-TestWindowPixels -Window $panel -Sync
+    try {
+        $back = Count-NonMatching $shotL8 $client.Left $ringY0 $ringX1 $ringY1 $PANEL_BG
+        Assert ($back -gt 0) "L7 the ring RETURNS with the keyboard ($back px)"
+    } finally {
+        Close-TestWindowPixels -Shot $shotL8
+    }
+
+    # c. The sibling-window shape: the terminal window takes the keyboard, the
+    # way it does when a user clicks it behind the panel.
+    Assert (Set-TestActiveWindow -Window $top) 'L7 the terminal window can be activated instead'
+    Start-Sleep -Milliseconds 400
+    Assert ((Get-TestActiveWindow -Window $panel) -eq $top) `
+        "L7 the ACTIVE window of the shared GUI thread is now the terminal (got $(Get-TestActiveWindow -Window $panel))"
+    Assert ((Get-TestFocusedWindow -Window $panel) -ne $panel) 'L7 ...so the panel no longer holds the keyboard'
+    $shotL9 = Get-TestWindowPixels -Window $panel -Sync
+    try {
+        $sibling = Count-NonMatching $shotL9 $client.Left $ringY0 $ringX1 $ringY1 $PANEL_BG
+        Assert ($sibling -eq 0) "L7 the ring is gone while a SIBLING window holds the keyboard ($sibling px still painted)"
+    } finally {
+        Close-TestWindowPixels -Shot $shotL9
+    }
+
+    # Leave the table holding the keyboard - section N's header probes need it.
+    Assert (Set-TestActiveWindow -Window $panel) 'L7 (teardown) the panel is active again'
+    Start-Sleep -Milliseconds 400
 
     # --- N. The column headings have a KEYBOARD route to the sort (T567) -----
     # Before this the headings were mouse-only: `onLeftDown` was the single path
