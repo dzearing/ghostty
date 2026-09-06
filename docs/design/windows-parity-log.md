@@ -23513,3 +23513,56 @@ ALL PASS; `close-confirm-idle.ps1` ALL PASS (58) with `-NegativeControl` red;
 `remote-disconnect.ps1` ALL PASS (49); `viewer-close.ps1` ALL PASS (44);
 `gate-negatives.ps1` ALL PASS (58); the nine due audits green.
 
+
+## 2026-09-06 - The narrow-toolbar test stops counting a control it cannot photograph (T1400)
+
+The card said `viewer-narrow-pane.ps1` fails in `D:\git\ghoztty` and passes in a
+fresh worktree on the same commit, and that the working directory therefore
+decides the verdict. It does not. Four runs from the repo, unchanged code,
+scored PASS, FAIL, PASS, PASS - always on the same assertion, "narrowing never
+ADDS ink to the strip". The worktree split was two small samples of a coin.
+
+Section E scans fixed-pitch boxes across the whole nav bar and counts a box as
+inked when it differs from the band background. The address field is a child
+EDIT sitting inside that scan, so its own background was being counted as ink -
+and a child control's pixels are not reliably part of a synchronous PrintWindow
+capture. A probe copy of the script captured one unmoved bar eight times per
+width and printed the per-box ink:
+
+```
+PROBE[55.1] bar 351 edit 176 [170..346] slots 8  ink: 0=14 1=14 2=15 3=14 4=35 5=35 6=35 7=35
+PROBE[55.3] bar 351 edit 176 [170..346] slots 4  ink: 0=14 1=14 2=15 3=14 4=0  5=0  6=0  7=0
+```
+
+Boxes 0-3 are what the bar paints itself and never moved. Boxes 4-7 are exactly
+the field's rect and carried 35 full-height rows or nothing. Every width with a
+field flickered; the two too narrow for a field never did. A wider band that
+sampled "field absent" measured FEWER inked boxes than the narrower band after
+it, which is precisely the shape the assertion refuses.
+
+The scan now stops at the field's left edge, so it counts only the leading
+cluster and the "..." overflow that closes it - which is also the only thing
+that section's four claims are about. The field's own assertion ("legible or
+absent, never a stub") already came from `GetWindowRect`, which is synchronous
+and never flaked.
+
+What this cost is the reason it is worth a log entry: four whole-script runs
+established only that the total moved. The per-box print named the mechanism in
+one. An intermittent assertion at CONSTANT geometry should go straight to
+printing the per-region measurement.
+
+The rule is in `docs/claude/testing.md` now: measure a child through its rect,
+bound an ink scan at its edge, and treat `-AllowUniform` as a probe that has
+given up its one guard against a capture that drew less than it should have. Of
+the twenty scripts that look up a child `Edit`/`Button`, only `viewer-find.ps1`
+also measures a parent capture over one, and its `>= 3 distinct colours`
+threshold survives the field being absent. Filed T1404: the rule is written
+down, but nothing CHECKS it, so the next probe that measures a child's pixels
+buys the same day of investigation.
+
+Floor: `floor-lane.ps1 -Lane all` lib/none/win32/agent ALL LANES PASS; ipc-p1/p2/p3
+ALL PASS; `viewer-narrow-pane.ps1` ALL PASS (63) four consecutive times with
+identical band numbers, from the repo AND from a fresh worktree built at the
+same commit, with `-NegativeControl` red at exactly its four failures; the seven
+due audits (isolation-meta, launch-preflight, verdict-exit, cleanslate,
+stderr-capture, docs-routing, desktop-launch) green.

@@ -365,6 +365,14 @@ try {
     #      pane - a short "..." against a full-height chevron - so the narrow
     #      bar is demonstrably showing the overflow control rather than the
     #      first navigation button with everything after it cut off.
+    #
+    # The ink scan stops at the address field (T1400). The field is a child
+    # EDIT, and whether a child's pixels are in a synchronous PrintWindow
+    # capture is a coin flip: the same bar, unmoved, photographed with the
+    # field's 35 full-height rows present in one capture and absent in the
+    # next, which made the monotone claim above flip verdicts run to run on
+    # identical code. What the bar paints ITSELF is deterministic, and it is
+    # also the only thing these claims are about.
     # -----------------------------------------------------------------------
     $htmlFile = Join-Path $env:TEMP "ghoztty-vnp-$PID.html"
     Set-Content -Path $htmlFile -Encoding utf8 -Value @'
@@ -411,9 +419,20 @@ try {
             $barRect = Get-Rect $barH
             $barW = Rect-Width $barRect
             if ($barW -le 0) { return $null }
+            # The address field's WIDTH, and where it STARTS in bar-local
+            # pixels. The second one bounds the ink scan below: the field is a
+            # child EDIT, and a child's pixels are not reliably part of a
+            # synchronous PrintWindow capture (T1400) - the same bar, unmoved,
+            # photographs with the field's background present or absent from
+            # one capture to the next. Its width comes from GetWindowRect,
+            # which never lies, so nothing here needs the field's pixels.
             $editW = 0
+            $fieldLeft = $barW
             foreach ($e in @(Get-TestChildWindows -Window $barH -Class 'Edit')) {
-                $editW = [Math]::Max($editW, (Rect-Width (Get-Rect ([IntPtr]$e.Hwnd))))
+                $er = Get-Rect ([IntPtr]$e.Hwnd)
+                if ((Rect-Width $er) -le 0) { continue }
+                $editW = [Math]::Max($editW, (Rect-Width $er))
+                $fieldLeft = [Math]::Min($fieldLeft, $er.left - $barRect.left)
             }
             $shot = $null
             try { $shot = Get-TestWindowPixels -Window $barH -Sync -AllowUniform } catch { $shot = $null }
@@ -427,6 +446,14 @@ try {
                     for ($i = 0; $i -lt $maxSlots; $i++) {
                         $x0 = $padPx + $i * $slotPx
                         $x1 = [Math]::Min($x0 + $targetPx, $shot.Width - 1)
+                        # Stop at the address field. Everything the bar paints
+                        # ITSELF - the leading cluster and the "..." overflow
+                        # that closes it - sits to the left of the field, and
+                        # the layout guarantees that cluster is never empty, so
+                        # this scans exactly the strip the assertions below are
+                        # about and never the one region whose pixels a capture
+                        # may or may not carry (T1400).
+                        if ($x1 -gt $fieldLeft) { break }
                         $rows = 0
                         for ($y = $topPx; $y -lt [Math]::Min($topPx + $targetPx, $shot.Height); $y++) {
                             $inked = $false

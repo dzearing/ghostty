@@ -1034,3 +1034,37 @@ describe as their positive control ("+ lit, × dark" is a product defect;
 answered per glyph. Same shape as the bug T209 found in `glyphCentered()`: a
 negative control that answers a question no paint site asks is decoration.
 
+
+**A CHILD CONTROL's pixels are not reliably part of a synchronous capture**
+(T1400). `Get-TestWindowPixels -Sync` photographs a window through
+`PrintWindow`, and what the window paints ITSELF — its `WM_PRINTCLIENT` — is
+deterministic: the same window, unmoved, gives byte-identical pixels every
+time. A child `WS_CHILD` control inside that window is not. `viewer-narrow-pane`
+measured the viewer nav bar and counted the address field's own background as
+ink; eight captures of one unmoved bar, at a constant width and with the
+field's rect reading a constant 122px from `GetWindowRect`, came back with the
+field's 35 full-height rows present in six and absent in two. The assertion
+downstream ("narrowing never ADDS ink to the strip") therefore flipped verdict
+run to run on identical code, and because a fresh worktree happened to draw a
+different pair of samples the split read as *the working directory decides*,
+which sent the investigation to layouts, saved state and per-exe-path
+directories for a day.
+
+What to do about it:
+
+- **Measure the child through its RECT, never through the parent's capture.**
+  `GetWindowRect` on the child is synchronous and cannot lie — that is where
+  "the address field is legible or absent, never a stub" already came from, and
+  it never flaked.
+- **Bound an ink scan at the child's edge**, so the pixels you count are the
+  ones the window painted itself. In `viewer-narrow-pane` that is one `break`
+  when a slot box reaches the field's left edge; the numbers went from three
+  values across eight captures to one.
+- **Suspect this shape whenever an assertion is intermittent at CONSTANT
+  geometry.** Print the per-region measurement, not just the total: the ink map
+  named the mechanism in one run after four whole-script runs had only
+  established that the total moved.
+- **`-AllowUniform` hides the loud version of it.** A capture that came back
+  blank is normally an error; that switch accepts it, and a probe carrying it
+  is a probe with nothing left to notice a capture that drew less than it
+  should have.
