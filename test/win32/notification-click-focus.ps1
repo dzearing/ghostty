@@ -24,6 +24,13 @@
 #     differently there - see the case for which half survives where, and for
 #     the 2026-08-07 interactive measurement (both calls succeed against the
 #     real shell).
+#   * By a SECOND SCRIPT, `test\win32\notification-click-real.ps1` (T572),
+#     which raises a real balloon, finds the toast the shell drew and clicks it
+#     with SendInput. It is interactive-only and not part of the floor, and it
+#     SKIPS with the `desktop-toasts` capability named on a box whose
+#     Notifications are off - which is the state of the box this suite runs on
+#     as of 2026-09-05, so the observation is still owed. Run it after turning
+#     Notifications on in Settings > System > Notifications.
 #   * By HAND, once, on the interactive desktop, because a balloon renders
 #     there and a real click cannot be faked off it:
 #

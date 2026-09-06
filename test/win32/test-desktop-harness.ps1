@@ -156,7 +156,7 @@ Write-Host ''
 Write-Host '-- Z. desktop capability declaration'
 
 $capBg = @{}
-foreach ($n in @('chrome-pixels', 'surface-pixels', 'screen-pixels', 'real-input', 'foreground')) {
+foreach ($n in @('chrome-pixels', 'surface-pixels', 'screen-pixels', 'real-input', 'foreground', 'desktop-toasts')) {
     $capBg[$n] = Get-TestDesktopCapability -Name $n
     Write-Host ("  background/{0,-14} available={1} - {2}" -f $n, $capBg[$n].Available, $capBg[$n].Reason)
 }
@@ -169,6 +169,7 @@ Assert (-not $capBg['surface-pixels'].Available) 'surface pixels are declared UN
 Assert (-not $capBg['screen-pixels'].Available) 'screen pixels are declared UNAVAILABLE on the background desktop'
 Assert (-not $capBg['real-input'].Available) 'real input is declared UNAVAILABLE on the background desktop'
 Assert (-not $capBg['foreground'].Available) 'a foreground window is declared UNAVAILABLE on the background desktop'
+Assert (-not $capBg['desktop-toasts'].Available) 'desktop toasts are declared UNAVAILABLE on the background desktop'
 # A refusal with no reason is a refusal nobody can act on: the SKIP line a
 # script prints is built out of this text.
 Assert (@($capBg.Values | Where-Object { -not $_.Reason }).Count -eq 0) 'every capability answer carries a reason'
@@ -179,6 +180,18 @@ Assert (@($capBg.Values | Where-Object { -not $_.Reason }).Count -eq 0) 'every c
 $capFg = Get-TestDesktopCapability -Name real-input -Interactive
 Write-Host ("  interactive/real-input available={0} measured={1} - {2}" -f $capFg.Available, $capFg.Measured, $capFg.Reason)
 Assert ($capFg.Measured) 'the interactive answer is MEASURED on the box, not assumed'
+# The probe's own struct, asserted rather than trusted: SendInput rejects every
+# event with ERROR_INVALID_PARAMETER when cbSize disagrees with the OS, and a
+# probe that can only answer "unavailable" silently skips every interactive
+# script gated on it. It read 48 for weeks (T572).
+Assert ([GhozttyDesktopCapability]::InputSize() -eq 40) `
+    "the probe's INPUT struct is the 40 bytes the x64 injection API requires (got $([GhozttyDesktopCapability]::InputSize()))"
+
+# Same for the toast answer (T572): it reads the user's Notifications switch
+# rather than declaring a fact about the desktop, so it must report Measured.
+$capToast = Get-TestDesktopCapability -Name desktop-toasts -Interactive
+Write-Host ("  interactive/desktop-toasts available={0} measured={1} - {2}" -f $capToast.Available, $capToast.Measured, $capToast.Reason)
+Assert ($capToast.Measured) 'the interactive toast answer is MEASURED on the box, not assumed'
 
 # A typo must not read as 'available': a silent answer to a question nobody
 # asked is how a probe scores itself green against a capability that does not

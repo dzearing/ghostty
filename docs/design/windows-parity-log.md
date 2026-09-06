@@ -23051,3 +23051,63 @@ harnesses the edit made due (upgrade-no-fork, isolation-meta, launch-preflight,
 verdict-exit, cleanslate, stderr-capture, desktop-launch), all ALL PASS. Filed
 T1379: the health line decides on `turn_age` alone and should read the same
 pane state, so the observer and the actor report the same reason.
+
+## 2026-09-05 - A real click on a real notification can be driven now, and the probe that was silently skipping every interactive test is fixed (T572)
+
+Clicking a Ghoztty notification is supposed to jump you to the pane that raised
+it. Everything either side of that click was measured - T448 proved the balloon
+is registered with the shell the way it has to be, and
+`notification-click-focus.ps1`'s 38 assertions prove the right pane gets focused
+once a click arrives - but nobody had ever had a machine click a real toast and
+watch the window come forward. `test\win32\notification-click-real.ps1` is that
+drive: an isolated debug build, two windows, an OSC 777 raised from a pane in
+window A, the foreground parked on window B, the toast located by DIFFERENCE
+against a snapshot of visible top-level windows taken before the raise, a real
+`SendInput` click on its body, and `GetForegroundWindow()` polled for window A.
+A second case clicks the dismiss X instead and asserts the foreground does NOT
+move, which is the `NIN_BALLOONHIDE` half of `tray_notify.classify`. It is
+interactive-by-design and declared as such, and it is not in the floor.
+
+The toast is found by difference rather than by class name on purpose: the shell
+has changed which class hosts a notification banner at least twice across
+Windows 10 and 11, and a hardcoded name is how this script would quietly stop
+finding one and start reporting that the product had broken.
+
+**The observation itself is still owed, and the script says so rather than
+lying.** This box draws no notification banners at all:
+`HKCU\...\PushNotifications\ToastEnabled` is 0 - Settings > System >
+Notifications, off - and with it flipped on, `WpnUserService` restarted and
+`explorer` restarted, a stock `System.Windows.Forms.NotifyIcon.ShowBalloonTip`
+*still* drew nothing, confirmed both by an `EnumWindows` diff and by a
+`CopyFromScreen` of the notification corner. The registry was put back to 0. So
+a new `desktop-toasts` capability answers the question before anything launches,
+and the toast wait itself calls `Exit-TestSkip` with the same capability name
+when the shell draws nothing - two stages of one gate, both demonstrated today.
+T572 is parked `blocked` with the one-line recipe for taking the observation:
+turn Notifications on, run the script.
+
+**And a defect found on the way, which is the bigger half of this entry.** The
+`real-input` capability probe could never say "available" - on any box, ever.
+Its `INPUT` struct carried two extra `int` fields, so `Marshal.SizeOf` read 48
+where x64 requires 40, and Windows rejected every injected event with
+`ERROR_INVALID_PARAMETER`. The probe reported `SendInput accepted 0 of 1 events
+(last error 87)`, which reads exactly like a busy box, and every script gated on
+it exited `SKIP ALL` before asserting anything. `context-menu-real-input.ps1` -
+the acceptance script for the T240 defect the user actually reported - had been
+skipping unconditionally. With the padding removed it runs, and passes 11 of 11.
+
+Validation: `notification-click-real.ps1` demonstrated in both of its skip
+stages - `desktop-toasts` refused at the registry pre-check, and then, with the
+switch flipped on for the run, refused at the toast wait after passing setup,
+isolation and the case-1 raise. `context-menu-real-input.ps1` ALL PASS (11),
+having previously skipped. `test-desktop-harness.ps1` ALL PASS (68), including
+three new assertions: the probe's struct is 40 bytes, `desktop-toasts` is
+declared unavailable on a background desktop, and its interactive answer is
+MEASURED. `foreground-audit.ps1` ALL PASS (40) and `desktop-launch-audit.ps1`
+ALL PASS (29) with the two new declarations in `lib\TestDesktop.ps1`; the
+isolation-meta, launch-preflight, verdict-exit, cleanslate, stderr-capture,
+test-reach, body-complete, printclient and harness-exitcode audits all ALL PASS.
+Floor: `floor-lane.ps1 -Lane all` ALL LANES PASS; P1/P2/P3 ALL PASS (25/20/16).
+Filed T1383: `profile-latency.ps1`
+was masked by the same broken probe and now refuses on a stale July
+`zig-out-prof` build that no documented command produces.

@@ -208,6 +208,7 @@
 # @input-desktop-exception: context-menu-real-input.ps1 -- (T240) the subject IS a real right-click: a script that synthesizes the trigger cannot validate the trigger.
 # @input-desktop-exception: profile-latency.ps1 -- (T53b) injection timing is the measurement, so a posted message would time the wrong path.
 # @input-desktop-exception: test-desktop-spike.ps1 -- (T207) the spike that measured what does and does not work off the input desktop; it has to reach both.
+# @input-desktop-exception: notification-click-real.ps1 -- (T572) the subject IS a real click on a shell-drawn toast: balloons render on the input desktop and nowhere else, and a posted WM_APP_TRAY cannot validate delivery.
 # @input-desktop-exception: rdp-session.ps1 -- (T1253/T1316) its subject is the desktop being shipped over the wire, and arm G reads the COMPOSITE of a viewer surface with the dim overlay blended onto it; DWM composes only the input desktop.
 #
 # LAUNCHES ON THE USER'S DESKTOP - the second list, and a different question
@@ -226,6 +227,7 @@
 # burn down instead of settling.
 #
 # @user-desktop-launch: context-menu-real-input.ps1 -- (T240) already interactive-by-design above: the subject IS a real right-click, so its app has to be on the input desktop too.
+# @user-desktop-launch: notification-click-real.ps1 -- (T572) already interactive-by-design above: the toast the shell draws for our balloon only exists on the input desktop, so the app that raises it has to be there too.
 # @user-desktop-launch: profile-latency.ps1 -- (T53b) already interactive-by-design above: injection timing is the measurement, and it can only be taken where input is injected.
 # @user-desktop-launch: go-loop-guard.ps1 -- (T1193) the ONE bare launch is the fallback taken when New-TestDesktop throws - a desktop we cannot create must not cost the whole suite, and the fallback says so loudly before it runs.
 #

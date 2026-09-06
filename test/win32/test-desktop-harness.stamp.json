@@ -1,14 +1,16 @@
 {
     "guard":  "test-desktop",
     "script":  "test/win32/test-desktop-harness.ps1",
-    "generated":  "2026-09-05T18:46:28-07:00",
-    "commit":  "ef1a649b1",
+    "generated":  "2026-09-05T20:41:35-07:00",
+    "commit":  "fa5647156",
     "uncommitted":  [
-                        "test/win32/lib/TestDesktop.ps1"
+                        "test/win32/lib/DesktopCapability.ps1",
+                        "test/win32/lib/TestDesktop.ps1",
+                        "test/win32/test-desktop-harness.ps1"
                     ],
     "files":  {
-                  "test/win32/lib/DesktopCapability.ps1":  "a4fbf1c197f5b0eb6a052ea00151c8f8d36cb569baa6ee3006770f975b202700",
-                  "test/win32/lib/TestDesktop.ps1":  "5ce05c3f49df0c018ea2dc0ee9c9c71712fcf3f2279b7d94e16ab8ab3e507e8d",
-                  "test/win32/test-desktop-harness.ps1":  "44303ca1679c441f4742929f44ed9b045a1639e6351f07f619091223adf91250"
+                  "test/win32/lib/DesktopCapability.ps1":  "ee7fa5006f36de6b7290f5b67f77b845366ab4d563ad82bedbeaceb1c6fa0a24",
+                  "test/win32/lib/TestDesktop.ps1":  "6345fe16fe0a1c71cb7c8e74c3d773209c933044bdbf20a6f33eb3ce71dac085",
+                  "test/win32/test-desktop-harness.ps1":  "e4fb2e7aa54684ef7745dbad908342df608c2bf32cb37d6b429a20b6cfc08e8d"
               }
 }

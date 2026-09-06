@@ -44,6 +44,13 @@
 #   foreground      A window can be brought to the foreground. A background
 #                   desktop has no foreground window at all (GetForegroundWindow
 #                   returns 0); on the interactive desktop it is measured.
+#   desktop-toasts  The shell draws a notification banner for a
+#                   `Shell_NotifyIcon` balloon, so there is something on screen
+#                   to click. A background desktop has no shell and no
+#                   notification area, so NIM_ADD itself fails there; on the
+#                   interactive desktop the user's master Notifications switch
+#                   decides, and it is read from the registry. Measured off on
+#                   this box on 2026-09-05 (T572) - see notification-click-real.ps1.
 #
 # HOW A SCRIPT USES IT. At the top, before it launches anything:
 #
@@ -89,13 +96,26 @@ using System.Runtime.InteropServices;
 public class GhozttyDesktopCapability {
     [StructLayout(LayoutKind.Sequential)]
     struct MOUSEINPUT { public int dx, dy; public uint mouseData, dwFlags, time; public IntPtr extra; }
+    // x64 INPUT is 40 bytes: 4 type + 4 alignment pad + a 32-byte union.
+    // MOUSEINPUT is already 32 once its trailing IntPtr is 8-aligned, so it
+    // needs NO tail padding - and adding some is not harmless. Two extra ints
+    // made Marshal.SizeOf 48, SendInput rejected every event with
+    // ERROR_INVALID_PARAMETER, and `real-input` therefore read UNAVAILABLE on
+    // every box it has ever been asked on: the interactive scripts gated on it
+    // skipped unconditionally and nobody saw a red (T572). The size is asserted
+    // in test-desktop-harness.ps1's capability section for exactly that reason.
     [StructLayout(LayoutKind.Sequential)]
-    struct INPUT { public uint type; public MOUSEINPUT mi; public int pad0, pad1; }
+    struct INPUT { public uint type; public MOUSEINPUT mi; }
 
     [DllImport("user32.dll", SetLastError = true)] static extern uint SendInput(uint n, INPUT[] inputs, int size);
     [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
 
     public static int LastError = 0;
+
+    // What SendInput is told each event weighs. Windows checks this against
+    // its own idea of sizeof(INPUT) and rejects the whole call when they
+    // disagree, so it is asserted rather than trusted (T572).
+    public static int InputSize() { return Marshal.SizeOf(typeof(INPUT)); }
 
     // Is there a foreground window at all? Zero means this thread's desktop is
     // not the input desktop (or the shell has not come up yet).
@@ -119,8 +139,21 @@ public class GhozttyDesktopCapability {
 }
 
 $script:GhozttyCapabilityNames = @(
-    'chrome-pixels', 'surface-pixels', 'screen-pixels', 'real-input', 'foreground'
+    'chrome-pixels', 'surface-pixels', 'screen-pixels', 'real-input', 'foreground',
+    'desktop-toasts'
 )
+
+# The user's master Notifications switch. 0 means Settings > System >
+# Notifications is off, and with it off NOTHING draws a banner - measured on
+# 2026-09-05 with a stock System.Windows.Forms.NotifyIcon balloon, which stayed
+# invisible to both an EnumWindows diff and a CopyFromScreen of the
+# notification corner. A missing value is the Windows default, which is ON.
+function Test-GhozttyToastsEnabled {
+    $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\PushNotifications'
+    $v = (Get-ItemProperty -Path $key -Name ToastEnabled -ErrorAction SilentlyContinue).ToastEnabled
+    if ($null -eq $v) { return $true }
+    return ([int]$v -ne 0)
+}
 
 function Get-GhozttyForcedMissingCapability {
     $raw = $env:GHOZTTY_TEST_FORCE_MISSING_CAPS
@@ -169,6 +202,7 @@ function Get-TestDesktopCapability {
             'screen-pixels'  { return & $mk $false 'DWM composes only the input desktop; BitBlt off a background desktop DC returns FALSE' $false }
             'real-input'     { return & $mk $false 'SendInput is ACCESS_DENIED off the input desktop (0 of 12 accepted, test-desktop-spike.ps1 INPUT-1)' $false }
             'foreground'     { return & $mk $false 'a background desktop has no foreground window (GetForegroundWindow returns 0)' $false }
+            'desktop-toasts' { return & $mk $false 'a background desktop has no shell and no notification area: NIM_ADD itself fails there, so no balloon is ever drawn' $false }
         }
     }
 
@@ -183,6 +217,17 @@ function Get-TestDesktopCapability {
                 return & $mk $true 'a foreground window exists on this desktop' $true
             }
             return & $mk $false 'GetForegroundWindow returned 0 - this process is not on the input desktop, or nothing owns the foreground' $true
+        }
+        'desktop-toasts' {
+            # The registry answer is a PRE-check, not the whole measurement: it
+            # catches the one condition that is knowable before anything is
+            # launched. The real oracle is the toast failing to appear, and the
+            # script that needs one calls Exit-TestSkip with this same
+            # capability name when its wait times out.
+            if (Test-GhozttyToastsEnabled) {
+                return & $mk $true 'notifications are enabled for this user (ToastEnabled)' $true
+            }
+            return & $mk $false 'notifications are turned OFF for this user (Settings > System > Notifications); the shell draws no banner, so there is nothing to click' $true
         }
         'real-input' {
             $n = [GhozttyDesktopCapability]::ProbeSendInput()
