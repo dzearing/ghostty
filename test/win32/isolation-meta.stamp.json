@@ -1,10 +1,10 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-09-06T01:04:27-07:00",
-    "commit":  "8948c0830",
+    "generated":  "2026-09-06T07:08:10-07:00",
+    "commit":  "34e44db54",
     "uncommitted":  [
-                        "test/win32/split-divider.ps1"
+
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "944e54bda392aa61007ee23280c6bb9767ed2e661f77f5157ca035dbe9b6e4ea",
@@ -106,7 +106,7 @@
                   "test/win32/gate-negatives.ps1":  "5942dfa85a157a5b884d7c3c35dec86b0d10ee2a5d3c5aca2996465bd97b34f3",
                   "test/win32/ghoztty-cleanup.ps1":  "81bfcb6cb5b018195e1056d6ce7203f18235763916bcec4cffcdafa811e73f76",
                   "test/win32/go-loop-guard.ps1":  "5044a3ba697b375627cff48ccd86b55754584562486c55819f438a00480b4359",
-                  "test/win32/go-loop-uptime.ps1":  "a97005d970a564088741646542ffaca3cb9ffe03d2eb30c55b96841607948b82",
+                  "test/win32/go-loop-uptime.ps1":  "2f3b0ddd2008e43ce3901790fe41aaba7fb18051b1b328feb5b8493780e8d56a",
                   "test/win32/guard-due.ps1":  "306e120c7282b5c4c50c75ac9d7a30a8db84e94e92745cc79caa6ea4eb437d01",
                   "test/win32/gui-launch-command.ps1":  "92343e0db67fea906f08a1a8ef37ec38c4bd2ca90b859269451d543e33ec6202",
                   "test/win32/gui-postmortem.ps1":  "bd3a16f1ac67d46c914a30582a69d391f923701ea29e90820472f0fec662ef7d",
