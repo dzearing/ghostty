@@ -1,10 +1,10 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-06T00:11:33-07:00",
-    "commit":  "81b05a13b",
+    "generated":  "2026-09-06T01:04:58-07:00",
+    "commit":  "8948c0830",
     "uncommitted":  [
-                        "test/win32/key-state-pill.ps1"
+                        "test/win32/split-divider.ps1"
                     ],
     "files":  {
                   "docs/claude/testing.md":  "ec2a58df8d8c30fe5ae586331be5ec26b1a84a3ea71358a44ac6b823a720d970",
@@ -272,7 +272,7 @@
                   "test/win32/soak.ps1":  "cc3d8774680af5795741d2cb4ab6521e3161a102c8c45c64f36e8d76d047e639",
                   "test/win32/split-dim.ps1":  "a0d3d7e7816fc6a89ab6c2f285c2d19f2e2a550333765c2a3fabdb377c9e8b8b",
                   "test/win32/split-dim-viewer.ps1":  "454a52890b54b98bd41361b823291d51d54b6986180613e921fd0d185324dea9",
-                  "test/win32/split-divider.ps1":  "cf4eeef4cc31b15427bd2be83bb97e5edd88a0b055687312a3e17e4d66e16fcf",
+                  "test/win32/split-divider.ps1":  "c647338dd6cf52f0cab945c2c4d3edd279702cf1d2879b05a1a8ae4263e94914",
                   "test/win32/split-zoom-nav.ps1":  "7ed3a76e0a6abc09573263efa8f7c7d3889ab31d6d8b258040ab7cf5e9882b12",
                   "test/win32/startup-failure.ps1":  "d2ed885900bd7d68765f605a5a94a622df2682d29c6d9fa27a4612b33cce6cb9",
                   "test/win32/stderr-capture-audit.ps1":  "04424b778285df67f2eeed9c8ee354d1446c62a920ab8de56bf8b4475569cf9b",
