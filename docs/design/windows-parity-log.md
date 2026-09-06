@@ -23456,3 +23456,60 @@ Floor: `floor-lane.ps1 -Lane all` lib/none/win32/agent ALL LANES PASS;
 `tab-strip.ps1` ALL PASS (70) with the negative control recorded in the task -
 with the title fix in and the focus fix out, the tightened assertion scores
 exactly the failure it promises over two 546 px tabs.
+
+## 2026-09-06 - Closing a busy pane asks again, because ConPTY's prompt marks lie (T1398)
+
+Ctrl+Shift+W on a pane with a build, a test run or an install still going was
+supposed to stop and ask. It had stopped asking - and it did not merely close
+unconfirmed, it closed with no sign that anything had been at stake. The idle
+case still behaved, so the shortcut looked entirely healthy right up to the
+moment it cost you something.
+
+The confirmation is decided by two answers. The core's - "is a process active?"
+- comes from `cursorIsAtPrompt`, fed by OSC 133 semantic prompt marks. T41
+established that on Windows that answer is useless in one direction: cmd.exe and
+stock PowerShell emit no marks, so an idle shell sitting at its prompt reads as
+"running" and every close confirmed. The Windows tiebreaker T41 added is the
+process table - a shell with no descendants has nothing to lose.
+
+What changed is that the marks are no longer absent. They arrive from ConPTY
+rather than from the shell, and ConPTY brackets the prompt (`133;B`, input
+starts) without ever saying a command started (`133;C`). Measured directly with
+`ping -n 100` running under the pane's cmd.exe: `semantic_content=.input`,
+`at_prompt=true`, and `Surface.close called process_active=false`. So the core
+now says "nothing is running" for the exact case the dialog exists for, the
+`process_active and !shellIsIdleNow()` gate short-circuits on the first half,
+and the process table - which had the right answer the whole time - is never
+asked.
+
+The fix inverts the precedence for the case the process table can see.
+`Surface.closeNeedsConfirm(map, process_active)` resolves the ordinary
+`confirm-close-surface = true` case from the shell's descendants alone, and
+keeps the core's verdict only for what the process table cannot know: an
+explicit `= false`, and a child that has already exited. `= always` and
+read-only stay forced. `Window.confirmCloseIfNeeded` had the same gate in the
+same shape and now shares the helper, so the whole-window close (title-bar X,
+Alt+F4) was fixed with it.
+
+The two symptoms the task described turned out to be one. The pane CLOSED, both
+backends; the harness's later checks - ctrl+c leaves no descendants, the idle
+chord opens no dialog, the window is gone - all pass trivially once the window
+is already gone, which is what made it read as a survival.
+
+Two things about the harness. `close-confirm-idle.ps1` found this and had no
+guard row, so nothing tied an edit of the close gate to running it: it has one
+now (`close-confirm`, covering both close paths and `ProcessTree.zig`) and
+stamps on a green run. And `remote-disconnect.ps1` section F is back on the
+busy-shell positive control it was written as - it had been switched to
+`confirm-close-surface = always` for a day precisely because this bug made the
+busy path unusable as a control.
+
+Filed T1403: two smaller consumers still trust the same marks - `clearScreen`
+sends a form-feed to the shell mid-command, and cursor-click-to-move enables
+itself mid-command. Visible, not destructive.
+
+Floor: `floor-lane.ps1 -Lane all` lib/none/win32/agent ALL LANES PASS; ipc-p1/p2/p3
+ALL PASS; `close-confirm-idle.ps1` ALL PASS (58) with `-NegativeControl` red;
+`remote-disconnect.ps1` ALL PASS (49); `viewer-close.ps1` ALL PASS (44);
+`gate-negatives.ps1` ALL PASS (58); the nine due audits green.
+

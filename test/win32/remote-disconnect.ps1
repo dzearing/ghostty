@@ -396,19 +396,38 @@ try {
     Write-Host ""
     Write-Host "== F: a LOCAL window is offered no Disconnect =="
 
-    # `confirm-close-surface = always` is what forces the dialog here. The
-    # obvious control - a BUSY local shell, which T41 says must confirm - is
-    # unusable while T1398 is open: that path currently raises no dialog at all,
-    # so it would report "no Disconnect button" over "no dialog" and prove
-    # nothing about the offer. `always` is the other branch `Surface.shellIsIdle`
-    # refuses to answer idle for, it is unconditional, and it gives this section
-    # exactly what it needs: a local confirmation to look inside.
+    # A BUSY local shell is the control this section is written on: T41 says a
+    # pane with something running under it must confirm, and it reaches the
+    # confirmation through the ordinary `confirm-close-surface = true` default,
+    # so what is asserted below is the dialog a real user gets. It was
+    # `confirm-close-surface = always` for one day while T1398 was open - that
+    # bug left the busy path raising no dialog at all, which would have reported
+    # "no Disconnect button" over "no dialog" and proved nothing about the offer.
     if ($g) { Stop-Process -Id $g.Pid -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 800 }
-    $g = Start-Gui @('--session-persistence=false', '--confirm-close-surface=always')
+    $g = Start-Gui @('--session-persistence=false')
     if (-not $g) { Write-Host 'SETUP FAIL: F GUI did not come up'; $script:fail++; exit 1 }
     $surface = Get-TestChildWindow -Window $g.Top -Class 'GhozttyTerminal'
     Assert ($surface -ne [IntPtr]::Zero) 'F: the local window has a terminal surface'
     if ($surface -eq [IntPtr]::Zero) { exit 1 }
+
+    # With session-persistence off the pane's shell is a direct child of the
+    # app, so the process table names it without asking the app anything.
+    $localShell = 0
+    foreach ($p in (Get-DescendantPids $g.Pid)) {
+        if ($p.Name -match '^(cmd|powershell|pwsh)\.exe$') { $localShell = [int]$p.ProcessId; break }
+    }
+    Assert ($localShell -gt 0) "F: the local pane has a shell process (pid $localShell)"
+    if ($localShell -le 0) { exit 1 }
+
+    Send-TestText -Window $g.Top -Target $surface -Text 'ping -n 100 127.0.0.1' | Out-Null
+    Send-TestKeys -Window $g.Top -Target $surface -Key Enter | Out-Null
+    $busy = @()
+    for ($t = 0; $t -lt 30 -and $busy.Count -eq 0; $t++) {
+        Start-Sleep -Milliseconds 400
+        $busy = @(Get-DescendantPids $localShell)
+    }
+    Assert ($busy.Count -gt 0) "F: something is running under the local shell ($($busy.Count) descendants)"
+    if ($busy.Count -eq 0) { Write-Host 'SETUP FAIL: F could not make the local shell busy'; exit 1 }
 
     # The window path (`Window.confirmCloseIfNeeded`), which is where sections
     # A-C got their three-button dialog.

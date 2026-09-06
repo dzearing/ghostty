@@ -1,10 +1,11 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-09-06T13:46:54-07:00",
-    "commit":  "20f11044b",
+    "generated":  "2026-09-06T14:49:28-07:00",
+    "commit":  "4b8cb874a",
     "uncommitted":  [
-                        "test/win32/tab-strip.ps1"
+                        "test/win32/close-confirm-idle.ps1",
+                        "test/win32/remote-disconnect.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "944e54bda392aa61007ee23280c6bb9767ed2e661f77f5157ca035dbe9b6e4ea",
@@ -68,7 +69,7 @@
                   "test/win32/clipboard-retry.ps1":  "28e774ed3e8a85ec6f2e39cd0c1e2d4638adc33500de991489d5fc4179914a10",
                   "test/win32/cli-shim-redirect.ps1":  "d9270707fa5daba04008292352c21cfb3aa71a688528a10a3db2319484e5f3bb",
                   "test/win32/cli-unknown-flag.ps1":  "07ea51f386b5d1f59c1ad1a1ae7ff93c4b14ab35b7d4468a7ae9313e208427f2",
-                  "test/win32/close-confirm-idle.ps1":  "e023ba31d4567b3b13f4970f5904a3989a80b28389af6e79885404dfa9eb007b",
+                  "test/win32/close-confirm-idle.ps1":  "dd096255e04935b98b0ba0eb87022edd019486352b4e8e40f857678b89244128",
                   "test/win32/close-glyph-white.ps1":  "cb2a97f2286e4fefff7a07ed5933ecbacbc49b32a28f594f5af44130e731e553",
                   "test/win32/color-contrast.ps1":  "464aa2aa9a4e6cf6470fbcd1ec523b705a9f3260a04f6af57f406ff36e00cb4e",
                   "test/win32/command-registry.ps1":  "4b451ab5f58c9456cee43a4127d2b26db4d0285accb0d1c8592fff49ac57fd01",
@@ -105,7 +106,7 @@
                   "test/win32/fork-identity.ps1":  "2a83e77b4f6fc5127e583e44175dc00a350ef16cacf5b9404c9e6e8fb388ab71",
                   "test/win32/gate-negatives.ps1":  "5942dfa85a157a5b884d7c3c35dec86b0d10ee2a5d3c5aca2996465bd97b34f3",
                   "test/win32/ghoztty-cleanup.ps1":  "81bfcb6cb5b018195e1056d6ce7203f18235763916bcec4cffcdafa811e73f76",
-                  "test/win32/go-loop-guard.ps1":  "d98c2f7132cbaa422974cf6324c5f009e3de3a590b9c97eda17acd547815ec8b",
+                  "test/win32/go-loop-guard.ps1":  "2d9db127ad778f064985a4188b2009b9824736954552a3e21c0959236b2a9d3a",
                   "test/win32/go-loop-uptime.ps1":  "2f3b0ddd2008e43ce3901790fe41aaba7fb18051b1b328feb5b8493780e8d56a",
                   "test/win32/guard-due.ps1":  "306e120c7282b5c4c50c75ac9d7a30a8db84e94e92745cc79caa6ea4eb437d01",
                   "test/win32/gui-launch-command.ps1":  "92343e0db67fea906f08a1a8ef37ec38c4bd2ca90b859269451d543e33ec6202",
@@ -237,7 +238,7 @@
                   "test/win32/relay-account.ps1":  "8dee3165d569d5069208dee6975b251d6bb3444434e4993e5d4bda207e80250f",
                   "test/win32/release-artifacts.ps1":  "2143ef793a06c48ee2d6cd826b9f17366db0630d3aa16335ab16e60890e343e5",
                   "test/win32/release-parity.ps1":  "92babe2c0e154c766dd02f9578073f6a04ec281ee706aa8a8dc83c505d579f9f",
-                  "test/win32/remote-disconnect.ps1":  "67efba1c31dfad8bdb3d2448028f3df20f6850086fda68250eadce7397d2b472",
+                  "test/win32/remote-disconnect.ps1":  "8f123d9e150de11bb9d27bf03bd43ca84f883ee7c585af13e733db015083028f",
                   "test/win32/remote-inherit.ps1":  "50b2a9d36a10d0e677963fbb7d155e3dbc45261111214c1ab8b6454f025e24da",
                   "test/win32/remote-pill.ps1":  "76ffee269bac8ababf6ead9bba303664e9ff20615ea8b738f8fbd362cb345f41",
                   "test/win32/remote-reconnect-fresh.ps1":  "57b43deff08f9c6e056ea8eac4d8ced8134fd30f528b81d3b645132b29d971d1",

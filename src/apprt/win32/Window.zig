@@ -7532,13 +7532,16 @@ pub fn confirmCloseIfNeeded(self: *Window) bool {
             // Viewers run no process, so they never gate a close (Mac
             // parity: `+close` never prompts for a viewer pane).
             const surface = entry.view.surface() orelse continue;
-            if (surface.core_surface_ready and
-                surface.core_surface.needsConfirmQuit() and
-                // The core's verdict is `cursorIsAtPrompt`, which no Windows
-                // shell answers (no OSC 133) - so it says "running" for an
-                // idle prompt too. The process table is the tiebreaker.
-                !surface.shellIsIdle(&pid_map))
-            {
+            // The core's verdict is `cursorIsAtPrompt`, and on Windows the
+            // OSC 133 marks behind it come from ConPTY rather than from the
+            // shell: it says "running" for an idle prompt (T41) and "idle" for
+            // a running command (T1398). `closeNeedsConfirm` puts the process
+            // table in front of it and keeps the core's verdict only for what
+            // the process table cannot see.
+            if (surface.closeNeedsConfirm(
+                &pid_map,
+                surface.core_surface_ready and surface.core_surface.needsConfirmQuit(),
+            )) {
                 needs = true;
             }
         }

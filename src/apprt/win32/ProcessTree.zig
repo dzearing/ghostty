@@ -77,9 +77,13 @@ pub fn isAncestor(map: *const PidMap, ancestor: u32, descendant: u32) bool {
 ///
 /// This is the Windows answer to "is anything running in this pane?" (T41).
 /// The Mac asks the terminal instead — `cursorIsAtPrompt`, fed by the shell's
-/// OSC 133 marks — but cmd.exe and stock PowerShell emit none, so on this
-/// platform the shell is always "not at a prompt" and the process table is the
-/// only thing that knows.
+/// OSC 133 marks. On Windows those marks do not come from the shell: cmd.exe
+/// and stock PowerShell emit none, and what arrives instead is ConPTY's own
+/// prompt marking, which brackets the prompt (`133;B`) without ever saying a
+/// command started (`133;C`). So the terminal's verdict is wrong in BOTH
+/// directions here — "not at a prompt" for an idle shell where no marks arrive
+/// at all (T41), and "at a prompt" all through a running command where they do
+/// (T1398) — and the process table is the only thing that knows.
 ///
 /// Conservative by construction: a recycled pid whose stale parent link points
 /// at `pid` reports a descendant that isn't one, which shows a confirmation

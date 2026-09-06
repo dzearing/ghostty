@@ -1695,17 +1695,64 @@ pub fn shellIsIdleNow(self: *Surface) bool {
     return self.shellIsIdle(&map);
 }
 
+/// Whether closing this surface has to CONFIRM first (T1398).
+///
+/// `process_active` is the core's own verdict (`Surface.needsConfirmQuit`),
+/// and on Windows it cannot be trusted in the affirmative direction. It
+/// resolves the ordinary `confirm-close-surface = true` case through
+/// `cursorIsAtPrompt`, which reads OSC 133 semantic prompt marks — and on
+/// Windows those marks arrive from ConPTY rather than from the shell, so
+/// cmd.exe gets a `133;B` (input starts) at its prompt and no `133;C` when a
+/// command starts. The cursor therefore still reads "at the prompt" while a
+/// build is running, the core answers "nothing active", and the confirmation
+/// that stands between Ctrl+Shift+W and that build never appears — the pane
+/// just closes. The IDLE half looked right, which is why this survived T41.
+///
+/// So the process table decides the one case it can see, exactly as T41
+/// established for the opposite direction, and the core's verdict decides only
+/// what the process table cannot know: an explicit `= false`, and a child that
+/// has already exited. `shellIsIdle` itself already answers FALSE for the
+/// forced branches (`= always`, read-only), so those are re-stated here rather
+/// than relied upon.
+pub fn closeNeedsConfirm(
+    self: *Surface,
+    map: *const ProcessTree.PidMap,
+    process_active: bool,
+) bool {
+    // Nothing to ask about a surface that never came up; the core's verdict is
+    // all there is.
+    if (!self.core_surface_ready) return process_active;
+    if (self.core_surface.readonly) return true;
+    if (self.core_surface.child_exited) return false;
+    return switch (self.core_surface.config.confirm_close_surface) {
+        .false => false,
+        .always => true,
+        .true => !self.shellIsIdle(map),
+    };
+}
+
+/// `closeNeedsConfirm` against a snapshot taken here. A failed snapshot
+/// answers "not idle", so it confirms.
+pub fn closeNeedsConfirmNow(self: *Surface, process_active: bool) bool {
+    const alloc = self.app.core_app.alloc;
+    var map = ProcessTree.snapshot(alloc) catch ProcessTree.PidMap.empty;
+    defer map.deinit(alloc);
+    return self.closeNeedsConfirm(&map, process_active);
+}
+
 pub fn close(self: *Surface, process_active: bool) void {
     log.debug("Surface.close called process_active={}", .{process_active});
     // If a shell command is still running, prompt the user before
     // closing. Without this, Ctrl+Shift+W silently kills the running
     // process — macOS shows the same kind of dialog for parity.
     //
-    // `process_active` is the core's verdict, and on Windows it is always
-    // true: it comes from `cursorIsAtPrompt`, which needs OSC 133 marks that
-    // cmd.exe and stock PowerShell never emit. So an idle shell sitting at its
-    // prompt looked identical to a running build. The process table is what
-    // knows here, so a shell with no descendants closes without a dialog (T41).
+    // `process_active` is the core's verdict, and on Windows it answers the
+    // wrong question in BOTH directions: it comes from `cursorIsAtPrompt`, and
+    // the OSC 133 marks that feeds on arrive here from ConPTY rather than from
+    // the shell. An idle shell sitting at its prompt looked identical to a
+    // running build (T41), and a running build can look like an idle prompt
+    // (T1398). The process table is what knows here, so `closeNeedsConfirm`
+    // asks it and keeps the core's verdict only for what it alone can say.
     //
     // A CROSS-MACHINE pane can offer DISCONNECT instead (T1390): close the pane
     // here and leave its agent session - and the process inside it - running on
@@ -1748,7 +1795,7 @@ pub fn close(self: *Surface, process_active: bool) void {
             .ok => {},
             .alt => self.pinDetach(),
         }
-    } else if (process_active and !self.shellIsIdleNow()) {
+    } else if (self.closeNeedsConfirmNow(process_active)) {
         const result = ConfirmDialog.show(
             self.app,
             self.parent_window.hwnd,

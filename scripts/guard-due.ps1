@@ -320,6 +320,24 @@ $GuardTable = @(
             'src\apprt\win32\ViewerPane.zig'
         )
     },
+    # The close confirmation's own harness (T41/T1398): the only thing on the box
+    # that watches a BUSY pane and an IDLE pane answer the same chord
+    # differently. It had no guard row until T1398, and that is how T1398
+    # happened - ConPTY started emitting prompt marks, the core's verdict
+    # silently flipped for a running command, and the confirmation that stands
+    # between Ctrl+Shift+W and a build disappeared with nothing obliged to
+    # notice. Covers both close paths and the process table they now decide on.
+    [pscustomobject]@{
+        Name   = 'close-confirm'
+        Script = 'test\win32\close-confirm-idle.ps1'
+        Stamp  = 'test\win32\close-confirm-idle.stamp.json'
+        Covers = @(
+            'test\win32\close-confirm-idle.ps1',
+            'src\apprt\win32\Surface.zig',
+            'src\apprt\win32\Window.zig',
+            'src\apprt\win32\ProcessTree.zig'
+        )
+    },
     # The remote Disconnect offer (T1390): the only thing that watches a real
     # process survive a close. The unit lanes check the policy and the pin in
     # isolation, and neither can see the answer reach the agent - which is the
