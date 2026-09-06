@@ -1,10 +1,11 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-09-06T08:49:37-07:00",
-    "commit":  "5999aee0a",
+    "generated":  "2026-09-06T10:19:05-07:00",
+    "commit":  "4556380e9",
     "uncommitted":  [
-
+                        "test/win32/close-confirm-idle.ps1",
+                        "test/win32/remote-disconnect.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "944e54bda392aa61007ee23280c6bb9767ed2e661f77f5157ca035dbe9b6e4ea",
@@ -68,7 +69,7 @@
                   "test/win32/clipboard-retry.ps1":  "28e774ed3e8a85ec6f2e39cd0c1e2d4638adc33500de991489d5fc4179914a10",
                   "test/win32/cli-shim-redirect.ps1":  "d9270707fa5daba04008292352c21cfb3aa71a688528a10a3db2319484e5f3bb",
                   "test/win32/cli-unknown-flag.ps1":  "07ea51f386b5d1f59c1ad1a1ae7ff93c4b14ab35b7d4468a7ae9313e208427f2",
-                  "test/win32/close-confirm-idle.ps1":  "09a5be3ee29edd36c7d7081a297ddbe61544d0617b56942a516efd77703afb96",
+                  "test/win32/close-confirm-idle.ps1":  "e023ba31d4567b3b13f4970f5904a3989a80b28389af6e79885404dfa9eb007b",
                   "test/win32/close-glyph-white.ps1":  "cb2a97f2286e4fefff7a07ed5933ecbacbc49b32a28f594f5af44130e731e553",
                   "test/win32/color-contrast.ps1":  "464aa2aa9a4e6cf6470fbcd1ec523b705a9f3260a04f6af57f406ff36e00cb4e",
                   "test/win32/command-registry.ps1":  "4b451ab5f58c9456cee43a4127d2b26db4d0285accb0d1c8592fff49ac57fd01",
@@ -198,6 +199,7 @@
                   "test/win32/relay-account.ps1":  "8dee3165d569d5069208dee6975b251d6bb3444434e4993e5d4bda207e80250f",
                   "test/win32/release-artifacts.ps1":  "2143ef793a06c48ee2d6cd826b9f17366db0630d3aa16335ab16e60890e343e5",
                   "test/win32/release-parity.ps1":  "92babe2c0e154c766dd02f9578073f6a04ec281ee706aa8a8dc83c505d579f9f",
+                  "test/win32/remote-disconnect.ps1":  "67efba1c31dfad8bdb3d2448028f3df20f6850086fda68250eadce7397d2b472",
                   "test/win32/remote-inherit.ps1":  "50b2a9d36a10d0e677963fbb7d155e3dbc45261111214c1ab8b6454f025e24da",
                   "test/win32/remote-pill.ps1":  "76ffee269bac8ababf6ead9bba303664e9ff20615ea8b738f8fbd362cb345f41",
                   "test/win32/remote-reconnect-fresh.ps1":  "57b43deff08f9c6e056ea8eac4d8ced8134fd30f528b81d3b645132b29d971d1",

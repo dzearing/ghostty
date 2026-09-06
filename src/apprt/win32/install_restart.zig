@@ -406,7 +406,8 @@ fn ask(version: []const u8, windows: usize) Answer {
 
     return switch (result) {
         .ok => .restart,
-        .cancel => .later,
+        // `.alt` (T1390) is not offered here; see install_maintenance.
+        .cancel, .alt => .later,
     };
 }
 

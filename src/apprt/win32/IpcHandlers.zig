@@ -1143,8 +1143,16 @@ fn handleRearrange(ctx: Context, request: Request) Allocator.Error!?[]u8 {
                 (if (s.core_surface_ready) s.core_surface.remoteSessionId() else null)
             else
                 null;
-            if (agent_recovery.closesDepartingLeaf(in_new_tree, sid, surviving_ids.items))
+            if (agent_recovery.closesDepartingLeaf(in_new_tree, sid, surviving_ids.items)) {
                 view.setSessionCloseIntent(true);
+            } else if (in_new_tree) {
+                // Re-adoption releases a Disconnect pin (T1390): this pane is
+                // live in the new layout, so a LATER close is a close like any
+                // other. The pin only ever has to outlive the ONE close the
+                // user answered, and a pane that survived that close is no
+                // longer in it.
+                view.clearDetachPin();
+            }
         }
     }
 

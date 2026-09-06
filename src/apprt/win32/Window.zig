@@ -85,6 +85,21 @@ pub const RemoteMachine = union(enum) {
         }
     }
 
+    /// How this machine is NAMED to the user (T1390): the hostname we dialed,
+    /// or the relay device id. Borrows this machine's strings, so it is only
+    /// valid while the window holds them.
+    ///
+    /// It is the same identity the connection pill's tooltip speaks of, and
+    /// deliberately not a prettier one: what the close confirmation has to
+    /// answer is "which box will keep running this", and a nickname that does
+    /// not match what the user typed answers a different question.
+    pub fn displayName(self: RemoteMachine) []const u8 {
+        return switch (self) {
+            .tcp => |t| t.host,
+            .relay => |r| r.device,
+        };
+    }
+
     /// This machine's key in the per-host defaults store (T174): the relay
     /// DEVICE ID (stable across renames), else `host:port` — Mac's
     /// `Machine.settingsKey`. Borrows this machine's strings.
@@ -124,6 +139,7 @@ const icon_button = @import("icon_button.zig");
 const icon_paint = @import("icon_button_paint.zig");
 const type_ramp = @import("type_ramp.zig");
 const remote_pill = @import("remote_pill.zig");
+const session_disconnect = @import("session_disconnect.zig");
 const tab_shape = @import("tab_shape.zig");
 const color_math = @import("color_math.zig");
 const chrome_theme = @import("chrome_theme.zig");
@@ -7499,28 +7515,71 @@ pub fn confirmCloseIfNeeded(self: *Window) bool {
     var pid_map = ProcessTree.snapshot(alloc) catch ProcessTree.PidMap.empty;
     defer pid_map.deinit(alloc);
 
+    // A cross-machine window can offer DISCONNECT (T1390): close the window
+    // here while its agent sessions, and the processes inside them, keep
+    // running on the box that hosts them. A LOCAL session-persistence window
+    // carries no `remote_machine` and is excluded on purpose - "closing a pane
+    // ends its session" is that feature's documented contract.
+    const offerable = session_disconnect.machineIsDisconnectable(self.remote_machine != null);
+
     var needs = false;
-    outer: for (0..self.tab_count) |i| {
+    var disconnectable: usize = 0;
+    for (0..self.tab_count) |i| {
         var it = self.tab_trees[i].iterator();
         while (it.next()) |entry| {
+            if (offerable and session_disconnect.isDisconnectable(entry.view.disconnectFacts()))
+                disconnectable += 1;
             // Viewers run no process, so they never gate a close (Mac
             // parity: `+close` never prompts for a viewer pane).
             const surface = entry.view.surface() orelse continue;
             if (surface.core_surface_ready and
                 surface.core_surface.needsConfirmQuit() and
                 // The core's verdict is `cursorIsAtPrompt`, which no Windows
-                // shell answers (no OSC 133) — so it says "running" for an
+                // shell answers (no OSC 133) - so it says "running" for an
                 // idle prompt too. The process table is the tiebreaker.
                 !surface.shellIsIdle(&pid_map))
             {
                 needs = true;
-                break :outer;
             }
         }
     }
-    if (!needs) return true;
+
+    // The idle gate is WIDENED for a remote window (T1390): ending a process on
+    // another machine is not the recoverable thing an idle local shell is, and
+    // an idle remote shell is precisely the one worth walking away from. It is
+    // widened HERE, at an interactive caller, and never inside the programmatic
+    // close path - a modal there would wedge every later `ghoztty +...`.
+    const offering = disconnectable > 0;
+    if (!needs and !offering) return true;
 
     const refocus: ?w32.HWND = if (self.getActiveSurface()) |s| s.hwnd else null;
+
+    if (!offering) {
+        const result = ConfirmDialog.show(
+            self.app,
+            self.hwnd,
+            self.scale,
+            refocus,
+            .{
+                .title = std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty"),
+                .text = std.unicode.utf8ToUtf16LeStringLiteral(
+                    "Processes are still running in this window.\nClose anyway?",
+                ),
+            },
+        );
+        return result == .ok;
+    }
+
+    var text_buf: [session_disconnect.text_cap]u8 = undefined;
+    const text = session_disconnect.informativeText(
+        &text_buf,
+        if (self.remote_machine) |m| m.displayName() else null,
+        disconnectable,
+    );
+    var wide: [session_disconnect.text_cap * 2:0]u16 = undefined;
+    const wlen = std.unicode.utf8ToUtf16Le(&wide, text) catch 0;
+    wide[wlen] = 0;
+
     const result = ConfirmDialog.show(
         self.app,
         self.hwnd,
@@ -7528,12 +7587,39 @@ pub fn confirmCloseIfNeeded(self: *Window) bool {
         refocus,
         .{
             .title = std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty"),
-            .text = std.unicode.utf8ToUtf16LeStringLiteral(
-                "Processes are still running in this window.\nClose anyway?",
-            ),
+            .text = wide[0..wlen :0],
+            .ok_label = std.unicode.utf8ToUtf16LeStringLiteral("Close"),
+            .alt_label = std.unicode.utf8ToUtf16LeStringLiteral("Disconnect"),
+            // Disconnect is the default: the answer that ends nothing.
+            .default_alt = true,
         },
     );
-    return result == .ok;
+    switch (result) {
+        .cancel => return false,
+        .ok => return true,
+        .alt => {
+            self.pinDisconnect();
+            return true;
+        },
+    }
+}
+
+/// Record the user's **Disconnect** on every pane a Disconnect would spare
+/// (T1390). Pinning is what survives the close: `Window.close`,
+/// `closeTabByIndex` and `closeSplitPane` all mark CLOSE-on-free
+/// unconditionally, from paths whose order varies, and the pin is what refuses
+/// those markings instead of racing them.
+///
+/// Only the panes the OFFER covered are pinned - an exited pane has nothing to
+/// keep, and a viewer never had a session - so those still close normally.
+fn pinDisconnect(self: *Window) void {
+    for (self.tab_trees[0..self.tab_count]) |*tree| {
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            if (session_disconnect.isDisconnectable(entry.view.disconnectFacts()))
+                entry.view.pinDetach();
+        }
+    }
 }
 
 /// Handle WM_CLOSE: clean up all tabs, then destroy the window.

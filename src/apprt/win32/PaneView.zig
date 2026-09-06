@@ -36,6 +36,7 @@ const RefCount = @import("pane_refcount.zig").RefCount;
 const Surface = @import("Surface.zig");
 const ViewerPane = @import("ViewerPane.zig");
 const Window = @import("Window.zig");
+const session_disconnect = @import("session_disconnect.zig");
 
 
 pub const Kind = enum { terminal, viewer };
@@ -271,6 +272,38 @@ pub fn setSessionCloseIntent(self: *PaneView, intent: bool) void {
         .terminal => |s| s.setSessionCloseIntent(intent),
         .viewer => {},
     }
+}
+
+/// Record the user's **Disconnect** for this pane (T1390), so every later
+/// CLOSE-on-free marking is refused. A viewer owns no agent session, so there
+/// is nothing to keep and nothing to pin.
+pub fn pinDetach(self: *PaneView) void {
+    switch (self.kind) {
+        .terminal => |s| s.pinDetach(),
+        .viewer => {},
+    }
+}
+
+/// Release the Disconnect pin (a `+rearrange` kept this pane, so it is live
+/// again and a later close is an ordinary close).
+pub fn clearDetachPin(self: *PaneView) void {
+    switch (self.kind) {
+        .terminal => |s| s.clearDetachPin(),
+        .viewer => {},
+    }
+}
+
+/// The facts `session_disconnect` decides on. A viewer reports `has_surface =
+/// false`, which is exactly why it is never counted in a Disconnect offer.
+pub fn disconnectFacts(self: *PaneView) session_disconnect.PaneFacts {
+    return switch (self.kind) {
+        .terminal => |s| s.disconnectFacts(),
+        .viewer => .{
+            .has_surface = false,
+            .process_exited = true,
+            .confirm_close_enabled = false,
+        },
+    };
 }
 
 // -------------------------------------------------------------------------

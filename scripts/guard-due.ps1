@@ -320,6 +320,24 @@ $GuardTable = @(
             'src\apprt\win32\ViewerPane.zig'
         )
     },
+    # The remote Disconnect offer (T1390): the only thing that watches a real
+    # process survive a close. The unit lanes check the policy and the pin in
+    # isolation, and neither can see the answer reach the agent - which is the
+    # whole feature, since a Disconnect that silently marked CLOSE anyway looks
+    # identical to one that worked from inside the app. Covers the policy, the
+    # three-button dialog and both interactive close paths.
+    [pscustomobject]@{
+        Name   = 'remote-disconnect'
+        Script = 'test\win32\remote-disconnect.ps1'
+        Stamp  = 'test\win32\remote-disconnect.stamp.json'
+        Covers = @(
+            'test\win32\remote-disconnect.ps1',
+            'src\apprt\win32\session_disconnect.zig',
+            'src\apprt\win32\ConfirmDialog.zig',
+            'src\apprt\win32\Window.zig',
+            'src\apprt\win32\Surface.zig'
+        )
+    },
     # Narrow viewer panes (T1130): the only thing that measures viewer chrome
     # against the pane it lives in. The unit lanes assert the pure layout
     # modules and cannot see a WINDOW placed outside its parent, and the P1-P3

@@ -52,6 +52,7 @@ const panel_theme = @import("panel_theme.zig");
 const system_colors = @import("system_colors.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const ProcessTree = @import("ProcessTree.zig");
+const session_disconnect = @import("session_disconnect.zig");
 const provenance = @import("provenance.zig");
 const color_math = @import("color_math.zig");
 
@@ -97,6 +98,12 @@ core_surface: CoreSurface = undefined,
 /// (WM_SETFOCUS, WM_SIZE, etc.) can arrive during init before
 /// core_surface is ready — handlers must check this flag.
 core_surface_ready: bool = false,
+
+/// The user answered **Disconnect** for this pane (T1390): the window closes
+/// but its agent session must stay alive and resumable, so every later
+/// CLOSE-on-free marking is refused. See `session_disconnect.DetachPin` for the
+/// ordering problem this exists to solve.
+detach_pin: session_disconnect.DetachPin = .{},
 
 /// Whether core_surface.init() completed successfully (ever).
 /// Different from core_surface_ready which is cleared during shutdown.
@@ -1699,7 +1706,49 @@ pub fn close(self: *Surface, process_active: bool) void {
     // cmd.exe and stock PowerShell never emit. So an idle shell sitting at its
     // prompt looked identical to a running build. The process table is what
     // knows here, so a shell with no descendants closes without a dialog (T41).
-    if (process_active and !self.shellIsIdleNow()) {
+    //
+    // A CROSS-MACHINE pane can offer DISCONNECT instead (T1390): close the pane
+    // here and leave its agent session - and the process inside it - running on
+    // the box that hosts it. That widens the gate past the idle check, because
+    // an idle shell on another machine is exactly the one worth walking away
+    // from. It is widened HERE, at an interactive caller; `+close` and the
+    // other scripted paths never reach this function, so nothing programmatic
+    // can raise a modal.
+    const offering = session_disconnect.machineIsDisconnectable(
+        self.parent_window.remote_machine != null,
+    ) and session_disconnect.isDisconnectable(self.disconnectFacts());
+
+    if (offering) {
+        var text_buf: [session_disconnect.text_cap]u8 = undefined;
+        const text = session_disconnect.informativeText(
+            &text_buf,
+            if (self.parent_window.remote_machine) |m| m.displayName() else null,
+            1,
+        );
+        var wide: [session_disconnect.text_cap * 2:0]u16 = undefined;
+        const wlen = std.unicode.utf8ToUtf16Le(&wide, text) catch 0;
+        wide[wlen] = 0;
+
+        const result = ConfirmDialog.show(
+            self.app,
+            self.parent_window.hwnd,
+            self.parent_window.scale,
+            self.hwnd,
+            .{
+                .title = std.unicode.utf8ToUtf16LeStringLiteral("Ghoztty"),
+                .text = wide[0..wlen :0],
+                .ok_label = std.unicode.utf8ToUtf16LeStringLiteral("Close"),
+                .alt_label = std.unicode.utf8ToUtf16LeStringLiteral("Disconnect"),
+                // Disconnect is the default: the answer that ends nothing.
+                .default_alt = true,
+            },
+        );
+        switch (result) {
+            .cancel => return,
+            .ok => {},
+            .alt => self.pinDetach(),
+        }
+    } else if (process_active and !self.shellIsIdleNow()) {
         const result = ConfirmDialog.show(
             self.app,
             self.parent_window.hwnd,
@@ -1730,8 +1779,34 @@ pub fn close(self: *Surface, process_active: bool) void {
 /// app-quit teardown (Window.deinit), so quitting leaves sessions alive for
 /// the next launch. No-op for local exec surfaces (the child dies with the
 /// surface anyway) and before core-surface init.
+/// A CLOSE marking is REFUSED while the pane is Disconnect-pinned (T1390), and
+/// silently: the callers are the ordinary close paths, all of which mark
+/// unconditionally, and none of them has anything useful to do about a refusal.
+/// A DETACH marking always goes through — it agrees with the pin.
 pub fn setSessionCloseIntent(self: *Surface, intent: bool) void {
-    if (self.core_surface_ready) self.core_surface.setSessionCloseIntent(intent);
+    const resolved = self.detach_pin.resolve(intent) orelse return;
+    if (self.core_surface_ready) self.core_surface.setSessionCloseIntent(resolved);
+}
+
+/// Record the user's **Disconnect** for this pane (T1390).
+pub fn pinDetach(self: *Surface) void {
+    self.detach_pin.pin();
+}
+
+/// Release the pin: this pane is live again (re-adopted by a `+rearrange` that
+/// kept it), so a LATER close is a close like any other.
+pub fn clearDetachPin(self: *Surface) void {
+    self.detach_pin.clear();
+}
+
+/// The facts `session_disconnect` decides on, read off this live pane.
+pub fn disconnectFacts(self: *Surface) session_disconnect.PaneFacts {
+    return .{
+        .has_surface = true,
+        .process_exited = !self.core_surface_ready or self.core_surface.child_exited,
+        .confirm_close_enabled = self.core_surface_ready and
+            self.core_surface.config.confirm_close_surface != .false,
+    };
 }
 
 pub fn supportsClipboard(

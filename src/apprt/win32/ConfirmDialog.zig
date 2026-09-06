@@ -31,7 +31,11 @@ const log = std.log.scoped(.win32);
 
 const CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyConfirmDialog");
 
-pub const Result = enum { ok, cancel };
+/// `alt` is the optional THIRD button (`Options.alt_label`) — a second
+/// affirmative that is not the primary one. It exists for the remote-close
+/// confirmation's **Disconnect** (T1390), where "close the window but keep the
+/// sessions" is neither OK nor Cancel.
+pub const Result = enum { ok, cancel, alt };
 pub const Style = enum { ok_only, ok_cancel };
 pub const Icon = enum { none, warning, info };
 
@@ -49,6 +53,17 @@ pub const Options = struct {
     /// fit the longer caption.
     ok_label: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("OK"),
     cancel_label: [:0]const u16 = std.unicode.utf8ToUtf16LeStringLiteral("Cancel"),
+    /// When non-null (and `style` is `.ok_cancel`), a THIRD button carrying
+    /// this caption, returning `.alt`. It takes the LEADING slot of the button
+    /// row — `[alt] [ok] [cancel]`, right-aligned with Cancel last — which is
+    /// the Windows convention this dialog already follows for two buttons, and
+    /// where a Win32 user looks for the primary action. (Mac puts its default
+    /// rightmost; the platforms disagree about the row, not about the answer.)
+    alt_label: ?[:0]const u16 = null,
+    /// Put the Enter default on the third button instead of OK/Cancel. Mac's
+    /// remote close defaults to Disconnect — the non-destructive answer — and
+    /// so does this. Ignored when there is no `alt_label`.
+    default_alt: bool = false,
     /// When non-null the dialog carries a single-line text field seeded with
     /// this text, below the message — Mac's NSAlert `accessoryView` prompts
     /// (rename a relay device, T176) are the same alert with a field bolted
@@ -79,6 +94,10 @@ pub const Check = struct {
 
 /// Checkbox row capacity (two agent runtimes today; room to grow).
 pub const max_checks = 4;
+
+/// Control id for the optional third button (T1390). A private value: the
+/// checkbox rows own 100.., and IDOK/IDCANCEL are already spoken for.
+const ID_ALT: u16 = 200;
 
 /// The dialog's palette (T563), derived from the surface `window-theme` puts
 /// the app on and the accent the user picked — the derivation the panels got
@@ -111,6 +130,8 @@ static: ?w32.HWND,
 note_static: ?w32.HWND = null,
 ok_btn: w32.HWND,
 cancel_btn: ?w32.HWND,
+/// The optional third button (`Options.alt_label`), returning `.alt` (T1390).
+alt_btn: ?w32.HWND = null,
 /// The optional text field (`Options.input`), read back by `prompt`.
 edit: ?w32.HWND = null,
 /// The optional checkbox rows (`Options.checks`), read back on OK.
@@ -119,6 +140,9 @@ n_checks: usize = 0,
 icon_handle: ?w32.HICON,
 icon_rect: w32.RECT,
 default_cancel: bool,
+/// Enter (and initial focus) lands on the third button rather than OK/Cancel.
+/// Mutually exclusive with `default_cancel`, which `run` resolves.
+default_alt: bool = false,
 result: Result = .cancel,
 done: bool = false,
 
@@ -140,6 +164,8 @@ pub const Layout = struct {
     note: w32.RECT,
     ok: w32.RECT,
     cancel: w32.RECT,
+    /// The optional third button (empty rect when the dialog has none).
+    alt: w32.RECT,
     font_h: i32,
 };
 
@@ -158,6 +184,7 @@ pub fn layoutFor(
     note_h: i32,
     has_input: bool,
     has_cancel: bool,
+    has_alt: bool,
     btn_w: i32,
 ) Layout {
     const margin = px(16, scale);
@@ -174,7 +201,10 @@ pub fn layoutFor(
     const note_gap = px(12, scale);
 
     const icon_span: i32 = if (has_icon) icon_px + icon_gap else 0;
-    const n_btns: i32 = if (has_cancel) 2 else 1;
+    // `alt` only ever accompanies a Cancel: it is a second AFFIRMATIVE, and a
+    // dialog offering two ways to say yes and no way to say no is not a choice.
+    const with_alt = has_alt and has_cancel;
+    const n_btns: i32 = (if (has_cancel) @as(i32, 2) else 1) + @intFromBool(with_alt);
     const btns_w = n_btns * btn_w + (n_btns - 1) * btn_gap_h;
 
     var client_w = margin + icon_span + text_w + margin;
@@ -214,8 +244,13 @@ pub fn layoutFor(
     const btn_top = margin + content_h + checks_span + note_span + input_span + btn_gap_v;
     const right_left = client_w - margin - btn_w;
     const left_left = right_left - btn_gap_h - btn_w;
+    const far_left = left_left - btn_gap_h - btn_w;
     // With two buttons OK sits left of Cancel; alone, OK takes the right slot.
+    // A third button takes the slot LEFT of OK, so the row reads
+    // [alt] [ok] [cancel] with the dismissive answer last (T1390) — OK does not
+    // move, which is why a two-button caller's layout is byte-identical.
     const ok_left = if (has_cancel) left_left else right_left;
+    const alt_left = far_left;
 
     return .{
         .client_w = client_w,
@@ -250,6 +285,12 @@ pub fn layoutFor(
             .bottom = note_top + note_h,
         } else .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
         .ok = .{ .left = ok_left, .top = btn_top, .right = ok_left + btn_w, .bottom = btn_top + btn_h },
+        .alt = if (with_alt) .{
+            .left = alt_left,
+            .top = btn_top,
+            .right = alt_left + btn_w,
+            .bottom = btn_top + btn_h,
+        } else .{ .left = 0, .top = 0, .right = 0, .bottom = 0 },
         .cancel = if (has_cancel) .{
             .left = right_left,
             .top = btn_top,
@@ -340,6 +381,8 @@ fn run(
     const ex_style: u32 = w32.WS_EX_DLGMODALFRAME;
     const has_icon = opts.icon != .none;
     const has_cancel = opts.style == .ok_cancel;
+    // A third button is only offered alongside a Cancel (see `layoutFor`).
+    const has_alt = opts.alt_label != null and has_cancel;
     const has_input = opts.input != null;
     const has_note = opts.note != null;
     const n_checks: usize = @min(opts.checks.len, max_checks);
@@ -416,10 +459,21 @@ fn run(
             w32.DT_CALCRECT | w32.DT_WORDBREAK | w32.DT_NOPREFIX,
         );
 
-        // Widest button caption, so custom labels never truncate.
-        const labels: [2][:0]const u16 = .{ opts.ok_label, opts.cancel_label };
-        for (labels, 0..) |label, i| {
-            if (i == 1 and !has_cancel) break;
+        // Widest button caption, so custom labels never truncate. All three
+        // buttons share one width, so the third one has to be measured too —
+        // "Disconnect" is wider than either of the stock captions (T1390).
+        var labels: [3][:0]const u16 = undefined;
+        var n_labels: usize = 1;
+        labels[0] = opts.ok_label;
+        if (has_cancel) {
+            labels[n_labels] = opts.cancel_label;
+            n_labels += 1;
+        }
+        if (has_alt) {
+            labels[n_labels] = opts.alt_label.?;
+            n_labels += 1;
+        }
+        for (labels[0..n_labels]) |label| {
             var r: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
             _ = w32.DrawTextW(
                 hdc,
@@ -475,6 +529,7 @@ fn run(
         note_h,
         has_input,
         has_cancel,
+        has_alt,
         buttonWidth(scale, label_w),
     );
 
@@ -511,7 +566,11 @@ fn run(
         // A prompt's Enter must commit what was typed, so a field forces the
         // Enter default onto OK regardless of the caller's MB_DEFBUTTON2
         // preference (which exists to protect destructive confirmations).
-        .default_cancel = has_cancel and opts.default_cancel and !has_input,
+        // A third button that claims the Enter default takes it from BOTH the
+        // other two, so the two flags can never disagree about who is default.
+        .default_cancel = has_cancel and opts.default_cancel and !has_input and
+            !(has_alt and opts.default_alt),
+        .default_alt = has_alt and opts.default_alt and !has_input,
     };
 
     const hwnd = w32.CreateWindowExW(
@@ -620,7 +679,7 @@ fn run(
         std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
         opts.ok_label.ptr,
         w32.WS_CHILD | w32.WS_VISIBLE_STYLE |
-            (if (self.default_cancel) 0 else w32.BS_DEFPUSHBUTTON),
+            (if (self.default_cancel or self.default_alt) 0 else w32.BS_DEFPUSHBUTTON),
         l.ok.left,
         l.ok.top,
         l.ok.right - l.ok.left,
@@ -658,6 +717,36 @@ fn run(
         self.cancel_btn = cancel_btn;
     }
 
+    // The optional third button (T1390). A failed create is NOT fatal the way
+    // a missing OK is: the dialog still answers Close/Cancel, which is exactly
+    // what it did before this button existed.
+    if (has_alt) {
+        if (w32.CreateWindowExW(
+            0,
+            std.unicode.utf8ToUtf16LeStringLiteral("BUTTON"),
+            opts.alt_label.?.ptr,
+            w32.WS_CHILD | w32.WS_VISIBLE_STYLE |
+                (if (self.default_alt) w32.BS_DEFPUSHBUTTON else 0),
+            l.alt.left,
+            l.alt.top,
+            l.alt.right - l.alt.left,
+            l.alt.bottom - l.alt.top,
+            hwnd,
+            @ptrFromInt(@as(usize, ID_ALT)),
+            hinstance,
+            null,
+        )) |alt_btn| {
+            _ = w32.SetWindowTheme(alt_btn, std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"), null);
+            self.alt_btn = alt_btn;
+        } else {
+            // Nothing can answer `.alt` any more, so the Enter default must go
+            // back to a button that exists — the same one a caller who never
+            // asked for a third button would have got.
+            self.default_alt = false;
+            self.default_cancel = has_cancel and opts.default_cancel and !has_input;
+        }
+    }
+
     if (note_font) |f| {
         if (self.note_static) |s| _ = w32.SendMessageW(s, w32.WM_SETFONT, @intFromPtr(f), 1);
     }
@@ -669,6 +758,7 @@ fn run(
         };
         _ = w32.SendMessageW(self.ok_btn, w32.WM_SETFONT, @intFromPtr(f), 1);
         if (self.cancel_btn) |c| _ = w32.SendMessageW(c, w32.WM_SETFONT, @intFromPtr(f), 1);
+        if (self.alt_btn) |a| _ = w32.SendMessageW(a, w32.WM_SETFONT, @intFromPtr(f), 1);
     }
 
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(&self)));
@@ -727,7 +817,14 @@ fn readEdit(edit: w32.HWND, buf: []u8) usize {
 /// Last-resort fallback when dialog construction fails: the old (light)
 /// MessageBoxW, so a prompt is never silently skipped.
 fn fallback(owner: ?w32.HWND, opts: Options) Result {
-    var flags: u32 = switch (opts.style) {
+    // A three-answer confirmation has no OK/Cancel shape, so the system box
+    // borrows Yes/No/Cancel: Yes is the third button, No is OK. MessageBoxW
+    // cannot be relabeled, so the captions are lost — acceptable only because
+    // this path is reached when the dialog CLASS failed to register, i.e. a
+    // degraded box beats no box. Answering it can never be worse than the
+    // dismissive default, which Cancel still is.
+    const alt = if (opts.style == .ok_cancel) opts.alt_label else null;
+    var flags: u32 = if (alt != null) w32.MB_YESNOCANCEL else switch (opts.style) {
         .ok_only => w32.MB_OK,
         .ok_cancel => w32.MB_OKCANCEL,
     };
@@ -736,7 +833,13 @@ fn fallback(owner: ?w32.HWND, opts: Options) Result {
         .warning => w32.MB_ICONWARNING,
         .info => w32.MB_ICONINFORMATION,
     };
-    if (opts.style == .ok_cancel and opts.default_cancel) flags |= w32.MB_DEFBUTTON2;
+    if (alt != null) {
+        // Yes(1) is the third button, No(2) is OK, Cancel(3) is Cancel — so an
+        // alt-default box needs no override and the other two name their slot.
+        if (!opts.default_alt) flags |= if (opts.default_cancel) w32.MB_DEFBUTTON3 else w32.MB_DEFBUTTON2;
+    } else if (opts.style == .ok_cancel and opts.default_cancel) {
+        flags |= w32.MB_DEFBUTTON2;
+    }
     // The note is a disclosure, not decoration (T600) — a fallback that
     // dropped it would show a consent prompt missing its fine print, so it
     // rides along as a trailing paragraph (or the message ships alone when
@@ -754,6 +857,10 @@ fn fallback(owner: ?w32.HWND, opts: Options) Result {
         break :blk @ptrCast(&buf);
     };
     const r = w32.MessageBoxW(owner, text_ptr, opts.title, flags);
+    if (alt != null) {
+        if (r == w32.IDYES) return .alt;
+        return if (r == w32.IDNO) .ok else .cancel;
+    }
     return if (opts.style == .ok_only or r == w32.IDOK) .ok else .cancel;
 }
 
@@ -790,7 +897,25 @@ fn runModal(self: *ConfirmDialog) void {
     }
 }
 
+/// What Enter answers when focus is not on a button. Pure, and the one place
+/// the two default flags are resolved into an answer.
+pub fn defaultResultFor(default_alt: bool, default_cancel: bool) Result {
+    if (default_alt) return .alt;
+    if (default_cancel) return .cancel;
+    return .ok;
+}
+
+fn defaultResult(self: *const ConfirmDialog) Result {
+    return defaultResultFor(self.default_alt and self.alt_btn != null, self.default_cancel);
+}
+
 fn defaultButton(self: *const ConfirmDialog) w32.HWND {
+    // The third button wins when it asked for the default (T1390): the
+    // remote-close confirmation defaults to Disconnect, the answer that
+    // destroys nothing.
+    if (self.default_alt) {
+        if (self.alt_btn) |a| return a;
+    }
     if (self.default_cancel) {
         if (self.cancel_btn) |c| return c;
     }
@@ -820,6 +945,7 @@ fn ownsHwnd(self: *const ConfirmDialog, hwnd: w32.HWND) bool {
     if (self.static) |s| if (hwnd == s) return true;
     if (self.note_static) |s| if (hwnd == s) return true;
     if (self.cancel_btn) |c| if (hwnd == c) return true;
+    if (self.alt_btn) |a| if (hwnd == a) return true;
     if (self.edit) |e| if (hwnd == e) return true;
     for (self.check_btns[0..self.n_checks]) |maybe| if (maybe) |b| {
         if (hwnd == b) return true;
@@ -855,17 +981,20 @@ fn handleKey(self: *ConfirmDialog, vk: u16) bool {
             const focus = w32.GetFocus();
             if (self.cancel_btn != null and focus == self.cancel_btn) {
                 self.finish(.cancel);
+            } else if (self.alt_btn != null and focus == self.alt_btn) {
+                self.finish(.alt);
             } else if (focus == @as(?w32.HWND, self.ok_btn)) {
                 self.finish(.ok);
             } else {
-                self.finish(if (self.default_cancel) .cancel else .ok);
+                self.finish(self.defaultResult());
             }
             return true;
         },
         w32.VK_TAB => {
             // Focus stops in order: checkboxes (top-down), field (when
-            // present), OK, Cancel.
-            var stops: [3 + max_checks]w32.HWND = undefined;
+            // present), then the button row LEFT TO RIGHT as it is painted —
+            // the third button, OK, Cancel (T1390).
+            var stops: [4 + max_checks]w32.HWND = undefined;
             var n: usize = 0;
             for (self.check_btns[0..self.n_checks]) |maybe| if (maybe) |b| {
                 stops[n] = b;
@@ -873,6 +1002,10 @@ fn handleKey(self: *ConfirmDialog, vk: u16) bool {
             };
             if (self.edit) |e| {
                 stops[n] = e;
+                n += 1;
+            }
+            if (self.alt_btn) |a| {
+                stops[n] = a;
                 n += 1;
             }
             stops[n] = self.ok_btn;
@@ -939,6 +1072,10 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
                     },
                     @as(u16, @intCast(w32.IDCANCEL)) => {
                         self.finish(.cancel);
+                        return 0;
+                    },
+                    ID_ALT => {
+                        self.finish(.alt);
                         return 0;
                     },
                     else => {},
@@ -1035,7 +1172,7 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
 const testing = std.testing;
 
 test "layoutFor: controls nest inside the client area at 1.0 scale" {
-    const l = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, 0, 0, false, true, false, 88);
     try testing.expect(l.client_w > 0 and l.client_h > 0);
     for ([_]w32.RECT{ l.icon, l.text, l.ok, l.cancel }) |r| {
         try testing.expect(r.left >= 0 and r.top >= 0);
@@ -1044,47 +1181,47 @@ test "layoutFor: controls nest inside the client area at 1.0 scale" {
 }
 
 test "layoutFor: buttons right-aligned, OK left of Cancel, no overlap" {
-    const l = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, 0, 0, false, true, false, 88);
     try testing.expect(l.ok.right < l.cancel.left);
     try testing.expectEqual(l.ok.top, l.cancel.top);
     try testing.expectEqual(l.cancel.right, l.client_w - 16);
 }
 
 test "layoutFor: ok-only puts OK in the rightmost slot, no cancel rect" {
-    const l = layoutFor(1.0, 300, 40, false, 0, 0, false, false, 88);
+    const l = layoutFor(1.0, 300, 40, false, 0, 0, false, false, false, 88);
     try testing.expectEqual(l.ok.right, l.client_w - 16);
     try testing.expectEqual(@as(i32, 0), l.cancel.right - l.cancel.left);
     try testing.expectEqual(@as(i32, 0), l.icon.right - l.icon.left);
 }
 
 test "layoutFor: text starts right of the icon with a gap" {
-    const l = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, 0, 0, false, true, false, 88);
     try testing.expect(l.text.left >= l.icon.right + 12);
     // Without an icon the text hugs the margin.
-    const l2 = layoutFor(1.0, 300, 40, false, 0, 0, false, true, 88);
+    const l2 = layoutFor(1.0, 300, 40, false, 0, 0, false, true, false, 88);
     try testing.expectEqual(@as(i32, 16), l2.text.left);
 }
 
 test "layoutFor: short text is vertically centered against the icon" {
-    const l = layoutFor(1.0, 300, 16, true, 0, 0, false, true, 88);
+    const l = layoutFor(1.0, 300, 16, true, 0, 0, false, true, false, 88);
     // Icon (32px) taller than text (16px): text drops to center.
     try testing.expect(l.text.top > l.icon.top);
     try testing.expectEqual(l.icon.top, 16);
     // Text (60px) taller than icon: icon centers instead.
-    const l2 = layoutFor(1.0, 300, 60, true, 0, 0, false, true, 88);
+    const l2 = layoutFor(1.0, 300, 60, true, 0, 0, false, true, false, 88);
     try testing.expect(l2.icon.top > l2.text.top);
 }
 
 test "layoutFor: narrow text still fits the button row" {
-    const l = layoutFor(1.0, 40, 20, false, 0, 0, false, true, 88);
+    const l = layoutFor(1.0, 40, 20, false, 0, 0, false, true, false, 88);
     // Two 88px buttons + 8px gap + 2*16 margins = 216, floored at 280.
     try testing.expect(l.client_w >= 280);
     try testing.expect(l.ok.left >= 16);
 }
 
 test "layoutFor: scales with DPI" {
-    const l1 = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
-    const l2 = layoutFor(2.0, 600, 80, true, 0, 0, false, true, 176);
+    const l1 = layoutFor(1.0, 300, 40, true, 0, 0, false, true, false, 88);
+    const l2 = layoutFor(2.0, 600, 80, true, 0, 0, false, true, false, 176);
     try testing.expectEqual(l1.client_w * 2, l2.client_w);
     try testing.expectEqual(l1.client_h * 2, l2.client_h);
     try testing.expectEqual(l1.ok.left * 2, l2.ok.left);
@@ -1099,8 +1236,54 @@ test "buttonWidth: standard until the caption outgrows it, then padded" {
     try testing.expectEqual(@as(i32, 124), buttonWidth(1.0, 100));
 }
 
+test "layoutFor: a third button sits LEFT of OK, Cancel stays last" {
+    // The remote-close confirmation's row (T1390): [Disconnect] [Close]
+    // [Cancel], right-aligned, with the dismissive answer in the trailing slot
+    // this dialog has always put it in.
+    const l = layoutFor(1.0, 300, 40, true, 0, 0, false, true, true, 88);
+    try testing.expect(l.alt.right <= l.ok.left);
+    try testing.expect(l.ok.right <= l.cancel.left);
+    // All three share the row and the width.
+    try testing.expectEqual(l.ok.top, l.alt.top);
+    try testing.expectEqual(l.ok.bottom, l.alt.bottom);
+    try testing.expectEqual(l.ok.right - l.ok.left, l.alt.right - l.alt.left);
+}
+
+test "layoutFor: a third button does not move OK or Cancel" {
+    // A two-button caller's layout must be byte-identical, so adding the
+    // button cannot regress every other confirmation in the app.
+    const two = layoutFor(1.0, 300, 40, true, 0, 0, false, true, false, 88);
+    const three = layoutFor(1.0, 300, 40, true, 0, 0, false, true, true, 88);
+    try testing.expectEqual(two.ok.left, three.ok.left);
+    try testing.expectEqual(two.cancel.left, three.cancel.left);
+    try testing.expectEqual(two.client_h, three.client_h);
+}
+
+test "layoutFor: a narrow dialog widens to fit three buttons" {
+    // Three 88px buttons + two 8px gaps + 2*16 margins = 312 > the 280 floor.
+    const l = layoutFor(1.0, 40, 20, false, 0, 0, false, true, true, 88);
+    try testing.expect(l.alt.left >= 16);
+    try testing.expectEqual(@as(i32, 312), l.client_w);
+}
+
+test "layoutFor: a third button without a Cancel is ignored" {
+    // Two ways to say yes and no way to say no is not a choice, so the third
+    // button is only ever offered alongside a Cancel.
+    const l = layoutFor(1.0, 300, 40, true, 0, 0, false, false, true, 88);
+    try testing.expectEqual(@as(i32, 0), l.alt.right - l.alt.left);
+}
+
+test "defaultResultFor: the third button outranks OK and Cancel" {
+    // The remote close defaults to Disconnect - the answer that destroys
+    // nothing - so Enter on an untouched dialog must not end a remote process.
+    try testing.expectEqual(Result.alt, defaultResultFor(true, true));
+    try testing.expectEqual(Result.alt, defaultResultFor(true, false));
+    try testing.expectEqual(Result.cancel, defaultResultFor(false, true));
+    try testing.expectEqual(Result.ok, defaultResultFor(false, false));
+}
+
 test "layoutFor: wide buttons widen the row and never overlap" {
-    const l = layoutFor(1.0, 40, 20, false, 0, 0, false, true, 124);
+    const l = layoutFor(1.0, 40, 20, false, 0, 0, false, true, false, 124);
     try testing.expectEqual(@as(i32, 124), l.ok.right - l.ok.left);
     try testing.expectEqual(@as(i32, 124), l.cancel.right - l.cancel.left);
     try testing.expect(l.ok.right < l.cancel.left);
@@ -1112,13 +1295,13 @@ test "layoutFor: wide buttons widen the row and never overlap" {
 // --- Prompt field (T176) -----------------------------------------------
 
 test "layoutFor: no input means no input rect and no extra height" {
-    const plain = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
+    const plain = layoutFor(1.0, 300, 40, true, 0, 0, false, true, false, 88);
     try testing.expectEqual(@as(i32, 0), plain.input.right - plain.input.left);
     try testing.expectEqual(@as(i32, 0), plain.input.bottom - plain.input.top);
 }
 
 test "layoutFor: the field sits between the message and the buttons" {
-    const l = layoutFor(1.0, 300, 40, true, 0, 0, true, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, 0, 0, true, true, false, 88);
     try testing.expect(l.input.top >= l.text.bottom);
     try testing.expect(l.input.top >= l.icon.bottom - 1);
     try testing.expect(l.ok.top >= l.input.bottom);
@@ -1134,8 +1317,8 @@ test "layoutFor: the field sits between the message and the buttons" {
 }
 
 test "layoutFor: the field's row is what makes a prompt taller" {
-    const plain = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
-    const with = layoutFor(1.0, 300, 40, true, 0, 0, true, true, 88);
+    const plain = layoutFor(1.0, 300, 40, true, 0, 0, false, true, false, 88);
+    const with = layoutFor(1.0, 300, 40, true, 0, 0, true, true, false, 88);
     // 12 gap + 26 field.
     try testing.expectEqual(plain.client_h + 38, with.client_h);
     // The message band above it does not move.
@@ -1146,14 +1329,14 @@ test "layoutFor: the field's row is what makes a prompt taller" {
 test "layoutFor: a prompt is never too narrow to type in" {
     // A two-word message would otherwise leave a 280-wide dialog whose field
     // is barely wider than the button row.
-    const l = layoutFor(1.0, 40, 20, false, 0, 0, true, true, 88);
+    const l = layoutFor(1.0, 40, 20, false, 0, 0, true, true, false, 88);
     try testing.expect(l.client_w >= 380);
     try testing.expect(l.input.right - l.input.left >= 340);
 }
 
 test "layoutFor: the field scales with DPI like everything else" {
-    const a = layoutFor(1.0, 300, 40, true, 0, 0, true, true, 88);
-    const b = layoutFor(2.0, 600, 80, true, 0, 0, true, true, 176);
+    const a = layoutFor(1.0, 300, 40, true, 0, 0, true, true, false, 88);
+    const b = layoutFor(2.0, 600, 80, true, 0, 0, true, true, false, 176);
     try testing.expectEqual(a.client_h * 2, b.client_h);
     try testing.expectEqual(a.input.top * 2, b.input.top);
     try testing.expectEqual((a.input.bottom - a.input.top) * 2, b.input.bottom - b.input.top);
@@ -1162,7 +1345,7 @@ test "layoutFor: the field scales with DPI like everything else" {
 // --- Checkbox rows (T870) ----------------------------------------------
 
 test "layoutFor: no checks means no check rects and no extra height" {
-    const plain = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
+    const plain = layoutFor(1.0, 300, 40, true, 0, 0, false, true, false, 88);
     for (plain.checks) |r| {
         try testing.expectEqual(@as(i32, 0), r.right - r.left);
         try testing.expectEqual(@as(i32, 0), r.bottom - r.top);
@@ -1170,7 +1353,7 @@ test "layoutFor: no checks means no check rects and no extra height" {
 }
 
 test "layoutFor: check rows sit between the message and the buttons" {
-    const l = layoutFor(1.0, 300, 40, true, 2, 0, false, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, 2, 0, false, true, false, 88);
     try testing.expect(l.checks[0].top >= l.text.bottom);
     try testing.expect(l.checks[1].top >= l.checks[0].bottom);
     try testing.expect(l.ok.top >= l.checks[1].bottom);
@@ -1187,9 +1370,9 @@ test "layoutFor: check rows sit between the message and the buttons" {
 }
 
 test "layoutFor: each check row adds its height, the block adds one gap" {
-    const plain = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
-    const one = layoutFor(1.0, 300, 40, true, 1, 0, false, true, 88);
-    const two = layoutFor(1.0, 300, 40, true, 2, 0, false, true, 88);
+    const plain = layoutFor(1.0, 300, 40, true, 0, 0, false, true, false, 88);
+    const one = layoutFor(1.0, 300, 40, true, 1, 0, false, true, false, 88);
+    const two = layoutFor(1.0, 300, 40, true, 2, 0, false, true, false, 88);
     // 12 gap + 20 row.
     try testing.expectEqual(plain.client_h + 32, one.client_h);
     // +4 row gap + 20 row.
@@ -1199,14 +1382,14 @@ test "layoutFor: each check row adds its height, the block adds one gap" {
 }
 
 test "layoutFor: checks stack above the input field when both are present" {
-    const l = layoutFor(1.0, 300, 40, true, 2, 0, true, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, 2, 0, true, true, false, 88);
     try testing.expect(l.input.top >= l.checks[1].bottom);
     try testing.expect(l.ok.top >= l.input.bottom);
 }
 
 test "layoutFor: check rows scale with DPI" {
-    const a = layoutFor(1.0, 300, 40, true, 2, 0, false, true, 88);
-    const b = layoutFor(2.0, 600, 80, true, 2, 0, false, true, 176);
+    const a = layoutFor(1.0, 300, 40, true, 2, 0, false, true, false, 88);
+    const b = layoutFor(2.0, 600, 80, true, 2, 0, false, true, false, 176);
     try testing.expectEqual(a.client_h * 2, b.client_h);
     try testing.expectEqual(a.checks[0].top * 2, b.checks[0].top);
     try testing.expectEqual((a.checks[1].bottom - a.checks[1].top) * 2, b.checks[1].bottom - b.checks[1].top);
@@ -1215,13 +1398,13 @@ test "layoutFor: check rows scale with DPI" {
 // --- Secondary note (T600) ---------------------------------------------
 
 test "layoutFor: no note means no note rect and no extra height" {
-    const plain = layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88);
+    const plain = layoutFor(1.0, 300, 40, true, 0, 0, false, true, false, 88);
     try testing.expectEqual(@as(i32, 0), plain.note.right - plain.note.left);
     try testing.expectEqual(@as(i32, 0), plain.note.bottom - plain.note.top);
 }
 
 test "layoutFor: the note sits between the checks and the buttons" {
-    const l = layoutFor(1.0, 300, 40, true, 2, 32, false, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, 2, 32, false, true, false, 88);
     try testing.expect(l.note.top >= l.checks[1].bottom);
     try testing.expect(l.ok.top >= l.note.bottom);
     // Aligned with the message column, running to the trailing margin like
@@ -1233,8 +1416,8 @@ test "layoutFor: the note sits between the checks and the buttons" {
 }
 
 test "layoutFor: the note band is what makes a disclosing dialog taller" {
-    const plain = layoutFor(1.0, 300, 40, true, 2, 0, false, true, 88);
-    const with = layoutFor(1.0, 300, 40, true, 2, 32, false, true, 88);
+    const plain = layoutFor(1.0, 300, 40, true, 2, 0, false, true, false, 88);
+    const with = layoutFor(1.0, 300, 40, true, 2, 32, false, true, false, 88);
     // 12 gap + the measured 32.
     try testing.expectEqual(plain.client_h + 44, with.client_h);
     // Nothing above it moves.
@@ -1243,23 +1426,23 @@ test "layoutFor: the note band is what makes a disclosing dialog taller" {
 }
 
 test "layoutFor: the note stacks above the input field when both are present" {
-    const l = layoutFor(1.0, 300, 40, true, 1, 28, true, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, 1, 28, true, true, false, 88);
     try testing.expect(l.note.top >= l.checks[0].bottom);
     try testing.expect(l.input.top >= l.note.bottom);
     try testing.expect(l.ok.top >= l.input.bottom);
 }
 
 test "layoutFor: the note scales with DPI" {
-    const a = layoutFor(1.0, 300, 40, true, 2, 30, false, true, 88);
-    const b = layoutFor(2.0, 600, 80, true, 2, 60, false, true, 176);
+    const a = layoutFor(1.0, 300, 40, true, 2, 30, false, true, false, 88);
+    const b = layoutFor(2.0, 600, 80, true, 2, 60, false, true, false, 176);
     try testing.expectEqual(a.client_h * 2, b.client_h);
     try testing.expectEqual(a.note.top * 2, b.note.top);
     try testing.expectEqual((a.note.bottom - a.note.top) * 2, b.note.bottom - b.note.top);
 }
 
 test "layoutFor: a check count beyond capacity is clamped, not overflowed" {
-    const l = layoutFor(1.0, 300, 40, true, max_checks + 3, 0, false, true, 88);
-    const capped = layoutFor(1.0, 300, 40, true, max_checks, 0, false, true, 88);
+    const l = layoutFor(1.0, 300, 40, true, max_checks + 3, 0, false, true, false, 88);
+    const capped = layoutFor(1.0, 300, 40, true, max_checks, 0, false, true, false, 88);
     try testing.expectEqual(capped.client_h, l.client_h);
 }
 
@@ -1281,7 +1464,7 @@ test "nextFocusIndex: cycles both ways and wraps" {
 
 test "layoutFor: the font comes from the ramp (T313)" {
     inline for (.{ @as(f32, 1.0), @as(f32, 1.25), @as(f32, 1.5), @as(f32, 2.0) }) |scale| {
-        const l = layoutFor(scale, 300, 40, true, 0, 0, false, true, 88);
+        const l = layoutFor(scale, 300, 40, true, 0, 0, false, true, false, 88);
         try testing.expectEqual(type_ramp.body(scale).height, l.font_h);
         // A confirm's message is body text, never a subtitle and never a
         // caption — one role, so it reads at the same size as the chooser it
@@ -1289,5 +1472,5 @@ test "layoutFor: the font comes from the ramp (T313)" {
         try testing.expect(l.font_h > type_ramp.caption(scale).height);
         try testing.expect(l.font_h < type_ramp.subtitle(scale).height);
     }
-    try testing.expectEqual(@as(i32, 14), layoutFor(1.0, 300, 40, true, 0, 0, false, true, 88).font_h);
+    try testing.expectEqual(@as(i32, 14), layoutFor(1.0, 300, 40, true, 0, 0, false, true, false, 88).font_h);
 }

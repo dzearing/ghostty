@@ -17,14 +17,20 @@
 #     ghoztty-agent.exe and the app only knows the pid the agent reports (the
 #     `remote` backend, local connection). A fix that only handles `exec`
 #     leaves every real user pane confirming.
-#   Section C - a CROSS-MACHINE pane (T356), dialed over TCP to a listening
+#   Section C - a CROSS-MACHINE pane, dialed over TCP to a listening
 #     ghoztty-agent. Here the app has no pid it may walk at all: the shell's pid
 #     indexes the far machine's process table, so `Surface.shellPid` returns 0 by
-#     design and every close used to confirm. The answer now comes from the
-#     machine that owns the process - the agent samples its own table each
-#     second and pushes `META{has_descendants}` on change, which the app reads
-#     synchronously at close time. The agent here listens on loopback, so the
-#     same Win32_Process oracle still works.
+#     design. The BUSY answer comes from the machine that owns the process
+#     (T356): the agent samples its own table each second and pushes
+#     `META{has_descendants}` on change, which the app reads synchronously at
+#     close time. The agent here listens on loopback, so the same Win32_Process
+#     oracle still works.
+#
+#     Its IDLE case is the one T1390 reversed. An idle cross-machine pane used
+#     to close with no dialog, like an idle local one; it now confirms, because
+#     ending a process on another machine is not the recoverable thing an idle
+#     local shell is - and the confirmation offers Disconnect. Section A is the
+#     discriminator: the same chord on a LOCAL idle pane still closes silently.
 #
 #   Section D - `confirm-close-surface = always` (T357). The user asked for a
 #     confirmation unconditionally, so the shell's state is not a question we
@@ -499,22 +505,34 @@ function Invoke-RemoteSection([string]$Label) {
         if ($left.Count -ne 0) { return }
         Start-Sleep -Milliseconds $script:PushSettleMs
 
+        # T1390 SUPERSEDED THIS CASE, deliberately. Until then an idle
+        # cross-machine pane closed with no dialog, exactly like an idle local
+        # one - which is what T356 built and what this block used to assert.
+        # Ending a process on ANOTHER machine is not the recoverable thing an
+        # idle local shell is, so the gate is now widened for a remote pane and
+        # the close offers Disconnect instead. The claim here is therefore the
+        # opposite one, and the discriminator for it is section A: the same
+        # harness, the same chord, the same idle oracle on a LOCAL pane, where
+        # the close still does not confirm. Where the Disconnect offer itself is
+        # exercised is test/win32/remote-disconnect.ps1.
         Send-TestKeys -Window $top -Target $surface -Modifiers ctrl -Key W | Out-Null
-        $dlg = Wait-Dialog $g.Pid $true 2500
-        $closed = $false
-        for ($t = 0; $t -lt 40 -and -not $closed; $t++) {
-            Start-Sleep -Milliseconds 100
-            $closed = (-not (Test-TestWindowExists -Window $top)) -or (-not (Test-TestWindowVisible -Window $top))
-        }
+        $dlg = Wait-Dialog $g.Pid $true 5000
 
         if ($NegativeControl) {
-            Write-Host "NEGATIVE CONTROL: asserting the IDLE remote close still confirms - this run MUST fail"
-            Assert ($dlg -ne [IntPtr]::Zero) "$Label idle remote shell: ctrl+w opens the confirm dialog (inverted)"
+            Write-Host "NEGATIVE CONTROL: asserting the IDLE remote close does NOT confirm - this run MUST fail"
+            Assert ($dlg -eq [IntPtr]::Zero) "$Label idle remote shell: ctrl+w opens the confirm dialog (inverted)"
         } else {
-            Assert ($dlg -eq [IntPtr]::Zero) "$Label idle remote shell: ctrl+w opens NO confirm dialog"
+            Assert ($dlg -ne [IntPtr]::Zero) "$Label idle remote shell: ctrl+w still confirms (T1390)"
         }
-        Assert $closed "$Label idle remote shell: the pane closed without confirming"
-        if ($dlg -ne [IntPtr]::Zero) { Send-TestControlKey -Control $dlg -Key Escape | Out-Null }
+        if ($dlg -ne [IntPtr]::Zero) {
+            $offer = @(Get-TestControls -Window $dlg -Class 'Button' |
+                Where-Object { $_.Text -eq 'Disconnect' })
+            Assert ($offer.Count -eq 1) "$Label idle remote shell: the confirmation offers Disconnect"
+            Send-TestControlKey -Control $dlg -Key Escape | Out-Null
+            $gone = Wait-Dialog $g.Pid $false
+            Assert ($gone -eq [IntPtr]::Zero) "$Label idle remote shell: Escape dismisses the confirm"
+            Assert (Test-TestWindowVisible -Window $top) "$Label idle remote shell: the window survives the cancelled close"
+        }
     } finally {
         if ($g) { Stop-Process -Id $g.Pid -Force -ErrorAction SilentlyContinue }
         Stop-Process -Id $agent.Id -Force -ErrorAction SilentlyContinue

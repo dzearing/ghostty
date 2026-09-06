@@ -53,6 +53,10 @@ test {
     // waits on the wrong pid, so the lane compiles and checks it in its own
     // right.
     _ = @import("win32/relaunch_guard.zig");
+    // The Disconnect policy and its detach pin (T1390). Both are pure, and the
+    // pin's whole reason for existing is an ORDERING invariant that a desktop
+    // test could only observe by accident — so the lane is where it is checked.
+    _ = @import("win32/session_disconnect.zig");
     // The update applier (T1178). Same argument as the guard above: it is the
     // process that replaces the app on disk, it runs when no app is left to
     // notice it going wrong, and its staging paths are per lineage so a debug

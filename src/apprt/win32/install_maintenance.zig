@@ -244,7 +244,10 @@ fn ask(version: []const u8) Answer {
 
     return switch (result) {
         .ok => .repair,
-        .cancel => .cancel,
+        // `.alt` is the optional third button (T1390), which this dialog does
+        // not offer - so it cannot arrive, and if it ever did, the dismissive
+        // answer is the safe reading of an answer we did not ask for.
+        .cancel, .alt => .cancel,
     };
 }
 
