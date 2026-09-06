@@ -48,6 +48,54 @@ pub fn shouldFillBackground(e: Erase) bool {
     return !e.has_presented_frame;
 }
 
+/// The other half of "does the user see a blank frame": whether the pane
+/// blocks for a frame at its new size before letting the resize land (T1393).
+///
+/// Declining the erase (above) only stops US from painting background. It does
+/// nothing about the gap between the window changing size and the renderer
+/// presenting at that size — during which the enlarged surface holds whatever
+/// the GL front buffer had, i.e. the flat clear color. That gap is closed by
+/// blocking the UI thread on the renderer's frame event, and until T1393 the
+/// gate on it named the GESTURE rather than the situation: `in_live_resize`,
+/// which is set at `WM_ENTERSIZEMOVE`.
+///
+/// Measured on 2026-09-06 with the `window resize cause=.. sync=..` oracle:
+///
+///   cause=restored  panes=2 sync=2   <- modal frame drag: guaranteed
+///   cause=maximized panes=2 sync=0   <- maximize: no guarantee at all
+///   cause=restored  panes=2 sync=0   <- restore: likewise
+///
+/// Maximize, restore, Aero-snap and a title-bar double-click resize the window
+/// WITHOUT a modal size loop, so no `WM_ENTERSIZEMOVE` ever arrives and every
+/// one of them relayouts panes the user is looking straight at with the
+/// anti-flicker path switched off. Hence the rule below is about the pane's
+/// state, not about which gesture got here: a pane with pixels in it waits;
+/// a pane with nothing to preserve does not, because there the wait is a pure
+/// stall (window creation, a restored session before its first draw) and the
+/// flat background is the honest answer anyway — the same carve-out
+/// `shouldFillBackground` makes, from the same fact.
+pub const Present = struct {
+    /// The pane is inside a modal size loop (`WM_ENTERSIZEMOVE` seen, no
+    /// `WM_EXITSIZEMOVE` yet).
+    in_live_resize: bool,
+
+    /// The layout pass declared itself one the user is watching in real time —
+    /// a divider drag, a banner expand/collapse, and since T1393 every
+    /// whole-window `WM_SIZE` pass.
+    in_live_layout: bool,
+
+    /// The renderer thread has presented into this window at least once.
+    has_presented_frame: bool,
+};
+
+/// True when `handleResize` should block for a frame at the new size.
+pub fn shouldPresentSynchronously(p: Present) bool {
+    // Nothing on screen to go stale: waiting here buys no pixels and costs the
+    // startup path a frame per pane.
+    if (!p.has_presented_frame) return false;
+    return p.in_live_resize or p.in_live_layout;
+}
+
 test "popups always get the flat fill" {
     // Both popup states, because "has presented a frame" is meaningless for a
     // window with no renderer and must not accidentally start gating them.
@@ -72,6 +120,43 @@ test "a surface that has presented is left alone" {
     // The one case that changed in T1031, and the whole point of the module.
     try std.testing.expect(!shouldFillBackground(.{
         .is_surface_window = true,
+        .has_presented_frame = true,
+    }));
+}
+
+test "a modal frame drag presents synchronously" {
+    try std.testing.expect(shouldPresentSynchronously(.{
+        .in_live_resize = true,
+        .in_live_layout = false,
+        .has_presented_frame = true,
+    }));
+}
+
+test "a watched layout pass presents synchronously without a size loop" {
+    // T1393: maximize, restore, Aero-snap and a title-bar double-click raise
+    // no WM_ENTERSIZEMOVE, so `in_live_resize` is false through a resize the
+    // user is watching. The pass says it is live instead, and that is enough.
+    try std.testing.expect(shouldPresentSynchronously(.{
+        .in_live_resize = false,
+        .in_live_layout = true,
+        .has_presented_frame = true,
+    }));
+}
+
+test "a pane with nothing presented never stalls" {
+    // Both live flags on, and still no wait: there are no pixels to preserve,
+    // so the block would be a pure frame of latency at window creation.
+    try std.testing.expect(!shouldPresentSynchronously(.{
+        .in_live_resize = true,
+        .in_live_layout = true,
+        .has_presented_frame = false,
+    }));
+}
+
+test "an unwatched relayout stays asynchronous" {
+    try std.testing.expect(!shouldPresentSynchronously(.{
+        .in_live_resize = false,
+        .in_live_layout = false,
         .has_presented_frame = true,
     }));
 }

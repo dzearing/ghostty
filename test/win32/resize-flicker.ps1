@@ -54,8 +54,22 @@
 #      layout pass (mechanism 3) did not trade a flicker for a gap or an
 #      overlap. T155's tiling invariant is what a stale divider line lives in.
 #
-# Mechanism 4 has no observable this script can reach: "the pane blocked up to
-# 16ms for a frame" is a schedule, not a pixel. The unit half of the fix -
+#   D. The SYNCHRONOUS PRESENT, added by T1393 - mechanism 4, which nothing
+#      here could see until the app was made to state it. Each layout pass logs
+#      `window resize cause=.. panes=.. sync=.. fresh=.. waits=.. timeouts=..`,
+#      and a pass that resized panes the user can see must have put every one
+#      of them on the wait (`sync + fresh >= panes`; `fresh` is a pane with
+#      nothing presented yet, for which declining is the rule). That is what
+#      caught the second cause of the same reported symptom five days after
+#      T1031 closed: the wait was gated on `in_live_resize` - i.e. on
+#      WM_ENTERSIZEMOVE, i.e. on a MODAL SIZE LOOP - so maximize, restore,
+#      Aero-snap and a title-bar double-click each resized every visible pane
+#      with the anti-flicker path switched off, and section C2 above could not
+#      tell, because `Set-TestWindowPos` never opens a size loop either.
+#
+# Mechanism 4 no longer has "no observable this script can reach": "the pane
+# blocked for a frame" is still a schedule rather than a pixel, but a schedule
+# the app can be asked about. The unit half of the fix -
 # WHEN the erase should still fill (a surface with no presented frame, and the
 # search/palette popups that share its window class) - is
 # src/apprt/win32/resize_paint.zig, run in every app-runtime lane.
@@ -63,7 +77,8 @@
 # Runs on the BACKGROUND test desktop (lib\TestDesktop.ps1), so it never takes
 # the user's foreground - asserted, not assumed.
 #
-# -NegativeControl inverts the erase assertion and MUST fail.
+# -NegativeControl inverts the erase and synchronous-present assertions and
+# MUST fail.
 #
 # Only touches ghoztty processes running from this repo's zig-out*.
 #   powershell -NoProfile -File test\win32\resize-flicker.ps1
@@ -93,6 +108,12 @@ $WM_LBUTTONDOWN = 0x0201
 $WM_LBUTTONUP = 0x0202
 $WM_MOUSEMOVE = 0x0200
 $MK_LBUTTON = [IntPtr]1
+# T1393: the non-modal whole-window resize paths.
+$WM_ENTERSIZEMOVE = 0x0231
+$WM_EXITSIZEMOVE = 0x0232
+$WM_SYSCOMMAND = 0x0112
+$SC_MAXIMIZE = 0xF030
+$SC_RESTORE = 0xF120
 
 $script:pass = 0
 $script:fail = 0
@@ -145,6 +166,27 @@ function Get-EraseDecisions([string]$log) {
     return @($out)
 }
 
+# The whole-window resize passes the app has logged so far, newest last (T1393).
+# Each entry is @{ Cause; Panes; Sync; Waits; Timeouts } - `Sync` being how many
+# of the `Panes` resized by that pass blocked for a frame at their new size.
+function Get-ResizePasses([string]$log) {
+    if (-not (Test-Path $log)) { return @() }
+    $out = @()
+    foreach ($l in @(Get-Content $log -ErrorAction SilentlyContinue)) {
+        if ($l -match 'window resize cause=(\w+) panes=(\d+) sync=(\d+) fresh=(\d+) waits=(\d+) timeouts=(\d+)') {
+            $out += [pscustomobject]@{
+                Cause    = $Matches[1]
+                Panes    = [int]$Matches[2]
+                Sync     = [int]$Matches[3]
+                Fresh    = [int]$Matches[4]
+                Waits    = [int]$Matches[5]
+                Timeouts = [int]$Matches[6]
+            }
+        }
+    }
+    return @($out)
+}
+
 # The defect, stated as a predicate: a terminal surface that already holds a
 # presented frame must never blank itself. Everything from $since onward.
 function Get-BlankingErases($all, [int]$since) {
@@ -187,7 +229,10 @@ $td = New-TestDesktop -Interactive:$Interactive
 try {
     Kill-RepoInstances
     $app = Start-OnTestDesktop -Exe $exe -StdErr $errlog -Arguments @(
-        '--config-default-files=false', '--background=#101014', '--session-persistence=false')
+        '--config-default-files=false', '--background=#101014', '--session-persistence=false',
+        # T1393 section D5: there is no CLI verb for either half of a tab
+        # switch, so the script binds two keys it can post.
+        '--keybind=f9=new_tab', '--keybind=f8=previous_tab')
     $appPid = $app.Pid
     Assert (-not (Test-TestDesktopLeak -ProcessId $appPid)) 'GUI is NOT enumerable on the interactive desktop'
 
@@ -335,6 +380,124 @@ try {
         $(if ($bannerFilling.Count) { ' -- ' + ($bannerFilling -join ', ') } else { '' }))
     Assert ($bannerViolations.Count -eq 0) ('panes tile after the banner strip is given back' +
         $(if ($bannerViolations.Count) { ' -- ' + ($bannerViolations -join '; ') } else { '' }))
+
+    # ---- D. the synchronous present, on every whole-window path ---------
+    # T1393. Sections A-C prove nobody PAINTS background over a pane. They say
+    # nothing about the other way a blank frame reaches the screen: the window
+    # changes size, and the enlarged GL surface sits there holding the flat
+    # clear color until the renderer presents at the new size. That gap is
+    # closed by blocking the UI thread on the renderer's frame event - and
+    # until T1393 the gate on it was `in_live_resize`, i.e. WM_ENTERSIZEMOVE,
+    # i.e. a MODAL SIZE LOOP.
+    #
+    # Which is why section C2 above passed while the user could still see the
+    # blink: `Set-TestWindowPos` resizes without a size loop, so it never
+    # exercised the wait at all, and neither does maximize, Aero-snap or a
+    # title-bar double-click - the three gestures a person actually uses to
+    # resize a whole window without dragging its edge. The pre-fix build,
+    # instrumented with the oracle below, answered:
+    #
+    #   cause=restored  panes=2 sync=2   <- bracketed frame drag
+    #   cause=maximized panes=2 sync=0   <- maximize: no guarantee
+    #   cause=restored  panes=2 sync=0   <- restore:  no guarantee
+    #
+    # Same oracle shape as the erase decision, and for the same reason: "the
+    # pane waited for its frame" is a SCHEDULE, not a pixel, so no probe in
+    # another process can photograph it. The pass states it instead.
+    # Four panes, not the two the sections above need: the guarantee is
+    # per-pane ("every pane of the pass waited"), so a two-pane window cannot
+    # tell "all of them" apart from "the active one". Sections A-C are done
+    # with the tiling assertions by here, so the extra splits are free.
+    & $exe +split --direction=down 2>&1 | Out-Null
+    Start-Sleep -Seconds 2
+    & $exe +split --direction=right 2>&1 | Out-Null
+    Start-Sleep -Seconds 3
+    $wide = @(Get-VisiblePanes ([IntPtr]$top))
+    Assert ($wide.Count -ge 4) "four panes open for the whole-window checks (saw $($wide.Count))"
+
+    $winresizeBefore = (Get-ResizePasses $errlog).Count
+
+    # D1. a bracketed modal frame drag - the one path that already worked, kept
+    # here as the positive control for the three below.
+    [void](Send-TestRawMessage -Window ([IntPtr]$top) -Message $WM_ENTERSIZEMOVE `
+        -WParam ([IntPtr]::Zero) -LParam ([IntPtr]::Zero))
+    foreach ($w in @(1120, 1040, 1180)) {
+        [void](Set-TestWindowPos -Window ([IntPtr]$top) -X 40 -Y 40 -Width $w -Height 820)
+        Start-Sleep -Milliseconds 250
+    }
+    [void](Send-TestRawMessage -Window ([IntPtr]$top) -Message $WM_EXITSIZEMOVE `
+        -WParam ([IntPtr]::Zero) -LParam ([IntPtr]::Zero))
+    Start-Sleep -Milliseconds 300
+
+    # D2. maximize, which is also what a title-bar double-click sends, and
+    # D3. restore. Neither raises WM_ENTERSIZEMOVE.
+    [void](Send-TestRawMessage -Window ([IntPtr]$top) -Message $WM_SYSCOMMAND `
+        -WParam ([IntPtr]$SC_MAXIMIZE) -LParam ([IntPtr]::Zero))
+    Start-Sleep -Milliseconds 900
+    [void](Send-TestRawMessage -Window ([IntPtr]$top) -Message $WM_SYSCOMMAND `
+        -WParam ([IntPtr]$SC_RESTORE) -LParam ([IntPtr]::Zero))
+    Start-Sleep -Milliseconds 900
+
+    # D4. a snap: the window is resized to half the work area with no size loop
+    # around it, which is the shape of Win+Left and of a drag-to-edge (whose
+    # resize lands after WM_EXITSIZEMOVE).
+    [void](Set-TestWindowPos -Window ([IntPtr]$top) -X 0 -Y 0 -Width 760 -Height 900)
+    Start-Sleep -Milliseconds 600
+
+    # D5. a second tab, and a switch BACK to the first after the window has
+    # changed size underneath it. A hidden tab's panes are not laid out while
+    # it is hidden, so the switch is the first time they take the new size -
+    # and the user is watching the tab appear, which makes it the same kind of
+    # relayout as a resize. `selectTabIndex` therefore reports through the same
+    # oracle, with cause=tabswitch.
+    #
+    # Driven by keybinds because there is no `+new-window --tab` verb and no
+    # IPC action for either half; the keys are POSTED (Send-TestKeys), so this
+    # works on the background desktop where SendInput does not.
+    $panesBefore = (Get-VisiblePanes ([IntPtr]$top)).Count
+    [void](Send-TestKeys -Window ([IntPtr]$top) -Target ([IntPtr]$wide[0].Hwnd) -Key F9)
+    Start-Sleep -Seconds 3
+    [void](Set-TestWindowPos -Window ([IntPtr]$top) -X 20 -Y 20 -Width 1240 -Height 780)
+    Start-Sleep -Milliseconds 600
+    [void](Send-TestKeys -Window ([IntPtr]$top) -Target ([IntPtr]$wide[0].Hwnd) -Key F8)
+    Start-Sleep -Milliseconds 900
+
+    $passes = @(Get-ResizePasses $errlog)
+    $newPasses = @($passes | Select-Object -Skip $winresizeBefore)
+    $withPanes = @($newPasses | Where-Object { $_.Panes -gt 0 })
+
+    # VACUITY, same discipline as section A: "no pass skipped the wait" is free
+    # for a build that logs nothing and for a run where no pane was resized.
+    if ($newPasses.Count -eq 0) {
+        $script:skipped++
+        Write-Host "SKIP  no ``window resize`` oracle in the log - release build?" -ForegroundColor Yellow
+    } else {
+        Assert ($withPanes.Count -gt 0) `
+            ("the resize oracle is live: $($newPasses.Count) whole-window pass(es), " +
+             "$($withPanes.Count) of them actually resized a pane")
+        $causes = @($withPanes | ForEach-Object { $_.Cause } | Sort-Object -Unique)
+        Assert ($causes -contains 'maximized') `
+            ("the non-modal paths were reached (causes: $($causes -join ', '))")
+        Assert ($causes -contains 'tabswitch') `
+            ("a background tab was switched to (causes: $($causes -join ', '))")
+    }
+
+    # THE DEFECT: a pass that resized panes the user can see must have put
+    # every one of them on the synchronous-present path.
+    $unguarded = @()
+    foreach ($p in $withPanes) {
+        # `Fresh` panes are the rule's own carve-out, not a gap: a pane with
+        # nothing presented has no pixels to protect, and a brand-new tab's
+        # pane is in exactly that state when the tab strip appears and
+        # relayouts the window (cause=tabbar panes=1 sync=0 fresh=1).
+        if (($p.Sync + $p.Fresh) -lt $p.Panes) {
+            $unguarded += "cause=$($p.Cause) panes=$($p.Panes) sync=$($p.Sync) fresh=$($p.Fresh)"
+        }
+    }
+    $syncOk = ($unguarded.Count -eq 0)
+    if ($NegativeControl) { $syncOk = -not $syncOk }
+    Assert $syncOk ('every whole-window resize waits for a frame in every pane' +
+        $(if ($unguarded.Count) { ' -- ' + (($unguarded | Select-Object -First 4) -join '; ') } else { '' }))
 
     Assert (-not (Test-TestDesktopLeak -ProcessId $appPid)) 'GUI never became visible on the interactive desktop'
     Complete-TestBody  # T1039: the run reached the end of its body

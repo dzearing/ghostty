@@ -28,6 +28,7 @@ const ViewerPane = @import("ViewerPane.zig");
 const Window = @import("Window.zig");
 const w32 = @import("win32.zig");
 const drag_perf = @import("drag_perf.zig");
+const resize_paint = @import("resize_paint.zig");
 const clipboard_open = @import("clipboard_open.zig");
 const utf16_text = @import("utf16_text.zig");
 const Scrollbar = @import("Scrollbar.zig").Scrollbar;
@@ -3298,11 +3299,26 @@ pub fn handleResize(self: *Surface, width: u32, height: u32) void {
     };
     if (size_timer) |*t| self.parent_window.addResizeUs(t.read() / std.time.ns_per_us);
 
-    // During live resize (user dragging the border), block until the
-    // renderer has presented one frame at the new size. This prevents
-    // the DWM from stretching stale framebuffer content to fill the
-    // new window area, which causes visible flicker.
-    if (self.in_live_resize or self.parent_window.in_live_layout) {
+    // During a resize the user is watching, block until the renderer has
+    // presented one frame at the new size. This prevents the DWM from
+    // stretching stale framebuffer content to fill the new window area, which
+    // causes visible flicker.
+    //
+    // "Watching" is not the same as "dragging the border", which is what this
+    // used to test (T1393): maximize, restore, Aero-snap and a title-bar
+    // double-click resize the window with no modal size loop, so no
+    // `WM_ENTERSIZEMOVE` arrives and `in_live_resize` stays false right
+    // through a resize happening in front of the user. `resize_paint` owns the
+    // rule now and is unit tested; the pass declaring itself live is what
+    // covers the gestures with no loop to be inside of.
+    const presented = self.has_presented_frame.load(.acquire);
+    if (!presented) self.parent_window.noteFreshPane();
+    if (resize_paint.shouldPresentSynchronously(.{
+        .in_live_resize = self.in_live_resize,
+        .in_live_layout = self.parent_window.in_live_layout,
+        .has_presented_frame = presented,
+    })) {
+        self.parent_window.notePresentSync();
         if (self.frame_event) |event| {
             // Reset the event before waking the renderer, so we
             // wait for a NEW frame, not a previously drawn one.

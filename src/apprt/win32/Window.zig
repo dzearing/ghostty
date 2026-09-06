@@ -428,6 +428,14 @@ drag_perf_on: bool = false,
 /// ONCE at the end, and the anti-flicker guarantee survives at a flat cost.
 frame_wait_events: [MAX_FRAME_WAITS]w32.HANDLE = undefined,
 frame_wait_len: usize = 0,
+/// Panes that handed this pass a frame event, i.e. that took the
+/// synchronous-present path (T1393). `frame_wait_len` is consumed by the
+/// close, so it cannot answer "did anybody wait?" afterwards, and that is the
+/// question the whole-window resize oracle is made of.
+frame_wait_deferred: u32 = 0,
+/// Panes resized by this pass that had never presented a frame, so the
+/// synchronous present was declined by the rule rather than missed (T1393).
+frame_wait_fresh: u32 = 0,
 /// Nesting depth of `beginFrameWaitBatch`/`endFrameWaitBatch`. Layout paths
 /// call each other (a hero relayout runs inside `layoutSplits`), and only the
 /// outermost pass may do the waiting — an inner one that waited would put the
@@ -2390,7 +2398,13 @@ pub fn selectTabIndex(self: *Window, idx: usize) void {
     }
     self.active_tab = idx;
     const pane = self.tab_active_pane[idx];
-    self.layoutSplits();
+    // LIVE (T1393). A background tab's panes are not laid out while it is
+    // hidden, so the switch is the first time they take a size — and the user
+    // is watching the tab appear. Without the wait the pane is shown before
+    // its renderer has presented at that size, which is the same flat frame
+    // the whole-window resize was producing.
+    self.layoutSplitsLive();
+    self.reportResizePass("tabswitch");
     if (pane.hwnd()) |h| App.deferSetFocus(h); // T48: defer out of WndProc
     self.updateWindowTitle();
 }
@@ -3079,6 +3093,8 @@ fn beginFrameWaitBatch(self: *Window) void {
         self.frame_wait_count = 0;
         self.frame_wait_timeouts = 0;
         self.frame_wait_resizes = 0;
+        self.frame_wait_deferred = 0;
+        self.frame_wait_fresh = 0;
         self.frame_overlay_us = 0;
         self.frame_resize_us = 0;
         self.frame_place_us = 0;
@@ -3098,6 +3114,41 @@ pub fn addResizeUs(self: *Window, us: u64) void {
 /// Record that a pane took a `WM_SIZE` in the current pass.
 pub fn noteResize(self: *Window) void {
     self.frame_wait_resizes +|= 1;
+}
+
+/// What the layout pass that just closed did about flicker (T1393), in one
+/// line a harness can parse. `sync` is how many of the `panes` it resized
+/// blocked for a frame at their new size; `sync` short of `panes` is a
+/// relayout the user watched with no anti-flicker guarantee.
+fn reportResizePass(self: *Window, cause: []const u8) void {
+    log.debug(
+        "window resize cause={s} panes={d} sync={d} fresh={d} waits={d} timeouts={d}",
+        .{
+            cause,
+            self.frame_wait_resizes,
+            self.frame_wait_deferred,
+            self.frame_wait_fresh,
+            self.frame_wait_count,
+            self.frame_wait_timeouts,
+        },
+    );
+}
+
+/// Record that a pane took the synchronous-present path in the current pass —
+/// it will hold the UI thread until its renderer has a frame at the new size,
+/// batched or inline (T1393). Counted separately from `frame_wait_count`,
+/// which counts WAITS (one per batch) rather than panes.
+pub fn notePresentSync(self: *Window) void {
+    self.frame_wait_deferred +|= 1;
+}
+
+/// Record that a pane resized by this pass has nothing presented in it yet, so
+/// declining the wait for it was the RULE and not a gap (T1393). Without this
+/// the oracle cannot tell a pane that was skipped wrongly from one that had no
+/// pixels to protect — which is the whole state a brand-new tab's pane is in
+/// the moment the tab strip appears and relayouts the window.
+pub fn noteFreshPane(self: *Window) void {
+    self.frame_wait_fresh +|= 1;
 }
 
 /// Record one frame wait against the current pass: how long it blocked, and
@@ -5026,7 +5077,7 @@ fn updateTabBarVisibility(self: *Window) void {
     };
     if (should_show != self.tab_bar_visible) {
         self.tab_bar_visible = should_show;
-        self.handleResize();
+        self.handleResize("tabbar");
     }
 }
 
@@ -6255,8 +6306,33 @@ pub fn toggleWindowDecorations(self: *Window) void {
 /// Timer id used to auto-hide the resize overlay.
 const RESIZE_OVERLAY_TIMER_ID: usize = 0x5247; // 'RG'
 
-fn handleResize(self: *Window) void {
-    self.layoutSplits();
+fn handleResize(self: *Window, cause: []const u8) void {
+    // LIVE, not the plain pass (T1393). A whole-window WM_SIZE is by
+    // definition a relayout the user is watching happen — a frame drag, a
+    // maximize, a snap, a title-bar double-click — and only the first of those
+    // raises `WM_ENTERSIZEMOVE`. Gating the panes' synchronous present on the
+    // size loop therefore left maximize/restore/snap resizing panes with the
+    // anti-flicker path switched off, which is one displayed frame of flat
+    // background per gesture. Declaring the pass live is what covers the
+    // gestures that have no loop to be inside of; `resize_paint` still
+    // declines the wait for a pane with nothing presented yet, so the initial
+    // layout does not pay a frame per pane for pixels that do not exist.
+    self.layoutSplitsLive();
+    // T1393's oracle, and the only one there is for this half of the report.
+    //
+    // T1031 gave the ERASE decision a voice (`surface erase ... fill=`) and
+    // that is still the right answer for mechanism 2 — but it says nothing
+    // about mechanism 4, the "block until the renderer has presented at the
+    // new size" path, and mechanism 4 is a SCHEDULE: no pixel a cross-process
+    // probe can photograph tells you whether a pane waited for its frame or
+    // shipped the old one. So the pass states it. `sync` is how many panes
+    // took the synchronous path, out of `panes` that were actually resized:
+    // `sync=0 panes=2` is a relayout the user watched with no anti-flicker
+    // guarantee at all, which is exactly what maximize, Aero-snap and a
+    // title-bar double-click were doing — none of them raises
+    // WM_ENTERSIZEMOVE, so `in_live_resize` stayed false through a resize the
+    // user was looking straight at.
+    self.reportResizePass(cause);
     // The caption band too, and not only because its right-anchored buttons
     // moved: `updateTabBarVisibility` routes through here, and since T205 the
     // strip appearing or disappearing CHANGES THE BAND — 36 DIP with a title
@@ -7881,7 +7957,11 @@ pub fn windowWndProc(
             // to "restore", so both a resize and a maximize/restore change
             // what it should be showing (T254).
             window.invalidateCaption();
-            window.handleResize();
+            window.handleResize(switch (wparam) {
+                w32.SIZE_MAXIMIZED => "maximized",
+                w32.SIZE_RESTORED => "restored",
+                else => "other",
+            });
             return 0;
         },
         w32.WM_MOVE => {
