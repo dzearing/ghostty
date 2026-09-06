@@ -13,7 +13,13 @@ struct DividerHandle: NSViewRepresentable {
     let onDragDelta: (CGFloat, CGFloat) -> Void
     /// Called when a drag finishes. Not called for a double-click.
     let onDragEnded: () -> Void
-    let onDoubleClick: () -> Void
+    /// Called on a double-click. When nil a double-click is treated as an
+    /// ordinary drag, which is what a divider with nothing to reset to wants.
+    let onDoubleClick: (() -> Void)?
+    /// Called when the pointer enters or leaves the grab zone, for dividers that
+    /// highlight on hover. The handle owns the cursor (see `resetCursorRects`),
+    /// so it is also the honest source of "is the pointer on the target".
+    var onHoverChanged: ((Bool) -> Void)? = nil
     /// Reads the current split fraction (captured at mouse-down).
     let currentSplit: () -> CGFloat
 
@@ -33,6 +39,7 @@ struct DividerHandle: NSViewRepresentable {
         view.onDragDelta = onDragDelta
         view.onDragEnded = onDragEnded
         view.onDoubleClick = onDoubleClick
+        view.onHoverChanged = onHoverChanged
         view.currentSplit = currentSplit
     }
 
@@ -42,15 +49,30 @@ struct DividerHandle: NSViewRepresentable {
         var onDragDelta: ((CGFloat, CGFloat) -> Void)?
         var onDragEnded: (() -> Void)?
         var onDoubleClick: (() -> Void)?
+        var onHoverChanged: ((Bool) -> Void)?
         var currentSplit: (() -> CGFloat)?
 
         private var dragOrigin: CGPoint?
         private var dragStartSplit: CGFloat = 0.5
 
+        override init(frame frameRect: NSRect) {
+            super.init(frame: frameRect)
+            addTrackingArea(NSTrackingArea(
+                rect: .zero,
+                options: [.mouseEnteredAndExited, .activeInActiveApp, .inVisibleRect],
+                owner: self,
+                userInfo: nil))
+        }
+
+        required init?(coder: NSCoder) { fatalError() }
+
+        override func mouseEntered(with event: NSEvent) { onHoverChanged?(true) }
+        override func mouseExited(with event: NSEvent) { onHoverChanged?(false) }
+
         override func mouseDown(with event: NSEvent) {
-            if event.clickCount == 2 {
+            if event.clickCount == 2, let onDoubleClick {
                 dragOrigin = nil
-                onDoubleClick?()
+                onDoubleClick()
                 return
             }
             dragOrigin = event.locationInWindow
