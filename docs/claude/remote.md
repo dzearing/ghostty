@@ -147,6 +147,52 @@ token and the rotation is persisted). Sign-out best-effort revokes at the relay
 (`/oauth/signout`, which also destroys the relay-held Google refresh token)
 before deleting the local store.
 
+#### Signing out revokes THIS machine (T1421)
+
+An account's **user session** and a machine's **device enrollment** are two
+independent relay credentials, and `/oauth/signout` revokes only the session —
+deliberately, because an account may own headless hosts that no app is signed in
+on. That independence was also a hole: signing out in the app running ON an
+enrolled machine left the machine listed, online and bridgeable from every other
+client on the account, with live sessions still visible through "See Activity".
+Sign-out looked like "this machine is no longer mine" and wasn't.
+
+The rule on both platforms: **app sign-out is a hard revocation of the machine
+the app runs on, when — and only when — that enrollment belongs to the account
+signing out.** On Windows `relay_signin.signOut` reads the local
+`relay.env`, asks `GET /v1/agent/whoami` whose machine it is, and on a match
+`POST`s `/v1/agent/deenroll` with the machine's OWN credential; the device row is
+deleted, every live connection is severed, and the local credential file goes
+with it. The decision itself is pure and lives in **`src/remote/relay_revoke.zig`**
+(`decide` → `.none` / `.revoke` / `.foreign` / `.unknown`), so every branch is
+unit-tested in the `none` lane.
+
+Two consequences worth stating rather than rediscovering:
+
+- **`.unknown` is never guessed.** A credential exists and the relay could not
+  say whose it is → the sign-out ABORTS and the account stays **signed in**,
+  because reporting "signed out" while the machine is still reachable is the bug
+  itself. The chooser says so and offers **Sign Out Anyway**
+  (`SignOutMode.force`), which does not re-run the revocation — the Mac's
+  `f3b1e5fb5` removed exactly that second pass, since it only makes the user wait
+  out the same timeouts twice.
+- **Identity is what the relay says, never the hostname.** Hostnames collide and
+  the failure mode is deleting somebody's other machine. A machine enrolled to
+  another account is `.foreign` and left completely alone; the chooser's existing
+  "Remove from Account" is the same hard revocation for a machine you can see but
+  are not running on.
+
+`relay.env`'s `RELAY_BASE` legitimately carries a `ws://` / `wss://` spelling
+(`relay_creds.baseMatches` strips all four schemes for that reason), so
+`relay_revoke.normalizeBase` rewrites it before any HTTP call, and a `RELAY_BASE`
+that is missing or unparseable falls back to the account's own relay rather than
+destroying the one credential that could revoke the machine.
+
+Still open, split out of the Mac change: **T1424** (retry a revocation that could
+not be completed), **T1425** (suspend rather than discard, so signing back in
+restores the machine) and **T1426** (the chooser saying a machine is still
+connected to an account it was signed out of).
+
 The Google OAuth client id is baked into the build via `-Dgoogle-client-id`
 (public — it appears in the browser URL), overridable with
 `GHOSTTY_GOOGLE_CLIENT_ID`; a dev build with neither reads a git-ignored

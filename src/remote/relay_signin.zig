@@ -22,9 +22,12 @@
 //! No Google token and no client secret ever touches this machine. The client
 //! id is public (it appears in the browser URL).
 //!
-//! Sign-out is the mirror: best-effort `POST {relay}/oauth/signout` at the
-//! relay that minted the session, then delete the local store. An unreachable
-//! relay never blocks the local sign-out.
+//! Sign-out is the mirror, plus a revocation (T1421): it de-enrolls THIS
+//! machine when the device credential in relay.env belongs to the account
+//! signing out, then fires `POST {relay}/oauth/signout` at the relay that
+//! minted the session and deletes the local store. A revocation that was
+//! required and did not happen ABORTS the sign-out and leaves the account
+//! signed in — see `signOut` and the pure rule in `relay_revoke.zig`.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -35,6 +38,7 @@ const relay_account = @import("relay_account.zig");
 const relay_directory = @import("relay_directory.zig");
 const relay_session = @import("relay_session.zig");
 const enroll = @import("agent/enroll.zig");
+const relay_revoke = @import("relay_revoke.zig");
 
 const log = std.log.scoped(.relay_signin);
 
@@ -222,27 +226,177 @@ pub fn signIn(alloc: Allocator, opts: Options) Error!Outcome {
     return .{ .email = try alloc.dupe(u8, session.value.email) };
 }
 
-/// Sign out: best-effort revoke the session at the relay that minted it, then
-/// delete the local store. Returns whether an account was actually signed in
-/// (so the caller can say "Signed out" vs "Already signed out"). Never fails —
-/// an unreachable relay or a legacy/corrupt store still signs out locally.
+/// How hard sign-out tries to revoke this machine's device enrollment (T1421).
+pub const SignOutMode = enum {
+    /// The normal path: revoke this machine's enrollment first, and ABORT the
+    /// sign-out if a revocation that was required did not happen.
+    revoke,
+    /// "Sign Out Anyway": the user has been told the machine could not be
+    /// revoked and chose to sign out regardless. No revocation is attempted —
+    /// re-running the whole thing only makes them wait out the same timeouts
+    /// twice (the Mac seat's `f3b1e5fb5` removed exactly that second pass).
+    force,
+};
+
+/// What became of this machine's device enrollment during a sign-out.
+pub const MachineOutcome = enum {
+    /// There was nothing to revoke: no local device credential, or one that
+    /// belongs to a different account and is therefore none of our business.
+    nothing_to_revoke,
+    /// The enrollment was revoked at the relay and the local credential
+    /// deleted. The machine is gone from every other client on the account.
+    revoked,
+    /// A revocation was REQUIRED and did not happen. The local account store is
+    /// untouched, so the user is still signed in — reporting "signed out" while
+    /// the machine is still reachable is the bug this whole path exists to fix.
+    not_revoked,
+    /// The user signed out knowing the machine is still enrolled (`.force`).
+    left_enrolled,
+};
+
+pub const SignOutResult = struct {
+    /// Whether an account was signed in when the sign-out started, so the
+    /// caller can say "Signed out" vs "Already signed out".
+    was_signed_in: bool,
+    /// What happened to this machine's enrollment.
+    machine: MachineOutcome,
+
+    /// Whether the local account store was actually cleared. False only for
+    /// `.not_revoked`, which deliberately leaves the user signed in.
+    pub fn signedOut(self: SignOutResult) bool {
+        return self.machine != .not_revoked;
+    }
+};
+
+/// Sign out — and revoke THIS machine's device enrollment on the way (T1421).
 ///
-/// Network-bound (the revoke POST): call from a background thread when the
-/// caller is the GUI.
-pub fn signOut(alloc: Allocator) bool {
-    const path = relay_account.accountPath(alloc) catch return false;
+/// An account's user session and a machine's device enrollment are two
+/// independent relay credentials, and `POST /oauth/signout` revokes only the
+/// session. Before this, signing out here left the machine listed, online and
+/// bridgeable from every other client on the account, with live sessions still
+/// visible through "See Activity". The rule now, matching the Mac client: app
+/// sign-out is a hard revocation of the machine the app runs on, when — and
+/// only when — that enrollment belongs to the account signing out.
+/// `relay_revoke.decide` is that rule, and it is pure.
+///
+/// **Failure is never silent.** When a required revocation does not happen the
+/// account stays SIGNED IN and the caller surfaces it; the user's way past that
+/// is `.force`, which says so rather than pretending.
+///
+/// Network-bound (whoami + de-enroll + the session revoke): call from a
+/// background thread when the caller is the GUI.
+pub fn signOut(alloc: Allocator, mode: SignOutMode) SignOutResult {
+    const path = relay_account.accountPath(alloc) catch
+        return .{ .was_signed_in = false, .machine = .nothing_to_revoke };
     const was_signed_in = relay_account.isSignedIn(alloc, path);
 
-    if (relay_account.load(alloc, path)) |acct| {
-        var account = acct;
-        defer account.deinit(alloc);
-        if (account.relay_base.len > 0) {
-            relay_session.signout(alloc, account.relay_base, account.session_token);
-        }
-    } else |_| {}
+    // A store that will not load (missing, corrupt, or a pre-T93 legacy one)
+    // names no account, so there is nobody to match an enrollment against.
+    // Sign out locally and leave the machine alone.
+    var account = relay_account.load(alloc, path) catch {
+        relay_account.delete(path);
+        return .{ .was_signed_in = was_signed_in, .machine = .nothing_to_revoke };
+    };
+    defer account.deinit(alloc);
 
+    const machine = switch (mode) {
+        .force => forceOutcome(alloc),
+        .revoke => revokeThisMachine(alloc, account) catch |err| blk: {
+            log.warn("sign-out: could not revoke this machine err={}", .{err});
+            break :blk .not_revoked;
+        },
+    };
+
+    // The one outcome that must not complete the sign-out.
+    if (machine == .not_revoked) {
+        return .{ .was_signed_in = was_signed_in, .machine = machine };
+    }
+
+    // Fire-and-forget, deliberately (`f3b1e5fb5`): awaiting it makes a
+    // signed-out-while-offline user wait out a request timeout for a call whose
+    // failure is ignored either way.
+    if (account.relay_base.len > 0) {
+        relay_session.signout(alloc, account.relay_base, account.session_token);
+    }
     relay_account.delete(path);
-    return was_signed_in;
+    return .{ .was_signed_in = was_signed_in, .machine = machine };
+}
+
+/// `.force`: no revocation attempt, but still say honestly whether a live
+/// enrollment is being left behind.
+fn forceOutcome(alloc: Allocator) MachineOutcome {
+    const env_path = enroll.relayEnvPath(alloc) catch return .nothing_to_revoke;
+    defer alloc.free(env_path);
+    var env = enroll.loadRelayEnv(alloc, env_path) catch return .nothing_to_revoke;
+    defer env.deinit(alloc);
+    const tok = env.device_token orelse return .nothing_to_revoke;
+    return if (tok.len > 0) .left_enrolled else .nothing_to_revoke;
+}
+
+/// The `.revoke` path: ask relay.env what credential this machine holds, ask
+/// the relay whose it is, and act on `relay_revoke.decide`'s answer.
+fn revokeThisMachine(alloc: Allocator, account: relay_account.Account) !MachineOutcome {
+    const env_path = try enroll.relayEnvPath(alloc);
+    defer alloc.free(env_path);
+    var env = enroll.loadRelayEnv(alloc, env_path) catch |err| {
+        // The file exists and cannot be read. That is not "no enrollment" —
+        // treating it as one is the original bug — so refuse to complete.
+        log.warn("sign-out: relay.env unreadable err={}", .{err});
+        return .not_revoked;
+    };
+    defer env.deinit(alloc);
+
+    const token = env.device_token orelse return .nothing_to_revoke;
+    if (token.len == 0) return .nothing_to_revoke;
+
+    // Aim at relay.env's base; fall back to the account's own relay when that
+    // line is missing or unusable, rather than destroying the one credential
+    // that could revoke the machine.
+    const raw_base = relay_revoke.revocationBase(
+        env.relay_base orelse "",
+        account.relay_base,
+    ) orelse {
+        log.warn("sign-out: no usable relay base to revoke this machine at", .{});
+        return .not_revoked;
+    };
+    const base = relay_revoke.normalizeBase(alloc, raw_base) catch return .not_revoked;
+    defer alloc.free(base);
+
+    if (env.relay_base) |eb| {
+        if (!relay_revoke.sameRelay(eb, account.relay_base)) {
+            log.info("sign-out: this machine is enrolled at a different relay than the account", .{});
+        }
+    }
+
+    var who = enroll.whoami(alloc, base, token);
+    defer if (who) |*w| w.deinit(alloc);
+
+    const decision = relay_revoke.decide(
+        token,
+        if (who) |w| w.email else null,
+        account.email,
+    );
+    switch (decision) {
+        .none => return .nothing_to_revoke,
+        .foreign => {
+            log.info("sign-out: this machine is enrolled to another account; leaving it alone", .{});
+            return .nothing_to_revoke;
+        },
+        .unknown => {
+            log.warn("sign-out: the relay could not say who this machine belongs to", .{});
+            return .not_revoked;
+        },
+        .revoke => {
+            // Deletes the device row server-side and severs every live
+            // connection — control and in-flight bridged data — then clears
+            // the local credential so a restart cannot dial with it.
+            enroll.deEnroll(alloc, base, token) catch |err| {
+                log.warn("sign-out: de-enroll failed err={}", .{err});
+                return .not_revoked;
+            };
+            return .revoked;
+        },
+    }
 }
 
 /// The signed-in account's email, or null when signed out / legacy / corrupt.
@@ -376,5 +530,7 @@ test "signOut: signed out already reports false and leaves no store" {
     // machine has no account — skip when the box IS signed in.
     const path = relay_account.accountPath(alloc) catch return;
     if (relay_account.isSignedIn(alloc, path)) return;
-    try testing.expect(signOut(alloc) == false);
+    const res = signOut(alloc, .revoke);
+    try testing.expect(res.was_signed_in == false);
+    try testing.expect(res.signedOut());
 }

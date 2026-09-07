@@ -24120,3 +24120,73 @@ the Window.zig edit: `viewer-close` 44, `close-confirm` 58, `remote-disconnect`
 49, and the ten static audits (`printclient-audit`, `test-reach`,
 `body-complete`, `isolation-meta`, `launch-preflight`, `verdict-exit`,
 `cleanslate`, `stderr-capture`, `desktop-launch`, `command-resolve`).
+
+## 2026-09-07 — signing out of your account now takes this machine with it (T1421)
+
+Two relay credentials, one word. An account's **user session** and a machine's
+**device enrollment** are separate things at the relay, and `/oauth/signout`
+revokes only the session — deliberately, since an account may own headless hosts
+no app is signed in on. On Windows that left a hole with a very plain user-facing
+shape: sign out in the app running ON an enrolled machine and the machine stayed
+listed, stayed online, stayed bridgeable from every other computer on the
+account, with whatever was on screen still pollable through "See Activity". Sign
+out looked like "this machine is no longer mine" and wasn't.
+
+Verified rather than assumed before building anything: `relay_signin.signOut`
+posted `/oauth/signout` and deleted the local account store, and never opened
+relay.env at all. Main fixed the Mac seat yesterday in `0c3a19764` plus an
+edge-case follow-up `f3b1e5fb5`; this is the Windows half, filed this morning by
+the daily intake as the only P0 on the board.
+
+The rule is now the same on both platforms: **app sign-out is a hard revocation
+of the machine the app runs on, when — and only when — that enrollment belongs to
+the account signing out.** The decision is pure and lives on its own in
+`src/remote/relay_revoke.zig`: `decide` reads the credential, the relay's answer
+about whose it is, and the signing-out address, and returns `.none`, `.revoke`,
+`.foreign` or `.unknown`. `signOut` then reads relay.env, asks
+`/v1/agent/whoami`, and on a match `POST`s `/v1/agent/deenroll` with the
+machine's OWN credential — the device row goes, every live connection is severed,
+and relay.env goes with it.
+
+The half that is easy to leave out is the one that matters most: **`.unknown` is
+never guessed.** A credential exists and the relay could not say whose it is, so
+the sign-out ABORTS and the account stays signed in — reporting "signed out"
+while the machine is still reachable is the bug itself. The chooser says so and
+offers "Sign Out Anyway", which does not re-run the revocation and make the user
+wait out the same timeouts twice. Identity is what the relay says and never the
+hostname: hostnames collide, and the failure mode there is deleting somebody's
+other machine.
+
+Two of `f3b1e5fb5`'s corrections were designed in rather than rediscovered. An
+unparseable `RELAY_BASE` no longer destroys the one credential that could revoke
+the machine — it falls back to the account's own relay, because the agent dials
+the base it was STARTED with and a broken line in a file does not make a machine
+unreachable. And relay.env legitimately carries a `ws://`/`wss://` spelling,
+which an HTTP client fails forever in a way that reads as "the relay is down", so
+the base is normalized before any call.
+
+Deliberately split rather than half-built: T1424 (retry a revocation that could
+not complete, at launch and when the network returns — today "Sign Out Anyway"
+warns and then never tries again), T1425 (suspend rather than discard, so signing
+back in restores your own machine instead of leaving it to be re-enrolled by
+hand) and T1426 (the chooser saying a machine is still connected to an account it
+was signed out of).
+
+One thing worth writing down about the box: a long comptime
+`utf8ToUtf16LeStringLiteral` in the new confirmation blew the eval branch quota
+in the APP build while the test lanes compiled it happily. Nothing in the floor
+caught it — `relay-account.ps1` did, by refusing to run against an exe older than
+the source. That refusal is the only reason a green four-lane sweep did not ship
+a build that would not compile.
+
+Green: `floor-lane.ps1 -Lane all` ALL LANES PASS (lib, none, win32 224s, agent
+395s), with 14 new unit tests for the pure rule running in BOTH the `none` and
+`win32` lanes. `relay-account.ps1` ALL PASS, `chooser-controls.ps1` ALL PASS
+(54), `chooser-selection.ps1` ALL PASS (35), `startup-failure.ps1` ALL PASS (42),
+`printclient-audit` (8), `test-reach-audit` (14), `docs-routing` (20). `ipc-p1`
+25, `ipc-p2` 20, `ipc-p3` 16.
+
+Not validated here, and said so on the card rather than ticked: the live
+end-to-end against a real relay, a real agent and a second enrolled client. This
+box owns one machine; the relay-side reproduction is `relay/signout_revoke_test.go`
+on the Mac seat.

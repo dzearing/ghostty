@@ -1138,7 +1138,7 @@ fn onAccountClicked(self: *MachineChooser) void {
         return;
     }
     const started = if (self.email != null)
-        RelayAccountRow.signOutAsync(self.window.app)
+        RelayAccountRow.signOutAsync(self.window.app, .revoke)
     else
         RelayAccountRow.signInAsync(self.window.app);
     if (!started) return;
@@ -1159,6 +1159,41 @@ pub fn onAccountResult(self: *MachineChooser, res: *const RelayAccountRow.Result
     }
     self.refreshAccountRow();
     if (res.message.len > 0) self.setHint(res.message);
+
+    // A sign-out that could not revoke this machine left the user SIGNED IN
+    // (T1421). Say so, and offer the way past it — silently doing nothing here
+    // would land them back on a row that still shows their email with no
+    // explanation, which is worse than the bug this path fixes.
+    if (res.kind == .sign_out and res.machine == .not_revoked) {
+        self.offerForcedSignOut();
+    }
+}
+
+/// The "Sign Out Anyway" confirmation (T1421). Modal, so it runs after the
+/// row has already been relabelled to its still-signed-in state — the user sees
+/// the true state behind the dialog rather than a half-applied one.
+fn offerForcedSignOut(self: *MachineChooser) void {
+    // The body is a long sentence and `utf8ToUtf16LeStringLiteral` walks it at
+    // comptime; the default quota does not reach the end of it.
+    @setEvalBranchQuota(20_000);
+    const window = self.window;
+    var title_buf: [256]u16 = undefined;
+    const title = utf16z(&title_buf, RelayAccountRow.not_revoked_title) orelse return;
+
+    const answer = ConfirmDialog.show(window.app, self.hwnd, window.scale, null, .{
+        .title = title.ptr,
+        .text = std.unicode.utf8ToUtf16LeStringLiteral(RelayAccountRow.not_revoked_body),
+        .icon = .warning,
+        .ok_label = std.unicode.utf8ToUtf16LeStringLiteral("Sign Out Anyway"),
+        .cancel_label = std.unicode.utf8ToUtf16LeStringLiteral("Stay Signed In"),
+        // The machine stays reachable either way; Enter must not choose that.
+        .default_cancel = true,
+    });
+    // The chooser can be closed from under a modal pump.
+    if (window.machine_chooser != self) return;
+    if (answer != .ok) return;
+
+    if (RelayAccountRow.signOutAsync(window.app, .force)) self.refreshAccountRow();
 }
 
 /// The share checkbox was clicked (T547). BS_CHECKBOX does not flip itself,

@@ -45,6 +45,11 @@ pub const Result = struct {
     email: []const u8,
     /// A short user-facing sentence for the chooser's footer hint.
     message: []const u8,
+    /// What became of THIS machine's device enrollment (T1421). Meaningful
+    /// only on `.sign_out`. `.not_revoked` is the one the chooser must act on:
+    /// the user is STILL SIGNED IN, and they have to be told and offered the
+    /// way past it rather than left believing a sign-out that did not happen.
+    machine: relay_signin.MachineOutcome = .nothing_to_revoke,
 };
 
 /// Only one account operation at a time. A second click while one is in flight
@@ -63,21 +68,25 @@ pub fn isRunning() bool {
 /// Start a browser sign-in on a detached thread. Safe to call from the GUI
 /// thread. Returns false when one is already in flight.
 pub fn signInAsync(app: *App) bool {
-    return startAsync(app, .sign_in);
+    return startAsync(app, .sign_in, .revoke);
 }
 
-/// Start a sign-out (relay revoke + local store delete) on a detached thread.
-/// Safe to call from the GUI thread. Returns false when one is in flight.
-pub fn signOutAsync(app: *App) bool {
-    return startAsync(app, .sign_out);
+/// Start a sign-out on a detached thread: revoke THIS machine's device
+/// enrollment (T1421), revoke the session, delete the local store. Safe to call
+/// from the GUI thread. Returns false when one is in flight.
+///
+/// `mode` is `.revoke` for the button, and `.force` for the "Sign Out Anyway"
+/// the chooser offers after a `.not_revoked` outcome.
+pub fn signOutAsync(app: *App, mode: relay_signin.SignOutMode) bool {
+    return startAsync(app, .sign_out, mode);
 }
 
-fn startAsync(app: *App, kind: Kind) bool {
+fn startAsync(app: *App, kind: Kind, mode: relay_signin.SignOutMode) bool {
     if (running.swap(true, .acq_rel)) {
         log.info("relay account: an operation is already running; ignoring", .{});
         return false;
     }
-    const thread = std.Thread.spawn(.{}, worker, .{ app, kind }) catch |err| {
+    const thread = std.Thread.spawn(.{}, worker, .{ app, kind, mode }) catch |err| {
         running.store(false, .release);
         log.warn("relay account: thread spawn failed err={}", .{err});
         return false;
@@ -86,7 +95,7 @@ fn startAsync(app: *App, kind: Kind) bool {
     return true;
 }
 
-fn worker(app: *App, kind: Kind) void {
+fn worker(app: *App, kind: Kind, mode: relay_signin.SignOutMode) void {
     defer running.store(false, .release);
 
     // The flow's own scratch memory: page-backed so it never touches the GUI
@@ -117,12 +126,15 @@ fn worker(app: *App, kind: Kind) void {
             }
         },
         .sign_out => blk: {
-            const was_signed_in = relay_signin.signOut(arena);
+            const out = relay_signin.signOut(arena, mode);
             break :blk .{
                 .kind = .sign_out,
-                .ok = true,
+                // A sign-out that left the account signed in is NOT ok, and the
+                // chooser must not re-read the account as though it had changed.
+                .ok = out.signedOut(),
                 .email = "",
-                .message = if (was_signed_in) "Signed out." else "Already signed out.",
+                .message = signOutMessage(out),
+                .machine = out.machine,
             };
         },
     };
@@ -213,6 +225,33 @@ pub fn statusText(email: ?[]const u8, busy: bool, configured: bool) []const u8 {
     return if (e.len == 0) signed_out else e;
 }
 
+/// The footer sentence for a finished sign-out (T1421). Pure, so every branch
+/// is readable in one place and testable in the `none` lane.
+///
+/// The wording carries the outcome rather than a generic "Signed out.", because
+/// the four outcomes are four different facts about the user's machine and only
+/// one of them means what "Signed out" used to mean. `.not_revoked` in
+/// particular must not read as success: the account is still signed in.
+pub fn signOutMessage(res: relay_signin.SignOutResult) []const u8 {
+    return switch (res.machine) {
+        .revoked => "Signed out — this machine was removed from your account.",
+        .not_revoked => "Couldn't remove this machine from your account, so you're still signed in.",
+        .left_enrolled => "Signed out. This machine is still connected to that account.",
+        .nothing_to_revoke => if (res.was_signed_in) "Signed out." else "Already signed out.",
+    };
+}
+
+/// The confirmation body shown when a sign-out could not revoke this machine.
+/// Pure for the same reason as `signOutMessage`, and separate because the
+/// dialog states the consequence the footer has no room for.
+pub const not_revoked_title = "Couldn't remove this machine from your account";
+pub const not_revoked_body =
+    "Signing out revokes this machine's registration so it stops being listed, " ++
+    "reachable and streamable from your other computers. That couldn't be done " ++
+    "just now — the relay didn't answer.\n\n" ++
+    "You can sign out anyway, but this machine stays connected to that account " ++
+    "until you remove it from the machine list on another computer.";
+
 /// The monogram letter for the avatar circle (T311): the email's first LETTER,
 /// uppercased, mirroring Mac's `initials` (MachineChooserView.swift:942-976).
 ///
@@ -283,4 +322,54 @@ test "statusText: an unconfigured build says so where signed-out says nothing (T
     try testing.expect(std.mem.indexOf(u8, unconfigured_hint, "relay-oidc-setup.md") != null);
     try testing.expect(std.mem.indexOf(u8, unconfigured_hint, "GHOSTTY_GOOGLE_CLIENT_ID") != null);
     try testing.expect(unconfigured_hint.len > unconfigured_status.len);
+}
+
+test "signOutMessage: the four outcomes say four different things (T1421)" {
+    // `.not_revoked` is the one that must NOT read as success — the account is
+    // still signed in, and a footer saying "Signed out." would be the same lie
+    // the whole revocation path exists to stop telling.
+    const not_revoked = signOutMessage(.{ .was_signed_in = true, .machine = .not_revoked });
+    try testing.expect(std.mem.indexOf(u8, not_revoked, "still signed in") != null);
+    try testing.expect(std.mem.indexOf(u8, not_revoked, "Signed out") == null);
+
+    const revoked = signOutMessage(.{ .was_signed_in = true, .machine = .revoked });
+    try testing.expect(std.mem.indexOf(u8, revoked, "removed from your account") != null);
+
+    // Signing out anyway must still admit what is left behind.
+    const left = signOutMessage(.{ .was_signed_in = true, .machine = .left_enrolled });
+    try testing.expect(std.mem.indexOf(u8, left, "still connected") != null);
+
+    // The unenrolled machine keeps the old wording, both ways round.
+    try testing.expectEqualStrings(
+        "Signed out.",
+        signOutMessage(.{ .was_signed_in = true, .machine = .nothing_to_revoke }),
+    );
+    try testing.expectEqualStrings(
+        "Already signed out.",
+        signOutMessage(.{ .was_signed_in = false, .machine = .nothing_to_revoke }),
+    );
+
+    // All four are distinct: a footer that cannot tell two outcomes apart is a
+    // footer the user cannot act on.
+    const all = [_][]const u8{ not_revoked, revoked, left, signOutMessage(.{ .was_signed_in = true, .machine = .nothing_to_revoke }) };
+    for (all, 0..) |a, i| {
+        try testing.expect(a.len > 0);
+        for (all[i + 1 ..]) |b| try testing.expect(!std.mem.eql(u8, a, b));
+    }
+}
+
+test "not_revoked_body: names the consequence and the remedy (T1421)" {
+    // The dialog is the only place the user learns that signing out anyway
+    // leaves the machine reachable, and where to go to finish the job.
+    try testing.expect(std.mem.indexOf(u8, not_revoked_body, "stays connected") != null);
+    try testing.expect(std.mem.indexOf(u8, not_revoked_body, "another computer") != null);
+    try testing.expect(not_revoked_title.len > 0);
+}
+
+test "SignOutResult.signedOut: only a failed revocation keeps the account" {
+    const R = relay_signin.SignOutResult;
+    try testing.expect((R{ .was_signed_in = true, .machine = .revoked }).signedOut());
+    try testing.expect((R{ .was_signed_in = true, .machine = .left_enrolled }).signedOut());
+    try testing.expect((R{ .was_signed_in = true, .machine = .nothing_to_revoke }).signedOut());
+    try testing.expect(!(R{ .was_signed_in = true, .machine = .not_revoked }).signedOut());
 }

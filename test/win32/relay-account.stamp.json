@@ -1,11 +1,15 @@
 {
     "guard":  "relay-account",
     "script":  "test/win32/relay-account.ps1",
-    "generated":  "2026-08-21T22:26:47-07:00",
-    "commit":  "56e310ef0",
+    "generated":  "2026-09-07T06:02:48-07:00",
+    "commit":  "8b10167d4",
+    "uncommitted":  [
+                        "src/apprt/win32/RelayAccountRow.zig",
+                        "src/remote/relay_signin.zig"
+                    ],
     "files":  {
-                  "src/apprt/win32/RelayAccountRow.zig":  "fbb3f7e392705c5fb1d8a2eaf1293571ef6ad34694cc8bc318e5ba3add12f9a9",
-                  "src/remote/relay_signin.zig":  "ce45e0dff2a93e2a0800a5f105f6ff3cb1772ccd0e9f1a36ff0af9c98c1f3cf7",
+                  "src/apprt/win32/RelayAccountRow.zig":  "cca96a50cb1cb0a1a0900470020a75a581b879dc0eb79b4dfdd306e48a387441",
+                  "src/remote/relay_signin.zig":  "d3157f5bdaa8f2d6802038345687e06c2cc01a8f0978ed8447e513b9fcfc7e59",
                   "test/win32/relay-account.ps1":  "8dee3165d569d5069208dee6975b251d6bb3444434e4993e5d4bda207e80250f"
               }
 }

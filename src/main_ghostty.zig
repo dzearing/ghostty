@@ -495,6 +495,7 @@ test {
     _ = @import("remote/relay_directory.zig");
     _ = @import("remote/relay_session.zig");
     _ = @import("remote/relay_signin.zig");
+    _ = @import("remote/relay_revoke.zig");
 
     // The `ghoztty-agent` lineage suffix (T167): pure naming logic shared by
     // the agent's single-instance guard, the win32 app's state dir / pipe /
