@@ -24539,3 +24539,45 @@ T1439 files what neither arm measures: a chooser dismissed while a restore is
 still in flight. Both arms are built so that path rebuilds anyway and frees
 everything it holds, and nothing has ever watched it do so — the delay seams on
 both sides make the interval reachable now.
+
+## 2026-09-07 — the chooser's missing CPU/mem turns out not to be missing (T619 skipped; T1440/T1441 filed)
+
+T619 said Mac's machine chooser paints each row's live CPU and memory and
+Windows' paints none. Read against the Mac source before building it, the claim
+does not hold in either direction, so the task closes `skipped` with no code and
+the idea underneath is refiled honestly on both seats.
+
+**Mac paints metrics on direct-TCP rows only.** `MachineChooserView` starts its
+`MachineMetricsProbe` as `probe.start(registry.machines.filter { !$0.isRelay })`
+(MachineChooserView.swift:2014), and `probe.readings` has exactly one reader,
+`tcpSublineText`, which is called only from the non-relay branch of
+`subline(for:)` (:1632-1668) and `detailSubtitle` (:627-633). A relay row shows
+`(hostname)` and never a metrics line — and the comment on it is explicit about
+why: status is carried by the leading shape indicator alone, and the metrics
+exist to replace the `host:port` the user did not want displayed.
+
+**And that filter has never matched anything.** Nothing in `macos/Sources` puts
+a direct-TCP machine in the registry: `MachineRegistry.add(_:)`
+(Machine.swift:343) has no callers, `refreshFromRelay`/`rebuild` produce relay
+machines only (:508-554), and Machine.swift:262 still carries
+`TODO(wp4): load TCP machines from ~/.config/ghostty`. Every other `Machine(...)`
+construction site — AppDelegate.swift:1459 and :1585,
+`LocalAgentManager.localMachine` — builds a value for a window or a connection,
+never for the list the chooser renders. So the feature `MachineMetricsProbe`'s
+own header describes has never reached a Mac user's screen.
+
+**Windows is level with it.** `MachineChooser.Row` is `local | device`, device
+indexing the relay directory, so the rows both platforms actually show carry the
+same three things: name, status shape, hostname subtext. What T619 checked in
+August was the Windows half, accurately; what it assumed was the Mac half.
+
+Building it on Windows alone would have been a divergence shipped off a false
+premise — precisely the shape step 1's `CHECK FIRST` (T404) exists to catch, and
+the second time this month the cheaper move was to read the other platform first.
+The UX idea is good and is not lost: **T1440** (win) and **T1441** (mac) carry it
+as a feature rather than a parity gap, each depending on T619 so the evidence
+travels with them, and each naming what it would build on — T298's probe policy
+and T461's connection pool here, the already-written probe there.
+
+Green: `floor-lane.ps1 -Lane all` (lib / none / win32 / agent). No source file
+changed, so no acceptance harness came due.
