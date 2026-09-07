@@ -143,6 +143,9 @@ $AccountStore = "$tmp\account.dat"
 # GHOSTTY_RELAY_ENV at the temp dir carries both out of the box's real state.
 $RelayEnvPath = "$tmp\relay.env"
 $PendingRevoke = "$tmp\pending-revoke.json"
+# T1425: the suspended-enrollment record lives in the same directory, for the
+# same reason - one GHOSTTY_RELAY_ENV carries the whole set into this sandbox.
+$SuspendRec = "$tmp\suspended-enrollment.json"
 $FakeABase = "http://127.0.0.1:$FakeAPort"
 $FakeBBase = "http://127.0.0.1:$FakeBPort"
 $RelayBase = "http://127.0.0.1:$RelayPort"
@@ -290,6 +293,11 @@ function Start-FakeRelay($port, $tok, $ttl, $renewTok, $hitsFile, $nonce) {
                     $out = Resp200 '{"email":"e2e@example.com","device_id":"dev-e2e","name":"E2E-Box"}'
                 } elseif ($line -match '^POST /v1/agent/deenroll') {
                     $out = $r204
+                } elseif ($line -match '^POST /v1/client/devices') {
+                    # T1425: the account-authenticated enroll. The relay hands
+                    # the raw device token over exactly once, which is why the
+                    # client has to persist it or lose it.
+                    $out = Resp200 '{"id":"dev-e2e-restored","name":"E2E-Box","token":"dev-tok-restored"}'
                 } elseif ($line -match '^GET /v1/client/devices') {
                     $out = Resp200 '{"devices":[{"id":"dev-e2e","name":"E2E-Box","hostname":"e2e.local","online":true}]}'
                 } else {
@@ -389,24 +397,54 @@ function Open-Chooser($g) {
 
 # Play the browser: the GUI logs "open this URL to sign in: <url>" to stderr;
 # parse the redirect_uri + state out of it and GET the redirect with a code.
+# States this run has already answered. The helper below is called more than
+# once against the SAME stderr log - a sign-out and a sign-in inside one GUI
+# (section 10) - and the first cut took `-match`'s FIRST hit, which is the
+# previous attempt's URL. That replays a redirect at a loopback port that has
+# already closed: the request fails, the helper still returns true, and the
+# sign-in it was supposed to complete simply never finishes. Every assertion
+# after it then measures a GUI that is still sitting on a consent screen.
+$script:answeredStates = @{}
+
 function Complete-BrowserRedirect($errlog, $timeoutSec = 20) {
     $redir = $null; $state = $null
     foreach ($i in 1..($timeoutSec * 4)) {
         Start-Sleep -Milliseconds 250
         $c = Get-Content $errlog -Raw -ErrorAction SilentlyContinue
-        if ($c -and $c -match 'open this URL to sign in: (\S+)') {
-            $url = $matches[1]
-            if ($url -match 'redirect_uri=([^&\s]+)') { $redir = [uri]::UnescapeDataString($matches[1]) }
-            if ($url -match 'state=([^&\s]+)') { $state = $matches[1] }
-            if ($redir -and $state) { break }
+        if (-not $c) { continue }
+        # Newest first, and never one already answered.
+        $urls = [regex]::Matches($c, 'open this URL to sign in: (\S+)')
+        for ($k = $urls.Count - 1; $k -ge 0; $k--) {
+            $url = $urls[$k].Groups[1].Value
+            $rd = $null; $st = $null
+            if ($url -match 'redirect_uri=([^&\s]+)') { $rd = [uri]::UnescapeDataString($matches[1]) }
+            if ($url -match 'state=([^&\s]+)') { $st = $matches[1] }
+            if ($rd -and $st -and -not $script:answeredStates.ContainsKey($st)) {
+                $redir = $rd; $state = $st; break
+            }
         }
+        if ($redir -and $state) { break }
     }
     if (-not ($redir -and $state)) { return $false }
+    $script:answeredStates[$state] = $true
     try {
         Invoke-WebRequest -UseBasicParsing -TimeoutSec 5 `
             -Uri "$redir/?code=FAKECODE-123&state=$state" | Out-Null
     } catch {}
     return $true
+}
+
+# Wait for the Nth occurrence of a stderr line. A GUI that signs in, out and in
+# again logs `sign_in ok` twice, and waiting for the pattern would be satisfied
+# by the FIRST one - i.e. by something that happened before the action under
+# test even started.
+function Wait-StderrCount($errlog, $pattern, $count, $timeoutSec = 20) {
+    foreach ($i in 1..($timeoutSec * 4)) {
+        Start-Sleep -Milliseconds 250
+        $e = Get-Content $errlog -Raw -ErrorAction SilentlyContinue
+        if ($e -and ([regex]::Matches($e, $pattern)).Count -ge $count) { return $true }
+    }
+    return $false
 }
 
 # Wait for a stderr line to appear (the GUI's own account-flow telemetry).
@@ -1002,16 +1040,20 @@ try {
         Start-Sleep -Milliseconds 800
     }
 
-    "  -- 9c: signing back in on this machine CANCELS the pending revocation"
+    "  -- 9c: signing back in CANCELS the revocation when the machine is still live"
     # Re-adopting the machine has to win, or the retry loop would revoke the
     # machine the user just signed back in on - the same shape as the Mac
     # seat's "signed back in and the machine was simply gone" (f3b1e5fb5).
-    # The record here points at a DEAD port, so nothing but the sign-in can
-    # clear it and the assertion cannot be satisfied by a lucky retry.
+    #
+    # The two bases here are deliberately different, and it is the only way the
+    # assertion is attributable. relay.env names the LIVE fake relay, so the
+    # sign-in can probe the credential and find it alive; the armed record names
+    # a DEAD port, so the background retry can never be the thing that clears
+    # it. Only the sign-in can satisfy this.
     $DeadRevokePort = Get-FreePort
     $DeviceTok3 = 'dev-tok-e2e-3'
     Set-Content -Path $RelayEnvPath -Encoding ascii -Value @(
-        "RELAY_BASE=http://127.0.0.1:$DeadRevokePort", "DEVICE_TOKEN=$DeviceTok3")
+        "RELAY_BASE=$FakeABase", "DEVICE_TOKEN=$DeviceTok3")
     Set-Content -Path $PendingRevoke -Encoding ascii -Value (
         '{"relay_base":"http://127.0.0.1:' + $DeadRevokePort + '","device_token":"' +
         $DeviceTok3 + '","account_email":"e2e@example.com","armed_at":1}')
@@ -1031,7 +1073,7 @@ try {
             Assert "browser redirect delivered (9c)" (Complete-BrowserRedirect $errlog9c)
             Assert "signed back in on this machine" (Wait-Stderr $errlog9c 'relay account: sign_in ok')
             $cancelled = $false
-            foreach ($i in 1..20) {
+            foreach ($i in 1..40) {
                 Start-Sleep -Milliseconds 250
                 if (-not (Test-Path $PendingRevoke)) { $cancelled = $true; break }
             }
@@ -1043,8 +1085,278 @@ try {
         }
         Start-Sleep -Milliseconds 800
     }
+
+    "  -- 9d: an email match ALONE does not cancel a revocation (T1425)"
+    # f3b1e5fb5's correction, and the reason 9c had to grow a live relay. A
+    # revocation whose POST landed with its response lost is indistinguishable
+    # from one that failed, so cancelling because the same address signed back
+    # in can leave a dead token in relay.env, the machine off the account, and
+    # nothing left to notice. Here the credential's own relay cannot be reached
+    # at all, so the honest answer is "still don't know" - and the record must
+    # survive the sign-in rather than be thrown away on the strength of the
+    # email.
+    $DeadCredPort = Get-FreePort
+    $DeviceTok4 = 'dev-tok-e2e-4'
+    Assert "the credential's relay port $DeadCredPort is dead for 9d" (Test-PortFree $DeadCredPort)
+    Set-Content -Path $RelayEnvPath -Encoding ascii -Value @(
+        "RELAY_BASE=http://127.0.0.1:$DeadCredPort", "DEVICE_TOKEN=$DeviceTok4")
+    Set-Content -Path $PendingRevoke -Encoding ascii -Value (
+        '{"relay_base":"http://127.0.0.1:' + $DeadCredPort + '","device_token":"' +
+        $DeviceTok4 + '","account_email":"e2e@example.com","armed_at":1}')
+    Remove-Item $AccountStore -ErrorAction SilentlyContinue
+
+    $errlog9d = "$tmp\gui-revoke-unknown.stderr.log"
+    $g9d = Launch-Gui $FakeABase $errlog9d
+    if (-not $g9d) {
+        Write-Host 'SETUP FAIL: GUI did not come up for the unanswerable case'; $script:failures++
+    } else {
+        $ch9d = Open-Chooser $g9d
+        Assert "chooser opened (unanswerable credential)" ($ch9d -ne [IntPtr]::Zero)
+        if ($ch9d -ne [IntPtr]::Zero) {
+            $b9d = Get-ChooserAccountButton -Chooser $ch9d
+            if ($null -ne $b9d) { Send-TestControlClick -Control $b9d.Hwnd | Out-Null }
+            Assert "browser redirect delivered (9d)" (Complete-BrowserRedirect $errlog9d)
+            Assert "signed back in (9d)" (Wait-Stderr $errlog9d 'relay account: sign_in ok')
+            Start-Sleep -Seconds 3
+            Assert "an unanswerable relay leaves the revocation ARMED" (Test-Path $PendingRevoke)
+            Assert "and the credential is left where the retry can still use it" (
+                Test-Path $RelayEnvPath)
+        }
+        if ($g9d.App.Process -and -not $g9d.App.Process.HasExited) {
+            Stop-Process -Id $g9d.Pid -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 800
+    }
+
     Remove-Item $RelayEnvPath -ErrorAction SilentlyContinue
     Remove-Item $PendingRevoke -ErrorAction SilentlyContinue
+    Remove-Item $SuspendRec -ErrorAction SilentlyContinue
+
+    # 10: signing out SUSPENDS this machine; signing back in RESTORES it (T1425)
+    #
+    # T1421 made sign-out take the machine off the account, which is the half a
+    # security review asks for. This is the half the user meets: their own
+    # computer disappeared from the machine list on every other device they own
+    # and did not come back when they signed in again. Sign-out was a one-way
+    # door, and the way home - re-running browser enrollment by hand - is not a
+    # thing most people know exists.
+    "== 10: sign-out suspends the machine and signing back in restores it (T1425)"
+    $DeviceTok10 = 'dev-tok-e2e-10'
+    Set-Content -Path $RelayEnvPath -Encoding ascii -Value @(
+        "RELAY_BASE=$FakeABase", "DEVICE_TOKEN=$DeviceTok10")
+    Remove-Item $AccountStore -ErrorAction SilentlyContinue
+    Remove-Item $SuspendRec -ErrorAction SilentlyContinue
+
+    $errlog10 = "$tmp\gui-restore.stderr.log"
+    $g10 = Launch-Gui $FakeABase $errlog10
+    if (-not $g10) {
+        Write-Host 'SETUP FAIL: GUI did not come up for the restore section'
+        $script:failures++
+    } else {
+        $ch10 = Open-Chooser $g10
+        Assert "chooser opened (suspend/restore)" ($ch10 -ne [IntPtr]::Zero)
+        if ($ch10 -ne [IntPtr]::Zero) {
+            $b10 = Get-ChooserAccountButton -Chooser $ch10
+            if ($null -ne $b10) { Send-TestControlClick -Control $b10.Hwnd | Out-Null }
+            Assert "browser redirect delivered (10 setup)" (Complete-BrowserRedirect $errlog10)
+            Assert "signed in for the sign-out under test (10)" (
+                Wait-Stderr $errlog10 'relay account: sign_in ok')
+            Start-Sleep -Milliseconds 600
+
+            $out10 = Get-ChooserAccountButton -Chooser $ch10
+            Assert "row offers Sign Out (10)" ($null -ne $out10 -and $out10.Text -eq 'Sign Out')
+            if ($null -ne $out10) {
+                Send-TestControlClick -Control $out10.Hwnd | Out-Null
+
+                # The relay is up, so this sign-out REVOKES rather than asking:
+                # no confirmation dialog, the credential goes, and the machine
+                # is off the account.
+                $revoked = $false
+                foreach ($i in 1..60) {
+                    Start-Sleep -Milliseconds 250
+                    if ((Get-Hits $HitsA) -match [regex]::Escape(
+                            "POST /v1/agent/deenroll HTTP/1.1|auth=$DeviceTok10")) {
+                        $revoked = $true; break
+                    }
+                }
+                Assert "the sign-out revoked this machine (T1421 still holds)" $revoked
+                Assert "and took the local credential with it" (-not (Test-Path $RelayEnvPath))
+
+                $suspended = $false
+                foreach ($i in 1..20) {
+                    Start-Sleep -Milliseconds 250
+                    if (Test-Path $SuspendRec) { $suspended = $true; break }
+                }
+                Assert "the sign-out SUSPENDED the enrollment rather than discarding it" $suspended
+                if ($suspended) {
+                    $rec10 = Get-Content $SuspendRec -Raw
+                    # The name is what makes the machine come back as itself
+                    # rather than as a stranger in the chooser.
+                    Assert "the record keeps the machine's name" ($rec10 -match 'E2E-Box')
+                    Assert "the record names the relay it was enrolled at" (
+                        $rec10 -match [regex]::Escape("127.0.0.1:$FakeAPort"))
+                    Assert "the record names the account that may restore it" (
+                        $rec10 -match 'e2e@example.com')
+                    # It describes a dead credential; it must not carry one.
+                    Assert "the record carries NO credential" (
+                        -not ($rec10 -match [regex]::Escape($DeviceTok10)))
+                }
+
+                # Sign back in on the SAME account: the machine comes back.
+                $b10b = Get-ChooserAccountButton -Chooser $ch10
+                Assert "row is back to Sign in (10)" (
+                    $null -ne $b10b -and $b10b.Text -eq $SignInLabel)
+                if ($null -ne $b10b) {
+                    Send-TestControlClick -Control $b10b.Hwnd | Out-Null
+                    Assert "browser redirect delivered (10 restore)" (
+                        Complete-BrowserRedirect $errlog10)
+                    Assert "signed back in on this machine (10)" (
+                        Wait-StderrCount $errlog10 'relay account: sign_in ok' 2)
+
+                    $reenrolled = $false
+                    foreach ($i in 1..60) {
+                        Start-Sleep -Milliseconds 250
+                        if ((Get-Hits $HitsA) -match [regex]::Escape(
+                                "POST /v1/client/devices HTTP/1.1|auth=$SessTok")) {
+                            $reenrolled = $true; break
+                        }
+                    }
+                    Assert "signing back in RE-ENROLLED this machine (T1425)" $reenrolled
+
+                    $back = $false
+                    foreach ($i in 1..40) {
+                        Start-Sleep -Milliseconds 250
+                        if (Test-Path $RelayEnvPath) { $back = $true; break }
+                    }
+                    Assert "relay.env is back, so the agent can dial again" $back
+                    if ($back) {
+                        $envBack = Get-Content $RelayEnvPath -Raw
+                        # The FRESH credential, not the revoked one: the agent's
+                        # watcher adopts this file within a tick, and the old
+                        # token is dead server-side.
+                        Assert "and it carries the FRESH device credential" (
+                            $envBack -match 'dev-tok-restored')
+                        Assert "not the revoked one" (
+                            -not ($envBack -match [regex]::Escape($DeviceTok10)))
+                    }
+                    $cleared10 = $false
+                    foreach ($i in 1..20) {
+                        Start-Sleep -Milliseconds 250
+                        if (-not (Test-Path $SuspendRec)) { $cleared10 = $true; break }
+                    }
+                    Assert "a redeemed suspension clears its record" $cleared10
+                }
+            }
+        }
+        if ($g10.App.Process -and -not $g10.App.Process.HasExited) {
+            Stop-Process -Id $g10.Pid -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 800
+    }
+
+    "  -- 10b: a restore that fails transiently is retried at the NEXT launch"
+    # The failure direction is safe - the machine simply stays unenrolled - but
+    # it must not be permanent. A machine that never comes back is not something
+    # a user would think to fix by signing out and in again, so the record
+    # survives the failure and every launch while signed in tries again.
+    $RestorePort = Get-FreePort
+    $RestoreBase = "http://127.0.0.1:$RestorePort"
+    $HitsS = "$tmp\hits-restore.log"
+    Assert "the restore relay's port $RestorePort is free (it must be DEAD first)" (
+        Test-PortFree $RestorePort)
+    Remove-Item $RelayEnvPath -ErrorAction SilentlyContinue
+    Set-Content -Path $SuspendRec -Encoding ascii -Value (
+        '{"relay_base":"' + $RestoreBase + '","machine_name":"E2E-Box",' +
+        '"owner_email":"e2e@example.com","suspended_at":1}')
+    Write-AccountStore $SessTok 3600 $RestoreBase
+
+    $g10b = Launch-Gui $RestoreBase "$tmp\gui-restore-offline.stderr.log"
+    if (-not $g10b) {
+        Write-Host 'SETUP FAIL: GUI did not come up for the offline restore'; $script:failures++
+    } else {
+        Start-Sleep -Seconds 3
+        Assert "an unreachable relay leaves the suspension ARMED" (Test-Path $SuspendRec)
+        Assert "and enrolls nothing" (-not (Test-Path $RelayEnvPath))
+        if ($g10b.App.Process -and -not $g10b.App.Process.HasExited) {
+            Stop-Process -Id $g10b.Pid -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 800
+    }
+
+    # The network comes back, and the next launch finishes the job with no
+    # sign-out/sign-in cycle from the user.
+    $jobS = Start-FakeRelay $RestorePort $SessTok 3600 $RenewedTok $HitsS $ProbeNonce
+    $upS = Wait-FakeRelay $RestorePort $ProbeNonce
+    if (-not $upS.Ok) { "  (restore relay never answered: $($upS.Why))" }
+    Assert "the restore relay is up now (the network came back)" $upS.Ok
+
+    $g10c = Launch-Gui $RestoreBase "$tmp\gui-restore-online.stderr.log"
+    if (-not $g10c) {
+        Write-Host 'SETUP FAIL: GUI did not come up for the launch retry'; $script:failures++
+    } else {
+        $late = $false
+        foreach ($i in 1..60) {
+            Start-Sleep -Milliseconds 500
+            if ((Get-Hits $HitsS) -match [regex]::Escape(
+                    "POST /v1/client/devices HTTP/1.1|auth=$SessTok")) {
+                $late = $true; break
+            }
+        }
+        Assert "the next launch restored the machine without a sign-out/in cycle" $late
+        $backLate = $false
+        foreach ($i in 1..40) {
+            Start-Sleep -Milliseconds 250
+            if ((Test-Path $RelayEnvPath) -and
+                ((Get-Content $RelayEnvPath -Raw) -match 'dev-tok-restored')) {
+                $backLate = $true; break
+            }
+        }
+        Assert "and wrote the fresh credential for the agent to adopt" $backLate
+        $cleared10b = $false
+        foreach ($i in 1..20) {
+            Start-Sleep -Milliseconds 250
+            if (-not (Test-Path $SuspendRec)) { $cleared10b = $true; break }
+        }
+        Assert "the record is spent once it is redeemed" $cleared10b
+        if ($g10c.App.Process -and -not $g10c.App.Process.HasExited) {
+            Stop-Process -Id $g10c.Pid -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 800
+    }
+
+    "  -- 10c: a DIFFERENT account never inherits the machine"
+    # The record names its owner, and anybody else signing in drops it unread
+    # rather than silently taking over the host.
+    Remove-Item $RelayEnvPath -ErrorAction SilentlyContinue
+    Set-Content -Path $SuspendRec -Encoding ascii -Value (
+        '{"relay_base":"' + $RestoreBase + '","machine_name":"Somebody-Elses-Box",' +
+        '"owner_email":"other@example.com","suspended_at":1}')
+    Write-AccountStore $SessTok 3600 $RestoreBase
+    $hitsBefore = (Get-Hits $HitsS)
+    $g10d = Launch-Gui $RestoreBase "$tmp\gui-restore-other.stderr.log"
+    if (-not $g10d) {
+        Write-Host 'SETUP FAIL: GUI did not come up for the other-account case'; $script:failures++
+    } else {
+        $dropped = $false
+        foreach ($i in 1..40) {
+            Start-Sleep -Milliseconds 250
+            if (-not (Test-Path $SuspendRec)) { $dropped = $true; break }
+        }
+        Assert "another account's suspension is dropped unread" $dropped
+        Assert "and nothing is enrolled for it" (-not (Test-Path $RelayEnvPath))
+        $enrollsBefore = ([regex]::Matches($hitsBefore, 'POST /v1/client/devices')).Count
+        $enrollsAfter = ([regex]::Matches((Get-Hits $HitsS), 'POST /v1/client/devices')).Count
+        Assert "no enroll was attempted for somebody else's machine" (
+            $enrollsAfter -eq $enrollsBefore)
+        if ($g10d.App.Process -and -not $g10d.App.Process.HasExited) {
+            Stop-Process -Id $g10d.Pid -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 800
+    }
+
+    Remove-Item $RelayEnvPath -ErrorAction SilentlyContinue
+    Remove-Item $SuspendRec -ErrorAction SilentlyContinue
+    Remove-Item $AccountStore -ErrorAction SilentlyContinue
 
 
 } catch {
@@ -1061,7 +1373,7 @@ try {
     Remove-Item env:GHOSTTY_ACCOUNT_STORE -ErrorAction SilentlyContinue
     if ($null -ne $savedTok) { $env:GHOSTTY_RELAY_TOKEN = $savedTok }
     Stop-TestProcs
-    foreach ($j in @($jobA, $jobB, $jobR)) {
+    foreach ($j in @($jobA, $jobB, $jobR, $jobS)) {
         if ($j) { Stop-Job $j -ErrorAction SilentlyContinue; Remove-Job $j -Force -ErrorAction SilentlyContinue }
     }
     # A failing run keeps its evidence (both GUIs' stderr, every CLI's stdout,

@@ -59,6 +59,10 @@ pub const DirectoryError = union(enum) {
     unauthorized,
     /// The device/resource is unknown or not owned by this account (HTTP 404).
     not_found,
+    /// The account is already at its device limit (HTTP 409). Its own case
+    /// because it is the one refusal the user can act on - remove a machine and
+    /// try again - and "unexpected HTTP 409" tells them nothing (T1425).
+    quota_exceeded,
     /// Any other non-2xx status, code preserved.
     http: u16,
 };
@@ -68,6 +72,7 @@ pub const DirectoryError = union(enum) {
 pub const FetchError = error{
     Unauthorized,
     NotFound,
+    QuotaExceeded,
     UnexpectedStatus,
     BadResponse,
 };
@@ -78,6 +83,7 @@ pub fn classifyStatus(status: u16) ?DirectoryError {
     return switch (status) {
         401 => .unauthorized,
         404 => .not_found,
+        409 => .quota_exceeded,
         else => .{ .http = status },
     };
 }
@@ -204,6 +210,64 @@ pub fn renameDevice(
     return parseDevice(alloc, resp.body);
 }
 
+/// The one-time enrollment response of `POST /v1/client/devices`: the new
+/// device's id and name plus its raw bearer token. The relay returns the token
+/// EXACTLY ONCE (it stores only the hash), so a caller that does not persist it
+/// has lost it.
+pub const Enrolled = struct {
+    id: []const u8,
+    name: []const u8,
+    token: []const u8,
+};
+
+/// An owned, parsed enrollment response. Same `.alloc_always` copy rule as
+/// `Parsed`, so the source body may be freed immediately.
+pub const ParsedEnrolled = std.json.Parsed(Enrolled);
+
+/// The enroll request body - the same `{"name": ...}` shape a rename takes, and
+/// deliberately the same builder, so the two can never escape each other's JSON
+/// differently.
+pub const enrollBody = renameBody;
+
+/// Parse the enrollment body. Pure.
+pub fn parseEnrolled(alloc: Allocator, body: []const u8) error{ BadResponse, OutOfMemory }!ParsedEnrolled {
+    return std.json.parseFromSlice(Enrolled, alloc, body, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.BadResponse,
+    };
+}
+
+/// `POST {base}/v1/client/devices` with `{"name": ...}` - enroll a NEW device
+/// owned by the account whose SESSION token is the bearer. Mirrors Mac's
+/// `RelayDirectoryClient.enroll`.
+///
+/// This is the account-authenticated way onto the relay, as opposed to the
+/// browser consent flow in `agent/enroll.zig`: the user has already proved who
+/// they are by signing in, so restoring the machine they just signed out of
+/// (T1425) needs no second trip through a browser. A 409 is the account's
+/// device limit and surfaces as `error.QuotaExceeded` so the caller can say
+/// which of its refusals this is.
+pub fn enrollDevice(
+    alloc: Allocator,
+    base: []const u8,
+    token: []const u8,
+    name: []const u8,
+) !ParsedEnrolled {
+    const url = try joinUrl(alloc, base, "v1/client/devices");
+    defer alloc.free(url);
+    const body = try enrollBody(alloc, name);
+    defer alloc.free(body);
+
+    var resp = try http_client.requestAuth(alloc, url, "POST", token, body, max_body_len);
+    defer resp.deinit(alloc);
+
+    if (statusError(resp.status, "enroll")) |err| return err;
+    return parseEnrolled(alloc, resp.body);
+}
+
 /// `DELETE {base}/v1/client/devices/{id}` — remove an owned device and revoke
 /// its credential (the relay answers 204). Mirrors
 /// `RelayDirectoryClient.delete`; the body, if any, is ignored.
@@ -231,6 +295,7 @@ fn statusError(status: u16, what: []const u8) ?FetchError {
     return switch (derr) {
         .unauthorized => error.Unauthorized,
         .not_found => error.NotFound,
+        .quota_exceeded => error.QuotaExceeded,
         .http => |code| blk: {
             log.warn("device {s}: relay returned HTTP {d}", .{ what, code });
             break :blk error.UnexpectedStatus;
@@ -420,6 +485,43 @@ test "statusError: one status means one error for every verb" {
     try testing.expectEqual(@as(?FetchError, error.Unauthorized), statusError(401, "rename"));
     try testing.expectEqual(@as(?FetchError, error.NotFound), statusError(404, "delete"));
     try testing.expectEqual(@as(?FetchError, error.UnexpectedStatus), statusError(500, "rename"));
+}
+
+test "parseEnrolled: the one-time token comes back whole" {
+    const body =
+        \\{"id":"dev-9","name":"E2E-Box","token":"dev-tok-9","created_at":"x"}
+    ;
+    var p = try parseEnrolled(testing.allocator, body);
+    defer p.deinit();
+    try testing.expectEqualStrings("dev-9", p.value.id);
+    try testing.expectEqualStrings("E2E-Box", p.value.name);
+    try testing.expectEqualStrings("dev-tok-9", p.value.token);
+}
+
+test "parseEnrolled: a body with no token is not an enrollment" {
+    // The token is the whole point of the call - the relay hands it over once
+    // and never again - so a body missing it must fail rather than produce an
+    // enrollment with an empty credential that gets written to relay.env.
+    try testing.expectError(
+        error.BadResponse,
+        parseEnrolled(testing.allocator, "{\"id\":\"d\",\"name\":\"n\"}"),
+    );
+}
+
+test "enrollBody: the enroll and rename bodies are the same shape" {
+    const a = try enrollBody(testing.allocator, "My \"Box\"");
+    defer testing.allocator.free(a);
+    const b = try renameBody(testing.allocator, "My \"Box\"");
+    defer testing.allocator.free(b);
+    try testing.expectEqualStrings(b, a);
+}
+
+test "classifyStatus: a full account is its own answer, not a mystery status" {
+    // 409 is the one refusal the user can act on. Reading it as
+    // `UnexpectedStatus` is how a restore that will never succeed looks
+    // identical to a relay hiccup that would (T1425).
+    try testing.expectEqual(DirectoryError.quota_exceeded, classifyStatus(409).?);
+    try testing.expectEqual(@as(?FetchError, error.QuotaExceeded), statusError(409, "enroll"));
 }
 
 test {

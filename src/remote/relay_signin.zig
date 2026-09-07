@@ -28,6 +28,13 @@
 //! minted the session and deletes the local store. A revocation that was
 //! required and did not happen ABORTS the sign-out and leaves the account
 //! signed in — see `signOut` and the pure rule in `relay_revoke.zig`.
+//!
+//! And it SUSPENDS rather than discards (T1425): the machine's name and relay
+//! are remembered, so signing back in with the same account re-enrolls this
+//! machine and writes the fresh credential to relay.env instead of leaving the
+//! user to re-run browser enrollment by hand. `relay_suspend.zig` owns that
+//! record and the rules for redeeming it; `signIn` calls into it rather than
+//! blindly clearing the pending revocation it used to.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -40,6 +47,7 @@ const relay_session = @import("relay_session.zig");
 const enroll = @import("agent/enroll.zig");
 const relay_revoke = @import("relay_revoke.zig");
 const pending_revoke = @import("relay_revoke_pending.zig");
+const relay_suspend = @import("relay_suspend.zig");
 
 const log = std.log.scoped(.relay_signin);
 
@@ -224,14 +232,26 @@ pub fn signIn(alloc: Allocator, opts: Options) Error!Outcome {
         return Error.StoreFailed;
     };
 
-    // Signing in on this machine RE-ADOPTS it, so any revocation still waiting
-    // to be retried (T1424) is cancelled. Without this, a user who signed out
-    // while offline and then signed back in would watch the retry loop revoke
-    // the machine they had just re-adopted — the same shape as `f3b1e5fb5`'s
-    // "signed back in and the machine was simply gone", arriving by a different
-    // road. The record holds a bearer credential, so cancelling it also stops
-    // that copy of the token outliving the sign-out that created it.
-    pending_revoke.clear(alloc);
+    // Signing in on this machine RE-ADOPTS it: any revocation still waiting to
+    // be retried (T1424) is settled, and the enrollment this account suspended
+    // when it signed out is restored (T1425), so the machine comes back to the
+    // list on their other devices under its old name.
+    //
+    // Deliberately NOT a blind `pending_revoke.clear`, which is what this was.
+    // A revocation whose response was lost is indistinguishable from one that
+    // failed, so cancelling on the sign-in alone can leave a dead token in
+    // relay.env, the machine out of the account, and nothing left to notice
+    // (`f3b1e5fb5`). `restoreFor` re-asks the relay whose credential this is
+    // and acts on the answer.
+    //
+    // Blocking and network-bound, which is fine here: `signIn` is already the
+    // long, off-thread call this whole module is documented as.
+    _ = relay_suspend.restoreFor(
+        alloc,
+        session.value.email,
+        session.value.session_token,
+        relay_base,
+    );
 
     return .{ .email = try alloc.dupe(u8, session.value.email) };
 }
@@ -376,6 +396,18 @@ fn forceOutcome(alloc: Allocator, account: relay_account.Account) MachineOutcome
         log.warn("sign-out: no usable relay base to retry the revocation at", .{});
     }
 
+    // A machine signed out of must come BACK when its owner signs back in
+    // (T1425). The `.revoke` attempt that preceded this may already have
+    // recorded a suspension from the relay's own answer, which names the
+    // machine properly; this only covers the case where the relay never
+    // answered at all, and it leaves the name empty rather than guessing —
+    // the restore falls back to the hostname there.
+    relay_suspend.recordIfAbsent(alloc, .{
+        .relay_base = env.relay_base orelse account.relay_base,
+        .owner_email = account.email,
+        .suspended_at = std.time.timestamp(),
+    });
+
     return .left_enrolled;
 }
 
@@ -433,6 +465,21 @@ fn revokeThisMachine(alloc: Allocator, account: relay_account.Account) !MachineO
             return .not_revoked;
         },
         .revoke => {
+            // Record the suspension BEFORE the POST, not after (T1425). The
+            // relay is about to delete the only record of this machine's name,
+            // and if the response is lost we can never learn it again — the
+            // retry sees a bare 401. Writing it first costs nothing when the
+            // revocation fails: a suspension sitting beside a live credential
+            // is self-healing, because the restore drops a record whose
+            // machine turns out to be enrolled already.
+            relay_suspend.record(alloc, .{
+                .relay_base = env.relay_base orelse base,
+                .machine_name = if (who) |w| w.name else "",
+                .owner_email = account.email,
+                .suspended_at = std.time.timestamp(),
+            }) catch |err|
+                log.warn("sign-out: could not record the suspended enrollment err={}", .{err});
+
             // Deletes the device row server-side and severs every live
             // connection — control and in-flight bridged data — then clears
             // the local credential so a restart cannot dial with it.

@@ -14,7 +14,7 @@ const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
 
 const AgentIntegration = @import("AgentIntegration.zig");
-const pending_revoke = @import("../../remote/relay_revoke_pending.zig");
+const relay_suspend = @import("../../remote/relay_suspend.zig");
 const AgentIntegrationsDialog = @import("AgentIntegrationsDialog.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const DarkMode = @import("DarkMode.zig");
@@ -895,13 +895,16 @@ pub fn init(
     // Background thread; same canonical-install gate as the PATH self-heal.
     AgentIntegration.checkOnLaunchAsync(self);
 
-    // Finish a sign-out that could not revoke this machine (T1424). "Sign Out
-    // Anyway" arms a pending revocation rather than abandoning it, and this is
-    // the launch half of the retry: no-op (one small local read) unless one is
-    // armed, and off-thread the moment there is. Until this existed the
-    // machine stayed listed and reachable from every other computer on the
-    // account until the user remembered to remove it by hand.
-    pending_revoke.retryAsync(self.core_app.alloc);
+    // Settle whatever the last sign-out left behind. ONE call, because the two
+    // halves must never run at once: signed out, it finishes a revocation that
+    // "Sign Out Anyway" armed (T1424) - the machine stayed listed and reachable
+    // from every other computer on the account until the user removed it by
+    // hand somewhere else. Signed in, it gives this machine BACK to the account
+    // (T1425): a re-enroll can fail transiently, and a machine that never comes
+    // back is not something a user would think to fix by signing out and in
+    // again, so every launch retries it. Both are no-ops (small local reads)
+    // when there is nothing to do, and off-thread the moment there is.
+    relay_suspend.launchAsync(self.core_app.alloc);
 }
 
 /// Defer a focus change to a terminal surface out of the current WndProc.

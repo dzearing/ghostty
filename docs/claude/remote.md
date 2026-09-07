@@ -224,8 +224,15 @@ owner-only ACL'd, exactly like the credential it sits next to.
   Anything else — no answer, a 5xx, a 404 from a relay with no such route —
   stays ARMED. Giving up after N tries means a closed lid strands the machine
   forever.
-- **Signing back in cancels it.** Re-adopting this machine has to win, or the
-  retry would revoke the machine the user just signed back in on.
+- **Signing back in cancels it — but never on the email alone.** Re-adopting
+  this machine has to win, or the retry would revoke the machine the user just
+  signed back in on. What settles it is a fresh probe of the credential
+  (`relay_suspend.pendingAction`), not the fact that the same address signed in:
+  a revocation whose response was lost is indistinguishable from one that
+  failed, so an email-only cancel can leave a dead token in `relay.env`, the
+  machine off the account, and nothing left to notice. Confirmed alive cancels,
+  confirmed dead drops the file and re-enrolls, an unanswerable relay stays
+  ARMED.
 
 Acceptance is section 9 of `test\win32\relay-account.ps1`, which arms the
 record against a port that is DEAD at sign-out time and brought up afterwards —
@@ -233,9 +240,54 @@ the only version of the test that can tell an armed retry from a lucky first
 attempt. It covers all three: completed with no relaunch, completed at the next
 launch, and cancelled by signing back in.
 
-Still open, split out of the Mac change: **T1425** (suspend rather than discard,
-so signing back in restores the machine) and **T1426** (the chooser saying a
-machine is still connected to an account it was signed out of).
+#### Sign-out SUSPENDS the machine; signing back in restores it (T1425)
+
+Revoking the machine is the half a security review asks for. The half the user
+meets is that their own computer vanished from the machine list on every other
+device they own — and signing back in did not bring it back. The only way home
+was re-running browser enrollment by hand, which is not a thing most people know
+exists, so sign-out was a one-way door.
+
+So a sign-out **suspends** rather than discards. `suspended-enrollment.json`
+lands beside `relay.env` (same directory rule as the pending record) holding the
+relay, the machine's relay-side display name and the account that owned it, and
+`src/remote/relay_suspend.zig` owns it. Signing back in with the same account
+re-enrolls this machine — `POST /v1/client/devices` with the SESSION token, so
+no second trip through a browser — and writes the fresh credential back to
+`relay.env`, which a running `ghoztty-agent` adopts within one watcher tick and
+reconnects with. Nothing is restarted.
+
+- **It holds no secret**, which is why it is not ACL-hardened the way
+  `pending-revoke.json` is: the credential it describes is dead, and the retry
+  that still needs a live one keeps it in `relay.env` where it already was.
+- **The record is written BEFORE the de-enroll POST.** The relay is about to
+  delete the only copy of this machine's name, and a lost response would leave
+  it unlearnable (the retry sees a bare 401). Writing it first costs nothing on
+  a revocation that fails: the restore drops a record whose machine turns out to
+  be enrolled already. A sign-out forced through against a relay that never
+  answered records the suspension with NO name, and the restore falls back to
+  this machine's hostname — the name a fresh enrollment would have given it.
+- **Four refusals**, each a `restoreAction` branch: a different account never
+  inherits the machine; restore is refused across relays (a session on relay A
+  cannot mint a device on relay B — revocation makes the opposite trade because
+  failing safe there means revoking *more*); a credential that arrived meanwhile
+  (a manual `--enroll` while signed out) is never overwritten; and a pending
+  revocation is settled on a probe, per the bullet above.
+- **Retried at every launch while signed in**, not only at sign-in
+  (`launchAsync` — the ONE entry point, so a pending retry can never race a
+  restore for the same credential). A re-enroll can fail transiently — a 5xx,
+  the account at its device limit (`409` → `error.QuotaExceeded`), a moment
+  offline — and a machine that never comes back is not something a user would
+  think to fix by signing out and in again.
+
+Acceptance is section 10 of `test\win32\relay-account.ps1`: sign out and back
+in on the fake relay and watch the machine return under its old name with a
+fresh credential; a restore against a DEAD port that stays armed and completes
+at the next launch once the port answers; and another account's suspension
+dropped unread with no enroll attempted.
+
+Still open, split out of the Mac change: **T1426** (the chooser saying a machine
+is still connected to an account it was signed out of).
 
 The Google OAuth client id is baked into the build via `-Dgoogle-client-id`
 (public — it appears in the browser URL), overridable with

@@ -376,6 +376,49 @@ pub fn loadDeviceToken(alloc: Allocator) ?[]u8 {
     return null;
 }
 
+/// This machine's name for the relay's device list: the DNS hostname on
+/// Windows (preserves case, and matches what the agent advertises in its
+/// HELLO) rather than %COMPUTERNAME%'s uppercased NetBIOS name; `gethostname`
+/// elsewhere. Null when it cannot be read, or when it will not fit in `out`.
+///
+/// All or nothing (T990): half a host name is a different machine, and a
+/// truncated one would enroll this box under a name nobody recognises. The
+/// conversion runs into a buffer that cannot be short and is copied out only
+/// when the whole thing fits.
+///
+/// It lives here because enrollment is what needs it: the browser flow names
+/// the machine with it (`ShareMachineRow`), and the sign-in restore falls back
+/// to it when the relay never told us what the machine was called (T1425).
+pub fn hostName(out: []u8) ?[]const u8 {
+    if (comptime builtin.os.tag == .windows) {
+        var wbuf: [256]u16 = undefined;
+        var size: u32 = wbuf.len;
+        // 1 == ComputerNameDnsHostname
+        if (kernel32.GetComputerNameExW(1, &wbuf, &size) == 0) return null;
+        // Four bytes per UTF-16 unit is the worst case, so this can never be
+        // the short destination `utf16LeToUtf8` panics on.
+        var scratch: [4 * 256]u8 = undefined;
+        const n = std.unicode.utf16LeToUtf8(&scratch, wbuf[0..size]) catch return null;
+        if (n == 0 or n > out.len) return null;
+        @memcpy(out[0..n], scratch[0..n]);
+        return out[0..n];
+    } else {
+        var buf: [std.posix.HOST_NAME_MAX]u8 = undefined;
+        const name = std.posix.gethostname(&buf) catch return null;
+        if (name.len == 0 or name.len > out.len) return null;
+        @memcpy(out[0..name.len], name);
+        return out[0..name.len];
+    }
+}
+
+const kernel32 = if (builtin.os.tag == .windows) struct {
+    extern "kernel32" fn GetComputerNameExW(
+        NameType: c_int,
+        lpBuffer: [*]u16,
+        nSize: *u32,
+    ) callconv(.winapi) std.os.windows.BOOL;
+} else struct {};
+
 /// Delete the agent's relay.env (and any leftover staging sibling — legacy
 /// `.tmp` or a crashed writer's unique-name debris). Best-effort: a missing
 /// file is success. Used by "Sign out" to drop the local credential so a
@@ -402,18 +445,31 @@ pub const WhoamiResult = struct {
     }
 };
 
-/// Ask the relay which account this device token is bound to — the data the
-/// machine chooser shows as "Signed in as <email>". `GET <base>/v1/agent/whoami` with the
-/// bearer token. Returns null on ANY failure (network, non-200, parse, OOM): the
-/// caller falls back to a neutral "Signed in" rather than surfacing an error.
-pub fn whoami(alloc: Allocator, relay_base: []const u8, token: []const u8) ?WhoamiResult {
+/// What `whoamiAnswer` learned. The three cases are deliberately distinct: a
+/// relay that says "this bearer is not a device" and a relay that says nothing
+/// at all look identical through a nullable result, and the difference decides
+/// whether a machine gets re-enrolled or left alone (T1425).
+pub const WhoamiAnswer = union(enum) {
+    /// The relay named the account this device belongs to.
+    ok: WhoamiResult,
+    /// The relay does not know this bearer (401) - the credential is dead.
+    dead,
+    /// No usable answer: no route to the relay, a 5xx, an unparseable body.
+    unknown,
+};
+
+/// Ask the relay which account this device token is bound to, keeping the
+/// difference between "not a device" and "could not ask".
+/// `GET <base>/v1/agent/whoami` with the bearer token.
+pub fn whoamiAnswer(alloc: Allocator, relay_base: []const u8, token: []const u8) WhoamiAnswer {
     const base = std.mem.trimRight(u8, relay_base, "/");
-    const url = std.fmt.allocPrint(alloc, "{s}/v1/agent/whoami", .{base}) catch return null;
+    const url = std.fmt.allocPrint(alloc, "{s}/v1/agent/whoami", .{base}) catch return .unknown;
     defer alloc.free(url);
 
-    var resp = http_client.getAuth(alloc, url, token, 64 * 1024) catch return null;
+    var resp = http_client.getAuth(alloc, url, token, 64 * 1024) catch return .unknown;
     defer resp.deinit(alloc);
-    if (resp.status != 200) return null;
+    if (resp.status == 401) return .dead;
+    if (resp.status != 200) return .unknown;
 
     const Wire = struct {
         email: []const u8 = "",
@@ -422,22 +478,34 @@ pub fn whoami(alloc: Allocator, relay_base: []const u8, token: []const u8) ?Whoa
     };
     const parsed = std.json.parseFromSlice(Wire, alloc, resp.body, .{
         .ignore_unknown_fields = true,
-    }) catch return null;
+    }) catch return .unknown;
     defer parsed.deinit();
 
     // Dupe all three out of the arena; free what we have on a mid-way OOM so we
     // never leak a partial result.
-    const email = alloc.dupe(u8, parsed.value.email) catch return null;
+    const email = alloc.dupe(u8, parsed.value.email) catch return .unknown;
     const device_id = alloc.dupe(u8, parsed.value.device_id) catch {
         alloc.free(email);
-        return null;
+        return .unknown;
     };
     const name = alloc.dupe(u8, parsed.value.name) catch {
         alloc.free(email);
         alloc.free(device_id);
-        return null;
+        return .unknown;
     };
-    return .{ .email = email, .device_id = device_id, .name = name };
+    return .{ .ok = .{ .email = email, .device_id = device_id, .name = name } };
+}
+
+/// Ask the relay which account this device token is bound to - the data the
+/// machine chooser shows as "Signed in as <email>". Returns null on ANY failure
+/// (network, non-200, parse, OOM): the caller falls back to a neutral "Signed
+/// in" rather than surfacing an error. `whoamiAnswer` is the form that tells a
+/// dead credential from an unreachable relay.
+pub fn whoami(alloc: Allocator, relay_base: []const u8, token: []const u8) ?WhoamiResult {
+    return switch (whoamiAnswer(alloc, relay_base, token)) {
+        .ok => |w| w,
+        .dead, .unknown => null,
+    };
 }
 
 /// Revoke this device on the relay AND delete the local credential — the
@@ -976,6 +1044,18 @@ test "relay.env: missing file loads as empty" {
     defer env.deinit(alloc);
     try testing.expect(env.relay_base == null);
     try testing.expect(env.device_token == null);
+}
+
+test "hostName: a real name, and never a truncated one" {
+    var buf: [256]u8 = undefined;
+    const name = hostName(&buf) orelse return; // a box that cannot answer is not a failure
+    try testing.expect(name.len > 0);
+
+    // A destination too small for the whole name yields null rather than a
+    // prefix: half a host name names a DIFFERENT machine, and enrolling under
+    // one is the T990 shape.
+    var tiny: [1]u8 = undefined;
+    if (name.len > 1) try testing.expect(hostName(&tiny) == null);
 }
 
 test {

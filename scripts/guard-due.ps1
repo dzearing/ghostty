@@ -2458,6 +2458,14 @@ $GuardTable = @(
         Covers = @(
             'src\apprt\win32\RelayAccountRow.zig',
             'src\remote\relay_signin.zig',
+            # The two records a sign-out leaves behind (T1424 pending
+            # revocation, T1425 suspended enrollment). Their rules are unit
+            # tested, but only section 9/10 of this harness proves the app
+            # WRITES and REDEEMS them - that the machine actually comes off the
+            # account and actually comes back - and neither file is reachable
+            # from any other harness.
+            'src\remote\relay_revoke_pending.zig',
+            'src\remote\relay_suspend.zig',
             'test\win32\relay-account.ps1'
         )
     },
