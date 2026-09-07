@@ -24190,3 +24190,78 @@ Not validated here, and said so on the card rather than ticked: the live
 end-to-end against a real relay, a real agent and a second enrolled client. This
 box owns one machine; the relay-side reproduction is `relay/signout_revoke_test.go`
 on the Mac seat.
+## 2026-09-07 — a sign-out that could not revoke this machine now finishes itself (T1424)
+
+T1421, an hour earlier, made sign-out revoke the machine it runs on and made a
+revocation that could NOT happen refuse to lie about it: the account stays signed
+in, the chooser says so, and the way past it is "Sign Out Anyway". What that left
+behind is what this task is: "Sign Out Anyway" told the user, honestly, that the
+machine was still connected to the account — and then never tried again. The
+machine stayed listed, reachable and streamable from every other computer on the
+account until they remembered to go to one of those computers and remove it by
+hand. Nobody does that. A security decision the user had already made was left
+depending on a chore they were never going to perform.
+
+So the forced path now ARMS a revocation instead of abandoning one.
+`pending-revoke.json` is written beside relay.env — same directory, so the one
+`GHOSTTY_RELAY_ENV` override carries both and they cannot end up in different
+sandboxes — holding the device token, the normalized relay base, the account that
+signed out and when. Atomic, and owner-only ACL'd exactly like the credential it
+sits next to. The new `src/remote/relay_revoke_pending.zig` owns it.
+
+**The retry authenticates as the DEVICE.** By the time it runs the user is signed
+out, so there is no session token to speak with; `/v1/agent/deenroll` takes the
+machine's own bearer. That is why the forced path KEEPS the local credential
+rather than deleting it on the way out — it is the only thing that can ever
+revoke this machine, and `f3b1e5fb5` already paid for that lesson once on the Mac
+seat in a different disguise.
+
+**Only an answer clears it.** The rule is pure (`nextAfter`): 204/200 clears it,
+revoked. A 401 clears it too — and concludes **nothing else**. That distinction
+is the whole reason `.clear_token_dead` exists as a separate outcome from
+`.clear_revoked`: a POST that landed with a lost response is indistinguishable
+from "already revoked" from here, and the Mac's first cut used that 401 to clear
+the machine's suspension record as well, so the user signed back in to find the
+machine simply gone with no name to re-enroll under. T1425 builds that
+suspension record, and this branch must not touch it. Everything else — no
+answer at all, a 5xx, a 404 from a relay with no such route — stays ARMED, because
+giving up after N tries means a closed lid strands the machine forever.
+
+**It runs at launch and while the app runs.** `retryAsync` is called from
+`App.startup` (a no-op single local read when nothing is armed) and again the
+instant a forced sign-out arms one, on a backoff of 0s, 5s, 15s, 60s, 5min, then
+every 15min. There is no local event for "the relay became reachable" — an
+adapter coming up is a different question — so the capped backoff is what turns
+"the network came back" into a bounded wait instead of a wait for the next
+relaunch.
+
+**Signing back in cancels it.** Re-adopting this machine has to win over a
+pending revocation, or the retry loop would revoke the machine the user just
+signed back in on — the same shape as the Mac's "signed back in and the machine
+was gone", arriving by a different road.
+
+The wording moved with the behavior: the "Sign Out Anyway" dialog no longer ends
+by telling the user to remove the machine from another computer as if that were
+the only remedy, and the footer says the machine is still connected *and* that
+Ghoztty will remove it when the relay answers. Both are unit-asserted, because a
+promise the product does not keep is worse than the warning it replaced.
+
+One real defect found by its own test rather than in the field:
+`std.json.parseFromSlice` hands back slices that point INTO the source buffer
+when a string needs no unescaping, and the record's source buffer is freed on the
+way out of `load`. The loaded record's token and base pointed at freed memory —
+the retry would have posted garbage at the relay. `.allocate = .alloc_always`,
+and the on-disk state-machine test is what caught it on the first run.
+
+Acceptance is section 9 of `test\win32\relay-account.ps1` (30 assertions), which
+arms the record against a port that is DEAD at sign-out time and brings it up
+only after the user commits — the only version of this test that can tell an
+armed retry from a lucky first attempt. It proves the revocation completes with
+no relaunch, completes at the next launch, and is cancelled by signing back in.
+The same change also isolates `GHOSTTY_RELAY_ENV` for every GUI that script
+launches: since T1421 a sign-out in this suite reaches for a device enrollment,
+and until now that would have been the box's REAL one.
+
+Green: `floor-lane.ps1 -Lane all` ALL LANES PASS, with 12 new unit tests for the
+pure rules and the on-disk state machine running in both the `none` and `win32`
+lanes. `relay-account.ps1` ALL PASS twice (30 new assertions in section 9).

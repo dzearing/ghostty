@@ -138,6 +138,11 @@ if ($FakeBPort -eq 0) { $FakeBPort = Get-FreePort }
 if ($RelayPort -eq 0) { $RelayPort = Get-FreePort }
 
 $AccountStore = "$tmp\account.dat"
+# The device credential and the pending-revocation record (T1424) live side by
+# side; the product derives the second from the first's directory, so pointing
+# GHOSTTY_RELAY_ENV at the temp dir carries both out of the box's real state.
+$RelayEnvPath = "$tmp\relay.env"
+$PendingRevoke = "$tmp\pending-revoke.json"
 $FakeABase = "http://127.0.0.1:$FakeAPort"
 $FakeBBase = "http://127.0.0.1:$FakeBPort"
 $RelayBase = "http://127.0.0.1:$RelayPort"
@@ -279,6 +284,12 @@ function Start-FakeRelay($port, $tok, $ttl, $renewTok, $hitsFile, $nonce) {
                     $out = Resp200 $body
                 } elseif ($line -match '^POST /oauth/signout') {
                     $out = $r204
+                } elseif ($line -match '^GET /v1/agent/whoami') {
+                    # T1421/T1424: the device-token side of the relay - which
+                    # account a device belongs to, and removing it.
+                    $out = Resp200 '{"email":"e2e@example.com","device_id":"dev-e2e","name":"E2E-Box"}'
+                } elseif ($line -match '^POST /v1/agent/deenroll') {
+                    $out = $r204
                 } elseif ($line -match '^GET /v1/client/devices') {
                     $out = Resp200 '{"devices":[{"id":"dev-e2e","name":"E2E-Box","hostname":"e2e.local","online":true}]}'
                 } else {
@@ -322,6 +333,11 @@ function Launch-Gui($relayBase, $errlog, [switch]$NoClientId) {
     Remove-Item $errlog -ErrorAction SilentlyContinue
     $env:GHOSTTY_ACCOUNT_STORE = $AccountStore
     $env:GHOSTTY_RELAY_BASE = $relayBase
+    # Sign-out REVOKES this machine's device enrollment (T1421) and, when that
+    # fails, arms a retry that keeps trying (T1424). Both read relay.env, so
+    # every GUI here gets a per-run one: without this the script's sign-outs
+    # would reach for the box's REAL enrollment and the real relay behind it.
+    $env:GHOSTTY_RELAY_ENV = $RelayEnvPath
     # -NoClientId is section 8's whole subject: the SHIPPED build carries no
     # -Dgoogle-client-id, so this is the state every real user meets. Every
     # other launch here sets one, which is exactly why the unconfigured path
@@ -346,7 +362,7 @@ function Launch-Gui($relayBase, $errlog, [switch]$NoClientId) {
     $env:GHOZTTY_ENROLL_NO_OPEN = '1'
     $app = Start-OnTestDesktop -Exe $Exe -Arguments @('--session-persistence=false') -StdErr $errlog
     foreach ($k in 'GHOSTTY_ACCOUNT_STORE', 'GHOSTTY_RELAY_BASE', 'GHOSTTY_GOOGLE_CLIENT_ID',
-        'GHOZTTY_RELAY_NO_CLIENT_ID',
+        'GHOZTTY_RELAY_NO_CLIENT_ID', 'GHOSTTY_RELAY_ENV',
         'GHOSTTY_OAUTH_AUTH_ENDPOINT', 'GHOZTTY_ENROLL_NO_OPEN') {
         Remove-Item "env:$k" -ErrorAction SilentlyContinue
     }
@@ -435,7 +451,7 @@ Remove-Item env:GHOSTTY_RELAY_TOKEN -ErrorAction SilentlyContinue
 
 Start-TestForegroundWatch
 $td = New-TestDesktop -Interactive:$Interactive
-$jobA = $null; $jobB = $null
+$jobA = $null; $jobB = $null; $jobR = $null
 
 try {
     "== 0: start the fake brokered relays"
@@ -815,6 +831,222 @@ try {
         Start-Sleep -Milliseconds 800
     }
 
+    # =========================================================================
+    # 9: "Sign Out Anyway" arms a revocation and FINISHES it later (T1424)
+    #
+    # T1421 made a sign-out that could not revoke this machine refuse to lie
+    # about it: the account stays signed in and the chooser offers "Sign Out
+    # Anyway". What it did not do is finish the job - the machine stayed
+    # listed, reachable and streamable from every other computer on the account
+    # until the user remembered to remove it by hand somewhere else. This
+    # section is the proof that it now completes itself, in the three ways the
+    # user can meet it: while the app keeps running, at the next launch, and
+    # never at all once they have signed back in on this machine.
+    #
+    # The relay the revocation is aimed at is a port that is DEAD at sign-out
+    # time and brought up afterwards - which is what "the network came back"
+    # looks like from the app's side, and the only version of this test that
+    # can tell an armed retry from a lucky first attempt.
+    "== 9: a forced sign-out arms a pending revocation and completes it (T1424)"
+    $RevokePort = Get-FreePort
+    $RevokeBase = "http://127.0.0.1:$RevokePort"
+    $HitsR = "$tmp\hits-revoke.log"
+    $DeviceTok = 'dev-tok-e2e'
+    Assert "the revocation relay's port $RevokePort is free (it must be DEAD at sign-out)" (
+        Test-PortFree $RevokePort)
+
+    Set-Content -Path $RelayEnvPath -Encoding ascii -Value @(
+        "RELAY_BASE=$RevokeBase", "DEVICE_TOKEN=$DeviceTok")
+    Remove-Item $PendingRevoke -ErrorAction SilentlyContinue
+    Remove-Item $AccountStore -ErrorAction SilentlyContinue
+
+    $errlog9 = "$tmp\gui-revoke.stderr.log"
+    $g9 = Launch-Gui $FakeABase $errlog9
+    if (-not $g9) {
+        Write-Host 'SETUP FAIL: GUI did not come up for the pending-revocation section'
+        $script:failures++
+    } else {
+        $ch9 = Open-Chooser $g9
+        Assert "chooser opened (pending revocation)" ($ch9 -ne [IntPtr]::Zero)
+        if ($ch9 -ne [IntPtr]::Zero) {
+            $b9 = Get-ChooserAccountButton -Chooser $ch9
+            if ($null -ne $b9) { Send-TestControlClick -Control $b9.Hwnd | Out-Null }
+            Assert "browser redirect delivered (T1424 setup)" (Complete-BrowserRedirect $errlog9)
+            Assert "signed in for the sign-out under test" (Wait-Stderr $errlog9 'relay account: sign_in ok')
+            Start-Sleep -Milliseconds 600
+
+            $out9 = Get-ChooserAccountButton -Chooser $ch9
+            Assert "row offers Sign Out" ($null -ne $out9 -and $out9.Text -eq 'Sign Out')
+            if ($null -ne $out9) {
+                Send-TestControlClick -Control $out9.Hwnd | Out-Null
+
+                # The revocation is aimed at a relay that is not there, so the
+                # sign-out ABORTS (T1421) and raises the confirmation.
+                $dlg = [IntPtr]::Zero
+                foreach ($i in 1..60) {
+                    Start-Sleep -Milliseconds 500
+                    $dlg = Get-TestWindow -ProcessId $g9.Pid -Class 'GhozttyConfirmDialog'
+                    if ($dlg -ne [IntPtr]::Zero) { break }
+                }
+                Assert "an unrevokable sign-out raises the confirmation (T1421)" ($dlg -ne [IntPtr]::Zero)
+                Assert "the account is still signed in behind it" (Test-Path $AccountStore)
+
+                if ($dlg -ne [IntPtr]::Zero) {
+                    $dlgText = (Get-TestControls -Window $dlg -Class 'Static' |
+                        ForEach-Object { $_.Text }) -join ' '
+                    # The promise is the deliverable: the dialog no longer asks
+                    # the user to remember a chore on another computer.
+                    Assert "the dialog says the app keeps trying (T1424)" ($dlgText -match 'keeps trying')
+
+                    $ok = @(Get-TestControls -Window $dlg -Class 'Button' |
+                        Where-Object { $_.Id -eq 1 })
+                    Assert "the dialog has a Sign Out Anyway button" ($ok.Count -eq 1)
+                    if ($ok.Count -eq 1) {
+                        Assert "and it is labelled for the choice it makes" (
+                            $ok[0].Text -match 'Sign Out Anyway')
+                        Send-TestControlClick -Control $ok[0].Hwnd | Out-Null
+
+                        # The network comes back the moment they commit to it.
+                        # Started HERE, not earlier: the first attempt fires as
+                        # soon as the record is armed, and a relay that was
+                        # already up would let a test pass with no retry at all.
+                        $jobR = Start-FakeRelay $RevokePort $SessTok 3600 $RenewedTok $HitsR $ProbeNonce
+
+                        $armed = $false
+                        foreach ($i in 1..40) {
+                            Start-Sleep -Milliseconds 250
+                            if (Test-Path $PendingRevoke) { $armed = $true; break }
+                        }
+                        Assert "the forced sign-out ARMED a pending revocation on disk" $armed
+                        if ($armed) {
+                            $rec = Get-Content $PendingRevoke -Raw
+                            Assert "the record carries the device credential the retry needs" (
+                                $rec -match [regex]::Escape($DeviceTok))
+                            Assert "the record names the relay to aim it at" (
+                                $rec -match [regex]::Escape("127.0.0.1:$RevokePort"))
+                        }
+                        Assert "the account store IS gone - they did sign out" (
+                            -not (Test-Path $AccountStore))
+                        # The credential is kept on purpose: it is the only
+                        # thing that can ever revoke this machine.
+                        Assert "relay.env is kept as the retry's own record" (Test-Path $RelayEnvPath)
+
+                        $upR = Wait-FakeRelay $RevokePort $ProbeNonce
+                        if (-not $upR.Ok) { "  (revocation relay never answered: $($upR.Why))" }
+                        Assert "the revocation relay is up now (the network came back)" $upR.Ok
+
+                        # No relaunch: the app that armed it finishes it.
+                        $done = $false
+                        foreach ($i in 1..120) {
+                            Start-Sleep -Milliseconds 500
+                            if ((Get-Hits $HitsR) -match [regex]::Escape(
+                                    "POST /v1/agent/deenroll HTTP/1.1|auth=$DeviceTok")) {
+                                $done = $true; break
+                            }
+                        }
+                        Assert "the retry de-enrolled this machine WITHOUT a relaunch (T1424)" $done
+                        $cleared = $false
+                        foreach ($i in 1..20) {
+                            Start-Sleep -Milliseconds 250
+                            if (-not (Test-Path $PendingRevoke)) { $cleared = $true; break }
+                        }
+                        Assert "a confirmed revocation clears the record" $cleared
+                        Assert "and the local device credential goes with it" (
+                            -not (Test-Path $RelayEnvPath))
+                    }
+                }
+            }
+        }
+        if ($g9.App.Process -and -not $g9.App.Process.HasExited) {
+            Stop-Process -Id $g9.Pid -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 800
+    }
+
+    "  -- 9b: an armed revocation is retried at the next LAUNCH"
+    # The other half of "while it is armed": the app that armed it may never
+    # run again in that session - the user closes the lid, the box reboots -
+    # and the machine must still come off the account at the next start.
+    $DeviceTok2 = 'dev-tok-e2e-2'
+    Set-Content -Path $RelayEnvPath -Encoding ascii -Value @(
+        "RELAY_BASE=$RevokeBase", "DEVICE_TOKEN=$DeviceTok2")
+    Set-Content -Path $PendingRevoke -Encoding ascii -Value (
+        '{"relay_base":"' + $RevokeBase + '","device_token":"' + $DeviceTok2 +
+        '","account_email":"e2e@example.com","armed_at":1}')
+    Remove-Item $AccountStore -ErrorAction SilentlyContinue
+
+    $errlog9b = "$tmp\gui-revoke-relaunch.stderr.log"
+    $g9b = Launch-Gui $FakeABase $errlog9b
+    if (-not $g9b) {
+        Write-Host 'SETUP FAIL: GUI did not come up for the relaunch retry'; $script:failures++
+    } else {
+        $done2 = $false
+        foreach ($i in 1..60) {
+            Start-Sleep -Milliseconds 500
+            if ((Get-Hits $HitsR) -match [regex]::Escape(
+                    "POST /v1/agent/deenroll HTTP/1.1|auth=$DeviceTok2")) {
+                $done2 = $true; break
+            }
+        }
+        Assert "a launch with the relay reachable finishes the armed revocation" $done2
+        $cleared2 = $false
+        foreach ($i in 1..20) {
+            Start-Sleep -Milliseconds 250
+            if (-not (Test-Path $PendingRevoke)) { $cleared2 = $true; break }
+        }
+        Assert "and clears the record at launch too" $cleared2
+        Assert "app survived the launch retry" (-not ($g9b.App.Process -and $g9b.App.Process.HasExited))
+        if ($g9b.App.Process -and -not $g9b.App.Process.HasExited) {
+            Stop-Process -Id $g9b.Pid -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 800
+    }
+
+    "  -- 9c: signing back in on this machine CANCELS the pending revocation"
+    # Re-adopting the machine has to win, or the retry loop would revoke the
+    # machine the user just signed back in on - the same shape as the Mac
+    # seat's "signed back in and the machine was simply gone" (f3b1e5fb5).
+    # The record here points at a DEAD port, so nothing but the sign-in can
+    # clear it and the assertion cannot be satisfied by a lucky retry.
+    $DeadRevokePort = Get-FreePort
+    $DeviceTok3 = 'dev-tok-e2e-3'
+    Set-Content -Path $RelayEnvPath -Encoding ascii -Value @(
+        "RELAY_BASE=http://127.0.0.1:$DeadRevokePort", "DEVICE_TOKEN=$DeviceTok3")
+    Set-Content -Path $PendingRevoke -Encoding ascii -Value (
+        '{"relay_base":"http://127.0.0.1:' + $DeadRevokePort + '","device_token":"' +
+        $DeviceTok3 + '","account_email":"e2e@example.com","armed_at":1}')
+    Remove-Item $AccountStore -ErrorAction SilentlyContinue
+
+    $errlog9c = "$tmp\gui-revoke-signin.stderr.log"
+    $g9c = Launch-Gui $FakeABase $errlog9c
+    if (-not $g9c) {
+        Write-Host 'SETUP FAIL: GUI did not come up for the sign-in cancellation'; $script:failures++
+    } else {
+        Assert "the record is still armed before the sign-in (dead relay)" (Test-Path $PendingRevoke)
+        $ch9c = Open-Chooser $g9c
+        Assert "chooser opened (sign-in cancellation)" ($ch9c -ne [IntPtr]::Zero)
+        if ($ch9c -ne [IntPtr]::Zero) {
+            $b9c = Get-ChooserAccountButton -Chooser $ch9c
+            if ($null -ne $b9c) { Send-TestControlClick -Control $b9c.Hwnd | Out-Null }
+            Assert "browser redirect delivered (9c)" (Complete-BrowserRedirect $errlog9c)
+            Assert "signed back in on this machine" (Wait-Stderr $errlog9c 'relay account: sign_in ok')
+            $cancelled = $false
+            foreach ($i in 1..20) {
+                Start-Sleep -Milliseconds 250
+                if (-not (Test-Path $PendingRevoke)) { $cancelled = $true; break }
+            }
+            Assert "signing in cancelled the pending revocation" $cancelled
+            Assert "and did NOT take the machine's credential with it" (Test-Path $RelayEnvPath)
+        }
+        if ($g9c.App.Process -and -not $g9c.App.Process.HasExited) {
+            Stop-Process -Id $g9c.Pid -Force -ErrorAction SilentlyContinue
+        }
+        Start-Sleep -Milliseconds 800
+    }
+    Remove-Item $RelayEnvPath -ErrorAction SilentlyContinue
+    Remove-Item $PendingRevoke -ErrorAction SilentlyContinue
+
+
 } catch {
     # $ErrorActionPreference is Continue, so a NON-terminating error prints and
     # the run carries on - but a terminating one (a marshalling failure, a
@@ -829,7 +1061,7 @@ try {
     Remove-Item env:GHOSTTY_ACCOUNT_STORE -ErrorAction SilentlyContinue
     if ($null -ne $savedTok) { $env:GHOSTTY_RELAY_TOKEN = $savedTok }
     Stop-TestProcs
-    foreach ($j in @($jobA, $jobB)) {
+    foreach ($j in @($jobA, $jobB, $jobR)) {
         if ($j) { Stop-Job $j -ErrorAction SilentlyContinue; Remove-Job $j -Force -ErrorAction SilentlyContinue }
     }
     # A failing run keeps its evidence (both GUIs' stderr, every CLI's stdout,

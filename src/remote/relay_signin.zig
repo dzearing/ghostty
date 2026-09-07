@@ -39,6 +39,7 @@ const relay_directory = @import("relay_directory.zig");
 const relay_session = @import("relay_session.zig");
 const enroll = @import("agent/enroll.zig");
 const relay_revoke = @import("relay_revoke.zig");
+const pending_revoke = @import("relay_revoke_pending.zig");
 
 const log = std.log.scoped(.relay_signin);
 
@@ -223,6 +224,15 @@ pub fn signIn(alloc: Allocator, opts: Options) Error!Outcome {
         return Error.StoreFailed;
     };
 
+    // Signing in on this machine RE-ADOPTS it, so any revocation still waiting
+    // to be retried (T1424) is cancelled. Without this, a user who signed out
+    // while offline and then signed back in would watch the retry loop revoke
+    // the machine they had just re-adopted — the same shape as `f3b1e5fb5`'s
+    // "signed back in and the machine was simply gone", arriving by a different
+    // road. The record holds a bearer credential, so cancelling it also stops
+    // that copy of the token outliving the sign-out that created it.
+    pending_revoke.clear(alloc);
+
     return .{ .email = try alloc.dupe(u8, session.value.email) };
 }
 
@@ -251,6 +261,8 @@ pub const MachineOutcome = enum {
     /// the machine is still reachable is the bug this whole path exists to fix.
     not_revoked,
     /// The user signed out knowing the machine is still enrolled (`.force`).
+    /// The revocation is ARMED, not abandoned (T1424): it is retried on a
+    /// backoff and at every launch until the relay confirms it.
     left_enrolled,
 };
 
@@ -300,7 +312,7 @@ pub fn signOut(alloc: Allocator, mode: SignOutMode) SignOutResult {
     defer account.deinit(alloc);
 
     const machine = switch (mode) {
-        .force => forceOutcome(alloc),
+        .force => forceOutcome(alloc, account),
         .revoke => revokeThisMachine(alloc, account) catch |err| blk: {
             log.warn("sign-out: could not revoke this machine err={}", .{err});
             break :blk .not_revoked;
@@ -319,18 +331,52 @@ pub fn signOut(alloc: Allocator, mode: SignOutMode) SignOutResult {
         relay_session.signout(alloc, account.relay_base, account.session_token);
     }
     relay_account.delete(path);
+
+    // The unfinished revocation starts trying immediately, so a user who was
+    // offline for a moment does not have to relaunch the app for their
+    // sign-out to take effect (T1424).
+    if (machine == .left_enrolled) pending_revoke.retryAsync(alloc);
+
     return .{ .was_signed_in = was_signed_in, .machine = machine };
 }
 
-/// `.force`: no revocation attempt, but still say honestly whether a live
-/// enrollment is being left behind.
-fn forceOutcome(alloc: Allocator) MachineOutcome {
+/// `.force`: no revocation attempt right now — the user has already waited out
+/// the failure once and re-running it only makes them wait again — but the
+/// unfinished revocation is REMEMBERED so it completes itself later (T1424),
+/// and the outcome still says honestly that a live enrollment is being left
+/// behind for now.
+///
+/// Before T1424 this only reported. "Sign Out Anyway" told the user the machine
+/// was still connected to the account and then never tried again, so the
+/// machine stayed listed and reachable until they remembered to remove it by
+/// hand from another computer — a security decision they had already made,
+/// left depending on a chore nobody performs.
+fn forceOutcome(alloc: Allocator, account: relay_account.Account) MachineOutcome {
     const env_path = enroll.relayEnvPath(alloc) catch return .nothing_to_revoke;
     defer alloc.free(env_path);
     var env = enroll.loadRelayEnv(alloc, env_path) catch return .nothing_to_revoke;
     defer env.deinit(alloc);
     const tok = env.device_token orelse return .nothing_to_revoke;
-    return if (tok.len > 0) .left_enrolled else .nothing_to_revoke;
+    if (tok.len == 0) return .nothing_to_revoke;
+
+    // Aim the retry the same way the live revocation would have (relay.env's
+    // base, falling back to the account's own relay), and store it normalized
+    // so the retry never re-reads a relay.env the user may edit meanwhile.
+    if (relay_revoke.revocationBase(env.relay_base orelse "", account.relay_base)) |raw_base| {
+        if (relay_revoke.normalizeBase(alloc, raw_base)) |base| {
+            defer alloc.free(base);
+            pending_revoke.arm(alloc, .{
+                .relay_base = base,
+                .device_token = tok,
+                .account_email = account.email,
+                .armed_at = std.time.timestamp(),
+            }) catch |err| log.warn("sign-out: could not arm the pending revocation err={}", .{err});
+        } else |err| log.warn("sign-out: no dialable relay to retry the revocation at err={}", .{err});
+    } else {
+        log.warn("sign-out: no usable relay base to retry the revocation at", .{});
+    }
+
+    return .left_enrolled;
 }
 
 /// The `.revoke` path: ask relay.env what credential this machine holds, ask
@@ -394,6 +440,9 @@ fn revokeThisMachine(alloc: Allocator, account: relay_account.Account) !MachineO
                 log.warn("sign-out: de-enroll failed err={}", .{err});
                 return .not_revoked;
             };
+            // A revocation that completed makes any earlier armed retry moot —
+            // and leaving one armed would keep a dead credential on disk.
+            pending_revoke.clear(alloc);
             return .revoked;
         },
     }

@@ -448,6 +448,27 @@ pub fn whoami(alloc: Allocator, relay_base: []const u8, token: []const u8) ?Whoa
 /// else is a hard failure the caller can surface. The local file is cleared
 /// regardless, best-effort.
 pub fn deEnroll(alloc: Allocator, relay_base: []const u8, token: []const u8) !void {
+    _ = try deEnrollStatus(alloc, relay_base, token);
+}
+
+/// Which of the two success answers the relay gave — the same call as
+/// `deEnroll`, for the one caller that must tell them apart.
+///
+/// A 204 is a revocation this attempt performed. A 401 is a bearer the relay no
+/// longer knows, which is what a PREVIOUS de-enroll whose response was lost
+/// looks like from here: it means "stop trying", and it is evidence about
+/// nothing else. The pending-revocation retry (T1424) needs that distinction
+/// because reading a 401 as proof of a completed revocation is exactly how the
+/// Mac seat lost a machine's suspension record (`f3b1e5fb5`, T1425); nothing
+/// else does, so `deEnroll` remains the plain form.
+pub const DeEnrollOutcome = enum {
+    /// The relay deleted the device on this call (204).
+    revoked,
+    /// The relay does not know this bearer (401) — already gone.
+    token_dead,
+};
+
+pub fn deEnrollStatus(alloc: Allocator, relay_base: []const u8, token: []const u8) !DeEnrollOutcome {
     const base = std.mem.trimRight(u8, relay_base, "/");
     const url = try std.fmt.allocPrint(alloc, "{s}/v1/agent/deenroll", .{base});
     defer alloc.free(url);
@@ -464,6 +485,7 @@ pub fn deEnroll(alloc: Allocator, relay_base: []const u8, token: []const u8) !vo
     if (status != 204 and status != 401) return error.DeenrollFailed;
 
     clearLocalCredential(alloc);
+    return if (status == 401) .token_dead else .revoked;
 }
 
 // -----------------------------------------------------------------------------

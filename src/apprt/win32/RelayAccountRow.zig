@@ -236,7 +236,7 @@ pub fn signOutMessage(res: relay_signin.SignOutResult) []const u8 {
     return switch (res.machine) {
         .revoked => "Signed out — this machine was removed from your account.",
         .not_revoked => "Couldn't remove this machine from your account, so you're still signed in.",
-        .left_enrolled => "Signed out. This machine is still connected to that account.",
+        .left_enrolled => "Signed out. This machine is still connected — Ghoztty will remove it when the relay answers.",
         .nothing_to_revoke => if (res.was_signed_in) "Signed out." else "Already signed out.",
     };
 }
@@ -249,8 +249,10 @@ pub const not_revoked_body =
     "Signing out revokes this machine's registration so it stops being listed, " ++
     "reachable and streamable from your other computers. That couldn't be done " ++
     "just now — the relay didn't answer.\n\n" ++
-    "You can sign out anyway, but this machine stays connected to that account " ++
-    "until you remove it from the machine list on another computer.";
+    "You can sign out anyway: this machine stays connected to that account for " ++
+    "now, and Ghoztty keeps trying to remove it until the relay answers — while " ++
+    "this app runs, and again every time it starts. You can also remove it from " ++
+    "the machine list on another computer.";
 
 /// The monogram letter for the avatar circle (T311): the email's first LETTER,
 /// uppercased, mirroring Mac's `initials` (MachineChooserView.swift:942-976).
@@ -335,9 +337,11 @@ test "signOutMessage: the four outcomes say four different things (T1421)" {
     const revoked = signOutMessage(.{ .was_signed_in = true, .machine = .revoked });
     try testing.expect(std.mem.indexOf(u8, revoked, "removed from your account") != null);
 
-    // Signing out anyway must still admit what is left behind.
+    // Signing out anyway must still admit what is left behind — and, since
+    // T1424, say that it is being finished rather than abandoned.
     const left = signOutMessage(.{ .was_signed_in = true, .machine = .left_enrolled });
     try testing.expect(std.mem.indexOf(u8, left, "still connected") != null);
+    try testing.expect(std.mem.indexOf(u8, left, "will remove it") != null);
 
     // The unenrolled machine keeps the old wording, both ways round.
     try testing.expectEqualStrings(
@@ -363,6 +367,9 @@ test "not_revoked_body: names the consequence and the remedy (T1421)" {
     // leaves the machine reachable, and where to go to finish the job.
     try testing.expect(std.mem.indexOf(u8, not_revoked_body, "stays connected") != null);
     try testing.expect(std.mem.indexOf(u8, not_revoked_body, "another computer") != null);
+    // T1424: the dialog no longer asks the user to remember a chore. It says
+    // the app finishes the job itself, because it now does.
+    try testing.expect(std.mem.indexOf(u8, not_revoked_body, "keeps trying") != null);
     try testing.expect(not_revoked_title.len > 0);
 }
 

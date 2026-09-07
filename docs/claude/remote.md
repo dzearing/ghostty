@@ -188,10 +188,54 @@ Two consequences worth stating rather than rediscovering:
 that is missing or unparseable falls back to the account's own relay rather than
 destroying the one credential that could revoke the machine.
 
-Still open, split out of the Mac change: **T1424** (retry a revocation that could
-not be completed), **T1425** (suspend rather than discard, so signing back in
-restores the machine) and **T1426** (the chooser saying a machine is still
-connected to an account it was signed out of).
+#### A forced sign-out finishes itself later (T1424)
+
+"Sign Out Anyway" used to be the end of the story: the user was told, honestly,
+that the machine stayed connected to the account — and nothing ever tried again.
+The machine remained listed, reachable and streamable from every other computer
+on the account until they remembered to go to one of those computers and remove
+it by hand, which nobody does. A security decision they had already made was
+left depending on a chore.
+
+So `SignOutMode.force` now **arms a pending revocation** instead of abandoning
+one: `pending-revoke.json`, written beside `relay.env` (same directory, so
+`GHOSTTY_RELAY_ENV` carries both), holding the device token, the normalized
+relay base, the account that signed out, and when it was armed. It is atomic and
+owner-only ACL'd, exactly like the credential it sits next to.
+`src/remote/relay_revoke_pending.zig` owns it.
+
+- **The retry authenticates as the DEVICE.** By then the user is signed out and
+  there is no session to speak with; `POST /v1/agent/deenroll` takes the
+  machine's own bearer. That is why the local credential is KEPT on the forced
+  path — deleting it would destroy the only thing that could ever revoke the
+  machine.
+- **It runs at every launch and on a backoff while the app runs**
+  (`retryAsync`, called from `App.startup` and again the moment a record is
+  armed): 0s, 5s, 15s, 60s, 5min, then every 15min. There is no local event for
+  "the relay became reachable" — an adapter coming up is not the same question —
+  so the capped backoff is what bounds "still enrolled" to minutes instead of
+  until the next relaunch.
+- **Only an answer clears it.** `nextAfter`: 204/200 → cleared, revoked. 401 →
+  cleared, and **nothing else concluded** — a POST that landed with a lost
+  response is indistinguishable from this, and reading it as proof of a
+  completed revocation is how the Mac seat's first cut also cleared the
+  machine's suspension record, so the user signed back in to find the machine
+  simply gone (`f3b1e5fb5`, and the reason T1425 must not touch that branch).
+  Anything else — no answer, a 5xx, a 404 from a relay with no such route —
+  stays ARMED. Giving up after N tries means a closed lid strands the machine
+  forever.
+- **Signing back in cancels it.** Re-adopting this machine has to win, or the
+  retry would revoke the machine the user just signed back in on.
+
+Acceptance is section 9 of `test\win32\relay-account.ps1`, which arms the
+record against a port that is DEAD at sign-out time and brought up afterwards —
+the only version of the test that can tell an armed retry from a lucky first
+attempt. It covers all three: completed with no relaunch, completed at the next
+launch, and cancelled by signing back in.
+
+Still open, split out of the Mac change: **T1425** (suspend rather than discard,
+so signing back in restores the machine) and **T1426** (the chooser saying a
+machine is still connected to an account it was signed out of).
 
 The Google OAuth client id is baked into the build via `-Dgoogle-client-id`
 (public — it appears in the browser URL), overridable with
