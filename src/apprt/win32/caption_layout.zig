@@ -92,11 +92,18 @@ pub const Button = enum { pill, overflow, minimize, maximize, close };
 pub const Pill = struct {
     w: i32 = 0,
     h: i32 = 0,
-    /// Is the pill a BUTTON right now? It only is while the link is down (see
-    /// `remote_pill.isAction`), and the difference is not cosmetic: a quiet
-    /// status chip must stay part of the DRAG region, or a window whose
-    /// titlebar is mostly tab strip grows a dead patch you cannot pick it up
-    /// by. Carried with the size so one struct decides where a click goes.
+    /// Is the pill a BUTTON right now? Since T610 a remote window's pill is one
+    /// in every state — connected it opens the Activity Monitor for the machine
+    /// it names, broken it re-dials — so the caller passes true for a pill that
+    /// has a machine behind it and false only when it has none to act on.
+    ///
+    /// The difference is not cosmetic: a NON-interactive chip stays part of the
+    /// DRAG region, so a window whose titlebar is mostly tab strip does not grow
+    /// a dead patch you cannot pick it up by. An interactive one takes its own
+    /// width out of that band, which is the trade T610 made deliberately — the
+    /// pill sits beside the "…", at the end of the band, where the drag region
+    /// already stops. Carried with the size so one struct decides where a click
+    /// goes.
     interactive: bool = false,
 
     pub fn isEmpty(self: Pill) bool {
@@ -444,14 +451,15 @@ pub fn hitBox(m: Metrics, l: Layout, b: Button) Rect {
     };
 }
 
-/// The system command a caption button stands for.
+/// What a caption button stands for. Four are `WM_SYSCOMMAND`s; two are the
+/// app's own.
 ///
 /// Kept here, as a pure mapping, rather than inline in the wndproc: it is the
 /// one part of the click path that is decidable without a window, and it is
 /// the part most likely to be wrong in a way nothing notices — a maximize
 /// button that always sends `SC_MAXIMIZE` looks perfect until you click it on
 /// an already-maximized window and nothing happens.
-pub const Command = enum { minimize, maximize, restore, close, menu, reconnect };
+pub const Command = enum { minimize, maximize, restore, close, menu, pill };
 
 pub fn command(b: Button, maximized: bool) Command {
     return switch (b) {
@@ -459,10 +467,14 @@ pub fn command(b: Button, maximized: bool) Command {
         // It is in this enum anyway so that "what does this button do" has
         // exactly one answer, decided in the pure module with the rest.
         .overflow => .menu,
-        // Likewise ours: the caller re-dials the window's machine. Whether the
-        // pill is clickable AT ALL is `remote_pill.isAction`, which the caller
-        // checks before it ever gets here.
-        .pill => .reconnect,
+        // Likewise ours, and deliberately not named for one of the two things
+        // it does: a click on the pill opens the Activity Monitor for the
+        // machine it names, or re-dials that machine when the link is down.
+        // WHICH is `remote_pill.clickAction`, asked of the live connection
+        // state at the moment of the release rather than baked in here — the
+        // ladder runs on a timer, and the link can come back between the press
+        // and the release.
+        .pill => .pill,
         .minimize => .minimize,
         .maximize => if (maximized) .restore else .maximize,
         .close => .close,
@@ -1145,7 +1157,7 @@ fn samplePill(s: f32) Pill {
     };
 }
 
-/// The same pill in its quiet (non-button) state.
+/// The same pill with no machine behind it, so it is not a button (T610).
 fn sampleQuietPill(s: f32) Pill {
     var p = samplePill(s);
     p.interactive = false;
@@ -1235,7 +1247,9 @@ test "the drag region stops at a CLICKABLE pill, so dragging never fires it" {
     }
 }
 
-test "a quiet pill is still titlebar you can pick the window up by" {
+// A pill with no machine behind it: the only shape that is still not a button
+// (T610), and the one the drag band still swallows.
+test "a pill with nothing to act on is still titlebar you can pick the window up by" {
     for (scales) |s| {
         const m = Metrics.init(s, .standalone);
         const l = layout(m, 1200, sampleQuietPill(s));
@@ -1326,7 +1340,7 @@ test "a band too narrow for the pill drops it rather than clipping it" {
     }
 }
 
-test "command: the pill re-dials; nothing else in the caption does" {
-    try testing.expectEqual(Command.reconnect, command(.pill, false));
-    try testing.expectEqual(Command.reconnect, command(.pill, true));
+test "command: the pill is the app's own; nothing else in the caption is" {
+    try testing.expectEqual(Command.pill, command(.pill, false));
+    try testing.expectEqual(Command.pill, command(.pill, true));
 }

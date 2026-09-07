@@ -1903,6 +1903,25 @@ $GuardTable = @(
     # the pill's anchor, its content deltas, its per-point click-through and
     # the explainer bubble back - and until T576 nothing tied an edit to any of
     # that code to the harness that already covered it.
+    # The remote connection pill (T367/T610). `remote-pill.ps1` is the only
+    # thing that stands up a real remote window against a loopback agent and
+    # reads the capsule's painted pixels, its WM_NCHITTEST answer and what a
+    # click on it actually does - which is now two different things depending
+    # on the live connection state. The row exists because T610 INVERTED one of
+    # that script's assertions (a connected pill answers HTOBJECT where it used
+    # to answer HTCAPTION): an edit that flips a harness's expected answer is
+    # exactly the shape that has to be tied to running the harness, and nothing
+    # tied `remote_pill.zig` or the caption band's click routing to it before.
+    [pscustomobject]@{
+        Name   = 'remote-pill'
+        Script = 'test\win32\remote-pill.ps1'
+        Stamp  = 'test\win32\remote-pill.stamp.json'
+        Covers = @(
+            'src\apprt\win32\remote_pill.zig',
+            'src\apprt\win32\caption_layout.zig',
+            'test\win32\remote-pill.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'key-state-pill'
         Script = 'test\win32\key-state-pill.ps1'

@@ -2914,7 +2914,7 @@ pub fn performCommand(self: *Surface, id: commands.Id) void {
         // palette entry opens it on the window's OWN connection when there is
         // one and the LOCAL source otherwise
         // (RemoteActivityMonitor.openFromPalette:132-141).
-        .activity => self.openActivityMonitor(),
+        .activity => self.parent_window.openActivityMonitor(),
 
         // Build provenance of this running instance (T52).
         .about => self.showAboutDialog(),
@@ -2942,34 +2942,6 @@ pub fn performCommand(self: *Surface, id: commands.Id) void {
             log.err("command action error id={s} err={}", .{ @tagName(id), err });
         },
     }
-}
-
-/// Open the Activity Monitor for THIS surface's window (T295): a remote window
-/// gets a panel riding its own connection, everything else gets Local.
-///
-/// The panel BORROWS that connection — the window owns it, and its session must
-/// outlive the panel closing (`RemoteActivityMonitor.presentReusing`). The
-/// source id is the window's machine identity, so a panel the chooser already
-/// opened for the same machine is focused rather than duplicated.
-fn openActivityMonitor(self: *Surface) void {
-    const window = self.parent_window;
-    const dialed = window.remote_dialed orelse return ActivityMonitor.openLocal(window);
-    const machine = window.remote_machine orelse return ActivityMonitor.openLocal(window);
-
-    // The registry key. A relay window keys on its DEVICE ID — the same string
-    // the chooser opens with — so the two entry points meet at one panel.
-    var id_buf: [ActivityMonitor.max_source_id]u8 = undefined;
-    const id: []const u8 = switch (machine) {
-        .relay => |r| blk: {
-            if (r.device.len > id_buf.len) return ActivityMonitor.openLocal(window);
-            @memcpy(id_buf[0..r.device.len], r.device);
-            break :blk id_buf[0..r.device.len];
-        },
-        .tcp => |t| std.fmt.bufPrint(&id_buf, "{s}:{d}", .{ t.host, t.port }) catch
-            return ActivityMonitor.openLocal(window),
-    };
-
-    ActivityMonitor.openReusing(window, .{ .remote = .{ .id = id } }, dialed.conn());
 }
 
 /// "Viewer: Open File in Pane…" (T396): a standard open-file dialog, then

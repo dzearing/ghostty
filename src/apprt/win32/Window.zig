@@ -13,6 +13,7 @@ const input = @import("../../input.zig");
 
 const App = @import("App.zig");
 const MachineChooser = @import("MachineChooser.zig");
+const ActivityMonitor = @import("ActivityMonitor.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const RenameDialog = @import("RenameDialog.zig");
 const BannerDialog = @import("BannerDialog.zig");
@@ -1556,6 +1557,59 @@ fn remotePillMode(self: *const Window) remote_pill.Mode {
     return remote_pill.modeFor(self.reconnect.ladder);
 }
 
+/// How this window's machine is NAMED to the user (T610), or empty when the
+/// window has no machine record to name.
+///
+/// `RemoteMachine.displayName` and nothing else: it is the one derivation in
+/// the app — the close confirmation speaks it, the pill's tooltip speaks it,
+/// and now the pill itself does — so all three name the same box the same way.
+/// A second, prettier derivation here is exactly the drift that makes a user
+/// ask which of the two names is the real machine.
+pub fn machineDisplayName(self: *const Window) []const u8 {
+    const m = self.remote_machine orelse return "";
+    return m.displayName();
+}
+
+/// Open the Activity Monitor for THIS window (T295/T610): a remote window gets
+/// a panel riding its own connection, everything else gets Local.
+///
+/// The panel BORROWS that connection — the window owns it, and its session must
+/// outlive the panel closing (`RemoteActivityMonitor.presentReusing`). The
+/// source id is the window's machine identity, so a panel the chooser already
+/// opened for the same machine is focused rather than duplicated.
+///
+/// It lives on the WINDOW rather than on a surface because two entry points now
+/// reach it and only one of them has a surface: the command palette's "Activity
+/// Monitor" (through `Surface.performCommand`) and a click on the connection
+/// pill, which is caption chrome. One derivation of the source, so the two
+/// cannot open two panels on one machine.
+pub fn openActivityMonitor(self: *Window) void {
+    const dialed = self.remote_dialed orelse return ActivityMonitor.openLocal(self);
+    const machine = self.remote_machine orelse return ActivityMonitor.openLocal(self);
+
+    // The registry key. A relay window keys on its DEVICE ID — the same string
+    // the chooser opens with — so the two entry points meet at one panel.
+    var id_buf: [ActivityMonitor.max_source_id]u8 = undefined;
+    const id: []const u8 = switch (machine) {
+        .relay => |r| blk: {
+            if (r.device.len > id_buf.len) return ActivityMonitor.openLocal(self);
+            @memcpy(id_buf[0..r.device.len], r.device);
+            break :blk id_buf[0..r.device.len];
+        },
+        .tcp => |t| std.fmt.bufPrint(&id_buf, "{s}:{d}", .{ t.host, t.port }) catch
+            return ActivityMonitor.openLocal(self),
+    };
+
+    // The panel titles itself from the name (`Source.label`), which is the same
+    // string the pill paints — so the window you clicked and the panel that
+    // opened name the same machine.
+    ActivityMonitor.openReusing(
+        self,
+        .{ .remote = .{ .id = id, .name = self.machineDisplayName() } },
+        dialed.conn(),
+    );
+}
+
 /// The pill's size for the caption's layout: zero when there is no pill, or
 /// when the label has not been measured yet.
 fn captionPill(self: *const Window) caption_layout.Pill {
@@ -1564,7 +1618,13 @@ fn captionPill(self: *const Window) caption_layout.Pill {
     return .{
         .w = self.remote_pill_w,
         .h = remote_pill.Metrics.init(self.scale).h,
-        .interactive = remote_pill.isAction(self.remotePillMode()),
+        // A button in every state, as long as there is a machine to act ON
+        // (T610): connected it opens the Activity Monitor for that machine,
+        // broken it re-dials. A window whose transport carries no machine
+        // record can do neither, so its pill stays a status mark inside the
+        // drag band rather than a control that answers a click with nothing.
+        .interactive = remote_pill.isAction(self.remotePillMode()) or
+            self.remote_machine != null,
     };
 }
 
@@ -1582,11 +1642,21 @@ pub fn refreshRemotePill(self: *Window) void {
         const mode = self.remotePillMode();
 
         var buf: [remote_pill.label_cap]u8 = undefined;
-        const text = remote_pill.label(&buf, self.reconnect.ladder);
+        const text = remote_pill.label(&buf, self.reconnect.ladder, self.machineDisplayName());
         break :blk remote_pill.width(m, mode, self.measurePillLabel(text));
     };
     if (want == self.remote_pill_w) return;
     self.remote_pill_w = want;
+    // The debug oracle for `test\win32\remote-pill.ps1` section 2 (T610). The
+    // pill's LABEL is the one thing a pixel probe cannot read back — a name
+    // rendered in the caption face at 100% is a handful of grey pixels — so the
+    // string is logged where it is decided, the way the tab tooltip's is.
+    var oracle: [remote_pill.label_cap]u8 = undefined;
+    log.debug("remote pill mode={s} label={s} w={d}", .{
+        @tagName(self.remotePillMode()),
+        remote_pill.label(&oracle, self.reconnect.ladder, self.machineDisplayName()),
+        want,
+    });
     self.invalidateChrome();
 }
 
@@ -1698,6 +1768,11 @@ pub fn setRemoteMachine(self: *Window, machine: RemoteMachine) Allocator.Error!v
             } };
         },
     };
+    // The name IS the connected pill's label (T610), so the record arriving is
+    // a width change. Without this the pill keeps the mark-only width it was
+    // measured at by `setRemoteDialed`, which runs first — the same "the two
+    // belong together" shape that comment describes, one step further along.
+    self.refreshRemotePill();
 }
 
 /// Remote inheritance for one new tab/split in a REMOTE window (T68, Mac
@@ -5337,13 +5412,15 @@ fn handleNcLButtonUp(self: *Window, wparam: usize) bool {
         // stray release is a message-ordering accident, not a bug worth
         // crashing a terminal over.
         .menu => return true,
-        // The connection pill: re-dial this window's machine now. Re-checked
-        // against the LIVE state rather than trusted from the press, because
-        // the ladder runs on a timer and the link can come back between the
-        // two — and `manualReconnect` on a connected window is meaningless.
-        .reconnect => {
-            if (remote_pill.isAction(self.remotePillMode())) {
-                RemoteReconnect.manualReconnect(self.app, self);
+        // The connection pill. WHAT it does is asked of the LIVE state rather
+        // than trusted from the press, because the ladder runs on a timer and
+        // the link can come back between the two — a release that fired
+        // `manualReconnect` on a window that had just reconnected would tear
+        // down a working transport to rebuild it.
+        .pill => {
+            switch (remote_pill.clickAction(self.remotePillMode())) {
+                .reconnect => RemoteReconnect.manualReconnect(self.app, self),
+                .activity => self.openActivityMonitor(),
             }
             return true;
         },
@@ -5586,11 +5663,10 @@ fn paintRemotePill(self: *Window, mem_dc: w32.HDC, l: caption_layout.Layout) voi
     const mode = self.remotePillMode();
     const pal = self.chromePalette();
 
-    // The pill only lights up when it is a BUTTON. A hover fill on the quiet
-    // states would promise an action that clicking does not deliver.
-    const state: icon_button.State = if (!remote_pill.isAction(mode))
-        .normal
-    else if (self.caption_pressed == .pill)
+    // Every state lights, because every state with a machine behind it is a
+    // button (T610). A pill with no machine to act on is not, and `captionPill`
+    // has already kept it out of the hit test, so no hover can reach it.
+    const state: icon_button.State = if (self.caption_pressed == .pill)
         .pressed
     else if (self.caption_hover == .pill)
         .hover
@@ -5652,7 +5728,7 @@ fn paintRemotePill(self: *Window, mem_dc: w32.HDC, l: caption_layout.Layout) voi
     // The label.
     if (inner.text.isEmpty()) return;
     var buf: [remote_pill.label_cap]u8 = undefined;
-    const text = remote_pill.label(&buf, self.reconnect.ladder);
+    const text = remote_pill.label(&buf, self.reconnect.ladder, self.machineDisplayName());
     if (text.len == 0) return;
     var wide: [remote_pill.label_cap]u16 = undefined;
     const n = std.unicode.utf8ToUtf16Le(&wide, text) catch return;

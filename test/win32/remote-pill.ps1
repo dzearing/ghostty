@@ -11,10 +11,16 @@
 #      caption_layout + remote_pill say the dot lands is measured to be
 #      distinctly green. Painted pixels from a live window - not a synthesized
 #      answer.
-#   2. A connected pill is NOT a button. WM_NCHITTEST at the pill answers
-#      HTCAPTION, i.e. it is still titlebar you can pick the window up by. A
-#      quiet status chip that ate a patch of the drag band would be a
-#      regression you only notice when your window will not move.
+#   2. A connected pill NAMES the machine and IS a button (T610). The label is
+#      read from the app's own oracle line (a name in the caption face is a
+#      handful of grey pixels no probe can read back), the capsule is measured
+#      to be wider than the wordless dot-only pill it used to be, and
+#      WM_NCHITTEST at the pill answers HTOBJECT. Mac's MachinePillCapsule is
+#      clickable in exactly this state; before T610 this section asserted the
+#      opposite, which was T367 stopping deliberately short.
+#   2b. Clicking a CONNECTED pill opens the Activity Monitor on this window's
+#      existing connection - a GhozttyActivityMonitor window appears, and the
+#      app logs that it reused a connection rather than dialing its own.
 #   3. DROPPED turns the pill red and MAKES it a button. The agent is killed;
 #      the script polls until the capsule paints red and WM_NCHITTEST answers
 #      HTOBJECT at the same point.
@@ -25,6 +31,8 @@
 #      manual one does not - and the pill goes GREEN again, which is the answer
 #      the button exists to give.
 #   5. A LOCAL window has no pill at all. Same strip of band, plain chrome.
+#      A local window keeps its whole drag band, which is the other half of
+#      section 2's trade: only a window that HAS a machine gives up that width.
 #
 # LIMITS, stated rather than glossed:
 #   * Section 4 posts the messages the OS would post. It proves the handler is
@@ -71,7 +79,7 @@ function Ok([string]$msg) { $script:pass++; Write-Host "  PASS  $msg" }
 function Bad([string]$msg) { $script:fail++; Write-Host "  FAIL  $msg" }
 function Check([bool]$cond, [string]$msg) { if ($cond) { Ok $msg } else { Bad $msg } }
 
-$HTCAPTION = 2; $HTOBJECT = 19
+$HTOBJECT = 19
 $WM_NCHITTEST = 0x0084; $WM_NCLBUTTONDOWN = 0x00A1; $WM_NCLBUTTONUP = 0x00A2
 
 function PackPoint([int]$x, [int]$y) {
@@ -144,8 +152,15 @@ try {
     # Restated here from the design system's numbers rather than read out of
     # the binary, which is what makes this an oracle: caption_layout puts the
     # pill one GROUP gap (pad_md) left of the "..." square, sharing its
-    # vertical center, and remote_pill puts the connected dot one pad_x
-    # (8 DIP) in from the capsule's trailing edge with an 8 DIP diameter.
+    # vertical center, and remote_pill puts the mark one pad_x (8 DIP) in from
+    # the capsule's LEADING edge with an 8 DIP diameter.
+    #
+    # The trailing edge is arithmetic; the leading edge is not, because the
+    # capsule's width follows a GDI-measured label (T610 gave the connected
+    # pill the machine's name, so this is true in every state now). It is found
+    # instead of assumed, by walking WM_NCHITTEST left until the answer stops
+    # being the pill - which is the same edge `caption_layout` computes
+    # `drag_right` from, asked of the running window.
     $m = Get-TestChromeMetrics -Window $remote -StripVisible $false
     $scale = $m.Scale
     $px = { param($dip) [int][Math]::Round($dip * $scale) }
@@ -155,31 +170,103 @@ try {
     $pillRight = $m.CaptionOverflowLeft - $m.PadMd
     $pillCy = $m.CaptionBtnTop + [int]($m.BtnPaint / 2)
     # Dot center: pad_x (8) + half a dot (4) in from the capsule's right edge.
-    $dotCx = $pillRight - (& $px 12.0)
+    # (filled in per measurement by PillLeft/DotX below)
     # Anywhere inside the capsule's trailing padding: fill color, whatever the
     # label happens to measure.
     $fillCx = $pillRight - (& $px 4.0)
-    $sxDot = $win.Left + $borderX + $dotCx
     $sxFill = $win.Left + $borderX + $fillCx
     $sy = $win.Top + $pillCy
-    Write-Host "  scale=$scale pillRight=$pillRight cy=$pillCy dotX=$dotCx fillX=$fillCx"
+    Write-Host "  scale=$scale pillRight=$pillRight cy=$pillCy fillX=$fillCx"
 
     function PillPixel([int]$sx) {
         $shot = Get-TestWindowPixels -Window $remote -Sync
         try { return Get-TestPixel -Shot $shot -X $sx -Y $sy } finally { Close-TestWindowPixels $shot }
     }
 
+    # The capsule's leading edge in SCREEN x: walk left from its trailing edge
+    # while WM_NCHITTEST still answers "the pill". -1 when the pill is not a
+    # button at all, which is a real answer and not a measurement failure.
+    function PillLeft {
+        $sxRight = $win.Left + $borderX + $pillRight
+        if ((HitAt $remote ($sxRight - 2) $sy) -ne $HTOBJECT) { return -1 }
+        for ($dx = 2; $dx -lt 400; $dx += 2) {
+            if ((HitAt $remote ($sxRight - $dx) $sy) -ne $HTOBJECT) { return $sxRight - $dx + 2 }
+        }
+        return -1
+    }
+
+    # Screen x of the status dot's center: pad_x (8) + half a dot (4) in from
+    # the capsule's leading edge.
+    function DotX {
+        $l = PillLeft
+        if ($l -lt 0) { return -1 }
+        return $l + (& $px 12.0)
+    }
+
     # --- 1. connected: a green dot -----------------------------------------
-    $dot = PillPixel $sxDot
+    $sxDot = DotX
+    Write-Host "  pill leading edge found at screen x=$(PillLeft), dot at $sxDot"
+    $dot = if ($sxDot -ge 0) { PillPixel $sxDot } else { $null }
     if ($NegativeControl) {
         Check (-not (IsGreenish $dot)) "NEGATIVE CONTROL: no green dot on a connected remote window"
     } else {
         Check (IsGreenish $dot) "connected pill paints a green dot (rgb $($dot.R),$($dot.G),$($dot.B))"
     }
 
-    # --- 2. a connected pill is still draggable titlebar --------------------
-    Check ((HitAt $remote $sxFill $sy) -eq $HTCAPTION) `
-        "a quiet pill answers HTCAPTION - it does not eat a patch of the drag band"
+    # --- 2. a connected pill names the machine, and is a button (T610) ------
+    # The label, from the app's own oracle line. `+new-remote-window --host`
+    # makes a `.tcp` machine, whose display name is the host we dialed - the
+    # same string the close confirmation and the tooltip speak.
+    $pillLine = ''
+    if (Test-Path $applog) {
+        $pillLine = @(Get-Content $applog | Select-String -Pattern 'remote pill mode=connected' |
+            Select-Object -Last 1 | ForEach-Object { $_.Line })
+        if ($pillLine -is [array]) { $pillLine = $pillLine[0] }
+    }
+    Check ($pillLine -match 'label=127\.0\.0\.1') `
+        "a connected pill NAMES the machine - $pillLine"
+
+    # ...and the capsule really got wider for it: the wordless pill was
+    # dot (8) + pad_x (8) * 2 = 24 DIP, so anything at that width is a pill
+    # that measured no label at all.
+    $wordless = & $px 24.0
+    $pillW = -1
+    if ($pillLine -match 'w=(\d+)') { $pillW = [int]$Matches[1] }
+    Check ($pillW -gt $wordless) `
+        "and the capsule grew for the name (w=$pillW px > wordless $wordless px)"
+
+    # A button, where it used to be draggable titlebar. The trade is stated in
+    # caption_layout.Pill: an interactive pill takes its own width out of the
+    # drag band, and it sits at the band's trailing end where the drag region
+    # already stopped for the "..." beside it.
+    Check ((HitAt $remote $sxFill $sy) -eq $HTOBJECT) `
+        "a connected pill answers HTOBJECT - clicking it is a click, not a drag"
+
+    # --- 2b. clicking a connected pill opens the Activity Monitor -----------
+    $panelsBefore = @(Get-TestWindows -ProcessId $proc.Pid -Class 'GhozttyActivityMonitor').Count
+    Send-TestRawMessage -Window $remote -Message $WM_NCLBUTTONDOWN -WParam ([IntPtr]$HTOBJECT) -LParam (PackPoint 0 0) | Out-Null
+    Start-Sleep -Milliseconds 150
+    Send-TestRawMessage -Window $remote -Message $WM_NCLBUTTONUP -WParam ([IntPtr]$HTOBJECT) -LParam (PackPoint 0 0) | Out-Null
+
+    $panel = [IntPtr]::Zero
+    for ($i = 0; $i -lt 15; $i++) {
+        Start-Sleep -Milliseconds 500
+        $now = @(Get-TestWindows -ProcessId $proc.Pid -Class 'GhozttyActivityMonitor')
+        if ($now.Count -gt $panelsBefore) { $panel = [IntPtr]$now[$now.Count - 1].Hwnd; break }
+    }
+    Check ($panel -ne [IntPtr]::Zero) "clicking a connected pill opens the Activity Monitor"
+
+    # On THIS window's connection, not a second dial of its own: the panel that
+    # dials logs `dialing`, the one that borrows logs `reusing`. Mac's
+    # presentReusing, and the reason the pill click is not just the palette
+    # entry with extra steps.
+    $reused = $false
+    if (Test-Path $applog) {
+        $reused = @(Get-Content $applog | Select-String -Pattern 'activity monitor: reusing').Count -gt 0
+    }
+    Check $reused "...on the window's EXISTING connection, not a second dial"
+
+    if ($panel -ne [IntPtr]::Zero) { Send-TestWindowClose -Window $panel | Out-Null; Start-Sleep -Milliseconds 800 }
 
     # --- 3. dropped: red, and now a button ----------------------------------
     Stop-Process -Id $agent.Id -Force -ErrorAction SilentlyContinue
@@ -229,10 +316,13 @@ try {
     # ...and the window is LIVE again. The machine is back but its sessions are
     # not, so this is the fresh-shell swap - the pill going quiet-green is the
     # window saying it has a working transport under it once more.
+    # Re-found, not reused: the capsule was "Reconnect" wide a moment ago and
+    # is name-wide again now, so the leading edge has moved.
     $greenAt = -1
     for ($i = 0; $i -lt 30; $i++) {
         Start-Sleep -Milliseconds 1000
-        if (IsGreenish (PillPixel $sxDot)) { $greenAt = $i; break }
+        $dx2 = DotX
+        if ($dx2 -ge 0 -and (IsGreenish (PillPixel $dx2))) { $greenAt = $i; break }
     }
     Check ($greenAt -ge 0) "and the window comes BACK - the pill is green again (after ${greenAt}s)"
 
@@ -264,6 +354,20 @@ try {
     Write-Host ""
     if ($script:fail -eq 0) { Write-Host "ALL PASS ($($script:pass) checks)"; $exitCode = 0 }
     else { Write-Host "$($script:fail) FAILURE(S) ($($script:pass) passed)"; $exitCode = 1 }
+
+    # --- stamp (T783, row added by T610) ----------------------------------
+    # A green run RECORDS the content of the pill's sources and this script, so
+    # scripts\guard-due.ps1 can answer "has anything run this harness against
+    # the code as it now stands?". Nothing tied an edit to `remote_pill.zig` or
+    # to the caption band's click routing to this script before T610, which is
+    # the gap that mattered the moment T610 INVERTED one of the assertions here
+    # (a connected pill answers HTOBJECT where it used to answer HTCAPTION). A
+    # red run leaves the stamp alone on purpose, and a -NegativeControl run
+    # never stamps.
+    if ($script:fail -eq 0 -and -not $NegativeControl) {
+        & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+            update -Guard remote-pill -Repo $repo 2>&1 | ForEach-Object { Write-Host "  $_" }
+    }
 } catch {
     Write-Host "  FAIL  $($_.Exception.Message)"
     Write-Host "1 FAILURE(S)"

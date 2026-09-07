@@ -343,9 +343,25 @@ a state rather than offering a command: the chooser's session badges
 (`remote_pill`, T367). Their height is likewise derived and not picked — one
 caption line box plus the 4 DIP step — so the chip follows the type ramp
 instead of pinning a number that stops matching its text. A chip on the fixed
-scale would read as a small button, which is precisely what these are not (the
-connection pill is only a button in ONE of its three states, and that is the
-state where it changes color and grows a verb).
+scale would read as a small button, and these are chips first: the connection
+pill only ever changes COLOR and grows a VERB in the one state where it is
+offering to fix something (`disconnected`), which is what keeps the other two
+from reading as commands even though they are clickable (T610).
+
+**A clickable chip in the caption band spends drag region, and that is a
+deliberate purchase.** Everything left of the leftmost clickable thing in the
+band is `HTCAPTION` — titlebar you can pick the window up by — so making the
+connection pill interactive in every state (T610: a click opens the Activity
+Monitor for the machine it names) moves that edge left by the pill's whole
+width, name included. It is allowed HERE and should not be assumed elsewhere,
+for three reasons: the pill sits at the band's trailing end, immediately left of
+the "…" button, so the drag region was already stopping within a `pad_md` of
+there; the width it takes is bounded (`remote_pill.max_label_dip`, 128 DIP), so
+a long hostname cannot quietly eat the band; and only a REMOTE window has a pill
+at all, which is a small minority of windows. A chip that wanted to be
+interactive in the MIDDLE of the band, or one whose width followed unbounded
+user data, would be taking drag region a user cannot predict, and that is the
+"my window will not move" defect — file it as a question before building it.
 
 **A second named exception: the FEEDBACK COMPOSER PILL is a capsule** — the
 viewer pane's feedback input (`viewer_feedback_layout.zig`, T634). By the table

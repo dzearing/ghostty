@@ -23987,3 +23987,83 @@ surfaced a week later, by hand.
 
 Green: `floor-lane.ps1 -Lane all` ALL LANES PASS (lib, none 313s, win32 418s,
 agent 418s). Re-stamped: `drag-perf` 12, `printclient-audit` 8, `test-reach` 14.
+
+## 2026-09-07 - a remote window's titlebar says which machine, and the chip is a control now (T610)
+
+Three remote windows looked identical. Each one carried a green dot in its
+titlebar saying "this link is fine", and nothing anywhere in the chrome said
+WHOSE link - you told them apart by reading whatever title the shell had
+happened to set. On a Mac that question has never come up, because Mac's
+titlebar chip is really two controls: a capsule with the machine's name in it,
+which you can click to open the Activity Monitor for that box, and a status
+chip that appears only when the connection is in trouble. T367 built the second
+one and deliberately stopped there.
+
+So the connected pill now NAMES the machine, and every state of it is a button.
+Connected and reconnecting open the Activity Monitor on the connection the
+window already holds - Mac's `presentReusing`, the panel borrowing a link it
+must not free - and the broken one still re-dials and still says `Reconnect`.
+Which of the two a click means is asked of the LIVE connection state at the
+moment of the release rather than baked into the caption's command table: the
+ladder runs on a timer, and a release that fired `manualReconnect` on a window
+that had reconnected in the 150ms since the press would tear down a working
+transport to rebuild it.
+
+The name is `RemoteMachine.displayName()` and nothing else. That call already
+existed (T1390) and the close confirmation and the pill's tooltip already spoke
+it, so the pill joining them is a third reader rather than a third derivation -
+which matters because the alternative, a prettier name resolved here, is
+precisely how a user ends up asking which of two names is the real machine. It
+does mean a relay machine is named by its device id today, since the friendly
+name lives only in a directory listing no window has ever fetched; that is
+filed as T1418, with the shape (a small id -> name store, so a RESTORED window
+gets the name too) written down rather than left to be rediscovered.
+
+Two consequences worth stating because they are trades, not free wins. An
+interactive pill takes its own width out of the drag band - everything left of
+the leftmost clickable thing in the caption is titlebar you can pick the window
+up by, and the pill has just become that thing. It is bought deliberately here:
+the pill sits at the band's trailing end where the drag region was already
+stopping for the "..." beside it, the width is bounded at 128 DIP so a long
+hostname cannot quietly eat the band, and only remote windows have a pill at
+all. The design system now says that in §3.1, along with the shapes that should
+NOT assume it. And the quiet states light on hover and press, because a control
+that never answers the pointer reads as decoration; the mark and the label are
+re-resolved against the SHADED fill, so the contrast floors hold in the state
+the pixels are actually in rather than in the resting one.
+
+One thing this deliberately did not decide: while the link is down, the chip
+says what is happening and the machine name moves to the tooltip. One capsule
+cannot say both without growing past what a titlebar can spare, and a dropping
+window needs to say what is wrong and what clicking will do. But that IS a
+difference a user can feel with two windows reconnecting at once, so it is
+D93 rather than a footnote.
+
+`remote-pill.ps1` had asserted the opposite of half of this - a connected pill
+answering HTCAPTION was T367's stated intent - so the script was rewritten
+around the new behavior and grew a section for the Activity Monitor click.
+Its dot probe had to change shape too: the mark used to be the pill's only
+content and therefore sat at the trailing edge, arithmetic from the caption's
+DIP constants; with a label it sits at the LEADING edge, which follows a
+GDI-measured string this script cannot predict. It now WALKS `WM_NCHITTEST`
+left until the answer stops being the pill, which finds the same edge
+`caption_layout` computes `drag_right` from - measured on the running window
+instead of assumed. The label itself is read from a debug oracle line, the
+tab tooltip's pattern: a machine name in the caption face is a handful of grey
+pixels no probe can read back.
+
+And the harness got a guard row. Nothing tied an edit of `remote_pill.zig` or
+of the caption's click routing to `remote-pill.ps1`, which is uncomfortable in
+general and specifically wrong for a change that INVERTS one of that script's
+expected answers - the shape most likely to leave a harness quietly asserting
+last month's behavior.
+
+Filed T1417 (the caption band has no tooltip host at all, so
+`remote_pill.tooltip()` is written, tested and unreachable - and D93's
+recommended wording leans on it) and T1418 (the relay friendly name).
+
+Green: `floor-lane.ps1 -Lane all` ALL LANES PASS (lib, none 302s, win32 391s,
+agent 402s). `remote-pill.ps1` ALL PASS (11) with `-NegativeControl` red;
+`ipc-p1` 25, `ipc-p2` 20, `ipc-p3` 16. Re-stamped for the Window.zig /
+Surface.zig edits: `remote-pill` (new), `remote-disconnect` 49, `close-confirm`
+58, `viewer-close` 44, and the ten static audits.

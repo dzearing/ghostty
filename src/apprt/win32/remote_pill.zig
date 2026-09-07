@@ -16,19 +16,27 @@
 //! app's own "…" button (T234/T205), so the pill joins that cluster and shares
 //! its vertical center — one baseline, not a second one invented here.
 //!
-//! ## Three states, and why the quiet one is quiet
+//! ## Three states, and what each one says
 //!
-//! | State | Mark | Label | Fill |
-//! |---|---|---|---|
-//! | `connected` | green dot | *(none)* | a tint of the band |
-//! | `reconnecting` | amber dot | `Reconnecting… n/5` | a tint of the band |
-//! | `disconnected` | refresh glyph | `Reconnect` | solid red, and it is a BUTTON |
+//! | State | Mark | Label | Fill | Click |
+//! |---|---|---|---|---|
+//! | `connected` | green dot | the machine's name | a tint of the band | Activity Monitor |
+//! | `reconnecting` | amber dot | `Reconnecting… n/5` | a tint of the band | Activity Monitor |
+//! | `disconnected` | refresh glyph | `Reconnect` | solid red | reconnect |
 //!
-//! Connected shows a dot and no words on purpose. A chip that permanently reads
-//! "Connected" is chrome that says nothing — the information a working window
-//! carries is "this one is remote, and it is fine", which is exactly what a
-//! status LED conveys. The pill then GROWS, with words, only when something is
-//! wrong, which is what makes the wrong case noticeable at all.
+//! The connected pill NAMES the machine (T610), which is the half of Mac's
+//! `MachinePillView` T367 left out: Mac's control is really two, a
+//! `MachinePillCapsule` (dot + machine name, clickable, opens the Remote
+//! Activity Monitor) and a `ConnectionStatusPill` that appears only when the
+//! link is not up. Windows merges them into one capsule, so the name is what
+//! the capsule says while there is nothing wrong to report. A permanent
+//! "Connected" would be chrome that says nothing; a permanent MACHINE NAME
+//! answers the question three remote windows actually pose — which is which.
+//!
+//! When the link IS in trouble the status takes the label back, and the machine
+//! name moves to the tooltip. One capsule cannot say both without growing past
+//! what a titlebar can spare, and a window whose connection is dropping needs to
+//! say what is happening and what clicking will do (decision D-T610).
 //!
 //! That also settles WCAG 1.4.1 without a second signal being bolted on: the
 //! three states differ in whether there is text and in what it says, so the hue
@@ -83,12 +91,29 @@ pub fn tone(mode: Mode) chrome_theme.Tone {
     };
 }
 
-/// Is this mode a BUTTON — does clicking it do something? Only the broken one
-/// is. A pill that is sometimes clickable is not a wobble in the model: the
-/// action it offers (reconnect) has no meaning while the link is up, and an
-/// enabled-looking control that does nothing is worse than none.
+/// Is this the ACTION mode — the red capsule whose whole job is the offer to
+/// re-dial? Only the broken one is. It is not the same question as "is the pill
+/// clickable" any more (T610: every state is — see `clickAction`); it is what
+/// decides the red fill, the refresh glyph and the imperative label, all of
+/// which would be lying about a link that is up.
 pub fn isAction(mode: Mode) bool {
     return mode == .disconnected;
+}
+
+/// What a click on the pill DOES in each state.
+///
+/// Two answers, and no state is inert: a working remote window's pill is Mac's
+/// `MachinePillCapsule`, which opens the Remote Activity Monitor on the
+/// connection the window already holds; a broken one's is the reconnect offer,
+/// and reconnecting is the only thing worth offering there. The reconnecting
+/// state keeps the Activity Monitor because its connection is still the
+/// window's own — the ladder is retrying that link, not replacing it — and
+/// taking the panel away mid-ladder would remove the one view that shows what
+/// the far machine is doing.
+pub const Click = enum { activity, reconnect };
+
+pub fn clickAction(mode: Mode) Click {
+    return if (isAction(mode)) .reconnect else .activity;
 }
 
 /// The mark drawn at the pill's leading edge: a status dot, or the refresh
@@ -102,20 +127,27 @@ pub fn mark(mode: Mode) Mark {
     };
 }
 
-/// Longest label any state can produce, so callers can size a stack buffer.
-/// `Reconnecting… ` plus two single digits and a slash, with the ellipsis
-/// counted as its three UTF-8 bytes.
-pub const label_cap: usize = 32;
+/// Longest machine name the pill will carry, in UTF-8 bytes. A longer name is
+/// cut at a character boundary rather than refused: `max_label_dip` already
+/// decides what is SEEN, and this is only the bound on what is copied.
+pub const name_cap: usize = 64;
 
-/// The pill's label, written into `buf` (needs `label_cap`). Empty for
-/// `connected` — the dot is the whole message there.
+/// Longest label any state can produce, so callers can size a stack buffer.
+/// The machine name is the long one — `Reconnecting… ` plus two digits and a
+/// slash is 20 bytes, with the ellipsis counted as its three.
+pub const label_cap: usize = name_cap;
+
+/// The pill's label, written into `buf` (needs `label_cap`). `machine` is the
+/// display name of the machine this window rides on, or empty when the window
+/// has none to name — a connected pill then falls back to the wordless dot it
+/// showed before T610, which is the honest answer rather than a placeholder.
 ///
 /// The attempt is shown as `n/5` rather than a bare count because a number with
 /// no ceiling cannot tell you whether waiting is still worth it. The ceiling is
 /// the policy's own `max_attempts`, asked for rather than restated.
-pub fn label(buf: []u8, state: policy.WindowState) []const u8 {
+pub fn label(buf: []u8, state: policy.WindowState, machine: []const u8) []const u8 {
     return switch (state) {
-        .connected => "",
+        .connected => copyName(buf, machine),
         .reconnecting => |r| std.fmt.bufPrint(
             buf,
             "Reconnecting\u{2026} {d}/{d}",
@@ -123,6 +155,16 @@ pub fn label(buf: []u8, state: policy.WindowState) []const u8 {
         ) catch "Reconnecting\u{2026}",
         .disconnected => "Reconnect",
     };
+}
+
+/// `machine` copied into `buf`, cut to `name_cap` on a UTF-8 character
+/// boundary. Cutting mid-sequence would hand GDI a lone continuation byte and
+/// paint a replacement glyph on the one control whose job is to be recognized.
+fn copyName(buf: []u8, machine: []const u8) []const u8 {
+    var n = @min(@min(buf.len, name_cap), machine.len);
+    while (n > 0 and n < machine.len and machine[n] & 0xC0 == 0x80) n -= 1;
+    @memcpy(buf[0..n], machine[0..n]);
+    return buf[0..n];
 }
 
 /// The tooltip / accessible description, written into `buf` (needs
@@ -165,6 +207,14 @@ pub const dot_dip: f32 = 8.0;
 /// other chrome mark at, so the button's glyph carries the same optical weight
 /// as the "…" beside it.
 pub const glyph_dip: f32 = 12.0;
+/// The widest a label may make the pill (T610). A machine name is user data and
+/// hostnames run long; without a ceiling one window's `build-agent-westus2.corp`
+/// would eat the band the tab run and the title live in, and the pill would be
+/// the only control on screen sized by somebody's DNS. 128 DIP is about sixteen
+/// characters of the caption face — enough that the names people actually give
+/// machines fit whole — and anything past it tail-ellipsizes, which is what the
+/// tooltip is there to rescue.
+pub const max_label_dip: f32 = 128.0;
 
 /// Every DIP constant the pill is built from, resolved for one DPI scale.
 pub const Metrics = struct {
@@ -178,6 +228,8 @@ pub const Metrics = struct {
     gap: i32,
     dot: i32,
     glyph: i32,
+    /// The label's own ceiling (`max_label_dip`), in physical pixels.
+    max_text: i32,
     /// The label's font — the caption role (12 DIP), the ramp's badge size.
     font: type_ramp.Font,
     /// The shared chrome button metrics, carried so the painter can hand them
@@ -194,6 +246,7 @@ pub const Metrics = struct {
             .gap = px(gap_dip, scale),
             .dot = px(dot_dip, scale),
             .glyph = px(glyph_dip, scale),
+            .max_text = px(max_label_dip, scale),
             .font = font,
             .ib = icon_button.Metrics.init(scale),
         };
@@ -214,9 +267,13 @@ fn px(v: f32, scale: f32) i32 {
 
 /// The pill's natural width for a label `text_w` px wide (GDI-measured by the
 /// caller at `m.font`). A label that measured to nothing takes its gap with it:
-/// the gap separates two things, and `connected` only has one.
+/// the gap separates two things, and a pill showing only its dot has one.
+///
+/// The label is clamped to `m.max_text` here rather than at the measuring site,
+/// so the ceiling is enforced once for everyone who asks how wide the pill is —
+/// `layout` then hands the clamped box to `DT_END_ELLIPSIS`.
 pub fn width(m: Metrics, mode: Mode, text_w: i32) i32 {
-    const tw = @max(text_w, 0);
+    const tw = @min(@max(text_w, 0), m.max_text);
     const content = m.markSize(mode) + (if (tw > 0) m.gap + tw else 0);
     return content + m.pad_x * 2;
 }
@@ -242,6 +299,11 @@ pub const Layout = struct {
 /// (the caller's `DT_END_ELLIPSIS`) instead of overflowing. Below the width its
 /// mark alone needs, the label is dropped outright — the same choice the caption
 /// band makes with a title it cannot fit.
+///
+/// Whether a mode HAS a label is not asked here (T610): every mode can have one
+/// now, and a `connected` pill on a window with no machine to name simply
+/// measured to zero and was never given the room. The text box follows the
+/// space, and the painter draws nothing into it when there is nothing to say.
 pub fn layout(m: Metrics, pill: Rect, mode: Mode) Layout {
     const empty: Layout = .{ .pill = pill, .mark = .{}, .text = .{} };
     if (pill.isEmpty()) return empty;
@@ -262,16 +324,12 @@ pub fn layout(m: Metrics, pill: Rect, mode: Mode) Layout {
 
     const text_left = mark_rect.right + m.gap;
     const text_right = pill.right - m.pad_x;
-    const text: Rect = if (hasLabel(mode) and text_right > text_left)
+    const text: Rect = if (text_right > text_left)
         .{ .left = text_left, .top = pill.top, .right = text_right, .bottom = pill.bottom }
     else
         .{};
 
     return .{ .pill = pill, .mark = mark_rect, .text = text };
-}
-
-fn hasLabel(mode: Mode) bool {
-    return mode != .connected;
 }
 
 // =============================================================================
@@ -296,6 +354,13 @@ pub const Ink = struct {
 /// red the caption's close-hover uses, so there is one red in the chrome and
 /// not two — and takes the same white foreground with it.
 ///
+/// Every mode reacts to hover and press (T610), because every mode is now a
+/// button: the quiet pill opens the Activity Monitor. The lit fill is the tint
+/// SHADED, in the direction the band is not — lighter on a dark band, darker on
+/// a light one — and the mark and label are then resolved against the shaded
+/// fill rather than the resting one, so the contrast floors hold in the state
+/// the pixels are actually in.
+///
 /// White, not `contrastForeground(fill)` (T528). A searched foreground on a red
 /// fill is exactly what put a BLACK X on the caption's close button: the red is
 /// resolved to carry white, so a foreground that re-decides per state can only
@@ -313,13 +378,20 @@ pub fn ink(bar: Rgb, pal: chrome_theme.Palette, mode: Mode, state: icon_button.S
         return .{ .fill = fill, .mark = pal.on_danger, .text = pal.on_danger };
     }
 
-    // The quiet modes have NO interaction states, and that is not an oversight
-    // to be tidied up later: they are not buttons (`isAction`), so hover and
-    // press cannot happen to them, and a lit fill would promise an action that
-    // clicking does not deliver. Ignoring `state` here keeps the color model
-    // from carrying combinations the UI can never produce.
+    // The quiet modes light too, now that clicking one opens the Activity
+    // Monitor: an affordance that never responds to the pointer reads as
+    // decoration, and the pill is the only chrome control a remote window has.
     const t = tone(mode);
-    const fill = chrome_theme.toneFill(bar, t);
+    const base = chrome_theme.toneFill(bar, t);
+    const d = if (icon_button.paintsFill(state))
+        icon_button.fillDelta(state, !color_math.isLight(bar))
+    else
+        0;
+    const fill: Rgb = .{
+        .r = icon_button.shadeChannel(base.r, d),
+        .g = icon_button.shadeChannel(base.g, d),
+        .b = icon_button.shadeChannel(base.b, d),
+    };
     return .{
         .fill = fill,
         .mark = chrome_theme.toneInk(fill, t),
@@ -341,26 +413,49 @@ test "modeFor: the ladder's three states map onto the three presentations" {
     try testing.expectEqual(Mode.disconnected, modeFor(policy.terminal_state));
 }
 
-test "isAction: only the broken pill is clickable" {
+test "isAction: only the broken pill wears the red action treatment" {
     try testing.expect(!isAction(.connected));
     try testing.expect(!isAction(.reconnecting));
     try testing.expect(isAction(.disconnected));
 }
 
-test "label: connected is wordless, the others say what is happening" {
+test "clickAction: no state is inert, and only the broken one re-dials" {
+    // Mac's capsule opens the Activity Monitor whenever the window has a
+    // connection to look at; only the status half turns into a Reconnect.
+    try testing.expectEqual(Click.activity, clickAction(.connected));
+    try testing.expectEqual(Click.activity, clickAction(.reconnecting));
+    try testing.expectEqual(Click.reconnect, clickAction(.disconnected));
+}
+
+test "label: connected names the machine, the others say what is happening" {
     var buf: [label_cap]u8 = undefined;
-    try testing.expectEqualStrings("", label(&buf, .connected));
+    try testing.expectEqualStrings("winbox", label(&buf, .connected, "winbox"));
+    // No machine to name -> the wordless dot, never a placeholder word.
+    try testing.expectEqualStrings("", label(&buf, .connected, ""));
+    // The status takes the label back while the link is in trouble; the
+    // machine name is the tooltip's job there (D-T610).
     try testing.expectEqualStrings(
         "Reconnecting\u{2026} 2/5",
-        label(&buf, .{ .reconnecting = .{ .attempt = 2 } }),
+        label(&buf, .{ .reconnecting = .{ .attempt = 2 } }, "winbox"),
     );
-    try testing.expectEqualStrings("Reconnect", label(&buf, policy.exhausted_state));
-    try testing.expectEqualStrings("Reconnect", label(&buf, policy.terminal_state));
+    try testing.expectEqualStrings("Reconnect", label(&buf, policy.exhausted_state, "winbox"));
+    try testing.expectEqualStrings("Reconnect", label(&buf, policy.terminal_state, "winbox"));
+}
+
+test "label: an over-long machine name is cut on a character boundary" {
+    var buf: [label_cap]u8 = undefined;
+    // Multi-byte throughout, so a naive byte cut would land mid-sequence.
+    const long = "\u{00e9}" ** name_cap;
+    const got = label(&buf, .connected, long);
+    try testing.expect(got.len <= name_cap);
+    try testing.expect(std.unicode.utf8ValidateSlice(got));
+    // And a name that fits is passed through whole.
+    try testing.expectEqualStrings("build-agent-1", label(&buf, .connected, "build-agent-1"));
 }
 
 test "label: the attempt ceiling is the policy's, not a restated number" {
     var buf: [label_cap]u8 = undefined;
-    const s = label(&buf, .{ .reconnecting = .{ .attempt = policy.max_attempts } });
+    const s = label(&buf, .{ .reconnecting = .{ .attempt = policy.max_attempts } }, "winbox");
     var expect_buf: [label_cap]u8 = undefined;
     const expect = try std.fmt.bufPrint(
         &expect_buf,
@@ -372,7 +467,7 @@ test "label: the attempt ceiling is the policy's, not a restated number" {
 
 test "label_cap holds the longest label at an absurd attempt count" {
     var buf: [label_cap]u8 = undefined;
-    const s = label(&buf, .{ .reconnecting = .{ .attempt = 999_999 } });
+    const s = label(&buf, .{ .reconnecting = .{ .attempt = 999_999 } }, "winbox");
     // Either it fit or it fell back — never a truncated half-word.
     try testing.expect(std.mem.startsWith(u8, s, "Reconnecting"));
 }
@@ -443,11 +538,22 @@ test "width: the wordless state pays for no gap" {
     }
 }
 
+test "width: a long machine name cannot grow the pill past its ceiling" {
+    for (scales) |s| {
+        const m = Metrics.init(s);
+        const capped = width(m, .connected, m.max_text);
+        // A name measuring twice the ceiling buys nothing more.
+        try testing.expectEqual(capped, width(m, .connected, m.max_text * 2));
+        // ...and the ceiling is a real one: it is reached, not merely declared.
+        try testing.expect(capped > width(m, .connected, 0));
+    }
+}
+
 test "width: grows with the label, monotonically" {
     for (scales) |s| {
         const m = Metrics.init(s);
         var last: i32 = 0;
-        for ([_]i32{ 0, 10, 40, 120 }) |tw| {
+        for ([_]i32{ 0, 10, 40, 100 }) |tw| {
             const w = width(m, .reconnecting, tw);
             try testing.expect(w > last);
             last = w;
@@ -578,22 +684,25 @@ test "ink: the quiet modes tint the band, the action mode owns it" {
     );
 }
 
-test "ink: the button's hover is a change of FILL; the quiet states have none" {
-    const bar: Rgb = .{ .r = 0x1E, .g = 0x1E, .b = 0x1E };
-    const pal = chrome_theme.resolve(bar, .{ .r = 0x00, .g = 0x78, .b = 0xD4 });
-
-    // §2.2: hover is a fill, not a recolored glyph.
-    const rest = ink(pal.bar, pal, .disconnected, .normal);
-    const hover = ink(pal.bar, pal, .disconnected, .hover);
-    try testing.expect(channelDistance(rest.fill, hover.fill) > 0);
-
-    // The quiet modes are not buttons, so no state can light them. Asserted
-    // rather than assumed: a lit chip that does nothing when clicked is the
-    // defect this rule exists to prevent.
-    for ([_]Mode{ .connected, .reconnecting }) |mode| {
-        const base = ink(pal.bar, pal, mode, .normal);
-        for ([_]icon_button.State{ .hover, .pressed, .active }) |st| {
-            try testing.expectEqual(base, ink(pal.bar, pal, mode, st));
+test "ink: hover is a change of FILL, in every state, on either theme" {
+    // §2.2: hover is a fill, not a recolored glyph. And since T610 the quiet
+    // states light too, because clicking one opens the Activity Monitor — a
+    // control that never answers the pointer reads as decoration.
+    for ([_]Rgb{
+        .{ .r = 0x1E, .g = 0x1E, .b = 0x1E },
+        .{ .r = 0xF3, .g = 0xF3, .b = 0xF3 },
+    }) |bar| {
+        const pal = chrome_theme.resolve(bar, .{ .r = 0x00, .g = 0x78, .b = 0xD4 });
+        for ([_]Mode{ .connected, .reconnecting, .disconnected }) |mode| {
+            const rest = ink(pal.bar, pal, mode, .normal);
+            const hover = ink(pal.bar, pal, mode, .hover);
+            const pressed = ink(pal.bar, pal, mode, .pressed);
+            try testing.expect(channelDistance(rest.fill, hover.fill) > 0);
+            // Pressed is a FIRMER hover, not a second direction.
+            try testing.expect(
+                channelDistance(rest.fill, pressed.fill) >
+                    channelDistance(rest.fill, hover.fill),
+            );
         }
     }
 }
