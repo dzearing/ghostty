@@ -1,11 +1,11 @@
 {
     "guard":  "printclient-audit",
     "script":  "test/win32/printclient-audit.ps1",
-    "generated":  "2026-09-07T00:05:52-07:00",
-    "commit":  "4b40e00b8",
+    "generated":  "2026-09-07T01:24:27-07:00",
+    "commit":  "dcd7d1fcc",
     "uncommitted":  [
-                        "src/apprt/win32/viewer_content.zig",
-                        "src/apprt/win32/ViewerPane.zig"
+                        "src/apprt/win32/chrome_fanout.zig",
+                        "src/apprt/win32/win32.zig"
                     ],
     "files":  {
                   "src/apprt/win32/activity_actions.zig":  "9f5cfa4c1238fd023d5c8a1d80790ae21751be5f7389662e2fe1b790fef8ad63",
@@ -45,7 +45,7 @@
                   "src/apprt/win32/chooser_rows.zig":  "22429346bc431d82a1c5091e240962f613f385c829b257ed80d2532192971fff",
                   "src/apprt/win32/chooser_session_sort.zig":  "1316bcd3df281a34b77aeeb86ca107e651f41702b6d16df8422cd878d2c0b7a3",
                   "src/apprt/win32/chooser_sessions.zig":  "8e4d3c35b5a986ff07148fafabea2521d98d4681723611623b77b8786bc8014c",
-                  "src/apprt/win32/chrome_fanout.zig":  "3d7e8dc85a2c885a3c09dd059e3110af2cadef245c8da3d9c3095ba42ec04ce1",
+                  "src/apprt/win32/chrome_fanout.zig":  "8a2d0a770e17ac5b110ce074e787dcdb63eed6591591460690810566ecf0022a",
                   "src/apprt/win32/chrome_reposition.zig":  "de7f7cecfa590c49e2b83450bd2ab2ca202f94646923497be1111918a0d47450",
                   "src/apprt/win32/chrome_theme.zig":  "f371f9852b1ef7afb754589edd3b34083a7cf8293796b88431f1ef3fd6a7bd11",
                   "src/apprt/win32/class_redraw.zig":  "fe65e8f95a15d18a581c8bbdcdb00e1820d53e837c6a69645173eaae2545a04a",
@@ -215,7 +215,7 @@
                   "src/apprt/win32/webview2.zig":  "0dd69c13634a7006ed240a911a14cf8ecdbe5dbbe4f958acad010ca685d0b511",
                   "src/apprt/win32/webview2_iface.zig":  "cdfe46db3c405118ff363783a9dd825b7ad4a14d6722b3158328ab27759d4636",
                   "src/apprt/win32/webview2_paths.zig":  "125e4d497fe25e488b9f5a8aee4f0ffe34b7c6f377b0741a89c6781552bc9cf6",
-                  "src/apprt/win32/win32.zig":  "6832aa9712c69936c3eaa2a4b1556d96a4a50792d4d980b6a9d40662924514b1",
+                  "src/apprt/win32/win32.zig":  "6a09d5598231bd34f2d6397f307f7ec041ba65933b02b0022e9c0c117422a467",
                   "src/apprt/win32/Window.zig":  "b491411af0d7f254b27ab377befbad901747ee3128baed250db7a742d0de39f9",
                   "src/apprt/win32/window_active.zig":  "8aa79fb8bcc6ab7aab8f422fde48072728c99173edd607dbe70226f3ed8927e0",
                   "src/apprt/win32/window_chord.zig":  "d349bbbe70be2592b09a3945fc64d4f77d9f5fb9e85219d86f335bdebd6e6df0",

@@ -23927,3 +23927,54 @@ Green: `floor-lane.ps1 -Lane all` ALL LANES PASS (lib 52s, none 353s, win32
 413s, agent 408s). Re-stamped after the source edit: `viewer-close` 44,
 `viewer-nav-pin` 24, `printclient-audit` 8, `test-reach` 14 - all ALL PASS.
 P1 25 / P2 20 / P3 16 ALL PASS.
+
+## 2026-09-07 - a stray always-on-top bit on the dim wash or the scrollbar heals on resize again (T1413)
+
+Another process can leave `WS_EX_TOPMOST` stuck on one of the small layered
+popups Ghoztty glues to a pane - the dim wash over an inactive split, the themed
+scrollbar - and the popup then floats over whatever application the user
+switches to. That is T142's report, and its cure has always been that
+repositioning the popup re-checks and heals it. Measured under T607, two of
+overlay-zorder.ps1's sections said the cure was gone: a resize no longer cleared
+the bit on either popup.
+
+T1345 named itself the cause in its own commit message, and it was half right.
+It bought a real saving - a splitter drag was walking the desktop's z-order once
+per overlay per pane per mouse move, up to 64 `GetWindow` steps of three kernel
+transitions each - by having an already-visible popup skip its heal during a
+live layout pass. What it actually skipped was too much. The heal answers TWO
+questions, and only one of them is expensive: "has something got between this
+popup and its owner?" is the walk, and a pass that moves visible popups with
+`SWP_NOZORDER` genuinely cannot change that answer. "Has another process left a
+stray topmost bit on it?" is two `GetWindowLongW` reads, it is about a different
+process entirely, and nothing a pass on this thread knows says anything about
+it. Skipping both left the reposition path with no heal at all - and since T1393
+made a whole-window `WM_SIZE` a live pass too, the one gesture a user reaches
+for when chrome is floating over the wrong app was exactly the path that had
+stopped healing.
+
+So the decision is now scoped rather than binary: `chrome_fanout.shouldHeal`
+becomes `healScope`, returning `.full` or `.stray_only`, and
+`win32.healOverlayZOrderScoped` always does the style reads and the demotion and
+skips only the walk. A stray that WAS found is followed by the walk whatever the
+scope, because the demotion just moved the popup and its seating stopped being
+something the pass could vouch for. A popup coming back from hidden still heals
+in full - `SWP_SHOWWINDOW` really does lift it above unrelated windows - and
+`WM_ACTIVATE` is unchanged.
+
+Both halves are held. `overlay-zorder.ps1` ALL PASS (39): `F/dim` and
+`F/scrollbar` clear the injected bit again, section B still reproduces the defect
+as a negative control, and section E still preserves the propagated bit on a
+legitimately floated window, so the heal stays owner-relative. `drag-perf.ps1`
+ALL PASS (12) with the drag line reading `chrome_heals=0 chrome_skipped=26 ...
+verdict=smooth` at 8 panes - the walk is still declined for every tick of a
+drag, which is the whole saving.
+
+Filed T1415: `overlay-zorder.ps1` is not a row in `guard-due.ps1`'s coverage
+table, so editing the heal path flags nothing. T1345 was a careful change with
+green floor lanes; the harness that owns this claim is the only thing that would
+have caught it at the boundary, and nobody was asked to run it. The regression
+surfaced a week later, by hand.
+
+Green: `floor-lane.ps1 -Lane all` ALL LANES PASS (lib, none 313s, win32 418s,
+agent 418s). Re-stamped: `drag-perf` 12, `printclient-audit` 8, `test-reach` 14.

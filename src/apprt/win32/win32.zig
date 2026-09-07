@@ -2421,14 +2421,33 @@ pub fn setTopmost(hwnd: HWND, want: bool) bool {
 /// `owner` may be a child window (the pane overlays are owned by the surface
 /// HWND); the z-order — and the topmost bit — live on its top-level ancestor.
 pub fn healOverlayZOrder(hwnd: HWND, owner: HWND) void {
-    chrome_fanout.noteHeal();
+    healOverlayZOrderScoped(hwnd, owner, .full);
+}
+
+/// `healOverlayZOrder`, told how much of itself to do. See
+/// `chrome_fanout.HealScope`: `.full` is the historical behavior, `.stray_only`
+/// keeps the two style reads that catch another process's stray topmost and
+/// drops the z-order walk that a live layout pass cannot have invalidated.
+///
+/// A stray that WAS there is followed by the walk regardless of scope: the
+/// demotion just moved the popup, so its seating is exactly the question that
+/// has stopped being answerable from what the pass knows.
+fn healOverlayZOrderScoped(
+    hwnd: HWND,
+    owner: HWND,
+    scope: chrome_fanout.HealScope,
+) void {
     const root = GetAncestor(owner, GA_ROOT) orelse owner;
     const root_ex = GetWindowLongW(root, GWL_EXSTYLE);
 
     const flags = SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE;
-    if (overlay_zorder.isStray(GetWindowLongW(hwnd, GWL_EXSTYLE), root_ex)) {
-        _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+    const stray = overlay_zorder.isStray(GetWindowLongW(hwnd, GWL_EXSTYLE), root_ex);
+    if (stray) _ = SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+    if (scope == .stray_only and !stray) {
+        chrome_fanout.noteHealSkipped();
+        return;
     }
+    chrome_fanout.noteHeal();
     if (seatedAboveOwner(hwnd, root)) return;
 
     // Insert AFTER whatever is directly above the owner (null = top of the
@@ -2450,20 +2469,24 @@ pub fn healOverlayZOrder(hwnd: HWND, owner: HWND) void {
 /// already-visible popups with `SWP_NOZORDER`, so it did not touch the
 /// ordering, and nothing else runs on this thread while it does.
 ///
-/// So during a live layout pass an already-shown overlay skips the walk.
-/// A popup coming back from hidden still heals — `SWP_SHOWWINDOW` lifts it
-/// above unrelated windows, which is the T142 case the heal exists for — and
-/// `WM_ACTIVATE` still heals every overlay a window owns, which is where a
-/// stray topmost set by another process is caught either way.
+/// So during a live layout pass an already-shown overlay skips the WALK — and
+/// only the walk (T1413). The stray-topmost half is two `GetWindowLongW` reads
+/// and it is about what ANOTHER process did, which a pass on this thread knows
+/// nothing about, so it runs on every reposition exactly as it always did.
+/// T1345 dropped it along with the walk, and since a whole-window `WM_SIZE` is a
+/// live pass too (T1393), that left the reposition path unable to clear a stray
+/// bit at all: resizing the window — the gesture a user reaches for when a
+/// background window's chrome is floating over the app in front — stopped
+/// healing a dim overlay or a scrollbar.
+///
+/// A popup coming back from hidden still heals in full — `SWP_SHOWWINDOW` lifts
+/// it above unrelated windows, which is the other T142 case — and `WM_ACTIVATE`
+/// still heals every overlay a window owns whichever way this went.
 pub fn healOverlayZOrderAfterMove(hwnd: HWND, owner: HWND, was_shown: bool) void {
-    if (!chrome_fanout.shouldHeal(.{
+    healOverlayZOrderScoped(hwnd, owner, chrome_fanout.healScope(.{
         .suppressed = chrome_fanout.state.suppressed(),
         .was_shown = was_shown,
-    })) {
-        chrome_fanout.noteHealSkipped();
-        return;
-    }
-    healOverlayZOrder(hwnd, owner);
+    }));
 }
 
 // -----------------------------------------------------------------------

@@ -59,8 +59,10 @@ pub const Counts = struct {
     /// Z-order re-checks actually performed. Each one walks the z-order with
     /// `GetWindow`, which is a kernel transition per step.
     heals: u32 = 0,
-    /// Heals `shouldHeal` declined, because the popup was already on screen
-    /// and the pass cannot have moved it in the z-order.
+    /// Z-order walks `healScope` declined, because the popup was already on
+    /// screen and the pass cannot have moved it in the z-order. The cheap
+    /// stray-topmost check still ran on every one of these (T1413) - what was
+    /// skipped is the walk, not the heal.
     heals_skipped: u32 = 0,
 
     pub fn reset(self: *Counts) void {
@@ -78,26 +80,47 @@ pub const Counts = struct {
     }
 };
 
-/// Whether a reposition of a layered overlay has to re-check its z-order.
+/// How much of the z-order heal a reposition of a layered overlay has to do.
+pub const HealScope = enum {
+    /// Clear a stray `WS_EX_TOPMOST`, then walk the z-order and re-seat the
+    /// popup above its owner if something has got between them.
+    full,
+    /// The cheap half only: read the two extended styles and demote a stray
+    /// topmost. No walk — unless the stray was actually there, in which case
+    /// the demotion moved the popup and the seating has to be re-checked.
+    stray_only,
+};
+
+/// How much of the z-order re-check a reposition of a layered overlay owes.
 ///
-/// The heal exists for two states an overlay can get into (T142): a stray
-/// `WS_EX_TOPMOST` set by another process, and the lift `SWP_SHOWWINDOW` gives
-/// a popup that was hidden. Neither can happen *inside* a layout pass that is
-/// only moving already-visible popups with `SWP_NOZORDER` — the z-order is not
-/// an input to that pass and nothing else runs on this thread while it does.
+/// The heal answers two questions (T142), and they do not cost the same. "Has
+/// another process left a stray `WS_EX_TOPMOST` on this popup?" is two
+/// `GetWindowLongW` reads. "Has something got between the popup and its owner?"
+/// walks the desktop's z-order with `GetWindow`, up to 64 steps of three kernel
+/// transitions each, and THAT is what a splitter drag was paying once per
+/// overlay per pane per mouse move.
 ///
-/// So during a suppressed pass an already-shown overlay skips the walk, and a
-/// hidden→shown transition still heals, which is the case that needs it. A
-/// pass that is not suppressed heals exactly as it always did, and `WM_ACTIVATE`
-/// still heals every overlay this window owns whichever way this went.
-pub fn shouldHeal(in: struct {
+/// Only the second question has an answer a live layout pass cannot change: the
+/// pass moves already-visible popups with `SWP_NOZORDER`, so it does not touch
+/// the ordering, and nothing else runs on this thread while it does. The FIRST
+/// question is about another process and is therefore always live — T1345 threw
+/// it out with the walk, and a stray bit injected onto a dim overlay or a
+/// scrollbar then had no heal left on the reposition path at all (T1413).
+///
+/// So a suppressed pass over an already-shown overlay keeps the cheap check and
+/// drops the walk; a hidden→shown transition heals in full, because
+/// `SWP_SHOWWINDOW` really does lift a popup above unrelated windows; and a pass
+/// that is not suppressed heals exactly as it always did. `WM_ACTIVATE` still
+/// heals every overlay a window owns whichever way this went.
+pub fn healScope(in: struct {
     /// A live layout pass is in progress (`Window.layoutSplitsLive`).
     suppressed: bool,
     /// The overlay was already visible before this reposition.
     was_shown: bool,
-}) bool {
-    if (!in.suppressed) return true;
-    return !in.was_shown;
+}) HealScope {
+    if (!in.suppressed) return .full;
+    if (!in.was_shown) return .full;
+    return .stray_only;
 }
 
 /// Whether a layered popup has to be re-blitted, given what it looked like
@@ -212,16 +235,42 @@ pub fn noteHealSkipped() void {
 test "a live pass skips the z-order walk for overlays that were already up" {
     // The whole claim the suppression rests on: an already-shown popup being
     // moved with SWP_NOZORDER cannot have changed places.
-    try testing.expect(!shouldHeal(.{ .suppressed = true, .was_shown = true }));
+    try testing.expectEqual(
+        HealScope.stray_only,
+        healScope(.{ .suppressed = true, .was_shown = true }),
+    );
 
     // A popup coming back from hidden is exactly the case the heal exists for
     // (SWP_SHOWWINDOW lifts it above unrelated windows), so it still heals
     // even mid-drag.
-    try testing.expect(shouldHeal(.{ .suppressed = true, .was_shown = false }));
+    try testing.expectEqual(
+        HealScope.full,
+        healScope(.{ .suppressed = true, .was_shown = false }),
+    );
 
     // Outside a live pass nothing is skipped, whatever the popup's state.
-    try testing.expect(shouldHeal(.{ .suppressed = false, .was_shown = true }));
-    try testing.expect(shouldHeal(.{ .suppressed = false, .was_shown = false }));
+    try testing.expectEqual(
+        HealScope.full,
+        healScope(.{ .suppressed = false, .was_shown = true }),
+    );
+    try testing.expectEqual(
+        HealScope.full,
+        healScope(.{ .suppressed = false, .was_shown = false }),
+    );
+}
+
+test "the stray-topmost check survives the suppression (T1413)" {
+    // T1345 skipped the whole heal during a live pass, which took the stray
+    // check out with the walk: a WS_EX_TOPMOST another process left on a dim
+    // overlay or a scrollbar had nothing to clear it any more, and a window
+    // resize - the one gesture a user reaches for when chrome is floating over
+    // the wrong app - is a live pass since T1393. No scope skips it.
+    for ([_]bool{ true, false }) |suppressed| {
+        for ([_]bool{ true, false }) |was_shown| {
+            const scope = healScope(.{ .suppressed = suppressed, .was_shown = was_shown });
+            try testing.expect(scope == .full or scope == .stray_only);
+        }
+    }
 }
 
 test "a blit is skipped only when the same pixels at the same size would land" {
