@@ -23741,3 +23741,37 @@ a byte and every packed pixel key collapses to its blue channel.
 `chooser-link-hover.ps1` packs pixels exactly that way and has been measuring a
 third of what its comment claims; it still discriminates the underline it was
 written for, which is why nothing has been failing.
+
+## 2026-09-06 - a document pane keeps the id scripts point at when the app restarts (T591)
+
+Every pane has a permanent id. A terminal pane kept its across a quit and
+relaunch; a viewer pane - a rendered markdown file, a live page, a diff - came
+back with a brand-new one, so any script or agent holding `--target=<id>` for a
+preview pane silently stopped finding it after every restart, with nothing
+saying why.
+
+The restore built a viewer from three recorded values - where it was pointed,
+where its Home button went, which directory it was opened from - and not its
+identity, so `Window.createViewerPane` kept the id `ViewerPane.create` had just
+generated a moment earlier. The terminal side has had the answer since T113:
+`ViewerPane.Open` now carries a `pane_id`, `ViewerPane.adoptPaneId` takes it
+(dropping a malformed one rather than producing a pane that answers to garbage)
+BEFORE the host window, the navigation or `start`, and `restoreViewerOpen` hands
+back `leaf.pane_id` the way `restoreAttachOverride` always has. The manifest was
+already recording it, so nothing on the capture side had to change.
+
+`docs/claude/cli.md` promised this all along - "stable for the pane's whole
+life... restored on app relaunch" - which is why the gap needed no argument, only
+a fix; the section now says the viewer case out loud.
+
+Section M of `test\win32\viewer-restore.ps1` is the coverage, and it was shown
+red before it was shown green: with the adoption line reverted the script scores
+`0/4 kept` and names all four regenerated ids, while its M2 control (the terminal
+in the same window) stays green, so the failure is provably viewer-specific.
+M3 then reloads the restored pane through its pre-restart id.
+
+Filed on the way past: T1410. In that negative-control run M3 exited 0 anyway,
+against a pane whose id no longer named anything - while the same script's new M4
+control proves that a well-formed id naming nothing IS refused with exit 1. Two
+answers to the same question is a bug, and until it is understood M3 only carries
+weight beside M4.

@@ -1911,6 +1911,9 @@ fn createViewerPane(self: *Window, open: ViewerPane.Open) !*ViewerPane {
     const alloc = self.app.core_app.alloc;
     const hwnd = self.hwnd orelse return error.WindowClosing;
     const viewer = try ViewerPane.create(alloc, self);
+    // T591: before the host window, the navigation and `start` — a restored
+    // viewer must never be observable under the id `create` just generated.
+    viewer.adoptPaneId(open.pane_id);
     errdefer {
         viewer.deinit(alloc);
         alloc.destroy(viewer);

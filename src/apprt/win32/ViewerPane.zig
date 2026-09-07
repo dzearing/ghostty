@@ -741,6 +741,22 @@ pub fn create(alloc: Allocator, parent: *Window) Allocator.Error!*ViewerPane {
     return self;
 }
 
+/// Adopt a restored pane id in place of the one `create` generated (T591).
+///
+/// Call BEFORE the pane is published anywhere — before its host window exists,
+/// before it navigates, before `+list --json` can see it — so nothing ever
+/// observes the generated id for a pane that is restoring. A malformed value is
+/// dropped rather than producing a pane that answers to garbage, exactly as
+/// `Surface.init` treats its own override.
+pub fn adoptPaneId(self: *ViewerPane, id: ?[]const u8) void {
+    const pid = id orelse return;
+    if (!pane_id_mod.isValid(pid)) {
+        log.warn("session-restore: ignoring malformed viewer pane id '{s}'", .{pid});
+        return;
+    }
+    @memcpy(&self.pane_id, pid[0..pane_id_mod.len]);
+}
+
 pub fn deinit(self: *ViewerPane, alloc: Allocator) void {
     // Before anything else: the watcher owns a THREAD that posts at this pane's
     // host window, and `stop` joins it. Every teardown below — the host window,
@@ -1924,6 +1940,17 @@ pub const Open = struct {
 
     /// The directory the pane was opened from (`--working-directory`).
     origin_directory: ?[]const u8 = null,
+
+    /// The pane id to ADOPT instead of the freshly generated one (T591): the
+    /// session-layout manifest's recorded id for the viewer leaf this pane is
+    /// restoring. A terminal leaf already gets this through
+    /// `Surface.Overrides.pane_id` (T113); without the viewer twin a document
+    /// or web pane comes back from every relaunch under a NEW id, so a script
+    /// or agent holding `--target=<id>` silently stops finding it. Borrowed for
+    /// the open call only (copied into the pane's own buffer); a malformed
+    /// value is ignored and the generated id stands. Null ⇒ keep the generated
+    /// one, which is what every non-restore open path wants.
+    pane_id: ?[]const u8 = null,
 
     /// The parked `window.open()` this pane is being built to adopt (T163).
     /// Non-null ONLY on the popup path. The pane takes its own reference on it
@@ -5919,6 +5946,29 @@ test "viewer pane id is a valid pane id" {
     var buf: pane_id_mod.Buf = undefined;
     const id = pane_id_mod.format(&buf, [_]u8{7} ** 16);
     try std.testing.expect(pane_id_mod.isValid(id));
+}
+
+test "T591: a restored viewer adopts its recorded pane id, and only a valid one" {
+    var pane: ViewerPane = .{};
+    const generated = pane_id_mod.generate(&pane.pane_id);
+    var generated_copy: pane_id_mod.Buf = undefined;
+    @memcpy(&generated_copy, generated[0..pane_id_mod.len]);
+
+    // Null (every non-restore open path): the generated id stands.
+    pane.adoptPaneId(null);
+    try testing.expectEqualStrings(&generated_copy, pane.paneId());
+
+    // Garbage from a corrupt manifest: dropped, so the pane still answers to a
+    // well-formed id rather than to nothing addressable.
+    pane.adoptPaneId("not-a-uuid");
+    try testing.expectEqualStrings(&generated_copy, pane.paneId());
+    try testing.expect(pane_id_mod.isValid(pane.paneId()));
+
+    // The restore case: the recorded id replaces the generated one, so
+    // `--target=<id>` still names this pane after the app was relaunched.
+    const recorded = "1E5F0A2C-3D4B-4A6E-8F90-ABCDEF012345";
+    pane.adoptPaneId(recorded);
+    try testing.expectEqualStrings(recorded, pane.paneId());
 }
 
 test "T594: a test build never hands a shell-open to the OS" {

@@ -2978,6 +2978,31 @@ test "leafAttachSessionId applies the one attach rule (T411 counts what restore 
     try std.testing.expect(leafAttachSessionId(.{}, &set) == null);
 }
 
+test "restoreViewerOpen carries the recorded pane id across the restore (T591)" {
+    // The defect this fixes: the open carried location/home/origin but not the
+    // identity, so `Window.createViewerPane` kept the id it had just generated
+    // and the pane came back under a new one on every relaunch.
+    const open = restoreViewerOpen(.{
+        .kind = "viewer",
+        .pane_id = "1E5F0A2C-3D4B-4A6E-8F90-ABCDEF012345",
+        .viewer_location = "https://example.com/two",
+        .viewer_home_location = "https://example.com/one",
+        .viewer_origin_directory = "D:\\work",
+    });
+    try std.testing.expectEqualStrings("1E5F0A2C-3D4B-4A6E-8F90-ABCDEF012345", open.pane_id.?);
+    // The rest of the open is unchanged by this — a restored pane still comes
+    // back where it had navigated to, homed where it started.
+    try std.testing.expectEqualStrings("https://example.com/two", open.location);
+    try std.testing.expectEqualStrings("https://example.com/one", open.home_location.?);
+    try std.testing.expectEqualStrings("D:\\work", open.origin_directory.?);
+
+    // A leaf that recorded no id (a manifest written by an older build) simply
+    // keeps the generated one rather than failing the restore.
+    const idless = restoreViewerOpen(.{ .kind = "viewer" });
+    try std.testing.expect(idless.pane_id == null);
+    try std.testing.expectEqualStrings("about:blank", idless.location);
+}
+
 test "AttachProbe.skip_live_holders withholds sessions a live viewer holds (T851)" {
     const alloc = std.testing.allocator;
 
@@ -3974,6 +3999,12 @@ fn decodeLeafSnapshot(self: *App, leaf: session_layout.Leaf) ?Snapshot {
 fn restoreViewerOpen(leaf: session_layout.Leaf) ViewerPane.Open {
     return .{
         .location = leaf.viewer_location orelse "about:blank",
+        // T591: hand back the RECORDED id, the same rule `restoreAttachOverride`
+        // applies to a terminal leaf (T113). A viewer has no shell holding
+        // `$GHOZTTY_PANE_ID`, but everything OUTSIDE the pane does — a script's
+        // `--target=<id>`, a `+reload`, the `+list --json` join key — and a
+        // freshly generated id breaks all of them once per app restart.
+        .pane_id = leaf.pane_id,
         // Restore-only: without this the pane would re-home to wherever it had
         // navigated by capture time, quietly moving what Home means.
         .home_location = leaf.viewer_home_location,

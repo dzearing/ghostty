@@ -483,7 +483,8 @@ Every pane has a **stable, ghoztty-owned pane id** (a UUID):
   --target=$GHOZTTY_PANE_ID …` works from inside any local pane.
 - Stable for the pane's whole life: persisted in the session-layout manifest and
   restored on app relaunch (session-persistence panes keep the same id AND the
-  same baked env), preserved across remote reconnect swaps, and re-applied to
+  same baked env; a **viewer** pane keeps its id across the same restore too,
+  having no shell env to bake), preserved across remote reconnect swaps, and re-applied to
   the respawned shell when the agent relaunches a session after its own restart
   (the RELAUNCH carries the pane's env/TERM/argv).
 

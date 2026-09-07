@@ -151,6 +151,20 @@ function Wait-Panes($target, $count, $timeoutSec = 30) {
     return @(Get-PaneList $target)
 }
 
+# Every viewer pane in this run's three windows, keyed by the location it is
+# showing (T591). The four locations are distinct by construction, so the map is
+# a stable join key across the app restart - which pane ids, being the thing
+# under test, are not.
+function Viewer-IdsByUrl {
+    $map = @{}
+    foreach ($t in @('vr', 'vrmiss', 'vrweb')) {
+        foreach ($p in @(Get-PaneList $t)) {
+            if ($p.type -eq 'viewer' -and $p.url) { $map[[string]$p.url] = [string]$p.id }
+        }
+    }
+    return $map
+}
+
 function Manifest-Path($tmp) { return (Join-Path $tmp 'ghoztty\session-layout-debug.json') }
 
 function Read-Manifest($tmp) {
@@ -384,6 +398,19 @@ try {
     Assert ($missLeaves.Count -eq 1 -and $missLeaves[0].viewer_location -eq $missingFile) `
         'C2 it recorded the missing file as its location'
 
+    # ---- M (T591): the pane IDS the restore must hand back ------------------
+    # Recorded here, while the panes the user built are still the live ones. A
+    # viewer's id is what a script holds (`--target=<id>`), what `+list --json`
+    # joins on, and what the manifest records for the leaf; before T591 the
+    # restore passed a viewer's location and home but not its identity, so
+    # `Window.createViewerPane` kept the id it had just generated and every
+    # relaunch renamed the pane out from under whoever was pointing at it.
+    $preViewerIds = Viewer-IdsByUrl
+    $preTermPane = @(@(Get-PaneList 'vr') | Where-Object { $_.type -ne 'viewer' })
+    $preTermId = if ($preTermPane.Count -eq 1) { [string]$preTermPane[0].id } else { '' }
+    Assert ($preViewerIds.Count -eq 4) `
+        "M0 all four viewer panes reported a pane id pre-quit (got $($preViewerIds.Count)/4)"
+
     # ---- kill the app; the agent keeps the terminal's PTY --------------------
     $beforeIds = @(Alive-Ids)
     Assert ($beforeIds.Count -ge 1) "at least one agent session is alive pre-quit (got $($beforeIds.Count))"
@@ -427,6 +454,46 @@ try {
         Assert ($missPost[0].url -eq $missingFile) `
             "G2 it is pointed at the missing file, error card and all (got '$($missPost[0].url)')"
     }
+
+    # ---- M (T591): every restored viewer kept its pane id -------------------
+    Say '== M: the restored viewers kept their pane ids'
+    $postViewerIds = Viewer-IdsByUrl
+    $kept = @()
+    $changed = @()
+    foreach ($u in @($preViewerIds.Keys)) {
+        $before = [string]$preViewerIds[$u]
+        $after = [string]$postViewerIds[$u]
+        if ($after -and $after -eq $before) { $kept += @($u) }
+        else { $changed += @("$u ($before -> $after)") }
+    }
+    Assert ($changed.Count -eq 0) `
+        "M1 every restored viewer answers to its recorded pane id ($($kept.Count)/$($preViewerIds.Count) kept; changed: $($changed -join '; '))"
+    if ($preTermId) {
+        $postTermPane = @(@(Get-PaneList 'vr') | Where-Object { $_.type -ne 'viewer' })
+        $postTermId = if ($postTermPane.Count -eq 1) { [string]$postTermPane[0].id } else { '' }
+        # The control (T113): the terminal in the SAME window has always kept
+        # its id, so an M1 failure is specific to viewers rather than a restore
+        # that rebuilt this window from scratch.
+        Assert ($postTermId -eq $preTermId) `
+            "M2 control: the terminal pane in the same window kept its id ($preTermId -> $postTermId)"
+    }
+    # The consequence M1 exists for: an id is only worth keeping if it still
+    # ADDRESSES the pane. A stale id resolves nothing and `+reload` exits
+    # non-zero, which is exactly what a script holding one used to hit.
+    # The doc viewer rather than the web one, so this reload stays out of the
+    # ordinal oracle section L reads off `vrweb`.
+    $docId = [string]$preViewerIds[$docFile]
+    if ($docId) {
+        $r = Invoke-Verb @('+reload', "--target=$docId")
+        Assert ($r.Code -eq 0) `
+            "M3 --target=<the pre-restart pane id> still resolves the restored viewer (exit $($r.Code))"
+    }
+    # M3's control. A well-formed pane id that names nothing must be REFUSED, or
+    # M3 is green for every build including one that kept no id at all - which is
+    # exactly what the T591 negative control observed before this line existed.
+    $rb = Invoke-Verb @('+reload', '--target=00000000-0000-4000-8000-000000000000')
+    Assert ($rb.Code -ne 0) `
+        "M4 control: a pane id that names nothing is refused (exit $($rb.Code)) $($rb.Out.Trim())"
 
     # ---- H: the terminal RE-ATTACHED ---------------------------------------
     Say '== H: the terminal in the mixed window re-attached'
