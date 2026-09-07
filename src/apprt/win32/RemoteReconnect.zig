@@ -833,6 +833,14 @@ fn applySwap(
     // retired transport's dying transitions keep waking the ladder.
     install(window);
 
+    // A panel BORROWING the transport we just retired would sample it forever
+    // (T614): it is deliberately kept alive, so every sample fails and the card
+    // reads "Couldn't connect" beside a window that has recovered. Hand it the
+    // new one the same way the panes were handed theirs — after the re-attach
+    // and after `install`, so the rebind can never race the state handler going
+    // in.
+    if (old) |o| ActivityMonitor.rebindBorrowed(o.conn(), fresh.conn());
+
     rc.attempt = 0;
     rc.due_ms = 0;
     rc.manual = false;

@@ -380,6 +380,63 @@ pub fn releaseBorrowed(conn: *remote_connection.Connection) void {
     }
 }
 
+/// A window has SWAPPED transports (T614). Any panel borrowing the old one has
+/// to follow it onto the new one, or it samples a retired connection forever.
+///
+/// `RemoteReconnect.retire` deliberately leaves the old pointer valid — nothing
+/// refcounts it, so it is kept until window teardown — which means a panel
+/// holding it is safe and permanently wrong: every sample fails and the card
+/// reads "Couldn't connect" while the window beside it is working. That is a
+/// confident wrong answer, which is worse than a missing one.
+///
+/// Called from `applySwap` AFTER the panes are re-attached and the new state
+/// handler is installed, the same ordering `releaseBorrowed` keeps. What it does
+/// NOT do is shut the old connection down or join the sample worker: the worker
+/// may be parked on an RPC the retiring window is already cutting loose in its
+/// own thread, and joining it here would block the GUI for the whole rpc
+/// timeout. Retiring the generation is what makes that worker's answer
+/// droppable instead of adoptable, exactly as a source switch does.
+pub fn rebindBorrowed(
+    old_conn: *remote_connection.Connection,
+    new_conn: *remote_connection.Connection,
+) void {
+    if (old_conn == new_conn) return;
+    for (ActivityMonitor.open_wins) |maybe| {
+        const self = maybe orelse continue;
+        const rc = self.remote_conn orelse continue;
+        if (rc.owned() or rc.conn != old_conn) continue;
+
+        log.info(
+            "activity monitor: borrowed connection swapped; following the window source={s}",
+            .{self.source.label()},
+        );
+        // No further callback can fire from the old transport once this
+        // returns (`connection.zig`'s unsubscribe contract).
+        rc.conn.unsubscribeMetrics();
+
+        // Anything the parked worker parks describes the retired transport.
+        self.source_gen +%= 1;
+        self.metrics_mutex.lock();
+        self.last_metrics = null;
+        self.metrics_mutex.unlock();
+
+        self.remote_conn = .{ .conn = new_conn, .dialed = null };
+        self.beginMetrics();
+
+        if (self.closing) continue;
+        // The panel is not broken any more, so it must stop saying it is: back
+        // to "Loading…" until the first sample over the new link lands.
+        self.refresh_failed = false;
+        self.loading = true;
+        self.logged_sample_error = false;
+        self.rebuildCards();
+        _ = w32.InvalidateRect(self.hwnd, null, 0);
+        // A no-op while the old worker is still parked; the timer's next tick
+        // picks it up either way.
+        self.kickSample();
+    }
+}
+
 /// Stop everything the current source owns, leaving the panel ready to begin a
 /// new one. Reusable by `switchTo` — unlike `close`, this leaves the window,
 /// the timer and the panel itself alive.

@@ -126,6 +126,7 @@ pub const startDial = dial_mod.startDial;
 pub const beginMetrics = dial_mod.beginMetrics;
 pub const borrowFromWindow = dial_mod.borrowFromWindow;
 pub const releaseBorrowed = dial_mod.releaseBorrowed;
+pub const rebindBorrowed = dial_mod.rebindBorrowed;
 pub const teardownSource = dial_mod.teardownSource;
 pub const resetForNewSource = dial_mod.resetForNewSource;
 

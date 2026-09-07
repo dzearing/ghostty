@@ -49,6 +49,15 @@
 #      told to let go rather than reading freed memory, the APP SURVIVES the
 #      close (T613), and the panel stays open.
 #
+# T614 uses the same borrow, one state further on:
+#
+#   J. when the borrowed-from WINDOW reconnects - its agent died and came back,
+#      so the swap retires the transport the panel is holding - the panel
+#      FOLLOWS the window onto the new one and resumes sampling on its own, with
+#      no reopen. The oracle is the NEW agent's root pid; a panel left on the
+#      retired transport cannot produce it, and one that re-dialed its way back
+#      fails the dial count beside it.
+#
 # WHY B NEEDS AN ORACLE AT ALL. The loopback agent enumerates the same box, so
 # "the table populated" proves nothing: a panel that silently sampled THIS
 # process would produce an identical-looking table under another machine's
@@ -740,6 +749,74 @@ try {
     cmd /c "`"$exe`" +send-keys --target=remact `"echo activity-after-borrow`" Enter > nul 2>&1" | Out-Null
     Start-Sleep -Seconds 3
     Assert ((Read-Pane 'remact') -match 'activity-after-borrow') 'G3 the remote pane still round-trips while the panel borrows its connection'
+
+    # --- J. The window RECONNECTS underneath the borrow (T614) --------------
+    # The panel is borrowing this window's live transport. Kill the agent and
+    # bring it back: the window's ladder redials, `applySwap` re-attaches the
+    # panes on the NEW transport and RETIRES the old one - deliberately kept
+    # alive so nothing dangles, and therefore permanently dead. A panel still
+    # holding it samples a corpse and reads "Couldn't connect" forever, beside a
+    # window that is working. It has to follow the window instead.
+    #
+    # The oracle is the same root pid the rest of this script leans on, and it
+    # is the load-bearing half: the NEW agent's pid. A panel that merely stopped
+    # saying "failed" would be indistinguishable from one that came back, and a
+    # panel still on the retired transport cannot produce this number at all.
+    # The dial count is the second oracle - following a window is a rebind, not
+    # a dial, so a panel that re-dialed its way back must not pass either.
+    $dialsBeforeJ = @(Select-String -Path $errlog -Pattern 'activity monitor: dialing ').Count
+    $stateBeforeJ = Get-PanelState
+    Assert ($null -ne $stateBeforeJ -and $stateBeforeJ.Root -eq $agentPid) `
+        "J the panel is sampling through the OLD agent ($agentPid) before the drop"
+
+    Stop-Process -Id $script:agent.Id -Force -ErrorAction SilentlyContinue
+    $script:agent = $null
+    Start-Sleep -Milliseconds 800
+    $env:GHOSTTY_AGENT_LOCK = Join-Path $tmp 'agent2.lock'
+    $script:agent = Start-Process -FilePath $agentExe `
+        -ArgumentList '--listen', "127.0.0.1:$Port", '--headless' -PassThru -WindowStyle Hidden
+    Start-Sleep -Seconds 2
+    if ($script:agent.HasExited) { Write-Host 'SETUP FAIL: the replacement agent died at launch'; exit 1 }
+    $agentPid2 = $script:agent.Id
+    Write-Host "OK    J: replacement agent pid=$agentPid2 on 127.0.0.1:$Port"
+
+    # The automatic ladder reaches an agent that owns none of this window's
+    # sessions, which is terminal by design (T611). The user's Reconnect click
+    # is what asks for the window back, and it is the click that swaps - the
+    # WM_NCLBUTTONDOWN/UP pair Windows posts on HTOBJECT, read by hit CODE.
+    $HTOBJECT = 19; $WM_NCLBUTTONDOWN = 0x00A1; $WM_NCLBUTTONUP = 0x00A2
+    $swapped = $false
+    foreach ($tryJ in 1..12) {
+        Send-TestRawMessage -Window $remoteTop -Message $WM_NCLBUTTONDOWN -WParam ([IntPtr]$HTOBJECT) -LParam ([IntPtr]0) | Out-Null
+        Start-Sleep -Milliseconds 150
+        Send-TestRawMessage -Window $remoteTop -Message $WM_NCLBUTTONUP -WParam ([IntPtr]$HTOBJECT) -LParam ([IntPtr]0) | Out-Null
+        foreach ($w in 1..10) {
+            Start-Sleep -Milliseconds 700
+            if (Select-String -Path $errlog -Pattern 'remote reconnect:.*is back on a fresh transport' -Quiet) { $swapped = $true; break }
+        }
+        if ($swapped) { break }
+    }
+    Assert $swapped 'J the window reconnected onto a fresh transport'
+
+    if ($swapped) {
+        Assert (Select-String -Path $errlog -Pattern 'borrowed connection swapped' -Quiet) `
+            'J1 the swap told the borrowing panel to follow the window'
+
+        $jState = $null
+        $deadlineJ = (Get-Date).AddSeconds(45)
+        while ((Get-Date) -lt $deadlineJ) {
+            $s = Get-PanelState
+            if ($null -ne $s -and $s.Source -eq "127.0.0.1:$Port" -and $s.Total -gt 0 -and $s.Root -eq $agentPid2) { $jState = $s; break }
+            Start-Sleep -Milliseconds 500
+        }
+        $seen = if ($null -ne $jState) { $jState.Root } else { (Get-PanelState).Root }
+        Assert ($null -ne $jState) `
+            "J2 the panel resumed sampling through the NEW agent ($agentPid2) with no reopen (root seen: $seen)"
+
+        Assert ((@(Select-String -Path $errlog -Pattern 'activity monitor: dialing ')).Count -eq $dialsBeforeJ) `
+            'J3 it followed the window rather than dialing its own connection'
+        Assert ((@(Get-Panels)).Count -ge 1) 'J3 the panel is the same one, never reopened'
+    }
 
     # G4. Closing the WINDOW while the panel borrows. The window frees the
     # transport; a panel still sampling through it would be reading freed
