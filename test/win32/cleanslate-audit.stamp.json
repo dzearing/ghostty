@@ -1,11 +1,10 @@
 {
     "guard":  "cleanslate",
     "script":  "test/win32/cleanslate-audit.ps1",
-    "generated":  "2026-09-07T00:54:11-07:00",
-    "commit":  "383473632",
+    "generated":  "2026-09-07T02:10:17-07:00",
+    "commit":  "93595cf6b",
     "uncommitted":  [
-                        "test/win32/float-on-top.ps1",
-                        "test/win32/overlay-zorder.ps1"
+                        "test/win32/msg-timer-ids.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "944e54bda392aa61007ee23280c6bb9767ed2e661f77f5157ca035dbe9b6e4ea",
@@ -209,6 +208,7 @@
                   "test/win32/menu-f10-binding.ps1":  "8c77c7eb953af10168b12742133c673281299ca715870a69d3a17864f5ea687c",
                   "test/win32/merge-terminology.ps1":  "c6e28d4f5dac63e423b492c7e854a11ae24e754ddf56587a8dd6cbeeb5efa6eb",
                   "test/win32/mouse-nc-routing.ps1":  "0e9c09958e46b3444898c47fdcadfbd1c509854b6c07e5bb8c5086abd2f80969",
+                  "test/win32/msg-timer-ids.ps1":  "ec583de0fee83ffd3e9df2e2562483fa534a132cce4dc4cabecfceebb9578ef1",
                   "test/win32/msi-upgrade.ps1":  "596f855376fa9af1f3ed137c55c060c10e872f2c6555b20b774688f0ca28e425",
                   "test/win32/new-window-cwd.ps1":  "0c35d0adaf39cdd7fa733c5e2912f1cb4dce1f7c12f05ed63b90a851acd5c440",
                   "test/win32/notification-click-focus.ps1":  "138c9a941340d6a5256da7b32bbf8427fa7873bdc7950f3247de169a2f1d27b9",

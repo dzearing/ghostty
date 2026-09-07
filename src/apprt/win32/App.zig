@@ -61,6 +61,7 @@ const install_maintenance = @import("install_maintenance.zig");
 const install_restart = @import("install_restart.zig");
 const utf16_text = @import("utf16_text.zig");
 const tray_notify = @import("tray_notify.zig");
+const msg_timer = @import("msg_timer.zig");
 const orphan_notify = @import("orphan_notify.zig");
 const session_layout = @import("session_layout.zig");
 const layout_refresh = @import("layout_refresh.zig");
@@ -156,13 +157,13 @@ const WM_APP_ORPHAN_ROSTER: u32 = w32.WM_APP + 33;
 const max_agent_upgrade_attempts: u8 = 2;
 
 /// Timer ID for the quit-after-last-window-closed delay.
-const QUIT_TIMER_ID: usize = 1;
+const QUIT_TIMER_ID: usize = msg_timer.quit;
 
 /// Timer ID (on `msg_hwnd`) for the debounced session-layout manifest write
 /// (T89f). `markLayoutDirty` (re)arms it; a mutation storm collapses into one
-/// write ~`LAYOUT_SYNC_DEBOUNCE_MS` after the last change. Distinct from the
-/// notification/quit/quick-terminal timer ids (1–3).
-const LAYOUT_SYNC_TIMER_ID: usize = 4;
+/// write ~`LAYOUT_SYNC_DEBOUNCE_MS` after the last change. Its id, like every
+/// other id armed on `msg_hwnd`, comes from `msg_timer.zig` (T608).
+const LAYOUT_SYNC_TIMER_ID: usize = msg_timer.layout_sync;
 
 /// Debounce window for the session-layout write (Mac `scheduleSync` uses the
 /// same 250ms). Window-frame changes are already coalesced to drag-end by
@@ -182,12 +183,12 @@ const LAYOUT_SYNC_MAX_RETRIES: u16 = 40;
 /// Timer ID (on `msg_hwnd`) for the local-agent link settle watch (T145). Armed
 /// only while a down link is being judged — there is no idle polling; the down
 /// EDGE arrives as `WM_APP_AGENT_LINK_DOWN`.
-const AGENT_WATCH_TIMER_ID: usize = 5;
+const AGENT_WATCH_TIMER_ID: usize = msg_timer.agent_watch;
 
 /// Timer ID (on `msg_hwnd`) for the in-place recovery RETRY (T723). Armed only
 /// after a recovery aborted with no reachable agent, one-shot per attempt, and
 /// disarmed the moment the link is back or the schedule is spent.
-const AGENT_RETRY_TIMER_ID: usize = 7;
+const AGENT_RETRY_TIMER_ID: usize = msg_timer.agent_retry;
 
 /// Timer ID (on `msg_hwnd`) for the periodic session-layout REFRESH (T922).
 /// Repeating, armed once at startup while persistence is on.
@@ -200,7 +201,7 @@ const AGENT_RETRY_TIMER_ID: usize = 7;
 /// user reads an hour-old screen instead of the error the crash interrupted.
 /// This tick re-captures; `session_layout.writeIfChanged` keeps an idle
 /// terminal from paying for it.
-const LAYOUT_REFRESH_TIMER_ID: usize = 10;
+const LAYOUT_REFRESH_TIMER_ID: usize = msg_timer.layout_refresh;
 
 /// Poll cadence for that refresh, and the quiet window it waits for. Each tick
 /// is one lock-free atomic read per pane (`Termio.remoteAppliedOffset`), so an
@@ -241,14 +242,14 @@ const LAYOUT_CAPTURE_BUDGET_MS: i64 = @intCast(layout_cost.frame_budget_us / std
 /// startup with a short first fire, then re-armed at the full cadence on every
 /// tick. (Timer 8 is the orphan balloon's icon-cleanup timer, defined beside
 /// the other NOTIF_* timer ids below.)
-const ORPHAN_CHECK_TIMER_ID: usize = 9;
+const ORPHAN_CHECK_TIMER_ID: usize = msg_timer.orphan_check;
 
 /// Timer ID (on `msg_hwnd`) for the DEFERRED launch restore (T976). Armed only
 /// when the launch restore ran before the local agent was dialable and had to
 /// carry windows forward; one-shot per attempt, and it disarms itself the
 /// moment the carried set is empty or the schedule in `restore_retry.zig` runs
 /// out. (Timer 10 is the layout refresh, defined above.)
-const RESTORE_RETRY_TIMER_ID: usize = 11;
+const RESTORE_RETRY_TIMER_ID: usize = msg_timer.restore_retry;
 
 /// Timer ID 12: the periodic "am I still the build that is on disk?" check
 /// (T1205). Repeating. Windows cannot replace a running image, so an upgrade
@@ -256,7 +257,7 @@ const RESTORE_RETRY_TIMER_ID: usize = 11;
 /// this timer completely invisible: the user installed 1.35.0, kept typing
 /// into a window from the day before, and had no way to find out. (Timer 13 is
 /// this notification's icon-cleanup timer, beside the other NOTIF_* ids.)
-const STALE_BUILD_CHECK_TIMER_ID: usize = 12;
+const STALE_BUILD_CHECK_TIMER_ID: usize = msg_timer.stale_build_check;
 
 /// How often to re-ask. A minute is far below the granularity a person cares
 /// about ("did my update take?") and far above anything that costs: one
@@ -271,7 +272,7 @@ const STALE_BUILD_CHECK_MS: u32 = 60_000;
 /// question - "is a newer build already on THIS disk?" - and the two are
 /// deliberately separate, because one is about the network and one is about
 /// a file.
-const UPDATE_RECHECK_TIMER_ID: usize = 14;
+const UPDATE_RECHECK_TIMER_ID: usize = msg_timer.update_recheck;
 
 /// How often the running app re-asks the release channel. Ten minutes is a
 /// tick, not a fetch: `shouldRunUpdateCheck` still throttles the network to
@@ -7851,15 +7852,18 @@ const RELEASE_TAG_URL_PREFIX = "https://github.com/dzearing/ghoztty/releases/tag
 /// Tray icon and timer IDs for notifications. Distinct IDs mean the
 /// desktop and update balloons can coexist without one's auto-cleanup
 /// removing the other's icon. The uIDs live in `tray_notify.zig` beside the
-/// decode that reads them back off the callback message.
+/// decode that reads them back off the callback message; the timer ids live in
+/// `msg_timer.zig` with every other id on `msg_hwnd`, which is what now makes
+/// "distinct" a fact the build checks rather than a claim (T608 — the update
+/// balloon's cleanup shared id 3 with the quick-terminal animation).
 const NOTIF_DESKTOP_UID: u32 = tray_notify.desktop_uid;
-const NOTIF_DESKTOP_TIMER_ID: usize = 2;
+const NOTIF_DESKTOP_TIMER_ID: usize = msg_timer.notif_desktop;
 const NOTIF_UPDATE_UID: u32 = tray_notify.update_uid;
-const NOTIF_UPDATE_TIMER_ID: usize = 3;
+const NOTIF_UPDATE_TIMER_ID: usize = msg_timer.notif_update;
 const NOTIF_ORPHAN_UID: u32 = tray_notify.orphan_uid;
-const NOTIF_ORPHAN_TIMER_ID: usize = 8;
+const NOTIF_ORPHAN_TIMER_ID: usize = msg_timer.notif_orphan;
 const NOTIF_STALE_UID: u32 = tray_notify.stale_build_uid;
-const NOTIF_STALE_TIMER_ID: usize = 13;
+const NOTIF_STALE_TIMER_ID: usize = msg_timer.notif_stale;
 
 /// Register a notification-area icon's behavior version, which is what turns
 /// the `NIN_*` balloon notifications on. Without it the icon keeps the

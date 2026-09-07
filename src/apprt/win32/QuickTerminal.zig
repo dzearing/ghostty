@@ -12,11 +12,12 @@ const App = @import("App.zig");
 const Window = @import("Window.zig");
 const Surface = @import("Surface.zig");
 const w32 = @import("win32.zig");
+const msg_timer = @import("msg_timer.zig");
 
 const log = std.log.scoped(.win32_quick_terminal);
 
 /// Animation timer ID (must not collide with QUIT_TIMER_ID=1 or notification=2).
-pub const ANIM_TIMER_ID: usize = 3;
+pub const ANIM_TIMER_ID: usize = msg_timer.quick_terminal_anim;
 
 /// Animation tick interval in milliseconds (~60fps).
 const ANIM_TICK_MS: u32 = 16;

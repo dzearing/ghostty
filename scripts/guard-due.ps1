@@ -1796,6 +1796,27 @@ $GuardTable = @(
     # no narrower list could name in advance. The audit is static text over
     # source and finishes in about a second, so being due often costs a second,
     # not a turn.
+    # `App.msg_hwnd` is one window, so every timer on it shares one id space and
+    # a repeated number silently cancels somebody else's timer (T608: the
+    # quick-terminal slide and the update balloon's icon cleanup were both id 3,
+    # in two files, for months). The registry's comptime assertion catches a
+    # duplicate INSIDE it; this audit is what keeps ids from being declared
+    # outside it, where nothing compares them. Armed by the registry, by the
+    # three files that arm msg_hwnd timers, and by the audit itself; it is
+    # static text plus one `zig test` of a leaf module, so being due costs
+    # seconds.
+    [pscustomobject]@{
+        Name   = 'msg-timer-ids'
+        Script = 'test\win32\msg-timer-ids.ps1'
+        Stamp  = 'test\win32\msg-timer-ids.stamp.json'
+        Covers = @(
+            'src\apprt\win32\msg_timer.zig',
+            'src\apprt\win32\App.zig',
+            'src\apprt\win32\QuickTerminal.zig',
+            'src\apprt\win32\RemoteReconnect.zig',
+            'test\win32\msg-timer-ids.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'printclient-audit'
         Script = 'test\win32\printclient-audit.ps1'

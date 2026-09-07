@@ -69,6 +69,7 @@ const tcp_dial = @import("../../remote/tcp_dial.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
 const remote_connection = @import("../../remote/connection.zig");
 const pane_id_mod = @import("pane_id.zig");
+const msg_timer = @import("msg_timer.zig");
 const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32);
@@ -85,7 +86,7 @@ pub const WM_APP_REMOTE_LINK: u32 = w32.WM_APP + 17;
 pub const WM_APP_REMOTE_DIALED: u32 = w32.WM_APP + 18;
 
 /// The reconnect poller's id on `App.msg_hwnd`.
-pub const TIMER_ID: usize = 6;
+pub const TIMER_ID: usize = msg_timer.remote_reconnect;
 
 /// How often the ladder is driven. Same 250ms as `agent_recovery.poll_ms`, for
 /// the same reason: fine enough that a backoff lands when it says it does,
