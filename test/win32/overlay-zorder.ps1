@@ -161,6 +161,35 @@ function Set-Active([IntPtr]$top, [IntPtr]$pane) {
     return $false
 }
 
+# Press the bound toggle_window_float_on_top until the window's band actually
+# agrees with $want, and say whether it got there (T607).
+#
+# One press is not a reliable request on this desktop. There is no foreground
+# window here at all, and in that state `SetWindowPos(HWND_TOPMOST)` returns
+# TRUE with `GetLastError()==0` and leaves WS_EX_TOPMOST clear - the T277
+# measurement. `win32.setTopmost` answers that by reading the ex-style back and
+# retrying, but all three of its attempts are one instant with no message pump
+# between them, so a press issued right after an activation change can lose all
+# three; a press a moment later lands. Measured under T607: with two windows and
+# a banner up, the press straight after this script's B/C/D churn did not pin,
+# and the very next press did.
+#
+# Repeating the press is safe because the action is not a stored flag: it reads
+# the live ex-style and asks for the band the window is NOT in (App.zig), so a
+# press that did nothing is re-requested rather than undone.
+function Set-Float([IntPtr]$top, [IntPtr]$pane, [bool]$want, [int]$presses = 4) {
+    for ($p = 0; $p -lt $presses; $p++) {
+        if ((Test-Topmost $top) -eq $want) { return $true }
+        Set-Active $top $pane | Out-Null
+        Send-TestKeys -Window $top -Target $pane -Key F9 -Modifiers ctrl, shift | Out-Null
+        for ($t = 0; $t -lt 12; $t++) {
+            Start-Sleep -Milliseconds 200
+            if ((Test-Topmost $top) -eq $want) { return $true }
+        }
+    }
+    return ((Test-Topmost $top) -eq $want)
+}
+
 # Who is visibly on top at the middle of the banner card, as
 # "<hwnd>:<rootHwnd>:<class>".
 function Get-FrontAt($rect) {
@@ -349,28 +378,22 @@ try {
     # HWND_TOPMOST from the harness the way B does: it is the mechanism
     # section E actually claims to protect.
     #
-    # SKIPPED, NOT ASSERTED, PENDING T277. The app cannot currently REACH a
-    # legitimately-topmost state: measured here, neither the bound action nor
-    # an injected HWND_TOPMOST leaves WS_EX_TOPMOST on a ghoztty window, while
-    # a plain Win32 window (charmap) in the same harness and desktop keeps it
-    # in every condition. Asserting the preservation rule against a state that
-    # never happens would be the vacuous assertion T217 batch 3 warns about,
-    # and FAILING here would report the T142 heal as broken when what is
-    # broken is float-on-top itself. So E announces the skip and names T277;
-    # the moment the float sticks, this block starts asserting again with no
-    # further edit.
+    # ASSERTED AGAIN AS OF T607. This block was skipped for a month on the
+    # reading that a second ghoztty window put the first into a state where
+    # nothing could pin it, and that read was wrong: measured under T607, the
+    # product's float DOES pin the first window with two windows up and a
+    # banner on it. What actually fails is the SINGLE press after an
+    # activation change - see Set-Float above for the mechanism and the
+    # measurement. So the setup presses until the band changes, and the skip
+    # below is now the honest "this environment would not let the state exist"
+    # rather than a pointer at a product bug that is not there.
     # -----------------------------------------------------------------------
     if (-not (Set-Active $A $paneA)) {
         Write-Host 'SKIP E: could not activate oz1 to send it the float keybind'
     } else {
-        Send-TestKeys -Window $A -Target $paneA -Key F9 -Modifiers ctrl, shift | Out-Null
-        $floated = $false
-        for ($t = 0; $t -lt 25 -and -not $floated; $t++) {
-            Start-Sleep -Milliseconds 200
-            $floated = Test-Topmost $A
-        }
+        $floated = Set-Float $A $paneA $true
         if (-not $floated) {
-            Write-Host 'SKIP E: toggle_window_float_on_top left the window non-topmost - float-on-top is broken (T277), so the "legitimate topmost owner" case cannot be set up'
+            Write-Host 'SKIP E: toggle_window_float_on_top never pinned the window across repeated presses - with no foreground window a band change can be refused outright (T277/T607), so the "legitimate topmost owner" case cannot be set up here'
         }
         if ($floated) {
             $propagated = Test-Topmost $ovHwnd
@@ -383,13 +406,7 @@ try {
                 $zA = Get-TestZIndex -Window $A
                 Assert ($zOv -lt $zA) "E: floating window's overlay still above it (ov=$zOv < A=$zA)"
             }
-            Send-TestKeys -Window $A -Target $paneA -Key F9 -Modifiers ctrl, shift | Out-Null
-            $unfloated = $false
-            for ($t = 0; $t -lt 25 -and -not $unfloated; $t++) {
-                Start-Sleep -Milliseconds 200
-                $unfloated = (-not (Test-Topmost $A))
-            }
-            Assert $unfloated 'E: the toggle un-floats the window again'
+            Assert (Set-Float $A $paneA $false) 'E: the toggle un-floats the window again'
             & $exe +set-banner --target=oz1 '**T142** grounded owner' | Out-Null
             $grounded = $false
             for ($t = 0; $t -lt 25 -and -not $grounded; $t++) {

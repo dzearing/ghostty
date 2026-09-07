@@ -1,10 +1,11 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-06T22:41:40-07:00",
-    "commit":  "a6799a46e",
+    "generated":  "2026-09-07T00:54:31-07:00",
+    "commit":  "383473632",
     "uncommitted":  [
-                        "test/win32/floor-lane-webview-settle.ps1"
+                        "test/win32/float-on-top.ps1",
+                        "test/win32/overlay-zorder.ps1"
                     ],
     "files":  {
                   "src/cli/ghostty.zig":  "ef54b501298cfda9306cfb958c1094db24ee30f355b25865656b3e2bc713bcd7",
@@ -95,7 +96,7 @@
                   "test/win32/drag-perf.ps1":  "d6077a30dfd50fb3fe9cc0e8b019b76dc8830f6b36e47bfd851282cdf508bf26",
                   "test/win32/false-positive-report.ps1":  "3e4c34e6b40b6b99969d38afbd1c055899802cfa119529c06f84c6ad24a4e981",
                   "test/win32/feedback-user-report.ps1":  "0b85eddc062d701c1cfe16d603156cdc5702e2d6c78fdc5a2bbd70b088f292cc",
-                  "test/win32/float-on-top.ps1":  "1d6c2fb69c3f28f0fbbeb99a8d37634b09784ecf0e14f4c5bcc97383fe31e538",
+                  "test/win32/float-on-top.ps1":  "da3cb0f45c2e3a8e48609bc4bf1b047a9fe67405c406b471d65d79e48cce68a8",
                   "test/win32/floor-lane-cache-heal.ps1":  "d40d1a377c30e9861010bacb09a810fb848ade4cbc54ed38ecc9980d4f13d740",
                   "test/win32/floor-lane-commit-headroom.ps1":  "63aed36ba60ecbd7af05f2349f050a390eccfa1f6768b52b416d9d27b60837ec",
                   "test/win32/floor-lane-compiler-crash.ps1":  "34827f1ed2d63df665d72275f13211f6a3f8273c44561b09396ffdc3f7505470",
@@ -177,7 +178,7 @@
                   "test/win32/notification-click-real.ps1":  "df4bcac68aa3163c1cd010a153a697c60c7cd00eb0c45590358922f89effa8d1",
                   "test/win32/one-installer.ps1":  "e8f2855cab4c267362f75fe7d78b810375ebc6fd253a31ab70c43579b3cea76e",
                   "test/win32/orphan-notify.ps1":  "b84c26f50537993e099e9ab406c27077b8f1cbc96ae1fe8d84ea94e9cfeb9eac",
-                  "test/win32/overlay-zorder.ps1":  "48f8bcc2f312e6031dede6f4c19fa50a961804fdbe81de80b2ed27247f92c6aa",
+                  "test/win32/overlay-zorder.ps1":  "0aecea140f4df82d4e0c6a52bdd358ba99b67bb2f656f8432a55e9ea5809a209",
                   "test/win32/palette-close-crash.ps1":  "e6046113e0de2c089224b358bac4ef12ed298e86983c3bf68bd48588a34c964d",
                   "test/win32/palette-jump.ps1":  "1745b9a557417e11bdfceaf4db1997de31bc457f7f9919664fa01b592f5b6ac7",
                   "test/win32/pane-banner.ps1":  "585671bd04f8e963eff275b669bf618856b60528d234386cb7adb578e115a7ff",

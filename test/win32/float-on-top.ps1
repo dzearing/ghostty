@@ -16,12 +16,15 @@ Sections:
   B. the pin propagates to the pane's banner overlay, and survives a banner
      reposition (the "legitimate topmost owner" the T142 heal protects)
 
-NOTE (T607): a SECOND ghoztty window on the background test desktop puts the
-first into a state where NOTHING can topmost it - not this app, not an external
-SetWindowPos from the harness - while a non-ghoztty window (charmap) in the very
-same desktop takes the bit in every condition. So this script deliberately runs
-ONE window. overlay-zorder.ps1 section E is the two-window case and stays
-skipped until T607 explains it.
+NOTE (T607): this script deliberately runs ONE window, and the two-window case
+lives in overlay-zorder.ps1 section E, which asserts again as of T607. The old
+reading here - that a second ghoztty window puts the first into a state where
+nothing can pin it - did not survive measurement: the product's float pins the
+first window with two windows up. What is unreliable off the input desktop is a
+SINGLE band-change request, because there is no foreground window for
+SetWindowPos(HWND_TOPMOST) to succeed against and `setTopmost`'s three retries
+are one instant with no pump between them. Section E presses until the band
+moves for that reason.
 #>
 param(
     [string]$ExePath,
