@@ -2891,7 +2891,20 @@ $GuardTable = @(
         Covers = @(
             'scripts\lib\BuildCache.ps1',
             'scripts\build-cache.ps1',
-            'test\win32\build-cache.ps1'
+            'test\win32\build-cache.ps1',
+            # T1431 put the OTHER drive under the same argument: zig's C/C++
+            # compile steps scratch in %TEMP%, and on this box that is C: while
+            # everything the sweeper measures is on D:. The four files below are
+            # where a build is told to scratch on the repo drive instead, and
+            # F16-F25 assert exactly that - so an edit to any of them can un-wire
+            # the fix while every other harness stays green. `floor-lane.ps1` is
+            # here for its ENVIRONMENT lines only, which is a narrower thing than
+            # the stall/heal/leak rows T1005 keeps it out of.
+            'scripts\floor-lane.ps1',
+            'test\win32\lib\BuildFresh.ps1',
+            'scripts\publish-windows-release.ps1',
+            'scripts\launch-upgrade.ps1',
+            'scripts\crash-databreak.ps1'
         )
     },
     # The resize paint path (T1031). `resize_paint.zig` is the rule that says a

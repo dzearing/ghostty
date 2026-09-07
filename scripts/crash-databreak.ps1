@@ -201,6 +201,9 @@ param(
 $ErrorActionPreference = 'Continue'
 . "$PSScriptRoot\lib\CrashCatch.ps1"
 . "$PSScriptRoot\lib\DataBreak.ps1"
+# T1431: Resolve-BuildTempDir, so the lane this script drives scratches on the
+# repo's drive rather than in %TEMP%.
+. "$PSScriptRoot\lib\BuildCache.ps1"
 
 $cdbPath = Get-CdbPath -Override $Cdb
 if (-not $cdbPath) {
@@ -314,6 +317,15 @@ function Start-Lane {
         # does not inherit a $env: set in an earlier shell, so it is set here.
         $cache = Join-Path (Split-Path -Qualifier $Repo) '\zig-global-cache'
     }
+    # T1431: and the OTHER directory a zig build writes into. Its C/C++ compile
+    # steps scratch in %TEMP%, which is on C: while the cache and the repo are
+    # on D:, and a full C: kills the build with the same bare
+    # `error: Unexpected` this script exists to get a stack FOR -- which would
+    # be a whole databreak run spent on a disk.
+    $buildTemp = Resolve-BuildTempDir -RepoPath $Repo
+    if (-not (Test-Path -LiteralPath $buildTemp)) {
+        New-Item -ItemType Directory -Path $buildTemp -Force | Out-Null
+    }
     # Through a .cmd FILE, not an argument: the lane line carries embedded
     # quotes (`-Dtest-filter="x"`), and Start-Process re-quotes an argument
     # list on its way to the child, which mangles them into a cmd that exits
@@ -323,6 +335,8 @@ function Start-Lane {
     @(
         '@echo off',
         "set `"ZIG_GLOBAL_CACHE_DIR=$cache`"",
+        "set `"TMP=$buildTemp`"",
+        "set `"TEMP=$buildTemp`"",
         "cd /d `"$Repo`"",
         "zig build $LaneArgLine"
     ) | Set-Content -LiteralPath $bat -Encoding ASCII

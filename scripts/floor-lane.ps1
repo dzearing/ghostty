@@ -406,7 +406,12 @@ function Invoke-Lane {
     if ($RawCommand) {
         # Self-test: the same watchdog loop over a synthetic command, so the
         # detector is exercised without waiting on a real 30-minute wedge.
-        $cmd = "$RawCommand > `"$log`" 2>&1"
+        # It carries the same build environment as a real lane, because the
+        # harnesses that drive builds through `-Command` (crash-databreak,
+        # floor-lane-compiler-crash) really are running builds, and covering a
+        # build under a different environment than the one it ships with is a
+        # gap the next full C: would find (T1431).
+        $cmd = "set `"TMP=$buildTemp`" && set `"TEMP=$buildTemp`" && $RawCommand > `"$log`" 2>&1"
         Write-Host "LANE $Name run $Iteration/$Repeat : $RawCommand"
     }
     else {
@@ -420,7 +425,7 @@ function Invoke-Lane {
         # `set "VAR=value"` -- the quotes are load-bearing: without them cmd folds
         # the space before && into the value and the link step then fails on a path
         # with a stray space, which names neither the variable nor the cause.
-        $cmd = "set `"ZIG_GLOBAL_CACHE_DIR=$cacheDir`" && cd /d `"$Repo`" && zig build $buildArgs > `"$log`" 2>&1"
+        $cmd = "set `"ZIG_GLOBAL_CACHE_DIR=$cacheDir`" && set `"TMP=$buildTemp`" && set `"TEMP=$buildTemp`" && cd /d `"$Repo`" && zig build $buildArgs > `"$log`" 2>&1"
         Write-Host "LANE $Name run $Iteration/$Repeat : zig build $buildArgs"
     }
     Write-Host "  log: $log"
@@ -784,6 +789,18 @@ $cacheDir = Resolve-CacheDir -RepoPath $Repo -Explicit $CacheDir
 if (-not (Test-Path $cacheDir)) { New-Item -ItemType Directory -Path $cacheDir -Force | Out-Null }
 Write-Host "ZIG_GLOBAL_CACHE_DIR=$cacheDir"
 
+# T1431. Zig's C/C++ compile steps (glslang, oniguruma, translate-c, helpgen)
+# scratch in %TEMP%, which on this box is C: while the cache, the repo and the
+# outputs are all on D:. On 2026-09-07 C: was down to 0.1 GB and every lane died
+# with the same bare `error: Unexpected` T1054 chased -- on a drive nothing was
+# measuring, so the pre-flight below reported a terabyte free and the failure
+# still read as broken code. Set on the BUILD SHELL rather than on this process:
+# `$env:TEMP` here is where `Invoke-Lane` writes its lane logs, and the
+# acceptance harness finds those by path.
+$buildTemp = Resolve-BuildTempDir -RepoPath $Repo
+if (-not (Test-Path $buildTemp)) { New-Item -ItemType Directory -Path $buildTemp -Force | Out-Null }
+Write-Host "build TMP/TEMP=$buildTemp"
+
 if ($SelfTest) {
     # Proves the three verdicts on synthetic commands, so the detector itself is
     # covered without waiting on a real wedge. `waitfor` blocks on a named signal
@@ -839,7 +856,7 @@ if ($Command) {
 if ($MinFreeGB -gt 0) {
     $short = @()
     $seenDrives = @{}
-    foreach ($d in @($Repo, $cacheDir)) {
+    foreach ($d in @($Repo, $cacheDir, $buildTemp)) {
         if (-not $d) { continue }
         $qual = Split-Path -Qualifier ([System.IO.Path]::GetFullPath($d))
         # Both paths are normally on the same drive (T243 requires it), and one

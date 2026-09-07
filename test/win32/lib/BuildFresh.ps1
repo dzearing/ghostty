@@ -79,6 +79,12 @@ if (-not (Get-Variable -Name GhozttyFreshCache -Scope Script -ErrorAction Silent
 # Directories under src\ whose contents cannot be in a win32 ghoztty.exe.
 $script:GhozttyFreshExcludedDirs = @('\src\apprt\gtk\')
 
+# T1431: `Invoke-GhozttyDebugBuild` scratches on the repo's drive rather than in
+# %TEMP%. The rule lives in one place (scripts\lib\BuildCache.ps1) beside the
+# global-cache rule it mirrors, so this file asks for it instead of keeping a
+# second copy that would be free to disagree.
+. (Join-Path (Split-Path (Split-Path (Split-Path $PSScriptRoot -Parent) -Parent) -Parent) 'scripts\lib\BuildCache.ps1')
+
 function Get-GhozttyRepoRootForFresh {
     <#
     .SYNOPSIS
@@ -237,6 +243,9 @@ function Invoke-GhozttyDebugBuild {
     .DESCRIPTION
     ZIG_GLOBAL_CACHE_DIR must sit on the repo's drive or zig 0.15.2 asserts
     instead of explaining itself (T243), so it is derived rather than assumed.
+    TMP/TEMP go to the repo's drive for the same reason (T1431): zig's C/C++
+    compile steps scratch there, %TEMP% is on C: on this box, and a full C:
+    makes every build die with a bare `error: Unexpected` that names no disk.
     #>
     param([string]$Repo)
 
@@ -246,6 +255,7 @@ function Invoke-GhozttyDebugBuild {
     }
     Write-Host "  BuildFresh: rebuilding $root (zig build -Dapp-runtime=win32 -Doptimize=Debug)..."
     $ok = $false
+    $prevTemp = Push-BuildTempEnv -RepoPath $root
     Push-Location $root
     try {
         # Stringify each record before Out-String: `2>&1` puts ErrorRecords on
@@ -264,6 +274,7 @@ function Invoke-GhozttyDebugBuild {
         $ok = $false
     } finally {
         Pop-Location
+        Pop-BuildTempEnv -Previous $prevTemp
     }
     return $ok
 }

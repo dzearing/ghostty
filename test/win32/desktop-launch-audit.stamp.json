@@ -1,10 +1,11 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-07T10:57:45-07:00",
-    "commit":  "e29c98561",
+    "generated":  "2026-09-07T11:27:30-07:00",
+    "commit":  "eff4baa53",
     "uncommitted":  [
-                        "test/win32/chooser-restore-all-remote.ps1"
+                        "test/win32/body-complete-audit.ps1",
+                        "test/win32/build-cache.ps1"
                     ],
     "files":  {
                   "src/cli/ghostty.zig":  "ef54b501298cfda9306cfb958c1094db24ee30f355b25865656b3e2bc713bcd7",
@@ -34,8 +35,8 @@
                   "test/win32/asserted-nothing.ps1":  "3a930fa9a26bdf5ed95254373cb55c047d3f803d5cc413059ed94391d19126ed",
                   "test/win32/auto-launch-cwd.ps1":  "eec10c5396d125e017edde1280851d1fce687337742a64ca5f34da9eee36bec3",
                   "test/win32/banner-resize-repaint.ps1":  "499fac53076f7641063f8ce3dab59a859ee9a947ce44ca6f2b05b08767c677f8",
-                  "test/win32/body-complete-audit.ps1":  "9da2ab2336bc36df1d9243e85becb7b0f9223c7382849b842a9180015b652c9c",
-                  "test/win32/build-cache.ps1":  "7d2681f0f6ecd8b5d0bbf99087cda3034e56c30ca7bd3f1f9b90f11ede846ab8",
+                  "test/win32/body-complete-audit.ps1":  "4eed0de529dad2bd28db2803a83f90ed800afb4726599ce225784dd229231540",
+                  "test/win32/build-cache.ps1":  "3f99acf99163823a5b1393a03cbad8fab16f78837408b66744a02de777fede7e",
                   "test/win32/build-fresh-guard.ps1":  "e104706bfed3e0183b462abdf421b820556f5b1cb0552909c9d3c8e939870e65",
                   "test/win32/build-locked-artifact.ps1":  "5b9a47f783f56d1ecb35367bb360416a4798c04a165b63b2949a782a972e48a9",
                   "test/win32/build-mode-guard.ps1":  "cd0e27e13a471649f9ee233d62a1ca4d25aacd9df04d39f82a522baac3c26047",

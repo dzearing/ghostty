@@ -277,6 +277,25 @@ AssertEq 'C4 a try that scores its own throw in a catch is the other honest shap
 $silent = $caught | ForEach-Object { if ($_ -eq '    $script:fail++') { '    Write-Host "oh well"' } else { $_ } }
 AssertEq 'C5 a catch that swallows the throw is named' 'silent-catch' (Kinds $silent)
 
+# A COMMENT naming the scorer is not a use of it. The script most likely to
+# name `lib\TestScore.ps1` in prose is the one explaining why it hand-rolls its
+# own scoring, and reporting that as two findings is a false finding in the one
+# audit whose whole value is that its findings are real.
+$commentOnly = @(
+    '# This script scores itself rather than through lib\TestScore.ps1, so it'
+    '# keeps its own $script:bodyComplete flag.'
+    'function Assert($n, $c) { if ($c) { $script:pass++ } else { $script:fail++ } }'
+    'try {'
+    '    Assert "one" $true'
+    '} finally { Write-Host "cleanup" }'
+    'if ($script:fail -eq 0) { Write-Host "ALL PASS" }'
+)
+AssertEq 'C5b a comment naming the scorer does not make a script scored by it' '' (Kinds $commentOnly)
+# ...and the rule still has teeth when the same file really does dot-source it.
+$commentAndReal = @('. (Join-Path $PSScriptRoot "lib\TestScore.ps1")') + $commentOnly
+AssertEq 'C5c but a real dot-source in the same file is still measured' `
+    'uncaught-try,missing' (Kinds $commentAndReal)
+
 $guarded = @(
     '. (Join-Path $PSScriptRoot "lib\TestScore.ps1")'
     'function Assert($n, $c) { if ($c) { $script:pass++ } else { $script:fail++ } }'

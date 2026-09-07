@@ -31,6 +31,14 @@
       E. The claim reports it, and the cost is bounded: `go-loop-exec.ps1` calls
          the sweeper, and a state check over a large fixture cache stays well
          inside a second.
+      F. The OTHER drive (T1431). Zig's C/C++ compile steps scratch in %TEMP%,
+         which on this box is C: while everything the cache sweeper measures is
+         on D: - so on 2026-09-07 a claim printed a terabyte free while C: held
+         0.1 GB and every lane died with the same bare `error: Unexpected`.
+         Two halves: the build shells scratch on the REPO's drive so a full C:
+         cannot stop a build at all, and the drive %TEMP% is really on is
+         measured and named so the box state is visible before a turn spends its
+         context on a fake compile error.
 
     Launches no GUI and touches no real cache: every section works on throwaway
     directories under $TEMP. Section D runs the real `floor-lane.ps1` but only
@@ -291,6 +299,93 @@ $sw.Stop()
 Write-Host "  (state of the real caches: $($realState.Entries) entries, $($realState.FreeGB) GB free, $($sw.ElapsedMilliseconds) ms)"
 Assert 'E5 a state check on the real caches costs under a second' ($sw.ElapsedMilliseconds -lt 1000)
 
+# ===========================================================================
+Write-Host ''
+Write-Host '== F: the drive %TEMP% is on is measured too, and builds do not scratch there'
+# ===========================================================================
+
+# The rule, and the fact that there is exactly ONE of it.
+$repoDrive = Split-Path -Qualifier $repo
+AssertEq 'F1 the build temp dir sits on the repo drive' `
+    $repoDrive (Split-Path -Qualifier (Resolve-BuildTempDir -RepoPath $repo))
+AssertEq 'F2 and an explicit path is left alone' `
+    'X:\somewhere' (Resolve-BuildTempDir -RepoPath $repo -Explicit 'X:\somewhere')
+$prevEnvTemp = $env:GHOZTTY_BUILD_TEMP
+try {
+    $env:GHOZTTY_BUILD_TEMP = 'Y:\from-env'
+    AssertEq 'F3 and GHOZTTY_BUILD_TEMP overrides, which is what lets a harness drive a fixture' `
+        'Y:\from-env' (Resolve-BuildTempDir -RepoPath $repo)
+} finally { $env:GHOZTTY_BUILD_TEMP = $prevEnvTemp }
+
+# Push/Pop actually moves TMP and TEMP, creates the directory, and puts back
+# exactly what was there - a helper that leaked would relocate the %TEMP% of
+# every acceptance script that loads BuildFresh.
+$fixtureTemp = Join-Path $tmp 'buildtemp-fixture'
+$beforeTmp = $env:TMP
+$beforeTemp = $env:TEMP
+$token = Push-BuildTempEnv -RepoPath $repo -Explicit $fixtureTemp
+AssertEq 'F4 the push points TMP at the build scratch dir' $fixtureTemp $env:TMP
+AssertEq 'F5 and TEMP with it - zig reads both' $fixtureTemp $env:TEMP
+Assert 'F6 and creates it, so the first build does not fail on a missing directory' `
+    (Test-Path -LiteralPath $fixtureTemp)
+Pop-BuildTempEnv -Previous $token
+AssertEq 'F7 the pop restores TMP' $beforeTmp $env:TMP
+AssertEq 'F8 and TEMP' $beforeTemp $env:TEMP
+$env:TMP = 'Z:\scratch'
+Pop-BuildTempEnv -Previous $null
+AssertEq 'F9 a null token is a no-op, so a finally can call it unconditionally' 'Z:\scratch' $env:TMP
+$env:TMP = $beforeTmp
+
+# The reporting half: a full %TEMP% drive is NAMED, and the summary says
+# whether it would actually stop a build.
+$low = Get-SystemTempState -RepoPath $repo -LowFreeGB 99999999
+Assert 'F10 an out-of-room %TEMP% drive reads as low' ([bool]$low.Low)
+Assert 'F11 and the summary names the drive rather than the compiler' `
+    ($low.Summary -match 'system temp low: \w:.*free')
+$onRepoDrive = Get-SystemTempState -RepoPath $repo -TempPath $repo -LowFreeGB 99999999
+Assert 'F12 %TEMP% already on the repo drive is not "redirected"' (-not $onRepoDrive.Redirected)
+Assert 'F13 and that case says a build WILL fail, because nothing moves it elsewhere' `
+    ($onRepoDrive.Summary -match "error: Unexpected")
+$healthy = Get-SystemTempState -RepoPath $repo -LowFreeGB 0
+Assert 'F14 a healthy box reads ok and still names where builds scratch' `
+    ((-not $healthy.Low) -and ($healthy.Summary -match 'system temp ok'))
+
+# And the wiring: the sweeper the claim runs asks the question, and the build
+# paths take the answer.
+$sweeper = Get-Content -LiteralPath (Join-Path $repo 'scripts\build-cache.ps1') -Raw
+Assert 'F15 the sweeper the claim runs measures the %TEMP% drive' ($sweeper -match 'Get-SystemTempState')
+Assert 'F16 floor-lane resolves the build temp from the shared rule' ($lane -match 'Resolve-BuildTempDir')
+Assert 'F17 and sets TMP and TEMP on the build shell it spawns' `
+    ($lane -match 'set .*TMP=' -and $lane -match 'set .*TEMP=')
+Assert 'F18 and its disk pre-flight covers that directory too' ($lane -match '\$Repo, \$cacheDir, \$buildTemp')
+$fresh = Get-Content -LiteralPath (Join-Path $repo 'test\win32\lib\BuildFresh.ps1') -Raw
+Assert 'F19 the acceptance rebuild scratches there as well' ($fresh -match 'Push-BuildTempEnv')
+Assert 'F20 and restores what it replaced' ($fresh -match 'Pop-BuildTempEnv')
+$publish = Get-Content -LiteralPath (Join-Path $repo 'scripts\publish-windows-release.ps1') -Raw
+Assert 'F21 so does the release build' ($publish -match 'Push-BuildTempEnv')
+$upgrade = Get-Content -LiteralPath (Join-Path $repo 'scripts\launch-upgrade.ps1') -Raw
+Assert 'F22 and the staging build the delivery makes' ($upgrade -match 'Push-BuildTempEnv')
+$databreak = Get-Content -LiteralPath (Join-Path $repo 'scripts\crash-databreak.ps1') -Raw
+Assert 'F22b and the lane the databreak runner drives through its own .cmd' `
+    ($databreak -match 'Resolve-BuildTempDir' -and $databreak -match 'set .*TMP=')
+
+# END TO END, because F16-F22 only read source. The wrapper really is asked for
+# a command and the CHILD SHELL really answers with the repo drive - which is
+# the only assertion here that would have caught the quoting trap the
+# ZIG_GLOBAL_CACHE_DIR line beside it carries a comment about. `/v:on` and
+# `!TMP!` on purpose: `%TMP%` would be expanded by the OUTER cmd while it parses
+# the line, i.e. before `set` has run, and the arm would read C: and fail for a
+# reason that has nothing to do with the code.
+$probe = (& powershell -NoProfile -ExecutionPolicy Bypass -File $floor `
+        -Command 'cmd /v:on /c echo TMPIS-!TMP! TEMPIS-!TEMP!' 2>&1 |
+    ForEach-Object { $_.ToString() }) -join "`n"
+$wantTemp = Resolve-BuildTempDir -RepoPath $repo
+Assert 'F23 the wrapper announces where the build will scratch' ($probe -match 'build TMP/TEMP=')
+Assert 'F24 and the build shell really answers with it for TMP' `
+    ($probe -match ('TMPIS-' + [regex]::Escape($wantTemp)))
+Assert 'F25 and for TEMP' `
+    ($probe -match ('TEMPIS-' + [regex]::Escape($wantTemp)))
+
 Write-Host ''
 if ($NegativeControl -and -not $script:negReached) {
     Assert 'NEGATIVE CONTROL never reached its inverted assertion' $false
@@ -308,4 +403,4 @@ if ($script:fail -eq 0 -and -not $NegativeControl) {
 }
 
 Write-Host ''
-Write-TestVerdict -Pass $script:pass -Fail $script:fail -Label 'build-cache' -MinPass 30
+Write-TestVerdict -Pass $script:pass -Fail $script:fail -Label 'build-cache' -MinPass 50

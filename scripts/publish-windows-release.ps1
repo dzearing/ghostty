@@ -50,6 +50,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
+# T1431: Push-BuildTempEnv, so the release build scratches on the repo's drive.
+. (Join-Path $PSScriptRoot 'lib\BuildCache.ps1')
 Set-Location $repo
 
 if (-not $Version) {
@@ -129,6 +131,12 @@ Write-Host "FILEVERSION $fileVer"
 if (-not $SkipBuild) {
     Write-Host "== zig build (ReleaseFast, x86_64-windows-gnu, semver $Version) =="
     if (-not $env:ZIG_GLOBAL_CACHE_DIR) { $env:ZIG_GLOBAL_CACHE_DIR = 'D:\zig-cache' }
+    # T1431: the compile steps scratch in %TEMP%, which is on C: while every
+    # other path this build touches is on the repo's drive. A full C: kills the
+    # build with a bare `error: Unexpected` that names no disk, so the release
+    # build scratches beside its cache. Scoped: this script's own %TEMP% files
+    # (the version probe below) stay where they were.
+    $prevBuildTemp = Push-BuildTempEnv -RepoPath $repo
     # The default install also produces zig-out\bin\ghoztty-agent.exe on
     # Windows (T89h); -Dagent-semver stamps its VERSIONINFO with the release
     # semver so Explorer/Details matches the tag. -Dstrip=false keeps the
@@ -140,7 +148,9 @@ if (-not $SkipBuild) {
         "-Dversion-string=$Version+$hash" `
         "-Dagent-semver=$Version" `
         "-Dwindows-update-check=true"
-    if ($LASTEXITCODE -ne 0) { throw "zig build failed" }
+    $buildFailed = ($LASTEXITCODE -ne 0)
+    Pop-BuildTempEnv -Previous $prevBuildTemp
+    if ($buildFailed) { throw "zig build failed" }
 }
 
 # Verify the exe actually carries the release semver (catches a stale

@@ -105,6 +105,7 @@ function Fail-Launch([string]$msg, [int]$code) {
     exit $code
 }
 
+. (Join-Path $PSScriptRoot 'lib\BuildCache.ps1')
 . (Join-Path $PSScriptRoot 'delivery-version.ps1')
 . (Join-Path $PSScriptRoot 'install-ownership.ps1')
 
@@ -177,6 +178,12 @@ if (-not $SkipBuild) {
         $env:ZIG_GLOBAL_CACHE_DIR = $zigCache
         Write-Host "ZIG_GLOBAL_CACHE_DIR was unset; using $zigCache (it must be on the repo's drive)"
     }
+    # T1431: same argument as ZIG_GLOBAL_CACHE_DIR above, for the other
+    # directory a zig build writes into. The C/C++ compile steps scratch in
+    # %TEMP%, which is on C: here, and a full C: kills the build with a bare
+    # `error: Unexpected` naming no disk. Pushed AFTER $buildLog is chosen so
+    # the log stays at the path this script has already printed.
+    $prevBuildTemp = Push-BuildTempEnv -RepoPath $Repo
     Write-Host "building the staging release into $Staging (log: $buildLog)"
     $buildArgs = @(
         'build', '-Dapp-runtime=win32', '-Doptimize=ReleaseFast',
@@ -219,6 +226,7 @@ if (-not $SkipBuild) {
         Fail-Launch 'The installed release was NOT upgraded. Do not report the delivery as done.' 3
     }
     Write-Host "staging build OK"
+    Pop-BuildTempEnv -Previous $prevBuildTemp
 }
 
 if (-not (Test-Path -LiteralPath $Staging -PathType Container)) {

@@ -1,10 +1,10 @@
 {
     "guard":  "release-artifacts",
     "script":  "test/win32/release-artifacts.ps1",
-    "generated":  "2026-09-06T18:55:41-07:00",
-    "commit":  "c9c883e98",
+    "generated":  "2026-09-07T11:24:34-07:00",
+    "commit":  "eff4baa53",
     "uncommitted":  [
-                        "test/win32/release-artifacts.ps1"
+                        "scripts/publish-windows-release.ps1"
                     ],
     "files":  {
                   ".github/workflows/fork-ci.yml":  "cfb49f8be10dbb535b282837002d491781ca41e80db4fda32eefe43e6744c85a",
@@ -12,7 +12,7 @@
                   "dist/windows-installer/build-release-artifacts.sh":  "f064485a18c06f18d5800886046a507255aecf48aa60712b00025ad4b9b52e65",
                   "dist/windows-installer/install-msitools.sh":  "445350af31c5bdb39d1ee9c75dd37b76ec11e62b993642c8802e1b01e1e53e9a",
                   "dist/windows-installer/sign-artifacts.sh":  "baabe938f6fc636cb04c7d3a0320b1559165943e3fbfcb1ed666ef102ad0bfcd",
-                  "scripts/publish-windows-release.ps1":  "4b2b82d21d6c04e291499716220bfa102fdb194433bb2f707ec54f878b45b146",
+                  "scripts/publish-windows-release.ps1":  "0b26b7ea16c1676b2a1d090f9acae47966f72302ad2cf6037d9c646b80cab544",
                   "test/win32/release-artifacts.ps1":  "ec0d56cc73482271744c78aa1bee501da00ba6b7012c2521b258d8c3a4e88eaa"
               }
 }

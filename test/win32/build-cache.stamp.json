@@ -1,11 +1,26 @@
 {
     "guard":  "build-cache",
     "script":  "test/win32/build-cache.ps1",
-    "generated":  "2026-08-21T07:01:53-07:00",
-    "commit":  "0e24dd44b",
+    "generated":  "2026-09-07T11:18:23-07:00",
+    "commit":  "eff4baa53",
+    "uncommitted":  [
+                        "scripts/build-cache.ps1",
+                        "scripts/crash-databreak.ps1",
+                        "scripts/floor-lane.ps1",
+                        "scripts/launch-upgrade.ps1",
+                        "scripts/lib/BuildCache.ps1",
+                        "scripts/publish-windows-release.ps1",
+                        "test/win32/build-cache.ps1",
+                        "test/win32/lib/BuildFresh.ps1"
+                    ],
     "files":  {
-                  "scripts/build-cache.ps1":  "5747bef7227b9e7750d7675a46ac91f70992549c5fbef98e95bc8ee19567464c",
-                  "scripts/lib/BuildCache.ps1":  "a38d2802e022790565572d070761640a09735e2d9a271814df12b678d19d346a",
-                  "test/win32/build-cache.ps1":  "7d2681f0f6ecd8b5d0bbf99087cda3034e56c30ca7bd3f1f9b90f11ede846ab8"
+                  "scripts/build-cache.ps1":  "5b41e5f28248820a297c978a6324a644feaf9f54937cd805b24500d694d2b2f8",
+                  "scripts/crash-databreak.ps1":  "60428758a92aed0c48be4a57d5c83de90dca9866001a9aa94c9d7578459eae6c",
+                  "scripts/floor-lane.ps1":  "9e56312d60e79591062fe9069c2f7e15fece67af3d71fd8cf3aef3f1217a0357",
+                  "scripts/launch-upgrade.ps1":  "10b62ac357edaf9aac67ab761f844a97ca92c8c3adab1a29f24c4f560f31ac72",
+                  "scripts/lib/BuildCache.ps1":  "80b13978e295b3d6a1efc0b9dc1e86534d11bad93677738d65e7db88f84040aa",
+                  "scripts/publish-windows-release.ps1":  "0b26b7ea16c1676b2a1d090f9acae47966f72302ad2cf6037d9c646b80cab544",
+                  "test/win32/build-cache.ps1":  "3f99acf99163823a5b1393a03cbad8fab16f78837408b66744a02de777fede7e",
+                  "test/win32/lib/BuildFresh.ps1":  "c9235d5bb7e93e2bd7bafbbdf01c4db8e52fe5e43a5d715f68aae39b9e2e43c8"
               }
 }

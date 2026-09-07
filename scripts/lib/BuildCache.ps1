@@ -82,6 +82,137 @@ function Resolve-ZigGlobalCacheDir {
     return (Join-Path $drive '\zig-global-cache')
 }
 
+function Resolve-BuildTempDir {
+    <#
+        Where a BUILD should scratch. Same shape and the same reason as
+        `Resolve-ZigGlobalCacheDir` above: one copy of the rule, on the repo's
+        own drive.
+
+        T1431. Zig's C/C++ compile steps (glslang, oniguruma, translate-c,
+        helpgen) write their intermediates into %TEMP%, which on this box lives
+        on C: while everything else the build touches lives on D:. On
+        2026-09-07 C: had 0.1 GB free and every `zig build` died with a bare
+        `error: Unexpected` naming no file, no line and no disk -- the T1054
+        failure again, but on a drive nothing was measuring, so the cache
+        sweeper reported 1 TB free while the build could not write a byte.
+        Pointing TMP/TEMP at the repo drive made the same build succeed with no
+        other change.
+
+        `GHOZTTY_BUILD_TEMP` overrides, which is what lets the acceptance
+        harness drive a fixture directory instead of the real one.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [string]$Explicit
+    )
+    if ($Explicit) { return $Explicit }
+    if ($env:GHOZTTY_BUILD_TEMP) { return $env:GHOZTTY_BUILD_TEMP }
+    $drive = (Split-Path -Qualifier $RepoPath)
+    return (Join-Path $drive '\zig-build-temp')
+}
+
+function Push-BuildTempEnv {
+    <#
+        Create the build scratch directory, point this process's TMP/TEMP at it,
+        and return the values that were there before so `Pop-BuildTempEnv` can
+        put them back.
+
+        Deliberately environment-based rather than a flag on the zig command
+        line: the compile steps that fill %TEMP% are several layers below the
+        caller (zig -> clang -> a linker temp), and an environment a child
+        inherits is the only place all of them can be reached from.
+
+        Scoped rather than permanent because these callers keep using %TEMP% for
+        their OWN files - a build log, a version probe - and a helper that moved
+        those too would relocate paths its caller had already printed. A caller
+        that must not move its own %TEMP% at all (`floor-lane.ps1`, whose lane
+        logs an acceptance harness finds by path) asks `Resolve-BuildTempDir`
+        instead and sets the two variables on the build shell it spawns.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        [string]$Explicit
+    )
+    $dir = Resolve-BuildTempDir -RepoPath $RepoPath -Explicit $Explicit
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    $prev = @{ TMP = $env:TMP; TEMP = $env:TEMP; Dir = $dir }
+    $env:TMP = $dir
+    $env:TEMP = $dir
+    return $prev
+}
+
+function Pop-BuildTempEnv {
+    <#
+        Restore what `Push-BuildTempEnv` replaced. Tolerates $null so a caller
+        can put this in a `finally` without asking whether the push happened.
+    #>
+    param($Previous)
+    if (-not $Previous) { return }
+    $env:TMP = $Previous.TMP
+    $env:TEMP = $Previous.TEMP
+}
+
+function Get-SystemTempState {
+    <#
+        How much room the drive %TEMP% is on has left, and whether a build
+        would be redirected off it.
+
+        Reported rather than acted on: %TEMP% belongs to the user's session, so
+        the remedy for a full C: is the redirect above plus a human deleting
+        something -- never this script clearing a directory Windows and every
+        other program on the box share. What it exists to stop is the SILENT
+        version, where a claim prints 1 TB free about D: and the very next lane
+        dies on C: with a message about neither.
+
+        Returns Path, Drive, FreeGB, BuildTemp, Redirected, Low, Summary.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$RepoPath,
+        # At or below this, the summary says so out loud. 10 GB is the same
+        # floor `floor-lane.ps1` refuses a lane below, so the two numbers cannot
+        # tell different stories about the same box.
+        [double]$LowFreeGB = 10,
+        [string]$TempPath,
+        [string]$BuildTemp
+    )
+    if (-not $TempPath) { $TempPath = $env:TEMP }
+    $buildTempDir = Resolve-BuildTempDir -RepoPath $RepoPath -Explicit $BuildTemp
+
+    $drive = ''
+    $free = $null
+    if ($TempPath) {
+        try { $drive = Split-Path -Qualifier ([System.IO.Path]::GetFullPath($TempPath)) } catch { $drive = '' }
+        $free = Get-DriveFreeGB -Path $TempPath
+    }
+    $buildDrive = ''
+    try { $buildDrive = Split-Path -Qualifier ([System.IO.Path]::GetFullPath($buildTempDir)) } catch { $buildDrive = '' }
+
+    $redirected = ($drive -ne '') -and ($buildDrive -ne '') -and ($drive -ne $buildDrive)
+    $low = ($null -ne $free) -and ($free -le $LowFreeGB)
+
+    $freeText = if ($null -eq $free) { 'unknown' } else { "$free GB" }
+    $summary =
+        if ($low -and $redirected) {
+            "system temp low: $drive has $freeText free - builds scratch in $buildTempDir instead, so this does not stop a build"
+        } elseif ($low) {
+            "system temp low: $drive has $freeText free and builds scratch there - a zig build will fail with a bare 'error: Unexpected'"
+        } else {
+            "system temp ok: $drive $freeText free, builds scratch in $buildTempDir"
+        }
+
+    return @{
+        Path       = $TempPath
+        Drive      = $drive
+        FreeGB     = $free
+        BuildTemp  = $buildTempDir
+        Redirected = $redirected
+        Low        = $low
+        Summary    = $summary
+    }
+}
+
 function Get-BuildCacheEntryCount {
     <#
         Number of output entries in a zig cache, counted with ONE non-recursive

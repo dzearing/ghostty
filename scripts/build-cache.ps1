@@ -74,6 +74,7 @@ $CacheDir = @($CacheDir | Where-Object { $_ } | Select-Object -Unique)
 
 $state = Get-BuildCacheState -CacheDirs $CacheDir -MinFreeGB $MinFreeGB `
     -MaxEntries $MaxEntries -WarnFreeGB $WarnFreeGB
+$tempState = Get-SystemTempState -RepoPath $Repo
 
 $cleared = @()
 $didClear = $false
@@ -104,6 +105,14 @@ if ($Json) {
         freeGB  = $state.FreeGB
         entries = $state.Entries
         caches  = @($state.Caches)
+        systemTemp = ([ordered]@{
+            path       = $tempState.Path
+            drive      = $tempState.Drive
+            freeGB     = $tempState.FreeGB
+            buildTemp  = $tempState.BuildTemp
+            redirected = [bool]$tempState.Redirected
+            low        = [bool]$tempState.Low
+        })
         cleared = @($cleared)
     } | ConvertTo-Json -Depth 5)
     exit 0
@@ -126,6 +135,18 @@ if ($didClear) {
     }
 } else {
     Write-Host $state.Summary
+}
+
+# T1431. The cache numbers above are about the REPO drive; zig's C/C++ compile
+# steps scratch in %TEMP%, which is a different drive on this box and was
+# measured by nothing. A claim that prints "1078 GB free" while C: holds 0.1 GB
+# is worse than silence: it is a reassurance that the next bare
+# `error: Unexpected` will be read as broken code. So the drive %TEMP% is
+# actually on gets a line of its own, and it says whether a build would even be
+# affected -- once the build shells scratch on the repo drive, a full C: is a
+# heads-up rather than an outage.
+if ($tempState.Low -or -not $tempState.Redirected) {
+    Write-Host "  $($tempState.Summary)"
 }
 
 if ($Action -ne 'clear') {

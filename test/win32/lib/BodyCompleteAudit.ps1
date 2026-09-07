@@ -189,6 +189,14 @@ function Get-BodyCompleteFindings {
     $scored = $false
     foreach ($l in $lines) {
         if ($l -match '#\s*body-audit:') { return $findings }
+        # A COMMENT naming the scorer does not make a script scored by it, and a
+        # script that explains why it hand-rolls its own scoring is exactly the
+        # comment most likely to name it: `chooser-restore-all-remote.ps1` says
+        # "this script scores itself rather than through lib\TestScore.ps1" and
+        # was reported twice for a scorer it deliberately does not use, which is
+        # a false finding in the one audit whose whole value is that its
+        # findings are real.
+        if ($l -match '^\s*#') { continue }
         if ($l -match 'TestScore\.ps1') { $scored = $true }
     }
     # Not scored by the shared scorer => this rule has nothing to say about it.

@@ -1,10 +1,13 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-09-07T10:57:25-07:00",
-    "commit":  "e29c98561",
+    "generated":  "2026-09-07T11:27:10-07:00",
+    "commit":  "eff4baa53",
     "uncommitted":  [
-                        "test/win32/chooser-restore-all-remote.ps1"
+                        "test/win32/body-complete-audit.ps1",
+                        "test/win32/build-cache.ps1",
+                        "test/win32/lib/BodyCompleteAudit.ps1",
+                        "test/win32/lib/BuildFresh.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "944e54bda392aa61007ee23280c6bb9767ed2e661f77f5157ca035dbe9b6e4ea",
@@ -33,8 +36,8 @@
                   "test/win32/asserted-nothing.ps1":  "3a930fa9a26bdf5ed95254373cb55c047d3f803d5cc413059ed94391d19126ed",
                   "test/win32/auto-launch-cwd.ps1":  "eec10c5396d125e017edde1280851d1fce687337742a64ca5f34da9eee36bec3",
                   "test/win32/banner-resize-repaint.ps1":  "499fac53076f7641063f8ce3dab59a859ee9a947ce44ca6f2b05b08767c677f8",
-                  "test/win32/body-complete-audit.ps1":  "9da2ab2336bc36df1d9243e85becb7b0f9223c7382849b842a9180015b652c9c",
-                  "test/win32/build-cache.ps1":  "7d2681f0f6ecd8b5d0bbf99087cda3034e56c30ca7bd3f1f9b90f11ede846ab8",
+                  "test/win32/body-complete-audit.ps1":  "4eed0de529dad2bd28db2803a83f90ed800afb4726599ce225784dd229231540",
+                  "test/win32/build-cache.ps1":  "3f99acf99163823a5b1393a03cbad8fab16f78837408b66744a02de777fede7e",
                   "test/win32/build-fresh-guard.ps1":  "e104706bfed3e0183b462abdf421b820556f5b1cb0552909c9d3c8e939870e65",
                   "test/win32/build-locked-artifact.ps1":  "5b9a47f783f56d1ecb35367bb360416a4798c04a165b63b2949a782a972e48a9",
                   "test/win32/build-mode-guard.ps1":  "cd0e27e13a471649f9ee233d62a1ca4d25aacd9df04d39f82a522baac3c26047",
@@ -163,9 +166,9 @@
                   "test/win32/layout-capture-cost.ps1":  "60a2c830f6bac395be0ea78847d0f07466cefca0c8bb9d86385ea27618628e8e",
                   "test/win32/lib/ApplierSandbox.ps1":  "82870ff2c01dd3d3e36b1b1f8ff7ed7359059245db8e5d88ac9e30838e177bd8",
                   "test/win32/lib/AssertedNothingAudit.ps1":  "1d6653930bb345709b81aa0c6bc480d8a7c09a28e7efb32f85eace39eda26dc3",
-                  "test/win32/lib/BodyCompleteAudit.ps1":  "5adfbff59b4fe5cd317adfdafd798630016f623a4cc94bf5c481544b6c3cd042",
+                  "test/win32/lib/BodyCompleteAudit.ps1":  "bf666bb6bd484b81a2bb21089bf92ff70e8a7a80fe52f9acf90b9ff11a9e02d8",
                   "test/win32/lib/BrowserLeak.ps1":  "ae41845c0869dc0a37c9104ff6189f07d1e4ede98445bdecbeb3e222f5224826",
-                  "test/win32/lib/BuildFresh.ps1":  "8d1b427f31ff44769e165d80ae1358c429496d398ef3c642255a97ed5c3d6864",
+                  "test/win32/lib/BuildFresh.ps1":  "c9235d5bb7e93e2bd7bafbbdf01c4db8e52fe5e43a5d715f68aae39b9e2e43c8",
                   "test/win32/lib/BuildMode.ps1":  "063d3e59680f1dbf49e9d93e795c460ddf7cffc8d8cc1b3ec3bf078b773b911a",
                   "test/win32/lib/ChooserControls.ps1":  "a89ca8550ef8143250eb27df76bfa9e11b5c1af46f086ea23e07defd5d8eaec0",
                   "test/win32/lib/ChooserCursor.ps1":  "07632267956e7b2647f6227181d98c0ca50e8d68556c7e987e1817424d583e74",
