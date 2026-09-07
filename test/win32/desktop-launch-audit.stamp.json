@@ -1,10 +1,10 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-06T21:15:42-07:00",
-    "commit":  "d019a0b3b",
+    "generated":  "2026-09-06T22:41:40-07:00",
+    "commit":  "a6799a46e",
     "uncommitted":  [
-                        "test/win32/viewer-restore.ps1"
+                        "test/win32/floor-lane-webview-settle.ps1"
                     ],
     "files":  {
                   "src/cli/ghostty.zig":  "ef54b501298cfda9306cfb958c1094db24ee30f355b25865656b3e2bc713bcd7",
@@ -101,6 +101,7 @@
                   "test/win32/floor-lane-compiler-crash.ps1":  "34827f1ed2d63df665d72275f13211f6a3f8273c44561b09396ffdc3f7505470",
                   "test/win32/floor-lane-leak-sweep.ps1":  "c339c10d3445889e7107e6158a32c593bad1ce2454b107551561b39e9f1fd24d",
                   "test/win32/floor-lane-solo-confirm.ps1":  "2e7b8705867fd366ef614013d2cdd8e9e213136a4f8e9347ac049215944c0a50",
+                  "test/win32/floor-lane-webview-settle.ps1":  "bc5bacaada532dae0758fc971b7ac0f209110e1c7ab7795ad1af05b95faa0909",
                   "test/win32/focus-defer.ps1":  "0781efdaa91cf1730f88acaec0143573697a9d4d305e4becdd08eab8774efafd",
                   "test/win32/focus-follows-mouse.ps1":  "09c5f9884b9c51bdb0d91321a12c0e8b8c554552434fd78f7b6267826caaa4e1",
                   "test/win32/font-inherit.ps1":  "f303affd8f1c72da77f48f09a10b18d0c7c72af845a4602455bf013662d8c257",

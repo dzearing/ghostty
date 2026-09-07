@@ -114,7 +114,52 @@ pub const Failure = enum {
             .environment_unavailable => "Check that %LOCALAPPDATA% is set and writable.",
         };
     }
+
+    /// Whether asking again, later, could plausibly answer differently.
+    ///
+    /// This is the difference between "this box cannot run a viewer" and "the
+    /// runtime refused us just now" — and it is what the hint above already
+    /// says out loud: `runtime_not_found` sends the user to an installer,
+    /// `create_callback_failed` says "reopen this pane to try again". The
+    /// TESTS are the caller that needs it as a value (T592): `-Lane all`
+    /// starts one WebView2 lane the instant the previous one exits, and an
+    /// environment asked for through a teardown comes back
+    /// `hr=0x80004005` → `create_callback_failed`. Retrying that is a settle;
+    /// retrying `runtime_not_found` is waiting for a runtime to install
+    /// itself.
+    pub fn isTransient(self: Failure) bool {
+        return switch (self) {
+            // The box's answer, and it will not change while the test runs.
+            .runtime_not_found,
+            .client_dll_unloadable,
+            .entry_point_missing,
+            => false,
+            // The runtime was there and would not start for us this time.
+            .create_call_failed,
+            .create_callback_failed,
+            .environment_unavailable,
+            => true,
+        };
+    }
 };
+
+test "a missing runtime is not a transient failure, a refused start is" {
+    // The whole point of the split: one of these is worth asking again for and
+    // the other is a box that needs an installer run on it.
+    try testing.expect(!Failure.runtime_not_found.isTransient());
+    try testing.expect(!Failure.client_dll_unloadable.isTransient());
+    try testing.expect(!Failure.entry_point_missing.isTransient());
+    try testing.expect(Failure.create_call_failed.isTransient());
+    try testing.expect(Failure.create_callback_failed.isTransient());
+    try testing.expect(Failure.environment_unavailable.isTransient());
+
+    // And every failure answers — a new variant added without a decision here
+    // is a compile error in the switch above, which is the enforcement.
+    inline for (@typeInfo(Failure).@"enum".fields) |f| {
+        const v: Failure = @enumFromInt(f.value);
+        _ = v.isTransient();
+    }
+}
 
 // -------------------------------------------------------------------- COM
 

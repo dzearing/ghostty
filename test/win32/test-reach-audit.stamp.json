@@ -1,12 +1,11 @@
 {
     "guard":  "test-reach",
     "script":  "test/win32/test-reach-audit.ps1",
-    "generated":  "2026-09-06T21:15:35-07:00",
-    "commit":  "d019a0b3b",
+    "generated":  "2026-09-06T22:41:33-07:00",
+    "commit":  "a6799a46e",
     "uncommitted":  [
-                        "src/apprt/win32/App.zig",
                         "src/apprt/win32/ViewerPane.zig",
-                        "src/apprt/win32/Window.zig"
+                        "src/apprt/win32/webview2.zig"
                     ],
     "files":  {
                   "src/apprt/win32.zig":  "5e2dc3b906c6617012aa666fcf317bc1f786f110e513283f473feef22d5d6326",
@@ -211,10 +210,10 @@
                   "src/apprt/win32/ViewerFeedbackWeb.zig":  "bd420cf35aa02909c9632b2589b36b69ba0ac141a87add034ae7c0080af4f1f3",
                   "src/apprt/win32/ViewerFindBar.zig":  "265556167eea1ac38bab8d1b05101bc8c3621a7cb100b7147b95b826b28dc03c",
                   "src/apprt/win32/ViewerNavBar.zig":  "67f3469b54c249dfe1f372fa7250b300862e12f43f617cc3acdda596972d8a45",
-                  "src/apprt/win32/ViewerPane.zig":  "3996dcdf2d774adeb500698b4b5f31f7554a9b30bf037ceb536dd35b502fde95",
+                  "src/apprt/win32/ViewerPane.zig":  "07030cf6c1435d8935ca383c0b4459195a0a378922f463d4ba81b1e5df4d029c",
                   "src/apprt/win32/ViewerTOCPanel.zig":  "9ea364bf3315b719ee8697446efe5cb478d6aa2e33ba0813f896159ce2ce1c26",
                   "src/apprt/win32/ViewerWorktreeProbe.zig":  "e3a261e7b84ec486a2ac69f2d6f65101cf6adbcf0103cbb0eebd41abd2ddca86",
-                  "src/apprt/win32/webview2.zig":  "089009bd902654576b08720a5f763a44d16b8035e902faef908dbf26194983e5",
+                  "src/apprt/win32/webview2.zig":  "0dd69c13634a7006ed240a911a14cf8ecdbe5dbbe4f958acad010ca685d0b511",
                   "src/apprt/win32/webview2_iface.zig":  "cdfe46db3c405118ff363783a9dd825b7ad4a14d6722b3158328ab27759d4636",
                   "src/apprt/win32/webview2_paths.zig":  "125e4d497fe25e488b9f5a8aee4f0ffe34b7c6f377b0741a89c6781552bc9cf6",
                   "src/apprt/win32/win32.zig":  "6832aa9712c69936c3eaa2a4b1556d96a4a50792d4d980b6a9d40662924514b1",

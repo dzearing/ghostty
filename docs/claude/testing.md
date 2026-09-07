@@ -61,6 +61,23 @@ three tests failed (a lane-wide break, not one slow wait), when `-Filter` is
 already narrowing the run, and under `-NoSoloConfirm`. Acceptance:
 `test\win32\floor-lane-solo-confirm.ps1`.
 
+**And two lanes never share a browser teardown** (T592). The `win32` and
+`agent` lanes each stand up a real WebView2, and `-Lane all` used to start the
+next one the instant the previous exited - into a browser tree that was still
+unwinding, which answers `hr=0x80004005` and read as a red floor three times in
+two days. Every lane now WAITS for the previous one's WebView2 processes to be
+gone before it starts, and the end-of-lane sweep waits on its own kills instead
+of returning on `Stop-Process`. The tree is identified by the private
+`ghoztty-wv2test-<pid>` profile as well as by `--webview-exe-name=`, since the
+crash-handler process carries only the first. Silence means there was nothing to
+wait for; `waited <n>ms` means there was; `WEBVIEW NOT SETTLED` names T592 and is
+the line to read a red lane behind it against. `-WebViewSettleSeconds` bounds the
+wait, `-NoSweep` turns it off. The test side of the same fix:
+`Failure.isTransient()` in `src/apprt/win32/webview2.zig` splits a box with no
+runtime from a runtime that refused us, and the host-floor test asks again -
+three times, never for a missing runtime. Acceptance:
+`test\win32\floor-lane-webview-settle.ps1`.
+
 A related bound worth knowing, on the other side of the same problem: the
 `waitFor` helper the win32 viewer tests pump through measures **stillness, not
 wall clock**. Its `timeout_s` is how long the pane may sit completely unchanged;

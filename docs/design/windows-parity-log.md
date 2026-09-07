@@ -23775,3 +23775,62 @@ against a pane whose id no longer named anything - while the same script's new M
 control proves that a well-formed id naming nothing IS refused with exit 1. Two
 answers to the same question is a bug, and until it is understood M3 only carries
 weight beside M4.
+
+## 2026-09-06 - the standing test gate stops going red because two browsers overlapped (T592)
+
+Running `floor-lane.ps1 -Lane all` sometimes reported a failure that was not
+one. Two of the four lanes stand up a real WebView2 - the same embedded browser
+a viewer pane runs on - and the wrapper started the next lane the instant the
+previous one exited. The incoming lane then asked for a browser environment
+while the outgoing lane's was still shutting down, was turned away with
+`hr=0x80004005`, and the whole run was marked failed. Re-running the same lane
+on its own passed. It happened three times in two days in August, and each one
+cost a turn: worse than the lost time is what a gate that cries wolf teaches,
+which is to re-run a red floor rather than read it.
+
+Two ends of the same fix. The wrapper now WAITS for a lane's browser processes
+to be gone before starting the next one, instead of calling `Stop-Process` and
+returning on the kill - a kill returns long before the process dies, so the old
+sweep was racing exactly the teardown it existed to end. It also recognises more
+of the browser than it used to: the tree was identified only by
+`--webview-exe-name=`, which the crash-handler process does not carry, so a
+sweep could report "0 leaked hosts" with part of the tree still holding the
+profile open. Matching the private `ghoztty-wv2test-<pid>` profile directory
+catches the whole tree, and the profile is only deleted once nothing is using
+it. The settle also runs at the START of every lane, so whatever ran before the
+wrapper - a hand-run acceptance script, another lane - is waited for too. It
+costs nothing when there is nothing to wait for, says how long it waited when
+there was, and names T592 when it gives up, so a red lane behind it can be read
+against that line rather than guessed at.
+
+The other end is the test itself. `Failure.isTransient()` now splits "this box
+cannot run a viewer" from "the runtime would not start for us just now" - the
+split the error card's own hint has always implied, since one sends the user to
+an installer and the other says "reopen this pane to try again". The host-floor
+test asks again, up to three times, only on the second kind; a missing runtime
+is still answered on the first reply and still reported in the words it always
+used. Its skip line now says which of the two happened, so a lane log
+distinguishes a box without WebView2 from the shape this task was filed over.
+
+`test\win32\floor-lane-webview-settle.ps1` is the coverage (20 assertions), and
+it demonstrates the wait rather than asserting it: arm 5 stands up a browser
+process, kills it a second and a half later, and requires the settle to have
+blocked for it - which no amount of `-Repeat` could have shown on a box where
+the real failure surfaces three times a month. Arm 3 is the rule that keeps it
+safe: a WebView2 process carrying neither test marker is the user's own viewer
+pane and is never touched.
+
+Filed on the way past: T1411. The same refusal can come back from the CONTROLLER
+rather than the environment, and that half is not retried - the test's skip
+branch is a pass, so a transient controller refusal quietly costs the whole ABI
+round trip the test exists for. Retrying it means rebuilding the pane and its
+host window rather than re-initing the environment host, which is why it is a
+task and not a line here.
+
+Green: `floor-lane.ps1 -Lane all` ALL LANES PASS (lib 52s, none 145s, win32
+412s, agent 412s) with the change in, and green as a baseline before it;
+`floor-lane-webview-settle` ALL PASS (20). Re-stamped after the source edits:
+`docs-routing` 20, `body-complete` 40, `isolation-meta` 13, `launch-preflight`
+19, `verdict-exit`, `cleanslate` 21, `stderr-capture` 25, `test-reach` 14,
+`desktop-launch` 29, `command-resolve` 15, `printclient-audit` 8, `viewer-close`
+44, `viewer-nav-pin` 24 - all ALL PASS. P1 25 / P2 20 / P3 16 ALL PASS.

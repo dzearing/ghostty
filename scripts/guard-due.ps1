@@ -1693,6 +1693,21 @@ $GuardTable = @(
             'test\win32\floor-lane-solo-confirm.ps1'
         )
     },
+    # The between-lane WebView2 settle (T592) speaks only on a box where the
+    # previous lane's browser tree is still up, which is a matter of a second or
+    # two -- so a matcher that has quietly stopped recognising a lane's browser
+    # process is indistinguishable from a machine that never leaves one running.
+    # Same coverage rule as the rows around it: the library and this harness
+    # gate, scripts\floor-lane.ps1 does not; the wiring arms prove the wiring.
+    [pscustomobject]@{
+        Name   = 'webview-settle'
+        Script = 'test\win32\floor-lane-webview-settle.ps1'
+        Stamp  = 'test\win32\floor-lane-webview-settle.stamp.json'
+        Covers = @(
+            'scripts\lib\WebViewLane.ps1',
+            'test\win32\floor-lane-webview-settle.ps1'
+        )
+    },
     # The commit preflight (T453) speaks only on a box that is already out of
     # memory, which is rarer still than a red lane -- and a gate nobody has ever
     # seen refuse is indistinguishable from one that cannot refuse. Same

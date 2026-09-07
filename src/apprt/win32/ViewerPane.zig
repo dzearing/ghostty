@@ -6164,6 +6164,56 @@ test "host floor: a real controller on a real window, on this box" {
     var host = webview2.Host.init(alloc);
     defer host.deinit();
 
+    // Get the ENVIRONMENT settled before the pane asks for one, and ask again
+    // when the runtime merely refused us (T592).
+    //
+    // `floor-lane.ps1 -Lane all` runs two lanes that each stand up a real
+    // WebView2, and it used to start the second the instant the first exited —
+    // into a browser tree that was still tearing down, which answers
+    // `hr=0x80004005`. The wrapper now waits for that tree to be gone, and this
+    // is the other end of the same fix: whatever else on the box is holding the
+    // runtime busy, one refusal is not this box's answer about whether a viewer
+    // can run here. A PERMANENT failure (no runtime installed, a DLL that will
+    // not load) is that answer, and is taken on the first reply — retrying it
+    // would only spend the deadline waiting for an installer to run itself.
+    //
+    // The skip branch further down still exists and still means what it meant:
+    // after this loop, `.failed` is a considered verdict rather than a race.
+    {
+        const max_attempts: u8 = 3;
+        var attempt: u8 = 0;
+        while (true) {
+            host.ensure();
+            const env_settled = webview2.pumpUntil(&host, struct {
+                fn f(ctx: *const anyopaque) bool {
+                    const h: *const webview2.Host = @alignCast(@ptrCast(ctx));
+                    return h.state != .creating;
+                }
+            }.f);
+            if (!env_settled) {
+                log.err(
+                    "host floor: no environment within the deadline (still {s}); " ++
+                        "something is probably holding the WebView2 profile",
+                    .{@tagName(host.state)},
+                );
+                return error.WebView2EnvironmentTimeout;
+            }
+            if (host.state == .ready) break;
+
+            const why = host.failure.?;
+            attempt += 1;
+            if (!why.isTransient() or attempt >= max_attempts) break;
+            log.warn(
+                "host floor: environment refused ({s}); attempt {d} of {d}, " ++
+                    "waiting for the runtime to settle",
+                .{ @tagName(why), attempt, max_attempts },
+            );
+            host.deinit();
+            host = webview2.Host.init(alloc);
+            std.Thread.sleep(2 * std.time.ns_per_s);
+        }
+    }
+
     var pane: ViewerPane = .{};
     defer pane.deinit(alloc);
     // `create` is what normally mints this, and this test builds the pane by
@@ -6209,10 +6259,24 @@ test "host floor: a real controller on a real window, on this box" {
     }
 
     if (pane.state == .failed) {
-        log.warn(
-            "SKIPPED live controller test, no usable runtime: {s}",
-            .{@tagName(pane.failure.?)},
-        );
+        // Name WHICH kind, so a reader of the lane log can tell "this box has
+        // no WebView2" from "the runtime would not start, three times running"
+        // — the second is the shape T592 was filed over and it is worth
+        // chasing; the first is simply the answer here.
+        const why = pane.failure.?;
+        if (why.isTransient()) {
+            log.warn(
+                "SKIPPED live controller test: the runtime refused to start ({s}) " ++
+                    "even after retries - suspect something else on this box holding " ++
+                    "a WebView2 profile (T592)",
+                .{@tagName(why)},
+            );
+        } else {
+            log.warn(
+                "SKIPPED live controller test, no usable runtime: {s}",
+                .{@tagName(why)},
+            );
+        }
         // The failure path is still a real assertion: whatever went wrong, the
         // pane must be able to PAINT it rather than sit blank.
         try testing.expect(pane.failure.?.message().len > 0);

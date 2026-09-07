@@ -1,0 +1,14 @@
+{
+    "guard":  "webview-settle",
+    "script":  "test/win32/floor-lane-webview-settle.ps1",
+    "generated":  "2026-09-06T22:02:40-07:00",
+    "commit":  "a6799a46e",
+    "uncommitted":  [
+                        "scripts/lib/WebViewLane.ps1",
+                        "test/win32/floor-lane-webview-settle.ps1"
+                    ],
+    "files":  {
+                  "scripts/lib/WebViewLane.ps1":  "3c72ca834fc6787d5733de83b6d29b1f2580ebc1cc0c1e9b950c233b31239c90",
+                  "test/win32/floor-lane-webview-settle.ps1":  "bc5bacaada532dae0758fc971b7ac0f209110e1c7ab7795ad1af05b95faa0909"
+              }
+}

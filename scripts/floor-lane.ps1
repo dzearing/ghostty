@@ -28,9 +28,15 @@
       * On a wedge (or the wall-clock cap) it dumps a diagnostic FIRST -- the
         process tree with CPU times, every thread's wait reason, any WebView2
         hosts, and the log tail -- and only then kills the tree.
-      * It sweeps leaked `msedgewebview2.exe` hosts, which are invisible to a
-        sweep that filters on zig-out/zig-cache paths (that exe lives under
-        Program Files). Match on `--webview-exe-name=` instead.
+      * It sweeps leaked `msedgewebview2.exe` processes, which are invisible to
+        a sweep that filters on zig-out/zig-cache paths (that exe lives under
+        Program Files). Match on `--webview-exe-name=` and on the private
+        `ghoztty-wv2test-<pid>` profile the whole browser tree carries.
+      * It WAITS for those processes to be gone before starting the next lane
+        (T592). Two lanes stand up a real WebView2 environment and `-Lane all`
+        starts the next the instant the previous exits; asking for an
+        environment through a teardown answers `hr=0x80004005`, which read as a
+        red floor three times. See scripts\lib\WebViewLane.ps1.
       * It counts -- and explains, and reaps -- the lane's own TEST BINARIES
         when they outlive the verdict (T837). The agent lane was measured
         leaving `ghoztty-agent-test.exe` and the since-removed (T434)
@@ -125,6 +131,13 @@ param(
     # do that with a fixture of its own rather than by leaking a real agent
     # test binary, which is the thing under investigation.
     [string[]]$ExtraTestExeNames = @(),
+    # How long a lane waits for the PREVIOUS lane's WebView2 browser processes
+    # to exit before it starts (T592). 20s covers every teardown measured here;
+    # the wait costs nothing when there is nothing to wait for, and a lane that
+    # runs out says so rather than failing. The acceptance harness
+    # (test\win32\floor-lane-webview-settle.ps1) lowers it to exercise the
+    # give-up path without staging a 20-second wedge.
+    [int]$WebViewSettleSeconds = 20,
     # Refuse to launch a zig lane when the repo or global cache drive has less
     # than this free (T1054). 10 GB, not 1: zig needs room for a whole cache
     # entry plus link output, and a lane that starts and dies at 500 MB free
@@ -182,6 +195,10 @@ $ErrorActionPreference = 'Stop'
 # Names the tests a red lane blamed, and words the verdict of the narrowed
 # re-run that follows (T1170) -- the pure half of the solo confirm pass below.
 . "$PSScriptRoot\lib\LaneSolo.ps1"
+# Identifies a test lane's WebView2 browser processes and WAITS for them to
+# exit, so the next lane does not ask for an environment through the previous
+# one's teardown and get hr=0x80004005 for it (T592).
+. "$PSScriptRoot\lib\WebViewLane.ps1"
 
 # Exit codes, named so a caller does not have to guess.
 $EXIT_PASS = 0
@@ -278,23 +295,6 @@ function Get-TreeCpu {
     return $total
 }
 
-function Get-WebViewHosts {
-    # Leaked WebView2 browser processes, keyed by the host exe that created
-    # them. They live under Program Files, so a path filter on zig-out or
-    # zig-cache never sees them; `--webview-exe-name=` does.
-    param([string[]]$ExeNames)
-    $hosts = @()
-    $all = Get-CimInstance Win32_Process -Filter "Name='msedgewebview2.exe'" -ErrorAction SilentlyContinue
-    foreach ($h in $all) {
-        $cl = $h.CommandLine
-        if (-not $cl) { continue }
-        foreach ($n in $ExeNames) {
-            if ($cl -like "*--webview-exe-name=$n*") { $hosts += $h; break }
-        }
-    }
-    return $hosts
-}
-
 function Write-Diagnostic {
     <#
         Everything a human needs to tell "this test is slow" from "this test is
@@ -337,8 +337,8 @@ function Write-Diagnostic {
     }
     if (-not $anyThreads) { Write-Host "  (no test binary alive in the tree)" }
 
-    $wv = Get-WebViewHosts -ExeNames $TEST_EXE_NAMES
-    Write-Host "-- WebView2 hosts owned by test binaries: $($wv.Count) --"
+    $wv = @(Get-WebViewLaneHost -ExeNames $TEST_EXE_NAMES)
+    Write-Host "-- WebView2 processes owned by test binaries: $($wv.Count) --"
     foreach ($h in $wv) {
         $udd = ''
         if ($h.CommandLine -match '--user-data-dir="([^"]+)"') { $udd = $matches[1] }
@@ -366,27 +366,21 @@ function Stop-Tree {
 }
 
 function Invoke-WebViewSweep {
+    # Kill this lane's leaked WebView2 processes, WAIT for them to be gone, and
+    # only then remove the private profiles they were holding. The wait is
+    # T592's half: `Stop-Process` returns before the process dies, and the next
+    # lane used to start on that return -- straight into the teardown it had
+    # just asked for. lib\WebViewLane.ps1 owns all three steps.
     param([switch]$Quiet)
-    $wv = Get-WebViewHosts -ExeNames $TEST_EXE_NAMES
-    foreach ($h in $wv) {
-        try { Stop-Process -Id $h.ProcessId -Force -ErrorAction Stop } catch {}
+    $r = Invoke-WebViewLaneSweep -ExeNames $TEST_EXE_NAMES -TimeoutSeconds $WebViewSettleSeconds
+    if (-not $Quiet -and $r.Killed -gt 0) {
+        Write-Host "swept $($r.Killed) leaked WebView2 process(es) owned by test binaries"
     }
-    if (-not $Quiet -and $wv.Count -gt 0) {
-        Write-Host "swept $($wv.Count) leaked WebView2 host(s) owned by test binaries"
+    if (-not $Quiet) {
+        $line = Format-WebViewSettle -Settle $r
+        if ($line) { Write-Host $line }
     }
-
-    # ...and the private profiles those hosts were running under
-    # (`webview2.TestProfile`, one per test-binary pid). The test cannot delete
-    # its own: the browser process outlives it and holds the files open. Only
-    # remove one whose owning pid is gone, so a concurrent run's profile is
-    # never pulled out from under it.
-    foreach ($d in (Get-ChildItem $env:TEMP -Directory -Filter 'ghoztty-wv2test-*' -ErrorAction SilentlyContinue)) {
-        $ownerPid = 0
-        if ($d.Name -match '^ghoztty-wv2test-(\d+)$') { $ownerPid = [int]$matches[1] }
-        if ($ownerPid -and (Get-Process -Id $ownerPid -ErrorAction SilentlyContinue)) { continue }
-        try { Remove-Item $d.FullName -Recurse -Force -ErrorAction Stop } catch {}
-    }
-    return $wv.Count
+    return $r.Killed
 }
 
 # ------------------------------------------------------------------- runner
@@ -430,6 +424,21 @@ function Invoke-Lane {
         Write-Host "LANE $Name run $Iteration/$Repeat : zig build $buildArgs"
     }
     Write-Host "  log: $log"
+
+    # Do not start into the previous lane's teardown (T592). Two of these lanes
+    # stand up a REAL WebView2 environment, `-Lane all` starts the next one the
+    # instant the previous exits, and asking for an environment while the old
+    # browser tree is still unwinding answers hr=0x80004005 -- which the
+    # host-floor test reported as a failure three times, each costing a turn.
+    # The sweep at the end of the previous lane already waits; this is the same
+    # wait asked for whatever ran BEFORE this process (a hand-run acceptance
+    # script, a lane from another invocation), and it is free when there is
+    # nothing to wait for.
+    if (-not $NoSweep) {
+        $settle = Wait-WebViewLaneSettle -ExeNames $TEST_EXE_NAMES -TimeoutSeconds $WebViewSettleSeconds
+        $settleLine = Format-WebViewSettle -Settle $settle
+        if ($settleLine) { Write-Host "  $settleLine" }
+    }
 
     # Which test binaries were ALREADY running, and from when. Anything holding
     # one of those names afterwards that is not on this list, and started after
