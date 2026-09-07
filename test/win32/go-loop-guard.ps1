@@ -2269,6 +2269,42 @@ foreach ($t in @('/reset-context read go.md and go', 'commit and push it',
 }
 Assert 'AG7 all four measured wedges are caught at 16m, not 59m' ($agSaved -eq 4)
 
+# --- AH. a WORKING session's queued text is not a wedge, and must not be wiped -
+# WHY (user, 2026-09-07). The nudge wipes the composer before it types, so a
+# false positive on this arm does not waste a nudge - it DESTROYS queued input.
+# Measured that same afternoon:
+#   16:24:08 healthy: composer=pending session=working   <- 'keep going', queued
+#   16:29:09 STALLED(by=composer) ... session=working
+#   16:29:29   wiped composer                            <- 'keep going', gone
+# The arm fired on a session that was actively working, on text queued exactly
+# as queuing is meant to work, purely because 45 minutes had passed. The bar was
+# only ever a proxy for "queuing has stopped being a believable story";
+# session=working says outright that it still is.
+$ahWorking = Resolve-LoopStallVerdict -TurnAgeMinutes 46 -StaleMinutes 180 -SuspectMinutes 45 `
+    -ComposerText 'keep going' -PaneState 'working'
+Assert 'AH1 the measured false positive is no longer a stall' (-not $ahWorking.Stalled)
+
+# The mirror of AG4: an unreadable pane has not said 'working' either, so it
+# still falls to the arm rather than being excused by a failed probe.
+$ahUnknown = Resolve-LoopStallVerdict -TurnAgeMinutes 46 -StaleMinutes 180 -SuspectMinutes 45 `
+    -ComposerText 'keep going' -PaneState 'unknown'
+Assert 'AH2 an unreadable pane still counts, it has not said working' `
+    ($ahUnknown.Stalled -and $ahUnknown.Clock -eq 'composer')
+
+# A turn wedged past the BACKSTOP is stalled whatever the pane claims - that is
+# what a backstop is for, and it is the safety net this exemption leans on.
+$ahBackstop = Resolve-LoopStallVerdict -TurnAgeMinutes 200 -StaleMinutes 180 -SuspectMinutes 45 `
+    -ComposerText 'keep going' -PaneState 'working'
+Assert 'AH3 past the backstop even a working session is stalled' `
+    ($ahBackstop.Stalled -and $ahBackstop.Clock -eq 'turn')
+
+# And the two composer arms must not disagree about the same pane: idle fires
+# early, working never fires, so no state can satisfy both.
+$ahIdle = Resolve-LoopStallVerdict -TurnAgeMinutes 46 -StaleMinutes 180 -SuspectMinutes 45 `
+    -ComposerText 'keep going' -PaneState 'idle'
+Assert 'AH4 the same text on an idle pane is still caught, under the idle clock' `
+    ($ahIdle.Stalled -and $ahIdle.Clock -eq 'composer-idle')
+
 # --- the watchdog acts on it ---
 Remove-Item $lock, $state -Force -ErrorAction SilentlyContinue
 $bbProc = Start-Sleeper; $sleepers += $bbProc

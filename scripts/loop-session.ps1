@@ -254,7 +254,26 @@ function Resolve-LoopStallVerdict {
                          "and no completed turn - nothing is running to consume it: '" +
                          $pending + "'") }
     }
-    if ($TurnAgeMinutes -gt $SuspectMinutes -and $pending) {
+    # ...AND A WORKING SESSION WITH QUEUED TEXT IS NOT A WEDGE (user, 2026-09-07).
+    #
+    # The other half of the same rule, and this one has teeth: the nudge WIPES
+    # the composer before typing, so a false positive here does not merely waste
+    # a nudge, it DESTROYS whatever was queued.
+    #
+    # Measured 2026-09-07:
+    #   16:24:08 healthy: composer=pending session=working  <- 'keep going', queued
+    #   16:29:09 STALLED(by=composer) ... composer=pending session=working
+    #   16:29:29   wiped composer  <- 'keep going' gone, never run
+    # The arm fired on a session that was actively working, on text that was
+    # queued exactly as queuing is meant to work, purely because 45 minutes had
+    # passed. The bar was always a proxy for "queuing has stopped being a
+    # believable story"; `session=working` says outright that it still is.
+    #
+    # 'unknown' still qualifies - a probe that cannot classify the pane must not
+    # be read as having said working, the mirror of the idle rule above. A turn
+    # genuinely wedged while the pane insists it is working is left to the 180m
+    # backstop, which is what a backstop is for.
+    if ($TurnAgeMinutes -gt $SuspectMinutes -and $pending -and $PaneState -ne 'working') {
         return @{ Stalled = $true; Clock = 'composer'
                   Why = ("the composer holds unsent text after $age with no completed turn: '" +
                          $pending + "'") }
