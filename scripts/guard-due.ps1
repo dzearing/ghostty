@@ -2923,6 +2923,11 @@ $GuardTable = @(
             'src\apprt\win32\chrome_theme.zig',
             'src\apprt\win32\color_math.zig',
             'src\apprt\win32\panel_theme.zig',
+            # T585: section F scores `repaintForColorChange`'s RDW_ALLCHILDREN
+            # directly - the child half of T307, which has no in-app symptom
+            # short of a stale accent inside a child window. It is a painter,
+            # but a nearly static one, so it does not make this row always-due.
+            'src\apprt\win32\system_colors.zig',
             'test\win32\lib\ColorMath.ps1',
             'test\win32\chrome-theme.ps1'
         )

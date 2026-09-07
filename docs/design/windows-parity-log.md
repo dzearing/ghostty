@@ -23566,3 +23566,39 @@ identical band numbers, from the repo AND from a fresh worktree built at the
 same commit, with `-NegativeControl` red at exactly its four failures; the seven
 due audits (isolation-meta, launch-preflight, verdict-exit, cleanslate,
 stderr-capture, docs-routing, desktop-launch) green.
+
+## 2026-09-06 - the accent inside a child window is scored, and the repaint it cannot score is filed (T585)
+
+Windows' accent colour reaches a CHILD window - the viewer's contents card,
+whose selected row is filled with the raw accent - only through its owner's
+redraw, and no acceptance run could photograph that surface at all. The card's
+pill paints only when its window is active, and the card was filed off as
+unscoreable because a background test desktop has no active window. That stopped
+being true in August: T215 moved the check off `GetForegroundWindow` onto the
+queue-scoped `GetActiveWindow`, and T568 gave the harness `Set-TestActiveWindow`
+to move it. So section F of `chrome-theme.ps1` now opens a viewer wide enough
+for the card's GUTTER layout, makes its window active, and reads the pill: F1 it
+is the accent, F2 after the accent changes - notified to the TOP-LEVEL only - it
+is the new one.
+
+Building that turned up something bigger, measured rather than argued:
+`system_colors.repaintForColorChange` was cut to a bare cache drop with no
+`RedrawWindow` at all and the script still passed 129 of 129, B4 - the assertion
+labelled "the LIVE-UPDATE claim" - included. Photographing a window makes it
+paint (`-Sync` is `WM_PRINTCLIENT`, async is `PrintWindow`), so the frame the
+camera gets reads the fresh accent whether or not anything invalidated it. No
+capture this harness can take separates "was invalidated" from "painted for the
+camera". Filed **T1405** (P1) for the oracle that would; F3 asserts the one
+load-bearing flag (`RDW_ALLCHILDREN`) as source text meanwhile, its analyzer
+exercised against a good and a bad fixture first per T1133, and B4's label is
+corrected to what it actually measures. `system_colors.zig` joins the
+chrome-theme coverage row in `guard-due.ps1`, so dropping that flag makes the
+harness due as well as red.
+
+Floor: `chrome-theme.ps1` ALL PASS (133) with the negative control at exactly
+`1 FAILURE(S) of 133`, F3 and nothing else; `floor-lane.ps1` lib/none/win32/agent
+all PASS; ipc-p1/p2/p3 ALL PASS; the seven due audits green. A note for the next
+turn: the first floor sweep scored none and win32 RED, and both passed alone
+seconds later - a leftover background lane from the dead turn was still running
+over the top of it, which is exactly the T401 overlap the harness rules forbid.
+A resumed turn inherits background jobs as well as a dirty tree.

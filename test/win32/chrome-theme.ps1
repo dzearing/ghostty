@@ -36,9 +36,10 @@
 #      reopens the panel around the message, so it scores the CACHE DROP only -
 #      a panel that repaints because it was freshly constructed passes it, and
 #      that close/reopen was the workaround standing in for the missing
-#      repaint. **B4 is the live-update claim** (T307): the panel stays OPEN
-#      across the notification and its accent pixel must move anyway, which is
-#      the thing a user with the panel on screen actually sees.
+#      repaint. B4 leaves the panel OPEN across the notification instead, which
+#      is closer to what a user with the panel on screen does - but it is NOT
+#      the live-update claim it was written as, and the measurement that says
+#      so is under WHAT NO CAPTURE IN THIS SCRIPT CAN CLAIM below (T585/T1405).
 #
 #   C. THE DEBUG BUILD MARKS ITSELF (T43), and the release build does not.
 #      A Debug/ReleaseSafe build drags the chrome background toward warning
@@ -67,29 +68,48 @@
 #      clears any floor by itself, so the extreme would pass without ever
 #      touching our text.
 #
-# WHAT THIS SCRIPT CANNOT CLAIM, and why - T307's CHILD-WINDOW half. T307
-# widened the reaction from "invalidate the chrome row" to "redraw this window
-# and every child", because a child HWND never receives the broadcast (it goes
-# to top-level windows only) and so its owner is the only place its repaint can
-# come from. B4 above scores the live update on a PANEL, but a panel is
-# top-level and gets the message itself, so it passes either way. Two oracles
-# for the child half were built and BOTH were measured to be undiscriminating
-# here; they are written down so the next attempt does not re-derive them:
+#   F. THE CHILD WINDOWS FOLLOW THE ACCENT TOO (T307's child half, T585). The
+#      surface is the viewer's contents card (`GhozttyViewerTOC`), a real child
+#      HWND whose ACTIVE row is filled with the RAW accent - the only unmixed
+#      accent pixel the card paints, so an exact-RGB hit is that pill and
+#      nothing else. The card is put in its GUTTER layout (a viewer pane wider
+#      than `viewer_toc_layout.gutter_min_dip`, which is why the window is
+#      resized), where it is always visible instead of being an overlay a click
+#      has to open.
 #
-#   - The hero carousel's accent-outlined selected tile. Measured PASS with
-#     the repaint reverted: its thumbnail refresh timer repaints the band every
-#     150ms unprompted, so it picks the new accent up from the cache drop
-#     alone. A surface that repaints on its own cannot score whether anything
-#     invalidated it.
-#   - The viewer's contents card (`GhozttyViewerTOC`), a child HWND whose
-#     ACTIVE row is filled with the raw accent. The card appears and captures
-#     fine, but the accent fill is gated on `isEmphasized()`, i.e. on
-#     `GetForegroundWindow`, and lib\TestDesktop.ps1's own header records that
-#     a background desktop HAS no foreground window - the pill is therefore
-#     always the unemphasized gray here. It would score on a real desktop.
+#      Scoring the pill at all needed T215: the fill is gated on
+#      `isEmphasized()`, which was a bare `GetForegroundWindow` comparison, and
+#      that is null for EVERY window on a background desktop - so the pill was
+#      the unemphasized gray here forever, which is what T585 was filed about.
+#      It now reads `w32.windowIsActive`, whose off-input-desktop proxy is the
+#      queue-scoped `GetActiveWindow`, and the harness can set that
+#      (`Set-TestActiveWindow`, T568). F asserts that activation rather than
+#      assuming it.
 #
-# The child claim is left to code review and a manual check, and the gap is
-# filed rather than papered over with an assertion that passes both ways.
+#      F3 is a SOURCE assertion, and the paragraph below is why.
+#
+# WHAT NO CAPTURE IN THIS SCRIPT CAN CLAIM: that anything INVALIDATED a window
+# (T585). Measured, not reasoned - `repaintForColorChange` was cut down to a
+# bare cache drop, with no `RedrawWindow` at all, and this script still passed
+# 129 of 129, B4 included. The reason is that photographing a window makes it
+# paint: `-Sync` is `WM_PRINTCLIENT`, the async path is
+# `PrintWindow(PW_RENDERFULLCONTENT)`, and both hand the window a DC and ask
+# for a frame. The frame it draws reads the accent through the cache the
+# message just dropped, so the new color appears whether or not anybody
+# invalidated anything.
+#
+# So every accent claim here - B3, B4, F1, F2 - scores the CACHE and its drop.
+# The repaint that puts a new accent in front of a user who is looking at the
+# window is scored by nothing, and B4's name for itself ("the LIVE-UPDATE
+# claim") over-reads what it can see. Filed as T1405 rather than papered over.
+# An oracle for it has to read pixels the window did not just draw for the
+# camera, which on a background desktop means something other than these two
+# capture paths.
+#
+# The candidate that failed for a related reason is written down so the next
+# attempt does not re-derive it: the hero carousel's accent-outlined selected
+# tile measured PASS with the repaint reverted, because its thumbnail refresh
+# timer repaints the band every 150ms unprompted.
 #
 # WHAT THIS SCRIPT DOES NOT CLAIM. T305's validation text asks for the
 # ACTIVE-TAB INDICATOR to track the accent. There is no such pixel: the tab
@@ -257,6 +277,14 @@ function Start-Gui([string[]]$ExtraArgs) {
     $pane = Get-TestChildWindow -Window $top -Class 'GhozttyTerminal'
     if ($pane -eq [IntPtr]::Zero) { return $null }
     return [pscustomobject]@{ Top = $top; Pane = $pane; Pid = $script:app.Pid }
+}
+
+# A CLI verb against the app under test. `$env:GHOZTTY_PIPE_SUFFIX` is already
+# set for this run, so the client resolves the isolated endpoint rather than
+# the user's (section F opens its viewer this way).
+function Invoke-Verb([string[]]$VerbArgs) {
+    $out = (& $exe @VerbArgs 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
+    return [pscustomobject]@{ Code = $LASTEXITCODE; Out = $out }
 }
 
 function Invoke-Palette([IntPtr]$top, [IntPtr]$pane, [string]$filter) {
@@ -577,8 +605,8 @@ try {
     Start-Sleep -Milliseconds 900
     $shot = Get-TestWindowPixels -Window $panel -Sync
     try {
-        Assert (Test-ShotHasColor $shot $ACCENT_A) "B4 the OPEN panel repaints to $(Format-Rgb $ACCENT_A) without being reopened"
-        Assert (-not (Test-ShotHasColor $shot $ACCENT_B)) 'B4 and the accent it opened with is gone - it repainted, it did not just gain a pixel'
+        Assert (Test-ShotHasColor $shot $ACCENT_A) "B4 the OPEN panel paints $(Format-Rgb $ACCENT_A) without being reopened"
+        Assert (-not (Test-ShotHasColor $shot $ACCENT_B)) 'B4 and the accent it opened with is gone - the panel holds no accent of its own'
     } finally { Close-TestWindowPixels -Shot $shot }
 
     Assert (-not ($script:app.Process -and $script:app.Process.HasExited)) 'B the app survived every accent change'
@@ -728,6 +756,142 @@ try {
             Kill-RepoInstances
         }
     }
+
+    # =======================================================================
+    # F. The CHILD windows follow the accent too (T307's child half; T585)
+    # =======================================================================
+    #
+    # Two claims, and they are deliberately different in KIND, because the
+    # measurement that would carry both does not exist here (see the header):
+    #
+    #   F1/F2, in PIXELS: a child window - the viewer's contents card - paints
+    #   the accent, and it paints the CURRENT one. That is the half T585 was
+    #   filed believing impossible: the pill is gated on `isEmphasized()`,
+    #   which was a bare `GetForegroundWindow` comparison and therefore always
+    #   false on a background desktop until T215 moved it to
+    #   `w32.windowIsActive`. The card holds no accent copy of its own beyond
+    #   the process-global cache, so after a change it cannot paint the old
+    #   one.
+    #
+    #   F3, in SOURCE: the parent's redraw still carries `RDW_ALLCHILDREN`.
+    #   That flag is what actually gets the new accent ON SCREEN in a child
+    #   window without something else happening to repaint it, and no capture
+    #   this harness can take will fail when it is removed - the capture is
+    #   itself a repaint. So the flag is asserted where it can be: as text,
+    #   the way section E and printclient-audit.ps1 assert the other contracts
+    #   with no observable symptom under the harness.
+    #
+    # The pixel is the contents card's active-row pill, the card's only raw
+    # accent (every other accent use on the card is mixed). The colors run
+    # A -> B, reusing the two probes B already vetted.
+    Kill-RepoInstances
+    Set-Accent $ACCENT_A
+    $g = Start-Gui @()
+    if (-not $g) { Write-Host 'SETUP FAIL: GUI did not come up for section F'; exit 1 }
+    try {
+        # A viewer whose pane is the whole window, then a window wide enough
+        # that `viewer_toc_layout.mode` picks `gutter`: the compact layout
+        # hides the card behind the nav bar's contents button, and a card
+        # nobody can see cannot be photographed.
+        $r = Invoke-Verb @('+new-window', '--target=ctchild', "--view=$(Join-Path $repo 'README.md')")
+        Assert ($r.Code -eq 0) "F +new-window --view opened the viewer (exit $($r.Code))"
+        Start-Sleep -Seconds 5
+
+        $vtop = [IntPtr]::Zero
+        foreach ($t in @(Get-TestWindows -ProcessId $g.Pid -Class 'GhozttyWindow')) {
+            if (@(Get-TestChildWindows -Window ([IntPtr]$t.Hwnd) -Class 'GhozttyViewer').Count -ge 1) {
+                $vtop = [IntPtr]$t.Hwnd
+            }
+        }
+        Assert ($vtop -ne [IntPtr]::Zero) 'F the viewer window is up'
+        if ($vtop -eq [IntPtr]::Zero) { Write-Host 'ABORT: no viewer window to score'; exit 1 }
+        Set-TestWindowSize -Window $vtop -Width 1400 -Height 900 | Out-Null
+        Start-Sleep -Seconds 2
+
+        $toc = [IntPtr]::Zero
+        foreach ($v in @(Get-TestChildWindows -Window $vtop -Class 'GhozttyViewer')) {
+            foreach ($c in @(Get-TestChildWindows -Window ([IntPtr]$v.Hwnd) -Class 'GhozttyViewerTOC')) {
+                $toc = [IntPtr]$c.Hwnd
+            }
+        }
+        Assert ($toc -ne [IntPtr]::Zero -and (Test-TestWindowVisible -Window $toc)) `
+            'F the contents card is a visible CHILD window (gutter layout)'
+        if ($toc -eq [IntPtr]::Zero) { Write-Host 'ABORT: no contents card to score'; exit 1 }
+
+        # The pill is the EMPHASIZED selection, and emphasis is
+        # `w32.windowIsActive` - off the input desktop, the GUI thread's
+        # `GetActiveWindow` (T215). Assert the activation rather than assume
+        # it: without it the pill is the unemphasized gray, and a missing
+        # accent pixel would read as a color defect instead of as the
+        # harness never having made the window active.
+        Set-TestActiveWindow -Window $vtop | Out-Null
+        Assert ((Get-TestActiveWindow -Window $vtop) -eq $vtop) `
+            'F the viewer window is the ACTIVE window, so the card paints its emphasized pill'
+        Start-Sleep -Milliseconds 800
+
+        $shot = Get-TestWindowPixels -Window $toc -Sync
+        try {
+            Assert ((Get-TestDistinctColors -Shot $shot) -ge 8) `
+                "F the card capture holds real content ($(Get-TestDistinctColors -Shot $shot) distinct colors)"
+            Assert (Test-ShotHasColor $shot $ACCENT_A) "F1 the card's selected row is filled with $(Format-Rgb $ACCENT_A)"
+            Assert (-not (Test-ShotHasColor $shot $ACCENT_B)) "F1 and nothing on it is $(Format-Rgb $ACCENT_B) yet"
+        } finally { Close-TestWindowPixels -Shot $shot }
+
+        # F2: the accent MOVES on the card. Notified to the top-level window,
+        # which is the only window DWM sends the broadcast to. What this scores
+        # is that the card reads the accent through the shared cache the
+        # message drops, and keeps no stale copy of its own - NOT that anything
+        # invalidated it, which F3 covers and the header explains.
+        Set-Accent $ACCENT_B
+        Send-TestRawMessage -Window $vtop -Message $WM_DWMCOLORIZATIONCOLORCHANGED -WParam 0 -LParam 0 | Out-Null
+        Start-Sleep -Milliseconds 1200
+        $shot = Get-TestWindowPixels -Window $toc -Sync
+        try {
+            Assert (Test-ShotHasColor $shot $ACCENT_B) `
+                "F2 the card's pill is $(Format-Rgb $ACCENT_B) after the accent changed, though only its OWNER was notified"
+            Assert (-not (Test-ShotHasColor $shot $ACCENT_A)) `
+                'F2 and the accent it painted with is gone - the card holds no accent of its own'
+        } finally { Close-TestWindowPixels -Shot $shot }
+    } finally {
+        Kill-RepoInstances
+    }
+
+    # -----------------------------------------------------------------------
+    # F3: the parent's redraw still reaches its children (T307's flag)
+    # -----------------------------------------------------------------------
+    #
+    # `repaintForColorChange` is the ONE reaction a top-level window has to a
+    # system color change, and `RDW_ALLCHILDREN` is the half that reaches a
+    # child HWND - which never receives the broadcast itself. Removing it has
+    # no symptom any capture here can see (the header), so it is asserted as
+    # source text.
+    #
+    # The analyzer is exercised against a fixture first, section-A style: a
+    # gate that has only ever been observed saying "fine" is indistinguishable
+    # from one that cannot say anything else (T1133).
+    function Test-RedrawsChildren([string]$Text) {
+        $m = [regex]::Match(
+            $Text,
+            '(?ms)^pub fn repaintForColorChange\(.*?^\}')
+        if (-not $m.Success) { return $null }
+        return ($m.Value -match 'w32\.RedrawWindow' -and $m.Value -match 'RDW_ALLCHILDREN')
+    }
+
+    $fixtureGood = @"
+pub fn repaintForColorChange(hwnd: w32.HWND) void {
+    invalidate();
+    _ = w32.RedrawWindow(hwnd, null, null, w32.RDW_INVALIDATE | w32.RDW_ERASE | w32.RDW_ALLCHILDREN);
+}
+"@
+    $fixtureBad = $fixtureGood.Replace(' | w32.RDW_ALLCHILDREN', '')
+    Assert ((Test-RedrawsChildren $fixtureGood) -eq $true) 'F3 the analyzer accepts a redraw that names RDW_ALLCHILDREN'
+    Assert ((Test-RedrawsChildren $fixtureBad) -eq $false) 'F3 and REJECTS the same function with the flag dropped'
+
+    $sysColors = Get-Content (Join-Path $repo 'src\apprt\win32\system_colors.zig') -Raw
+    $redraws = Test-RedrawsChildren $sysColors
+    Assert ($null -ne $redraws) 'F3 system_colors.zig still defines repaintForColorChange'
+    Assert ($redraws -eq $true) `
+        'F3 repaintForColorChange redraws the window AND EVERY CHILD (RDW_ALLCHILDREN) - the only route a child HWND has to a new accent'
 
 } finally {
     if ($dirJob) { Stop-Job $dirJob -ErrorAction SilentlyContinue; Remove-Job $dirJob -Force -ErrorAction SilentlyContinue }
