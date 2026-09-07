@@ -17,6 +17,13 @@
               what `go-loop-exec.ps1 claim` runs once a turn.
       clear   Clear now, whatever the numbers say.
 
+    `check` and `sweep` also ask whether the fetched packages in the global
+    cache look WHOLE, not merely numerous (T1436). On 2026-09-07 the claim
+    printed "build cache ok: 1025.8 GB free, 1474 entries" and every build on
+    the box was already dead: one package had been half-extracted, and this
+    report counted it as an entry like any other. Scanning for that costs ~90ms
+    over 1,500 packages and is described in scripts\lib\CacheHeal.ps1.
+
     Clearing is WHOLE, never by age: pruning `o\` alone leaves Zig's manifests
     in `h\` claiming outputs that no longer exist, and the next build fails
     with `failed to spawn build runner ... FileNotFound`. See
@@ -61,6 +68,8 @@ $ErrorActionPreference = 'Stop'
 
 if (-not $Repo) { $Repo = Split-Path -Parent $PSScriptRoot }
 . (Join-Path $PSScriptRoot 'lib\BuildCache.ps1')
+# Get-TornPackage: the integrity half of the cache question (T1436).
+. (Join-Path $PSScriptRoot 'lib\CacheHeal.ps1')
 
 if (-not $CacheDir -or $CacheDir.Count -eq 0) {
     $CacheDir = @(
@@ -75,6 +84,13 @@ $CacheDir = @($CacheDir | Where-Object { $_ } | Select-Object -Unique)
 $state = Get-BuildCacheState -CacheDirs $CacheDir -MinFreeGB $MinFreeGB `
     -MaxEntries $MaxEntries -WarnFreeGB $WarnFreeGB
 $tempState = Get-SystemTempState -RepoPath $Repo
+
+# Asked of every cache dir that has a `p\`, which in practice is the global
+# one. Never fatal and never nonzero, like everything else this script reports:
+# a torn package is a thing to NAME before a lane trips over it, and the repair
+# is a delete the caller decides on.
+$torn = @()
+foreach ($dir in $CacheDir) { $torn += @(Get-TornPackage -GlobalCacheDir $dir) }
 
 $cleared = @()
 $didClear = $false
@@ -105,6 +121,7 @@ if ($Json) {
         freeGB  = $state.FreeGB
         entries = $state.Entries
         caches  = @($state.Caches)
+        tornPackages = @($torn)
         systemTemp = ([ordered]@{
             path       = $tempState.Path
             drive      = $tempState.Drive
@@ -135,6 +152,18 @@ if ($didClear) {
     }
 } else {
     Write-Host $state.Summary
+}
+
+# T1436: "big" and "healthy" are different questions and only the first one was
+# ever asked here. A torn package is silent until a build needs the file that
+# went missing, and then it takes every lane down at once with a message that
+# names no task and no change.
+if (-not $didClear -and $torn.Count -gt 0) {
+    Write-Host "  BUILD CACHE TORN: $($torn.Count) fetched package(s) look half-extracted"
+    foreach ($t in ($torn | Select-Object -First 5)) {
+        Write-Host "    $($t.Reason): $($t.Entry) - $($t.Detail)"
+    }
+    Write-Host "    delete the named director(y/ies); the next build re-fetches them"
 }
 
 # T1431. The cache numbers above are about the REPO drive; zig's C/C++ compile

@@ -12,11 +12,17 @@
 
   Arms 1-8 drive the library functions against planted logs and a planted
   fake cache tree (all under a private temp dir; no real cache is touched).
-  Arm 9 is end-to-end: floor-lane.ps1 -Command mode cannot exercise the heal
-  path (heals are for zig lanes), so the wiring arm instead runs the script
-  with a stubbed lane via -SelfTest to prove the file still parses and the
-  dot-source of CacheHeal.ps1 resolves; the heal-decision logic itself is the
-  same code arms 1-8 proved.
+  Arm 9 proves floor-lane.ps1 still parses and dot-sources the library.
+
+  Arms 16-22 cover T1436, the other shape: a half-extracted FETCHED PACKAGE,
+  which is reported by the cache layer rather than the compiler and so carries
+  no `:line:col:` for the rules above to match. Arm 20 is the integrity scan
+  that answers the same question WITHOUT a failing build, arm 21 is its
+  reachability from the claim's cache report, and arm 22 is genuinely end to
+  end: floor-lane.ps1 -Command drives a real process that fails while the torn
+  package exists and passes once it is gone, so a PASS is proof the lane healed
+  and re-ran. (Arm 9 could not do that until T1436 lifted the heal policy out
+  of the lane loop into a function -Command mode also runs.)
 
   Prints a single ALL PASS / N FAILURE(S) line, like every other script here.
 
@@ -226,6 +232,151 @@ try {
     $healOut4 = Invoke-CacheHeal -Entries $torn 6>&1 | ForEach-Object { $_.ToString() } | Out-String
     Check 'heal deletes a hash-file entry' (-not (Test-Path $zFile)) $healOut4
     Check 'heal names the rule that fired' ($healOut4 -match 'rule: error-in-cache') $healOut4
+    # =====================================================================
+    # T1436: a torn FETCHED PACKAGE. The 2026-09-07 outage -- every build and
+    # all four floor lanes red at once -- came through a shape none of the
+    # arms above can see: no `:line:col:`, and an entry under `p\` whose name
+    # is a package hash rather than a hex digest. Fixtures below reproduce the
+    # real package directory's contents exactly (four AppleDouble sidecars,
+    # AUTHORS.txt and OFL.txt, and no `fonts/`), which is what is still sitting
+    # on the box as `<hash>.torn-20260907`.
+    # =====================================================================
+
+    $PkgAnon = 'N-V-__8AAIC5lwAVPJJzxnCAahSvZTIlG-HhtOvnM1uh-66x'
+    $PkgNamed = 'libxev-0.0.0-86vtc4IcEwCqEYxEYoN_3KXmc6A9VLcm22aVImfvecYs'
+
+    function New-TornPackageDir {
+        param([string]$Root, [string]$Name)
+        $d = Join-Path $Root "p\$Name"
+        New-Item -ItemType Directory -Path $d -Force | Out-Null
+        foreach ($f in '._.', '._AUTHORS.txt', '._fonts', '._OFL.txt', 'AUTHORS.txt', 'OFL.txt') {
+            Set-Content -Path (Join-Path $d $f) -Value 'x' -Encoding Ascii
+        }
+        return $d
+    }
+
+    # -- 16: the real error line names the PACKAGE directory, both name shapes
+    foreach ($pkg in @($PkgAnon, $PkgNamed)) {
+        $pd = New-TornPackageDir -Root $GlobalCache -Name $pkg
+        $log = New-Log @(
+            "error: failed to check cache: '$pd\fonts\ttf\JetBrainsMono-Regular.ttf' file_hash FileNotFound"
+        )
+        $torn = @(Get-TornCacheEntry -LogPath $log -RepoPath $FakeRepo -GlobalCacheDir $GlobalCache)
+        Check "torn package is detected ($($pkg.Substring(0,6))...)" ($torn.Count -eq 1) "got $($torn.Count)"
+        Check "and the entry is the package dir, not the file ($($pkg.Substring(0,6))...)" `
+            ($torn.Count -eq 1 -and $torn[0].Entry -ieq $pd) `
+            $(if ($torn.Count -ge 1) { $torn[0].Entry } else { '(none)' })
+        Check "and says which rule fired ($($pkg.Substring(0,6))...)" `
+            ($torn.Count -eq 1 -and $torn[0].Reason -eq 'torn-package') `
+            $(if ($torn.Count -ge 1) { $torn[0].Reason } else { '(none)' })
+    }
+
+    # -- 17: NEGATIVE CONTROL -- the same line naming a path outside any cache
+    # heals nothing. This is the arm that says the rule is about the cache and
+    # not about the words "failed to check cache".
+    $log = New-Log @(
+        "error: failed to check cache: 'D:\git\ghoztty\src\font\res\JetBrainsMono-Regular.ttf' file_hash FileNotFound"
+        "error: failed to check cache: 'C:\Users\someone\Downloads\thing.ttf' file_hash FileNotFound"
+    )
+    $torn = @(Get-TornCacheEntry -LogPath $log -RepoPath $FakeRepo -GlobalCacheDir $GlobalCache)
+    Check 'a fetch-check line outside the cache heals nothing' ($torn.Count -eq 0) "got $($torn.Count)"
+
+    # -- 18: NEGATIVE CONTROL -- a directory under `p\` whose name is not a
+    # package hash is refused. The set-aside copy this box makes by hand is the
+    # live example, and deleting one of those would destroy the evidence.
+    foreach ($bad in @("$PkgAnon.torn-20260907", 'tmp', 'not-a-hash')) {
+        $bd = Join-Path $GlobalCache "p\$bad"
+        New-Item -ItemType Directory -Path $bd -Force | Out-Null
+        $log = New-Log @("error: failed to check cache: '$bd\fonts\x.ttf' file_hash FileNotFound")
+        $torn = @(Get-TornCacheEntry -LogPath $log -RepoPath $FakeRepo -GlobalCacheDir $GlobalCache)
+        Check "a non-package dir under p\ is refused ($bad)" ($torn.Count -eq 0) "got $($torn.Count)"
+    }
+    Check 'Test-PackageEntryName accepts the anonymous hash' (Test-PackageEntryName -Name $PkgAnon) ''
+    Check 'Test-PackageEntryName accepts a named hash' (Test-PackageEntryName -Name $PkgNamed) ''
+    Check 'Test-PackageEntryName rejects the set-aside copy' `
+        (-not (Test-PackageEntryName -Name "$PkgAnon.torn-20260907")) ''
+
+    # -- 19: the heal deletes the package directory, and refuses a p-bucket
+    # path that is not package-shaped even when handed one directly.
+    $pd = Join-Path $GlobalCache "p\$PkgAnon"
+    $log = New-Log @("error: failed to check cache: '$pd\fonts\ttf\x.ttf' file_hash FileNotFound")
+    $torn = @(Get-TornCacheEntry -LogPath $log -RepoPath $FakeRepo -GlobalCacheDir $GlobalCache)
+    $healOut5 = Invoke-CacheHeal -Entries $torn 6>&1 | ForEach-Object { $_.ToString() } | Out-String
+    Check 'heal deletes the torn package directory' (-not (Test-Path $pd)) $healOut5
+    Check 'heal names the torn-package rule' ($healOut5 -match 'rule: torn-package') $healOut5
+    $bogusPkg = [pscustomobject]@{
+        Entry  = (Join-Path $GlobalCache 'p\not-a-hash')
+        File   = 'x'; Reason = 'torn-package'; Line = 'y'
+    }
+    $healOut6 = Invoke-CacheHeal -Entries @($bogusPkg) 6>&1 | ForEach-Object { $_.ToString() } | Out-String
+    Check 'heal refuses a p-bucket dir that is not package-shaped' `
+        ((Test-Path $bogusPkg.Entry) -and $healOut6 -match 'CACHE HEAL REFUSED') $healOut6
+
+    # -- 20: Get-TornPackage -- the integrity question, asked WITHOUT a build.
+    $ScanCache = Join-Path $Sandbox 'scan-cache'
+    $tornPkg = New-TornPackageDir -Root $ScanCache -Name $PkgAnon
+    $emptyPkg = Join-Path $ScanCache "p\$PkgNamed"
+    New-Item -ItemType Directory -Path $emptyPkg -Force | Out-Null
+    $found = @(Get-TornPackage -GlobalCacheDir $ScanCache)
+    Check 'the scan finds both suspect packages' ($found.Count -eq 2) "got $($found.Count)"
+    Check 'and names the orphan sidecar' `
+        (@($found | Where-Object { $_.Reason -eq 'orphan-sidecar' -and $_.Entry -ieq $tornPkg }).Count -eq 1) `
+        (($found | ForEach-Object { "$($_.Reason):$($_.Entry)" }) -join '; ')
+    Check 'and names the empty package' `
+        (@($found | Where-Object { $_.Reason -eq 'empty-package' -and $_.Entry -ieq $emptyPkg }).Count -eq 1) ''
+
+    # NEGATIVE CONTROL for the scan: an intact package (including the `._.`
+    # root sidecar, which ships in three of this box's real packages and names
+    # no sibling) and a non-package directory are both left alone.
+    $CleanCache = Join-Path $Sandbox 'clean-cache'
+    $good = Join-Path $CleanCache "p\$PkgAnon"
+    New-Item -ItemType Directory -Path (Join-Path $good 'fonts') -Force | Out-Null
+    foreach ($f in '._.', '._fonts', '._OFL.txt', 'OFL.txt') {
+        Set-Content -Path (Join-Path $good $f) -Value 'x' -Encoding Ascii
+    }
+    New-Item -ItemType Directory -Path (Join-Path $CleanCache 'p\tmp') -Force | Out-Null
+    Check 'an intact package (with a ._. root sidecar) is not flagged' `
+        ((@(Get-TornPackage -GlobalCacheDir $CleanCache)).Count -eq 0) `
+        ((@(Get-TornPackage -GlobalCacheDir $CleanCache) | ForEach-Object { "$($_.Reason):$($_.Detail)" }) -join '; ')
+    Check 'a cache with no p\ at all scans clean' `
+        ((@(Get-TornPackage -GlobalCacheDir (Join-Path $Sandbox 'no-such-cache'))).Count -eq 0) ''
+
+    # -- 21: the claim's cache report can tell "big" from "torn". build-cache
+    # `check` is what go-loop-exec.ps1 claim runs (as `sweep`), so this is the
+    # reachability arm for that goal.
+    $bcScript = Join-Path $RepoRoot 'scripts\build-cache.ps1'
+    $bcTorn = & powershell -NoProfile -ExecutionPolicy Bypass -File $bcScript check `
+        -Repo $FakeRepo -CacheDir $ScanCache -MinFreeGB 0 2>&1 |
+        ForEach-Object { $_.ToString() } | Out-String
+    Check 'build-cache check reports a torn package' ($bcTorn -match 'BUILD CACHE TORN: 2 fetched package') $bcTorn
+    Check 'and names the entry to delete' ($bcTorn -match [regex]::Escape($tornPkg)) $bcTorn
+    $bcClean = & powershell -NoProfile -ExecutionPolicy Bypass -File $bcScript check `
+        -Repo $FakeRepo -CacheDir $CleanCache -MinFreeGB 0 2>&1 |
+        ForEach-Object { $_.ToString() } | Out-String
+    Check 'a healthy cache prints no torn line' ($bcClean -notmatch 'BUILD CACHE TORN') $bcClean
+
+    # -- 22: end to end. floor-lane runs a command that fails exactly the way
+    # 2026-09-07 failed while the package directory exists, and succeeds once
+    # it is gone -- so a PASS here is proof the lane healed and re-ran rather
+    # than reporting a bare FAIL. This is the arm arm 9 could not be.
+    $E2ECache = Join-Path $Sandbox 'e2e-cache'
+    $e2ePkg = New-TornPackageDir -Root $E2ECache -Name $PkgAnon
+    $failScript = Join-Path $Sandbox 'e2e-fail.ps1'
+    @(
+        "if (Test-Path '$e2ePkg') {"
+        "  Write-Host `"error: failed to check cache: '$e2ePkg\fonts\ttf\JetBrainsMono-Regular.ttf' file_hash FileNotFound`""
+        "  exit 1"
+        "}"
+        "Write-Host 'rebuilt clean'"
+        "exit 0"
+    ) | Set-Content -Path $failScript -Encoding Ascii
+    $laneOut = & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $RepoRoot 'scripts\floor-lane.ps1') `
+        -Command "powershell -NoProfile -File $failScript" -CacheDir $E2ECache -MinFreeGB 0 2>&1 |
+        ForEach-Object { $_.ToString() } | Out-String
+    Check 'floor-lane heals the torn package it was handed' (-not (Test-Path $e2ePkg)) $laneOut
+    Check 'floor-lane says it healed and re-ran' ($laneOut -match 'healed 1 torn cache entr') $laneOut
+    Check 'and the re-run passes, so the lane is not a bare FAIL' ($laneOut -match 'FLOOR SUMMARY: command=PASS') $laneOut
+
     Complete-TestBody  # T1039: the run reached the end of its body
 }
 finally {

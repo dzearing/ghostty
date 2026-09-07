@@ -44,10 +44,26 @@
                                 cache entry ... error.Overflow" lines, which
                                 corroborate a torn cache but name no entry
       Test-CacheFileIntact      one cached file -> does it look whole on disk
+      Get-TornPackage           global cache -> fetched packages that look
+                                half-extracted, asked WITHOUT a failing build
       Invoke-CacheHeal          delete the named entries, loudly
 
+    A THIRD shape is a torn FETCHED PACKAGE rather than a torn generated file
+    (T1436). On 2026-09-07 every build and all four floor lanes died at once on
+
+      error: failed to check cache: 'D:\zig-global-cache\p\N-V-__8A...\fonts\ttf\JetBrainsMono-Regular.ttf' file_hash FileNotFound
+
+    -- the package directory held two text files and a few macOS AppleDouble
+    sidecars, and the `fonts/` tree the message names was simply gone. Nothing
+    here saw it: the line carries no `:line:col:`, so the compile-error rule
+    above never matched it, and the unit of repair is a directory under `p\`
+    whose name is a package hash rather than a hex digest, which
+    Resolve-CachePath refused. Both are handled now -- the `failed to check
+    cache:` line is parsed on its own terms, and `p\<package-hash>` is a
+    recognized entry shape, deleted whole so the next build re-fetches it.
+
     Safety over eagerness: an entry is only ever named when the path resolves
-    to <cache-root>\<single-letter-bucket>\<hex-hash>, and Invoke-CacheHeal
+    to <cache-root>\<single-letter-bucket>\<hash>, and Invoke-CacheHeal
     re-verifies that shape before deleting. A mis-parsed compiler line can
     therefore never aim the delete at source, and a genuine compile error in
     generated-but-correct cache content simply fails again on the retry, which
@@ -73,6 +89,28 @@ function Get-TornCacheEntry {
     $seen = @{}
     $out = @()
     foreach ($line in @(Get-Content $LogPath -ErrorAction SilentlyContinue)) {
+        # T1436: a torn FETCHED PACKAGE is reported by the cache layer, not by
+        # the compiler, so it carries no `:line:col:` and the rule below never
+        # sees it. The quoted path is a file zig expected to find inside a
+        # package it had already extracted; the unit of repair is the package.
+        # This is unconditional for the same reason `error-in-cache` is: zig
+        # only says this about content it owns, and the path still has to
+        # resolve INSIDE a cache before anything is named.
+        if ($line -match "failed to check cache:\s*'(?<path>[^']+)'\s*(?<field>\S+)\s+(?<why>\S+)") {
+            $file = $matches['path'] -replace '/', '\'
+            $resolved = Resolve-CachePath -FilePath $file -RepoPath $RepoPath -GlobalCacheDir $GlobalCacheDir
+            if (-not $resolved) { continue }
+            $key = $resolved.Entry.ToLowerInvariant()
+            if ($seen.ContainsKey($key)) { continue }
+            $seen[$key] = $true
+            $out += [pscustomobject]@{
+                Entry  = $resolved.Entry
+                File   = $file
+                Reason = 'torn-package'
+                Line   = $line.Trim()
+            }
+            continue
+        }
         if ($line -notmatch '(?<path>\S[^\s:]*(?::\\[^\s:]*)?):\d+:\d+:\s*(?<kind>error|note):\s*(?<msg>.*)$') { continue }
         $file = $matches['path'] -replace '/', '\'
         $kind = $matches['kind']
@@ -140,6 +178,120 @@ function Test-CacheFileIntact {
     return $true
 }
 
+function Test-PackageEntryName {
+    <#
+    .SYNOPSIS
+        Is this directory name a zig PACKAGE hash (the `p\` bucket's entries)?
+    .DESCRIPTION
+        Two shapes exist, both copied verbatim into build.zig.zon by `zig fetch`:
+
+          libxev-0.0.0-86vtc4IcEwCqEYxEYoN_3KXmc6A9VLcm22aVImfvecYs
+          N-V-__8AAIC5lwAVPJJzxnCAahSvZTIlG-HhtOvnM1uh-66x     (anonymous)
+
+        Both END in a base64url digest of at least 40 characters, and that is
+        the discriminator: the last 40 characters of the name must be pure
+        base64url ([A-Za-z0-9_-]) with no dot in them, the whole name must
+        look like a package hash ([A-Za-z0-9_.-]), and it must contain a
+        hyphen, which every one of these does. Splitting on the last hyphen
+        instead does NOT work and was the first attempt -- base64url uses `-`
+        as a digit, so the anonymous hash above ends `...-66x`.
+
+        Deliberately strict, because the whole point of a shape test is that
+        a mis-parsed path cannot aim a recursive delete at something that is
+        not regenerable. It rejects the set-aside copies this box makes by
+        hand (`<hash>.torn-20260907` puts a dot inside the final 40), scratch
+        directories like `tmp`, short names, and anything carrying a path
+        separator.
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+    if ($Name -match '[\\/]') { return $false }
+    if ($Name.Length -lt 40) { return $false }
+    if ($Name -notmatch '-') { return $false }
+    if ($Name -notmatch '^[A-Za-z0-9_.\-]+$') { return $false }
+    return ($Name.Substring($Name.Length - 40) -match '^[A-Za-z0-9_\-]{40}$')
+}
+
+function Get-TornPackage {
+    <#
+    .SYNOPSIS
+        Fetched packages that look half-extracted, asked of the cache itself.
+    .DESCRIPTION
+        The other half of T1436: a torn package is SILENT until a build needs
+        the file that went missing, so `go-loop-exec claim` reported
+        "build cache ok: 1025.8 GB free, 1474 entries" minutes before every
+        lane on the box went red. That check counts entries and free space; it
+        never asks whether any of them is whole.
+
+        Whole is not cheaply decidable -- the honest answer is re-hashing the
+        tree, which is minutes for 1500 packages -- so this asks the two
+        questions that are O(one non-recursive listing) per package and that
+        the observed tear answers YES to:
+
+          * EMPTY: the package directory exists and holds nothing. An
+            extraction that produced no files at all.
+          * ORPHAN SIDECAR: a macOS AppleDouble `._<name>` with no companion
+            `<name>` beside it. That is exactly what was left on 2026-09-07 --
+            `._fonts` survived and the whole `fonts/` tree it describes did
+            not -- and a sidecar without its file cannot be a correct
+            extraction of any archive. `._.` is exempt: it describes the
+            archive's own root, names no sibling, and ships intact in three
+            of this box's packages.
+
+        It is a smoke alarm, not a proof: a package torn in a way that leaves
+        neither tell reads as fine here and is still caught by
+        Get-TornCacheEntry the moment a build trips over it. Missing one costs
+        nothing that was not already covered; a false positive would cost a
+        re-fetch, which is why both rules describe states that cannot occur in
+        a correct extraction.
+    .OUTPUTS
+        One object per suspect package: Entry (the directory), Reason, Detail.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$GlobalCacheDir,
+        # Belt and braces for a cache far larger than this box's: stop after
+        # this many suspects rather than building an unbounded report.
+        [int]$MaxReported = 20
+    )
+    $out = @()
+    $pdir = Join-Path $GlobalCacheDir 'p'
+    if (-not (Test-Path -LiteralPath $pdir -PathType Container)) { return $out }
+    $dirs = @()
+    try { $dirs = @([System.IO.Directory]::EnumerateDirectories($pdir)) } catch { return $out }
+    foreach ($d in $dirs) {
+        $name = Split-Path -Leaf $d
+        if (-not (Test-PackageEntryName -Name $name)) { continue }
+        $names = @()
+        try { foreach ($e in [System.IO.Directory]::EnumerateFileSystemEntries($d)) { $names += (Split-Path -Leaf $e) } }
+        catch { continue }
+        if ($names.Count -eq 0) {
+            $out += [pscustomobject]@{ Entry = $d; Reason = 'empty-package'; Detail = 'directory holds no entries' }
+        }
+        else {
+            $have = @{}
+            foreach ($n in $names) { $have[$n.ToLowerInvariant()] = $true }
+            foreach ($n in $names) {
+                if ($n.Length -le 2 -or $n.Substring(0, 2) -ne '._') { continue }
+                $companion = $n.Substring(2)
+                # `._.` is the sidecar for the archive's own root directory and
+                # is present in three intact packages on this box, so it names
+                # no missing entry. Measured, not assumed: the first run of this
+                # scan over the live cache reported exactly those three.
+                if ($companion -eq '.' -or $companion -eq '..') { continue }
+                if (-not $have.ContainsKey($companion.ToLowerInvariant())) {
+                    $out += [pscustomobject]@{
+                        Entry  = $d
+                        Reason = 'orphan-sidecar'
+                        Detail = "'$n' has no companion '$companion'"
+                    }
+                    break
+                }
+            }
+        }
+        if ($out.Count -ge $MaxReported) { break }
+    }
+    return $out
+}
+
 function Resolve-CachePath {
     <#
     .SYNOPSIS
@@ -156,8 +308,14 @@ function Resolve-CachePath {
           <root>\<bucket>\<hash>             the hash FILE is the entry itself
               (the /z ZIR store keeps one file per hash), so it is deleted.
 
-        Bucket-letter and hex-hash are both required, so nothing that is not
-        hash-addressed content can ever be named.
+        Bucket-letter and hash are both required, so nothing that is not
+        hash-addressed content can ever be named. The `p` bucket (fetched
+        dependencies) is hash-addressed too, but by a PACKAGE hash rather than
+        a hex digest -- `libxev-0.0.0-86vtc4IcEwCqEYxEYoN_3KXmc6A9VLcm22aVImfvecYs`
+        or the anonymous `N-V-__8AAIC5lwAVPJJzxnCAahSvZTIlG-HhtOvnM1uh-66x`,
+        both verbatim from build.zig.zon -- so it gets its own shape test
+        (Test-PackageEntryName). Deleting a package directory costs a re-fetch
+        and nothing else.
     .OUTPUTS
         @{ Entry; FullPath } or $null.
     #>
@@ -187,7 +345,10 @@ function Resolve-CachePath {
     # Need at least <root>\<bucket>\<hash> below the root.
     if ($parts.Count -lt $rootIdx + 3) { return $null }
     if ($parts[$rootIdx + 1] -notmatch '^[a-z]$') { return $null }
-    if ($parts[$rootIdx + 2] -notmatch '^[0-9a-fA-F]{16,64}$') { return $null }
+    if ($parts[$rootIdx + 1] -ceq 'p') {
+        if (-not (Test-PackageEntryName -Name $parts[$rootIdx + 2])) { return $null }
+    }
+    elseif ($parts[$rootIdx + 2] -notmatch '^[0-9a-fA-F]{16,64}$') { return $null }
     return [pscustomobject]@{
         Entry    = ($parts[0..($rootIdx + 2)] -join '\')
         FullPath = $full
@@ -242,7 +403,15 @@ function Invoke-CacheHeal {
     $healed = 0
     foreach ($e in @($Entries)) {
         $dir = [string]$e.Entry
-        if ($dir -notmatch '(?i)cache[^\\]*\\[a-z]\\[0-9a-f]{16,64}$') {
+        # <cache>\<bucket>\<hex-hash> for generated content, or
+        # <cache>\p\<package-hash> for a fetched dependency (T1436) -- the
+        # package name is shape-tested rather than pattern-matched inline, so
+        # the two callers cannot drift apart on what a package looks like.
+        $shapeOk = $dir -match '(?i)cache[^\\]*\\[a-z]\\[0-9a-f]{16,64}$'
+        if (-not $shapeOk -and $dir -match '(?i)cache[^\\]*\\p\\(?<pkg>[^\\]+)$') {
+            $shapeOk = Test-PackageEntryName -Name $matches['pkg']
+        }
+        if (-not $shapeOk) {
             Write-Host "CACHE HEAL REFUSED: '$dir' is not <cache>\<bucket>\<hash>"
             continue
         }

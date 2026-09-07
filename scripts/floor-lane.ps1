@@ -661,6 +661,46 @@ function Invoke-CompilerCrashPolicy {
     return $out
 }
 
+<#
+.SYNOPSIS
+Heals a torn cache entry a red run blamed, and re-runs once.
+
+.DESCRIPTION
+The T494 policy, lifted out of the lane loop so `-Command` mode runs it too
+(T1436). It lived inline in the loop, which meant the only mode a test can
+fixture -- `-Command`, which drives a real process through the wrapper -- was
+the one mode that could not demonstrate a heal end to end. The rules are
+unchanged: at most ONE heal per lane per invocation, and the re-run's verdict
+is final, so a genuine failure simply fails again.
+#>
+function Invoke-CacheHealPolicy {
+    param(
+        [string]$Name,
+        [string]$Result,
+        [bool]$AlreadyHealed,
+        [string]$LogPath,
+        [string]$RepoPath,
+        [string]$GlobalCacheDir,
+        [Parameter(Mandatory)][scriptblock]$Rerun
+    )
+
+    $out = @{ Result = $Result; Healed = $AlreadyHealed }
+    if ($Result -ne 'FAIL' -or $AlreadyHealed -or -not $LogPath) { return $out }
+
+    $torn = @(Get-TornCacheEntry -LogPath $LogPath -RepoPath $RepoPath -GlobalCacheDir $GlobalCacheDir)
+    if ($torn.Count -eq 0) { return $out }
+
+    $out.Healed = $true
+    $warn = @(Get-CacheCorruptionWarning -LogPath $LogPath)
+    if ($warn.Count -gt 0) {
+        Write-Host "CACHE HEAL corroboration: $($warn.Count) invalid-timestamp warning(s) in the same log"
+    }
+    $removed = Invoke-CacheHeal -Entries $torn
+    Write-Host "LANE $Name healed $removed torn cache entr(y/ies); re-running once (a second FAIL is final)"
+    $out.Result = & $Rerun
+    return $out
+}
+
 # ------------------------------------------------- solo confirm pass (T1170)
 
 <#
@@ -836,6 +876,14 @@ if ($Command) {
     $policy = Invoke-CompilerCrashPolicy -Name 'command' -Result $r -AlreadyRetried $false `
         -Rerun { Invoke-Lane -Name 'command' -Iteration 1 -RawCommand $Command }
     $r = $policy.Result
+    # And the cache-heal policy (T1436), for the reason the function's own
+    # comment gives: this is the only mode a test can drive a real failing
+    # process through, so it is the only place the heal can be demonstrated
+    # end to end rather than asserted about the source.
+    $heal = Invoke-CacheHealPolicy -Name 'command' -Result $r -AlreadyHealed $false `
+        -LogPath $script:LastLaneLog -RepoPath $Repo -GlobalCacheDir $cacheDir `
+        -Rerun { Invoke-Lane -Name 'command' -Iteration 1 -RawCommand $Command }
+    $r = $heal.Result
     Write-Host ""
     Write-Host "FLOOR SUMMARY: command=$r$($policy.Note)"
     switch ($r) {
@@ -941,19 +989,11 @@ foreach ($l in $lanes) {
         $r = $policy.Result
         $compilerRetriedThisLane = $policy.Retried
         $note = $policy.Note
-        if ($r -eq 'FAIL' -and -not $healedThisLane -and $script:LastLaneLog) {
-            $torn = @(Get-TornCacheEntry -LogPath $script:LastLaneLog -RepoPath $Repo -GlobalCacheDir $cacheDir)
-            if ($torn.Count -gt 0) {
-                $healedThisLane = $true
-                $warn = @(Get-CacheCorruptionWarning -LogPath $script:LastLaneLog)
-                if ($warn.Count -gt 0) {
-                    Write-Host "CACHE HEAL corroboration: $($warn.Count) invalid-timestamp warning(s) in the same log"
-                }
-                $removed = Invoke-CacheHeal -Entries $torn
-                Write-Host "LANE $l healed $removed torn cache entr(y/ies); re-running once (a second FAIL is final)"
-                $r = Invoke-Lane -Name $l -Iteration $i
-            }
-        }
+        $heal = Invoke-CacheHealPolicy -Name $l -Result $r -AlreadyHealed $healedThisLane `
+            -LogPath $script:LastLaneLog -RepoPath $Repo -GlobalCacheDir $cacheDir `
+            -Rerun { Invoke-Lane -Name $l -Iteration $i }
+        $r = $heal.Result
+        $healedThisLane = $heal.Healed
         # A red lane is re-run narrowed to the tests it blamed, so the run
         # itself answers "is this the code or the box?" (T1170, the T1137 rule
         # applied to lanes). The verdict is NOT changed by the answer.
