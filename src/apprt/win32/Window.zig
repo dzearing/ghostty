@@ -14,6 +14,7 @@ const input = @import("../../input.zig");
 const App = @import("App.zig");
 const MachineChooser = @import("MachineChooser.zig");
 const ActivityMonitor = @import("ActivityMonitor.zig");
+const activity_borrow = @import("activity_borrow.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const RenameDialog = @import("RenameDialog.zig");
 const BannerDialog = @import("BannerDialog.zig");
@@ -1587,27 +1588,41 @@ pub fn openActivityMonitor(self: *Window) void {
     const dialed = self.remote_dialed orelse return ActivityMonitor.openLocal(self);
     const machine = self.remote_machine orelse return ActivityMonitor.openLocal(self);
 
-    // The registry key. A relay window keys on its DEVICE ID — the same string
-    // the chooser opens with — so the two entry points meet at one panel.
-    var id_buf: [ActivityMonitor.max_source_id]u8 = undefined;
-    const id: []const u8 = switch (machine) {
-        .relay => |r| blk: {
-            if (r.device.len > id_buf.len) return ActivityMonitor.openLocal(self);
-            @memcpy(id_buf[0..r.device.len], r.device);
-            break :blk id_buf[0..r.device.len];
-        },
-        .tcp => |t| std.fmt.bufPrint(&id_buf, "{s}:{d}", .{ t.host, t.port }) catch
-            return ActivityMonitor.openLocal(self),
-    };
+    var id_buf: [activity_borrow.max_id]u8 = undefined;
+    const src = activityPanelSource(&id_buf, machine) orelse
+        return ActivityMonitor.openLocal(self);
 
-    // The panel titles itself from the name (`Source.label`), which is the same
-    // string the pill paints — so the window you clicked and the panel that
-    // opened name the same machine.
-    ActivityMonitor.openReusing(
-        self,
-        .{ .remote = .{ .id = id, .name = self.machineDisplayName() } },
-        dialed.conn(),
-    );
+    ActivityMonitor.openReusing(self, .{ .remote = src }, dialed.conn());
+}
+
+/// How an Activity panel IDENTIFIES and NAMES a machine — one derivation for
+/// both, and for both entry points (T1419).
+///
+/// The key is `activity_borrow.sourceId`, which is what the carousel derives
+/// for this window's card (`activity_machines.refreshWindowMachines`) and what
+/// `borrowFrom` matches on, so the panel the palette opens and the card the
+/// carousel offers are the same registry entry. A relay window keys on its
+/// DEVICE ID — the same string the chooser opens with — so the chooser's entry
+/// point meets them there too.
+///
+/// The NAME is that same string rather than `machineDisplayName()`. T610 named
+/// the panel with the display name and gave a direct-host box two names a click
+/// apart: `Activity — 127.0.0.1` from the palette, `127.0.0.1:47913` once the
+/// carousel had been through it, because a window-derived card has only the id
+/// to label itself with. The id is also the only one of the two that can tell
+/// two agents on one host apart, which is the question a process panel exists
+/// to answer. The pill and the close confirmation keep the bare host on
+/// purpose: what they answer is "which box did I type", and that is a different
+/// question.
+///
+/// Null when the identity does not fit `buf`, which the caller answers by
+/// opening the Local panel rather than a mislabeled one.
+pub fn activityPanelSource(buf: []u8, machine: RemoteMachine) ?ActivityMonitor.Remote {
+    const id = activity_borrow.sourceId(buf, switch (machine) {
+        .relay => |r| .{ .relay = r.device },
+        .tcp => |t| .{ .tcp = .{ .host = t.host, .port = t.port } },
+    }) orelse return null;
+    return .{ .id = id, .name = id };
 }
 
 /// The pill's size for the caption's layout: zero when there is no pill, or
@@ -8526,4 +8541,41 @@ test "T228: split_geometry's divider cursor ids ARE the OS's IDC_* values" {
     try std.testing.expectEqual(w32.IDC_SIZEWE, split_geometry.DividerCursor.size_we.idc());
     try std.testing.expectEqual(w32.IDC_SIZENS, split_geometry.DividerCursor.size_ns.idc());
     try std.testing.expectEqual(w32.IDC_SIZEWE, split_geometry.HERO_DIVIDER_CURSOR.idc());
+}
+
+test "T1419: an Activity panel names a machine by its identity, both entry points" {
+    // The regression this locks: T610 named the panel `machineDisplayName()`,
+    // which drops the port, while the carousel's card for the same window keeps
+    // it — so one box answered to two names a click apart.
+    var buf: [activity_borrow.max_id]u8 = undefined;
+
+    const tcp: RemoteMachine = .{ .tcp = .{ .host = "127.0.0.1", .port = 47913 } };
+    const src = activityPanelSource(&buf, tcp).?;
+    try std.testing.expectEqualStrings("127.0.0.1:47913", src.id);
+    // The name is the id, NOT the display name — and the two really do differ
+    // here, so this is a live check rather than a tautology.
+    try std.testing.expectEqualStrings(src.id, src.name);
+    try std.testing.expectEqualStrings("127.0.0.1", tcp.displayName());
+
+    // Same key the carousel derives for that window's card, so the palette
+    // entry and the carousel meet at ONE registry entry.
+    var other: [activity_borrow.max_id]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        activity_borrow.sourceId(&other, .{
+            .tcp = .{ .host = "127.0.0.1", .port = 47913 },
+        }).?,
+        src.id,
+    );
+
+    // A relay machine is its device id under both derivations, which is what
+    // the chooser opens with.
+    const relay: RemoteMachine = .{ .relay = .{ .base = "https://relay", .device = "dev-abc" } };
+    const rsrc = activityPanelSource(&buf, relay).?;
+    try std.testing.expectEqualStrings("dev-abc", rsrc.id);
+    try std.testing.expectEqualStrings("dev-abc", rsrc.name);
+
+    // An identity that does not fit is refused rather than truncated: the
+    // caller opens the Local panel instead of a mislabeled remote one.
+    var small: [4]u8 = undefined;
+    try std.testing.expect(activityPanelSource(&small, tcp) == null);
 }

@@ -870,3 +870,16 @@ if (-not $Interactive -and $env:GHOZTTY_TEST_INTERACTIVE -ne '1') {
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ACTIVITY MONITOR REMOTE ACCEPTANCE: ALL PASS ($script:pass assertions)" }
 else { Write-Host "$script:fail FAILURE(S) ($script:pass passed)" -ForegroundColor Red; exit 1 }
+
+# --- stamp (T783, row added by T1419) ------------------------------------
+# A green run RECORDS the content of the borrowed-panel sources and this script,
+# so scripts\guard-due.ps1 can answer "has anything run this harness against the
+# code as it now stands?". Nothing tied the panel's IDENTITY derivation to this
+# script before T1419, which is exactly how T610 shipped a direct-host box
+# answering to two names with sections A and B red and nobody obliged to look. A
+# red run leaves the stamp alone on purpose (the `exit 1` above sees to that),
+# and a -NegativeControl run never stamps.
+if (-not $NegativeControl) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard activity-monitor-remote -Repo $repo 2>&1 | ForEach-Object { Write-Host "  $_" }
+}

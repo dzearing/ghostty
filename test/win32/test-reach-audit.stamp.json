@@ -1,12 +1,10 @@
 {
     "guard":  "test-reach",
     "script":  "test/win32/test-reach-audit.ps1",
-    "generated":  "2026-09-07T04:06:34-07:00",
-    "commit":  "5bbab5834",
+    "generated":  "2026-09-07T04:52:01-07:00",
+    "commit":  "fa6bfaf87",
     "uncommitted":  [
-                        "src/apprt/win32/activity_dial.zig",
-                        "src/apprt/win32/ActivityMonitor.zig",
-                        "src/apprt/win32/RemoteReconnect.zig"
+                        "src/apprt/win32/Window.zig"
                     ],
     "files":  {
                   "src/apprt/win32.zig":  "5e2dc3b906c6617012aa666fcf317bc1f786f110e513283f473feef22d5d6326",
@@ -219,7 +217,7 @@
                   "src/apprt/win32/webview2_iface.zig":  "cdfe46db3c405118ff363783a9dd825b7ad4a14d6722b3158328ab27759d4636",
                   "src/apprt/win32/webview2_paths.zig":  "125e4d497fe25e488b9f5a8aee4f0ffe34b7c6f377b0741a89c6781552bc9cf6",
                   "src/apprt/win32/win32.zig":  "6a09d5598231bd34f2d6397f307f7ec041ba65933b02b0022e9c0c117422a467",
-                  "src/apprt/win32/Window.zig":  "8eec58b28bac91cac97bb0fa8a51c3f8b94e1772fd8caf8f902bd803f789b428",
+                  "src/apprt/win32/Window.zig":  "2c8dbe23ce282f260b0e7acb0b02ce74ec2659aa86ac70087f4638a9ef0931e4",
                   "src/apprt/win32/window_active.zig":  "8aa79fb8bcc6ab7aab8f422fde48072728c99173edd607dbe70226f3ed8927e0",
                   "src/apprt/win32/window_chord.zig":  "d349bbbe70be2592b09a3945fc64d4f77d9f5fb9e85219d86f335bdebd6e6df0",
                   "src/apprt/win32/window_memory.zig":  "b4f2912a881c6380b205744d5516b50677557f483d1776e8edbaaa75a99e1269",

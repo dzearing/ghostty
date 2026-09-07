@@ -24075,3 +24075,48 @@ agent 402s). `remote-pill.ps1` ALL PASS (11) with `-NegativeControl` red;
 `ipc-p1` 25, `ipc-p2` 20, `ipc-p3` 16. Re-stamped for the Window.zig /
 Surface.zig edits: `remote-pill` (new), `remote-disconnect` 49, `close-confirm`
 58, `viewer-close` 44, and the ten static audits.
+
+## 2026-09-07 - one machine, one name in the Activity panel however you opened it (T1419)
+
+Open the Activity Monitor on a window running somewhere else and the panel was
+titled `Activity - 127.0.0.1`. Move its machine carousel to Local and back and
+the same panel, same machine, same connection, was now `127.0.0.1:47913`. Two
+names for one box, a click apart - and on a host running more than one agent the
+shorter one cannot even tell them apart.
+
+Two derivations was the whole defect. T610 moved the palette entry onto the
+window and named the panel `machineDisplayName()`, which answers the bare host
+for a direct-TCP machine on purpose: the close confirmation wants the box the
+user typed. The carousel's card for that same window has only the source id to
+label itself with, so the two disagreed the moment T610 landed.
+
+The fix is one derivation rather than a second special case.
+`Window.activityPanelSource()` is new: it runs `activity_borrow.sourceId` - the
+key the carousel derives for this window's card and the key `borrowFrom` matches
+on - and hands the panel that string as BOTH id and name. `openActivityMonitor`
+had its own copy of the `host:port` formatting; it is gone.
+`machineDisplayName()` is untouched, so the pill and the close confirmation keep
+the bare host: they answer "which box did I type", and the panel answers "which
+of the agents on it am I looking at", which only the identity can say.
+
+The gap under the gap is why this shipped red for a day:
+`activity-monitor-remote.ps1` was tied to no guard row, so an edit to the site
+that names the panel made nothing due. It has a row now - `activity_borrow.zig`,
+`activity_machines.zig`, `Window.zig`, the script - and the script stamps itself
+on a green run like its neighbours. `Window.zig` is on that list despite moving
+for a hundred unrelated reasons, because the entry point lives there and its
+absence is exactly how the drift got out.
+
+Filed T1420: the same shape for a RELAY machine, where the friendly name rather
+than the identity is the right answer and only the directory knows it - so the
+panel has to adopt it when the machine list lands rather than take it from the
+window, which has no name to give.
+
+Green: `floor-lane.ps1 -Lane all` ALL LANES PASS (lib, none 306s, win32 224s,
+agent 422s). `activity-monitor-remote.ps1` ALL PASS (96) with A and B - the
+sections this task was filed on - now green; `remote-pill.ps1` ALL PASS (11),
+the pill's label unmoved. `ipc-p1` 25, `ipc-p2` 20, `ipc-p3` 16. Re-stamped for
+the Window.zig edit: `viewer-close` 44, `close-confirm` 58, `remote-disconnect`
+49, and the ten static audits (`printclient-audit`, `test-reach`,
+`body-complete`, `isolation-meta`, `launch-preflight`, `verdict-exit`,
+`cleanslate`, `stderr-capture`, `desktop-launch`, `command-resolve`).

@@ -2690,6 +2690,29 @@ $GuardTable = @(
             'test\win32\activity-selection.ps1'
         )
     },
+    # The Activity Monitor on a REMOTE machine (T1419). The panel a remote
+    # window opens is BORROWED - no dial, no relay - and it is the only shape in
+    # which the panel's IDENTITY is derived twice: once by the window that opens
+    # it (`Window.activityPanelSource`) and once by the carousel card the same
+    # machine gets (`activity_machines.refreshWindowMachines`, keyed through
+    # `activity_borrow.sourceId`). T610 edited the first and not the second, and
+    # a direct-host box answered to two names a click apart - `127.0.0.1` from
+    # the palette, `127.0.0.1:47913` after a trip through the carousel - with
+    # this harness's sections A and B red for a day and nothing obliged to run
+    # it. `Window.zig` is on the list despite moving for a hundred unrelated
+    # reasons, because the entry point that names the panel lives there and its
+    # absence is exactly how the drift shipped.
+    [pscustomobject]@{
+        Name   = 'activity-monitor-remote'
+        Script = 'test\win32\activity-monitor-remote.ps1'
+        Stamp  = 'test\win32\activity-monitor-remote.stamp.json'
+        Covers = @(
+            'src\apprt\win32\activity_borrow.zig',
+            'src\apprt\win32\activity_machines.zig',
+            'src\apprt\win32\Window.zig',
+            'test\win32\activity-monitor-remote.ps1'
+        )
+    },
     # The Activity Monitor's DIALED path (T297) - the third row on
     # ActivityMonitor.zig, for the same reason there is a second: it is the only
     # harness that runs a dial at all. 'activity-monitor' drives a LOCAL panel
