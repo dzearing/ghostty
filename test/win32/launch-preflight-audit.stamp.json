@@ -1,10 +1,10 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-09-06T20:01:24-07:00",
-    "commit":  "6885bef74",
+    "generated":  "2026-09-06T21:08:16-07:00",
+    "commit":  "d019a0b3b",
     "uncommitted":  [
-                        "test/win32/chooser-kill-hover.ps1"
+                        "test/win32/viewer-restore.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "944e54bda392aa61007ee23280c6bb9767ed2e661f77f5157ca035dbe9b6e4ea",
@@ -324,7 +324,7 @@
                   "test/win32/viewer-nav-pin.ps1":  "7cbcd650ee1a3dd4ea2a8e47847185ecf2c870949c5671cb174f01b06f79a115",
                   "test/win32/viewer-panes.ps1":  "f679e363da3a45c230d2ef91e3e7b61d8baa34ae59af3b05cfd43a0fb3ea632c",
                   "test/win32/viewer-popup.ps1":  "207d22eddae6f4326f1c25a3d64e1e745b705bf53651526519b596318b8de890",
-                  "test/win32/viewer-restore.ps1":  "ccca2d3b05ca78901733377666281e357f64b36a57b729f2c54af0252239afb0",
+                  "test/win32/viewer-restore.ps1":  "28bca34940c13598967468ac5b4f5b7353f980a17b50d4a32be007bbc753c576",
                   "test/win32/viewer-window-chords.ps1":  "f8a4613094f1ff5449211e6c3bddee67c8ee3ed3050f95b02e61717744fba7eb",
                   "test/win32/viewer-worktree.ps1":  "b58c40302cdc8cd34690887d581cd2763eef490c3e9387145884a313caee01fd",
                   "test/win32/viewer-worktree-port.ps1":  "74df2c3c92ef08ce58bed2f4ad1912b9f72058f4990c42b84b6039a2fc4a2cea",
