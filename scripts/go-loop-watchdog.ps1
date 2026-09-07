@@ -552,16 +552,35 @@ function Invoke-Tick {
         # session - ten minutes after a turn completed is a user typing or the
         # gap between turns, not a stall. One read answers both questions
         # (T1370).
+        # PROBE ON EVERY TICK, DECIDE ON THE SAME BARS (user, 2026-09-07).
+        #
+        # The read used to be gated on the same threshold the verdict uses, which
+        # made the log unable to answer the one question needed to move that
+        # threshold. Two idle stalls today were each caught at ~47m, and both had
+        # gone quiet about 40m in - so the obvious move is a lower bar. But the
+        # evidence for it did not exist and COULD NOT: a pane under 45m was never
+        # looked at, and past 45m an idle pane is stalled by definition, so
+        # "healthy and idle" was impossible by construction rather than unobserved.
+        # Counting it and calling it proof is the circular argument this comment
+        # exists to stop someone (me, next time) from making.
+        #
+        # So: look every tick, change no threshold. After a few days the log can
+        # say how often a HEALTHY loop under 45m reads idle - during a 4-minute
+        # Start-Sleep, a long build, a background lane - and that is the number
+        # that decides whether the bar can come down. `probed=` marks a real
+        # observation so a future reader never has to guess again.
         $pane = @{ Composer = ''; Working = 'unknown' }
-        if ($turnAge -gt $TurnSuspectMinutes -and $lock.pane_id) {
+        $probed = $false
+        if ($lock.pane_id) {
             $pane = Read-PaneState -PaneId $lock.pane_id -GhozttyExe $GhozttyExe
+            $probed = $true
         }
         # And SAY what it saw. T1319's arm was diagnosed off `limit=180m` alone -
         # the log named the bar it chose but never the observation behind it, so
         # "the composer looked empty" and "the composer was never read" were the
         # same line. Both now appear on every decision (T1370).
         $seen = ("composer=$(if ($pane.Composer) { 'pending' } else { 'none' }) " +
-                 "session=$($pane.Working)")
+                 "session=$($pane.Working) probed=$probed")
         $verdict = Resolve-LoopStallVerdict -TurnAgeMinutes $turnAge `
             -StaleMinutes $TurnStaleMinutes -SuspectMinutes $TurnSuspectMinutes `
             -ComposerText $pane.Composer -PaneState $pane.Working
