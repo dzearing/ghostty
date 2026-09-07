@@ -240,3 +240,14 @@ as the digest that showed them.
 - Publish on a clock the loop cannot miss (daily release trigger on the supervisor tick, not the turn)
 - A red harness counts as due (guard-due treats a failing last run as unrun)
 - Warm the first frame (measure and cut double-click to first usable prompt)
+
+## 2026-09-07
+
+- Ship the evening's work, not the morning's (publish on the day's last good commit, not a clock)
+- See what you are about to update to (update prompt names the changes, not a version number)
+- Drag a pane out into its own window (and drop it back onto another window's strip)
+- Zoom one pane to fill the window, temporarily (chord to swell the focused pane and back)
+- A pane that remembers where it was looking (restore scrollback position, not just the text)
+- Tell me when this finishes, whatever I am doing (per-pane toast on command exit, click to focus)
+- A test that cannot pass while switched off (harness rule: prove a live-update assertion can fail)
+- Say how far behind the installed build is (surface the commits-since-release gap in About)
