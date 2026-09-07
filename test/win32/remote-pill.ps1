@@ -282,6 +282,23 @@ try {
     Check ($redAt -ge 0) "a dropped link turns the pill red (after ${redAt}s)"
     Check ($hitAt -ge 0) "and makes it a button - WM_NCHITTEST answers HTOBJECT (after ${hitAt}s)"
 
+    # ...and it STILL names the machine (D93 / T1433). Until 2026-09-07 the
+    # status REPLACED the name here, which made three dropping remote windows
+    # identical in the titlebar - the one question the pill exists to answer,
+    # unanswerable exactly when it matters. The oracle line is used because the
+    # label is a handful of grey pixels a probe cannot read back.
+    $degradedLine = ''
+    if (Test-Path $applog) {
+        $degradedLine = @(Get-Content $applog |
+            Select-String -Pattern 'remote pill mode=(reconnecting|disconnected)' |
+            Select-Object -Last 1 | ForEach-Object { $_.Line })
+        if ($degradedLine -is [array]) { $degradedLine = $degradedLine[0] }
+    }
+    Check ($degradedLine -match 'label=127\.0\.0\.1 ') `
+        "a degraded pill STILL names the machine - $degradedLine"
+    Check ($degradedLine -match 'label=127\.0\.0\.1 .*Reconnect') `
+        "and the status follows the name rather than replacing it"
+
     # --- 4. the button acts, and the window comes back ----------------------
     # Two arms, and the second is the one that matters to a user: the click has
     # to DIAL, and it has to leave the window working. The agent is restarted

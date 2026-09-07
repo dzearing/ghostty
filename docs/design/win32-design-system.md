@@ -356,8 +356,9 @@ Monitor for the machine it names) moves that edge left by the pill's whole
 width, name included. It is allowed HERE and should not be assumed elsewhere,
 for three reasons: the pill sits at the band's trailing end, immediately left of
 the "…" button, so the drag region was already stopping within a `pad_md` of
-there; the width it takes is bounded (`remote_pill.max_label_dip`, 128 DIP), so
-a long hostname cannot quietly eat the band; and only a REMOTE window has a pill
+there; the width it takes is bounded (`remote_pill.max_name_dip`, 128 DIP, and
+`max_name_degraded_dip`, 72 DIP, once a connection status shares the capsule
+with the name -- D93), so a long hostname cannot quietly eat the band; and only a REMOTE window has a pill
 at all, which is a small minority of windows. A chip that wanted to be
 interactive in the MIDDLE of the band, or one whose width followed unbounded
 user data, would be taking drag region a user cannot predict, and that is the

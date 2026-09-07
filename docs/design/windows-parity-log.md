@@ -24403,3 +24403,56 @@ freetype's autofitter, so this one is a hang rather than the crash that watch is
 armed for, and the task stays parked. T1432 files what the episode exposed —
 a test binary the sweep kills reads as a bare red lane with `crash=0` and
 `leaked test binaries: 0`, and only a hand-read dump says otherwise.
+
+## 2026-09-07 — a remote window that is reconnecting still says which machine it is (T1433)
+
+D93 was put to the user with the shipped behaviour as the assumption, and the
+answer was the other option: *always show the name, with the status after it*.
+Until today the connection pill in a remote window's titlebar swapped the
+machine's name out the moment the link wobbled — `winbox` became
+`Reconnecting… 3/5` and then a red `Reconnect` — so with three remote windows
+open and two of them dropping, the titlebar could not tell you which was which.
+That is the one question the pill exists to answer, and it went unanswerable
+exactly when it mattered. The name stays now, and the status follows it.
+
+**The label is two strings, and that is the whole design.** `DT_END_ELLIPSIS`
+cuts the FAR end of what it is given, and the far end here is the status: one
+composed string squeezed by a narrow titlebar would produce
+`build-agent-westus2 — Reconn…`, which spends the pill's whole width restating
+what the window title already says. So `remote_pill.parts` hands back the name
+and the status separately, `layout` gives each its own box, and the painter
+draws each with its own ellipsis. The separator (` — `) leads the STATUS rather
+than trailing the name, so a name cut to its floor loses its own characters and
+never the one glyph that made the two a sentence — and a window with no machine
+to name still says `Reconnect`, never `— Reconnect`.
+
+**Who gives way is decided, not left to arithmetic.** The status is served
+first, because a clipped status says nothing the name did not. The name then
+takes what is left down to `min_name_dip` (24 DIP) and no further: below that the
+status is clipped instead, because a pill on a window that HAS a machine must
+never stop naming it. A rule that surrenders the name under pressure is the
+defect D93 was answered to end, with a narrower trigger.
+
+**And the cost D93 named is paid up front.** The name's ceiling is now per-mode:
+128 DIP while the link is up, and `max_name_degraded_dip` — 72 DIP, about nine
+characters — once a status shares the capsule. That is aggressive on purpose. A
+degraded pill measured 189 px at 1.25 against the connected pill's 92 px on this
+box, and the pill's width sets `band_left`, the seam the tab strip lays out
+against; without the tighter ceiling a long hostname plus a status would push the
+tab run aside every time a link wobbled. The tooltip still carries the name in
+full, which is what the truncation leans on.
+
+Acceptance reads the pill's own debug oracle, since a label in the caption face
+is a handful of grey pixels a probe cannot read back: `remote-pill.ps1` section 3
+now asserts that a dropped link's pill still carries `label=127.0.0.1` with the
+status after it, and not instead of it.
+
+Green: `floor-lane.ps1 -Lane all` (lib / none / win32 / agent), with unit tests
+at 1.0/1.25/1.5/2.0 for the per-mode ceiling and for the squeeze order;
+`remote-pill.ps1` ALL PASS (13, was 11); `ipc-p1` (25), `ipc-p2` (20), `ipc-p3`
+(16), and the fourteen harnesses a `Window.zig` plus `test\win32\` edit makes
+due — including `remote-disconnect` and `activity-monitor-remote`, the two that
+drive the same pill from the other side.
+
+T1435 files what the change exposes and does not measure: the tab strip's own
+layout at the widened pill, which `remote-pill.ps1` reads past.

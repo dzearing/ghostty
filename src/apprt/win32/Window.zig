@@ -1657,8 +1657,13 @@ pub fn refreshRemotePill(self: *Window) void {
         const mode = self.remotePillMode();
 
         var buf: [remote_pill.label_cap]u8 = undefined;
-        const text = remote_pill.label(&buf, self.reconnect.ladder, self.machineDisplayName());
-        break :blk remote_pill.width(m, mode, self.measurePillLabel(text));
+        const parts = remote_pill.parts(&buf, self.reconnect.ladder, self.machineDisplayName());
+        break :blk remote_pill.width(
+            m,
+            mode,
+            self.measurePillLabel(parts.name),
+            self.measurePillLabel(parts.status),
+        );
     };
     if (want == self.remote_pill_w) return;
     self.remote_pill_w = want;
@@ -5689,7 +5694,15 @@ fn paintRemotePill(self: *Window, mem_dc: w32.HDC, l: caption_layout.Layout) voi
         .normal;
 
     const ink = remote_pill.ink(pal.bar, pal, mode, state);
-    const inner = remote_pill.layout(pm, l.pill, mode);
+    var label_buf: [remote_pill.label_cap]u8 = undefined;
+    const parts = remote_pill.parts(&label_buf, self.reconnect.ladder, self.machineDisplayName());
+    const inner = remote_pill.layout(
+        pm,
+        l.pill,
+        mode,
+        self.measurePillLabel(parts.name),
+        self.measurePillLabel(parts.status),
+    );
     if (inner.mark.isEmpty()) return;
 
     // The capsule.
@@ -5740,22 +5753,30 @@ fn paintRemotePill(self: *Window, mem_dc: w32.HDC, l: caption_layout.Layout) voi
         ),
     }
 
-    // The label.
-    if (inner.text.isEmpty()) return;
-    var buf: [remote_pill.label_cap]u8 = undefined;
-    const text = remote_pill.label(&buf, self.reconnect.ladder, self.machineDisplayName());
-    if (text.len == 0) return;
-    var wide: [remote_pill.label_cap]u16 = undefined;
-    const n = std.unicode.utf8ToUtf16Le(&wide, text) catch return;
-    if (n == 0) return;
-
+    // The label, in its two halves. They are drawn separately and not as one
+    // string because `DT_END_ELLIPSIS` cuts the FAR end, and the far end here is
+    // the status — the half a squeezed pill most needs to keep (D93). `layout`
+    // has already decided who gave way; each half just fills the box it was
+    // given, ellipsizing its own characters.
     const old_font = if (self.pill_font) |f| w32.SelectObject(mem_dc, f) else null;
     defer if (old_font) |f| {
         _ = w32.SelectObject(mem_dc, f);
     };
     _ = w32.SetBkMode(mem_dc, w32.TRANSPARENT);
     _ = w32.SetTextColor(mem_dc, w32.RGB(ink.text.r, ink.text.g, ink.text.b));
-    var tr = stripRect(inner.text);
+    drawPillText(mem_dc, inner.name, parts.name);
+    drawPillText(mem_dc, inner.status, parts.status);
+}
+
+/// One half of the pill's label, tail-ellipsized into `box`. A no-op for an
+/// empty box or an empty string, which is how a connected pill draws no status
+/// and a nameless window draws no name without either caller asking.
+fn drawPillText(mem_dc: w32.HDC, box: remote_pill.Rect, text: []const u8) void {
+    if (box.isEmpty() or text.len == 0) return;
+    var wide: [remote_pill.label_cap]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&wide, text) catch return;
+    if (n == 0) return;
+    var tr = stripRect(box);
     _ = w32.DrawTextW(
         mem_dc,
         &wide,
