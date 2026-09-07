@@ -394,6 +394,35 @@ processes, the stamp gate against a throwaway repo, the analyzer against
 fixtures both directions, the suite sweep), whose `-TeethCheck` plants a real
 violator so the sweep keeps its teeth.
 
+**A script that cannot START is scored too** (T586). `chrome-theme.ps1` shipped
+calling `Test-ExeIsDebugBuild`, a function that exists nowhere in this repo, and
+died at line 299 before its first assertion - for a week, because nothing runs
+these scripts but a person deciding to, and a script that cannot start reads
+exactly like a script nobody ran. `test\win32\command-resolve-audit.ps1` asks
+the one question that catches it: **every command name an acceptance script
+writes down must resolve** - to a function it defines, a function in a file it
+dot-sources (transitively; `Join-Path $PSScriptRoot` and `"$Repo\..."` shapes
+are both understood), a cmdlet or alias, or an external program on a fixed list,
+so the verdict does not change with the box's PATH. It reads the AST, launches
+nothing, and takes about twenty seconds over all 291 roots.
+
+`lib\*.ps1` files are audited **through their consumers** rather than on their
+own: a library legitimately calls its siblings' helpers, which the consuming
+script dot-sources. B3 reports any library no root reaches, so that consequence
+is visible rather than assumed away. The three scripts that load helpers by a
+variable path, `Invoke-Expression` or `[scriptblock]::Create` have every `.ps1`
+literal they mention treated as dot-sourced - generous on purpose, and narrower
+than exempting the file. Exemption: the stated-intent `# resolve-audit: <reason>`
+marker. `-TeethCheck` plants a real violator and requires the sweep to name it.
+The guard-due row `command-resolve` covers `test\win32\*.ps1` and its libraries,
+so touching any script here makes the sweep due and `parity-tasks.ps1 validate`
+fails until it has run.
+
+Its first sweep found a second live instance: `release-artifacts.ps1` had one
+if/elseif/else chain pasted twice, so the second `} elseif (...) {` parsed as a
+**command named `elseif`**. Zero parse errors, a green-looking file, and a run
+that threw two thirds of the way through section B with B5-B9 unmeasured.
+
 **And there is exactly ONE way to put the box back to empty** (T248, T351). A
 script never writes its own kill of the app under test or its sibling agent:
 `Stop-RepoGhoztty` in `test\win32\lib\CleanSlate.ps1` is it, with `-AppOnly` /

@@ -23643,3 +23643,54 @@ Floor: `floor-lane.ps1 -Lane all` lib/none/win32/agent all PASS; ipc-p1/p2/p3
 ALL PASS; the fourteen guard rows this edit made due all green, viewer-close,
 close-confirm-idle, remote-disconnect, viewer-narrow-pane and viewer-diff-tree
 among them (`Window.zig` and `ViewerTOCPanel.zig` each gained one line).
+
+## 2026-09-06 - an acceptance script that cannot start is now caught before somebody runs it (T586)
+
+`chrome-theme.ps1` shipped on 2026-08-07 calling `Test-ExeIsDebugBuild`, a
+function that exists nowhere in this repo. PowerShell resolves a command name at
+CALL time, so the file parsed, ran, and died at line 299 before its first
+assertion - and stayed that way for a week, because nothing runs these scripts
+but a person deciding to, and a script that cannot start reads exactly like a
+script nobody ran. The one-line fix landed with T307; the gap did not.
+
+`test\win32\command-resolve-audit.ps1` closes it by asking one question of all
+291 acceptance scripts: **every command name a script writes down must resolve**
+- to a function it defines, a function in a file it dot-sources (transitively,
+with `Join-Path $PSScriptRoot` and `"$Repo\..."` both understood), a cmdlet or
+alias, or an external program on a FIXED list, so the verdict cannot change with
+the box's PATH. It reads the AST, launches nothing, and takes about twenty
+seconds.
+
+Two shape decisions carry it. Libraries are audited **through their consumers**
+rather than as roots: a `lib\*.ps1` legitimately calls its siblings' helpers,
+which the consuming script dot-sources, so reading one on its own reported a
+dozen names that resolve perfectly in every real run - and B3 names any library
+no root reaches, so the consequence is visible instead of assumed away. And the
+three scripts that load helpers in ways no static resolver can follow (a
+variable dot-source path, a function pulled out of another script's text by
+regex and `Invoke-Expression`, a `[scriptblock]::Create`) have every `.ps1`
+literal they mention treated as dot-sourced - generous by construction, and
+narrower than the three exemption markers the alternative needed.
+
+The first sweep found a second live instance of exactly this class.
+`release-artifacts.ps1` had one if/elseif/else chain pasted twice, so the second
+`} elseif (-not $pyExe) {` parsed as a **command named `elseif`**: zero parse
+errors, a green-looking file, and a run that threw two thirds of the way through
+section B with B5-B9 unmeasured. The duplicate is gone (the surviving branch is
+the corrected one - its own comment records that asking a `gl` Directory element
+for its descendant Files answers empty through PowerShell's XML adapter, which
+is what the deleted copy did), and B5-B9 now run and pass.
+
+Teeth, per the T1133 rule: `-TeethCheck` plants the 2026-08-07 defect into a
+real file in the suite directory and requires the sweep to go red naming it,
+then removes it - ALL PASS (18 assertions) with the plant, ALL PASS (15) without.
+Wiring: the guard-due row `command-resolve` covers `test\win32\*.ps1` and its
+libraries, so touching any script here makes the sweep due, the claim reports it
+and `validate` fails until it has run.
+
+Filed on the way past: T1408, a torn zig PACKAGE directory (the JetBrainsMono
+fetch lost its whole `fonts\` subtree) failed all four floor lanes in five
+seconds with `failed to check cache: ... file_hash FileNotFound`, and
+`CacheHeal.ps1` does not recognize that shape - it looks for a compile error
+whose file location sits in a cache entry, and this line has no file:line:col at
+all. Deleting the package directory and re-running is the remedy.

@@ -1,16 +1,14 @@
 {
-    "guard":  "stderr-capture",
-    "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-06T19:23:49-07:00",
+    "guard":  "command-resolve",
+    "script":  "test/win32/command-resolve-audit.ps1",
+    "generated":  "2026-09-06T19:22:45-07:00",
     "commit":  "c9c883e98",
     "uncommitted":  [
-                        "docs/claude/testing.md",
                         "test/win32/command-resolve-audit.ps1",
                         "test/win32/lib/CommandResolveAudit.ps1",
                         "test/win32/release-artifacts.ps1"
                     ],
     "files":  {
-                  "docs/claude/testing.md":  "da8d5dff8644c00e5e145a6c5340f424ea44ae7c9c2aaa8545d41306e1cdb1ec",
                   "test/win32/activity-monitor.ps1":  "944e54bda392aa61007ee23280c6bb9767ed2e661f77f5157ca035dbe9b6e4ea",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
                   "test/win32/activity-monitor-probe-fail.ps1":  "3ca33b2b1d163db1fe2b2f8d0cb573c0f9d7decd435f61d64bb5906e71dc6aa4",

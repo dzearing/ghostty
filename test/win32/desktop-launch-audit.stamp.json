@@ -1,10 +1,11 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-06T18:18:01-07:00",
-    "commit":  "5aff9cf17",
+    "generated":  "2026-09-06T19:23:55-07:00",
+    "commit":  "c9c883e98",
     "uncommitted":  [
-                        "test/win32/chrome-theme.ps1"
+                        "test/win32/command-resolve-audit.ps1",
+                        "test/win32/release-artifacts.ps1"
                     ],
     "files":  {
                   "src/cli/ghostty.zig":  "ef54b501298cfda9306cfb958c1094db24ee30f355b25865656b3e2bc713bcd7",
@@ -73,6 +74,7 @@
                   "test/win32/close-glyph-white.ps1":  "cb2a97f2286e4fefff7a07ed5933ecbacbc49b32a28f594f5af44130e731e553",
                   "test/win32/color-contrast.ps1":  "464aa2aa9a4e6cf6470fbcd1ec523b705a9f3260a04f6af57f406ff36e00cb4e",
                   "test/win32/command-registry.ps1":  "4b451ab5f58c9456cee43a4127d2b26db4d0285accb0d1c8592fff49ac57fd01",
+                  "test/win32/command-resolve-audit.ps1":  "eaa0de0d68487f7f7f160478be85c600066d9960208237a763b4f6fcf35a8c99",
                   "test/win32/config-errors.ps1":  "1d64c1391b3f98388d3d4cdee2f6a23c4c30d952f005b977afb40b32625fe8c3",
                   "test/win32/confirm-dialogs.ps1":  "3025926c2faa030f749ffe0bc6ba75beb407a5b1b27cb5d62304b4006cb75fbf",
                   "test/win32/conformance.ps1":  "c2f6486404a9ccfa710968614aa1ae24ea7ccced0d4677ffc1bd42c853aa73da",
@@ -199,7 +201,7 @@
                   "test/win32/registration-sites.ps1":  "c634ca739f7e0afdff7a0ea269d9f27d300ed7f095b5585ec909b7f76eebaea3",
                   "test/win32/relaunch-guard.ps1":  "784140b66081be866d4cae5cb2858ef00c9979cdce73dc6f0e4fd5a95aa1628f",
                   "test/win32/relay-account.ps1":  "8dee3165d569d5069208dee6975b251d6bb3444434e4993e5d4bda207e80250f",
-                  "test/win32/release-artifacts.ps1":  "2143ef793a06c48ee2d6cd826b9f17366db0630d3aa16335ab16e60890e343e5",
+                  "test/win32/release-artifacts.ps1":  "ec0d56cc73482271744c78aa1bee501da00ba6b7012c2521b258d8c3a4e88eaa",
                   "test/win32/release-parity.ps1":  "92babe2c0e154c766dd02f9578073f6a04ec281ee706aa8a8dc83c505d579f9f",
                   "test/win32/remote-disconnect.ps1":  "8f123d9e150de11bb9d27bf03bd43ca84f883ee7c585af13e733db015083028f",
                   "test/win32/remote-inherit.ps1":  "50b2a9d36a10d0e677963fbb7d155e3dbc45261111214c1ab8b6454f025e24da",

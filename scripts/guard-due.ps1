@@ -2937,6 +2937,22 @@ $GuardTable = @(
             'test\win32\chrome-theme.ps1'
         )
     }
+
+    # T586 - the sweep that answers "can this script even START?". It covers the
+    # whole acceptance directory AND its libraries, which makes it due whenever
+    # any script here is touched: that is the point, since the case it exists
+    # for is a script edited today that calls a helper nobody wrote, and the
+    # only other thing that would notice is somebody running that one script.
+    # It launches nothing and takes about twenty seconds.
+    [pscustomobject]@{
+        Name   = 'command-resolve'
+        Script = 'test\win32\command-resolve-audit.ps1'
+        Stamp  = 'test\win32\command-resolve-audit.stamp.json'
+        Covers = @(
+            'test\win32\*.ps1',
+            'test\win32\lib\*.ps1'
+        )
+    }
 )
 
 function Get-RepoRelative([string]$full) {
