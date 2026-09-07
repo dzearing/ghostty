@@ -24476,3 +24476,66 @@ drive the same pill from the other side.
 
 T1435 files what the change exposes and does not measure: the tab strip's own
 layout at the widened pill, which `remote-pill.ps1` reads past.
+
+## 2026-09-07 — bringing your own windows back no longer freezes the app when the agent is slow (T618)
+
+Restore All, pointed at This Machine, asked the background session daemon for
+this box's saved window layouts and then probed which of its sessions were still
+alive — both on the GUI thread, both with a two-second budget. Against a healthy
+daemon that is a few milliseconds and nobody could tell; against one that is
+wedged, paused, or halfway through its own upgrade it is up to four seconds of a
+stopped app, with no cursor, no redraw and no way to cancel. A wedged daemon is
+exactly the situation somebody reaches for that button in.
+
+T339 fixed the cross-machine half of this and deliberately left the local half
+alone, on the reasoning that a named-pipe round trip to a daemon on this box is
+not a network. That reasoning is right about the median and wrong about the tail,
+and the tail is the only place the button is interesting.
+
+So the local arm now splits the same way the relay arm does.
+`RestoreAllLocal.zig` runs the pull, the decode and the liveness probe on a
+worker thread and posts one `Job` back to the app's message window; the GUI
+thread does the deciding and the building, which is the part that has to be there
+(`createWindow` is GUI-thread-only, and the double-attach guard has to be
+re-applied against the panes that are live NOW rather than the ones the worker
+snapshotted). The reply lands on the APP's window rather than the chooser's, so a
+chooser dismissed in the meantime cannot take the decode and the roster down with
+its message queue.
+
+**The borrowed connection is the one thing that is not the relay's shape.** A
+remote rebuild hands every window a transport it owns; a local one borrows
+`LocalAgent`'s single warm connection. The worker may USE that pointer —
+`LocalAgent.retire` never frees a replaced connection, precisely because surfaces
+hold it raw (T145), which is the same basis `SessionRoster.fetch` borrows it on.
+What it may not do is assume the pointer is still current: the daemon can crash
+and be re-dialed while the worker is blocked. So `adoptRestoreAllLocal`
+re-resolves the shared connection on the GUI thread and attaches the rebuilt
+panes over that one, and windows built on a retired link stop being possible.
+`markLayoutDirty` — the local arm's bind-back, Mac's `bindLocal` — moved with the
+rebuild.
+
+**The freeze is measured, not asserted.** A healthy local agent answers in single
+digit milliseconds, which is no interval at all to ask "is the app still
+pumping?" in. The relay script makes its interval by telling a fake relay to
+defer every connect; there is no equivalent lever in front of a real agent's pipe
+short of wedging the daemon that owns the user's sessions. So a seam
+(`GHOZTTY_RESTORE_PULL_DELAY_MS`) stalls the pull, sitting immediately in front
+of the RPC it describes and therefore on whichever thread that RPC runs on — a
+build that moved the pull back would stall the GUI thread, which is what the
+assertion is looking for. `chooser-restore-all-adopt.ps1` arms it at 2500 ms and
+probes the chooser with a `WM_NULL` `SendMessageTimeout` every 150 ms: **13
+probes, 0 unanswered, across a restore that was in flight for 2812 ms**. Its own
+control asserts the stall was armed and paid, so a restore that finished before
+the first probe cannot pass.
+
+Green: `floor-lane.ps1 -Lane all` (lib / none / win32 / agent);
+`chooser-restore-all-adopt.ps1` ALL PASS (30, was 26),
+`chooser-restore-all.ps1` (31), `chooser-restore-all-remote.ps1` (46),
+`chooser-controls.ps1` (54), `chooser-selection.ps1` (35); `ipc-p1` (25),
+`ipc-p2` (20), `ipc-p3` (16), and the ten static audits a new `src\apprt\win32\`
+file makes due.
+
+T1439 files what neither arm measures: a chooser dismissed while a restore is
+still in flight. Both arms are built so that path rebuilds anyway and frees
+everything it holds, and nothing has ever watched it do so — the delay seams on
+both sides make the interval reachable now.

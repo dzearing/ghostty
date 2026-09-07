@@ -67,6 +67,7 @@ const SessionCpuProbe = @import("SessionCpuProbe.zig");
 const chooser_session_sort = @import("chooser_session_sort.zig");
 const machine_pool = @import("machine_pool.zig");
 const MachineConnectionPool = @import("MachineConnectionPool.zig");
+const RestoreAllLocal = @import("RestoreAllLocal.zig");
 const RestoreAllRelay = @import("RestoreAllRelay.zig");
 const remote_connection = @import("../../remote/connection.zig");
 const relay_directory = @import("../../remote/relay_directory.zig");
@@ -293,11 +294,11 @@ pool_lease: ?*MachineConnectionPool.Lease = null,
 /// last lease goes.
 cpu: SessionCpuProbe = .{},
 
-/// A cross-machine Restore All is dialing on a worker thread (T339). It gates
-/// a second press: the first one's dials are still in flight, and pressing
-/// again would rebuild the same topology twice — the button has no other way
-/// to say "already working on it" now that the work no longer blocks the
-/// keystroke.
+/// A Restore All is working on a worker thread — dialing across the relay
+/// (T339) or pulling this box's own layouts (T618). It gates a second press:
+/// the first one's RPCs are still in flight, and pressing again would rebuild
+/// the same topology twice — the button has no other way to say "already
+/// working on it" now that the work no longer blocks the keystroke.
 restore_inflight: bool = false,
 
 /// Dialog layout in physical pixels from the owner DPI scale. Pure — the math
@@ -3277,17 +3278,38 @@ fn resumeRow(self: *MachineChooser, row: SessionRoster.VisibleRow) void {
 /// (`SessionLayoutRestore.swift:755-773`); the footer hint is this dialog's
 /// equivalent and does not steal the user's next keystroke.
 ///
-/// The LOCAL arm runs here and now — every RPC in it is a bounded named-pipe
-/// round trip to a daemon on this box. The REMOTE arm hands the job to a worker
-/// thread (T339) and comes back through `onRestoreAll`: its N+1 relay dials are
-/// the ones that would otherwise stop the message loop for as long as the link
-/// is slow.
+/// BOTH arms hand the blocking half to a worker thread and come back through a
+/// posted reply: the remote one's N+1 relay dials (T339, `onRestoreAll`), and
+/// the local one's `GET_LAYOUTS` + `LIST_SESSIONS` (T618, `onRestoreAllLocal`).
+/// The local pair is milliseconds against a healthy agent on this box, which is
+/// why it ran here for a year — but each carries a `restore_probe_timeout_ns`
+/// budget, so a wedged, paused or upgrading agent froze the app for ~4 s, and a
+/// wedged agent is exactly when a user reaches for this button.
 fn restoreAll(self: *MachineChooser) void {
     const row = self.selectedRow() orelse return;
     const app = self.window.app;
 
-    const n = switch (row) {
-        .local => app.restoreAllLocalSessions(),
+    switch (row) {
+        .local => {
+            // A second press while the first pull is still outstanding would
+            // build the same windows twice — the snapshot guard cannot see a
+            // window that does not exist yet.
+            if (self.restore_inflight) return;
+            // Resolving the shared connection is the GUI thread's job (it owns
+            // that state); only the RPCs over it move (T618). No agent means
+            // there is nothing to restore FROM, and that is its own sentence.
+            const pull = app.local_agent.sharedConnection() orelse {
+                self.restoreAllFailed(error.NoAgent);
+                return;
+            };
+            if (!RestoreAllLocal.start(app, self.id, pull)) {
+                self.setHint("Couldn't start the restore.");
+                return;
+            }
+            self.restore_inflight = true;
+            self.setHint("Restoring this machine's windows...");
+            return;
+        },
         .device => |i| {
             // A second press while the first one's dials are still open would
             // build the same windows twice — the snapshot guard cannot see a
@@ -3313,11 +3335,43 @@ fn restoreAll(self: *MachineChooser) void {
             self.setHint("Restoring this machine's windows...");
             return;
         },
-    } catch |err| {
-        self.restoreAllFailed(err);
+    }
+}
+
+/// GUI thread: a LOCAL Restore All came back (T618). Same rules as the relay
+/// reply below — the rebuild happens whether or not the chooser survived, and a
+/// reply with no chooser only loses the sentence it had nowhere to say.
+pub fn onRestoreAllLocal(app: *App, job: *RestoreAllLocal.Job) void {
+    defer job.destroy();
+
+    var owner: ?*MachineChooser = null;
+    for (app.windows.items) |win| {
+        const chooser = win.machine_chooser orelse continue;
+        if (chooser.id != job.chooser_id) continue;
+        owner = chooser;
+        break;
+    }
+    if (owner) |c| c.restore_inflight = false;
+
+    if (job.err) |err| {
+        if (owner) |c| c.restoreAllFailed(err) else log.warn(
+            "machine chooser: restore all failed after its chooser closed err={}",
+            .{err},
+        );
+        return;
+    }
+
+    const n = app.adoptRestoreAllLocal(job) catch |err| {
+        if (owner) |c| c.restoreAllFailed(err) else log.warn(
+            "machine chooser: restore all failed after its chooser closed err={}",
+            .{err},
+        );
         return;
     };
-    self.restoreAllFinished(n);
+    if (owner) |c| c.restoreAllFinished(n) else log.info(
+        "machine chooser: restore all rebuilt {d} window(s) after its chooser closed",
+        .{n},
+    );
 }
 
 /// GUI thread: a cross-machine Restore All came back (T339). The REBUILD happens

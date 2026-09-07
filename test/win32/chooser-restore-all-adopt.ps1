@@ -3,7 +3,7 @@
 # T194 moved crash recovery to launch time, and chooser-restore-all.ps1 moved
 # with it: its fixture (kill the app, drop the manifest, relaunch) now recovers
 # before the chooser can be opened, so the local BUTTON's own rebuild -
-# `restoreAllLocalSessions`: the shared-agent-connection transport plus the
+# its local arm: the shared-agent-connection transport plus the
 # `markLayoutDirty` bind-back that only the local arm does - stopped being
 # exercised on this box. The remote script still drives the shared rebuild
 # (`restoreAllFrom`) across the relay, but the local arm's two behaviours have
@@ -40,7 +40,15 @@
 #      window carries the same auto `window-N` name B's live window holds, so
 #      the rebuilt copy must come up beside it without stealing the name -
 #      which is why the auto window is identified by SHAPE here, like T338.
-#   5. the bind-back: `restoreAllLocalSessions` marks the layout dirty after a
+#   4b. T618: the app KEEPS PUMPING while that restore is in flight. The pull
+#      and the liveness probe used to run on the GUI thread with a 2 s budget
+#      each, so a wedged agent froze the app for ~4 s with no cursor and no
+#      redraw - the local half of the freeze T339 fixed for the relay. B is
+#      launched with `GHOZTTY_RESTORE_PULL_DELAY_MS`, which stalls the pull in
+#      front of the RPC it describes, and therefore on whichever thread that RPC
+#      runs on; the chooser is then asked for a WM_NULL every 150 ms throughout.
+#      Before T618 every one of those probes would time out.
+#   5. the bind-back: the local arm marks the layout dirty after a
 #      rebuild (Mac's `bindLocal`), so the manifest deleted in step 2 must
 #      reappear - now recording all three of B's windows, named window
 #      included. That write is what makes the NEXT launch restore these
@@ -65,7 +73,11 @@
 #
 # Only touches ghoztty processes running from this repo's zig-out.
 param(
-    [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe'
+    [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
+    # T618: how long B's Restore All pull is stalled for, so "is the app still
+    # pumping?" has an interval to be asked in. A healthy local agent answers a
+    # named pipe in single-digit milliseconds, which is no interval at all.
+    [int]$PullDelayMs = 2500
 )
 
 # T351: the shared reset/kill helpers (Stop-RepoGhoztty). Dot-sourced HERE, ahead
@@ -302,7 +314,12 @@ try {
     Write-Host ''
     Write-Host '1. viewer B launches first: one live session, nothing to recover'
     Use-Instance $SuffixB
+    # T618: armed for B's whole life and read only when Restore All starts, so
+    # nothing before section 4 is affected. Cleared immediately so instance A
+    # (launched below) never inherits it.
+    $env:GHOZTTY_RESTORE_PULL_DELAY_MS = "$PullDelayMs"
     $gB = Launch-Gui $errlogB @('--session-persistence=true')
+    Remove-Item env:GHOZTTY_RESTORE_PULL_DELAY_MS -ErrorAction SilentlyContinue
     if (-not $gB) { Write-Host 'SETUP FAIL: instance B died at launch'; exit 1 }
     $aliveB = @(Wait-AliveCount 1)
     Assert ($aliveB.Count -eq 1) "B's startup pane is the machine's only session ($($aliveB.Count))"
@@ -392,11 +409,41 @@ try {
     Assert ($btn -ne [IntPtr]::Zero -and (Test-TestWindowVisible -Window $btn)) `
         'Restore All is offered (five alive sessions clear the >= 2 rule)'
     Assert (Focus-RestoreAll $chooser $filter $btn) 'Tab reaches the button (the positive control)'
+    $pressAt = Get-Date
     Send-TestKeys -Window $chooser -Target $btn -Key Return | Out-Null
 
+    # 4b (T618): the app keeps pumping while the pull is stalled. Each probe is a
+    # WM_NULL SendMessageTimeout at the chooser - its wndproc runs on the GUI
+    # thread, so an answer IS the message loop turning over. Probing stops at the
+    # first sign the pull is over: the rebuild itself legitimately occupies the
+    # GUI thread, and measuring that would be measuring the wrong thing.
+    $probes = 0
+    $blocked = 0
+    $probeDeadline = $pressAt.AddMilliseconds($PullDelayMs - 300)
+    while ((Get-Date) -lt $probeDeadline) {
+        if (-not (Test-TestWindowExists -Window $chooser)) { break }
+        if (Select-String -Path $errlogB -Pattern 'restore all: rebuilt \d+ window' -Quiet -ErrorAction SilentlyContinue) { break }
+        $probes++
+        if (-not (Test-TestWindowResponsive -Window $chooser -TimeoutMs 1000)) { $blocked++ }
+        Start-Sleep -Milliseconds 150
+    }
+
     $rebuilt = Wait-LogLine $errlogB 'restore all: rebuilt (\d+) window' 15000
+    $restoreMs = ((Get-Date) - $pressAt).TotalMilliseconds
     Assert ($null -ne $rebuilt -and $rebuilt -match 'rebuilt 2 window') `
         "B's local arm rebuilt exactly two windows ($rebuilt)"
+
+    # The control for 4b, in two halves: the stall was ARMED (B logged reading
+    # the seam) and it was PAID (the restore really was in flight that long).
+    # Without both, "the app stayed responsive" would be equally consistent with
+    # a restore that finished before the first probe.
+    Assert ($null -ne (Wait-LogLine $errlogB "pull stalled ${PullDelayMs}ms" 1000)) `
+        "the pull was stalled ${PullDelayMs}ms for this press (the interval is real)"
+    Assert ($restoreMs -ge $PullDelayMs) `
+        "and the restore was in flight for all of it ($([int]$restoreMs) ms)"
+    Assert ($probes -ge 3) "the restore stayed in flight long enough to measure ($probes probes)"
+    Assert ($blocked -eq 0) `
+        "4b the app kept pumping while the local pull was stalled ($blocked of $probes probes went unanswered)"
 
     $shapes = @(Wait-WindowCount 3)
     Assert ($shapes.Count -eq 3) "B now shows three windows ($($shapes.Count))"
@@ -425,7 +472,7 @@ try {
     Write-Host ''
     Write-Host '5. the rebuild re-records the windows locally (markLayoutDirty, Mac''s bindLocal)'
     # The manifest was deleted after A died and nothing but B can write it now.
-    # `restoreAllLocalSessions` marks the layout dirty on a rebuild > 0, so the
+    # `App.adoptRestoreAllLocal` marks the layout dirty on a rebuild > 0, so the
     # file must come back recording ALL of B's windows - which is what lets the
     # NEXT launch restore them from the manifest without the agent round trip.
     # This is the local arm's own behaviour: the remote adopt path skips it on

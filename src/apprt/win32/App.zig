@@ -24,6 +24,7 @@ const IpcServer = @import("IpcServer.zig");
 const MachineChooser = @import("MachineChooser.zig");
 const SessionRoster = @import("SessionRoster.zig");
 const SessionCpuProbe = @import("SessionCpuProbe.zig");
+const RestoreAllLocal = @import("RestoreAllLocal.zig");
 const RestoreAllRelay = @import("RestoreAllRelay.zig");
 const ActivityMonitor = @import("ActivityMonitor.zig");
 const RelayAccountRow = @import("RelayAccountRow.zig");
@@ -5754,11 +5755,11 @@ pub const RestoreAllError = error{
     Unauthorized,
 };
 
-/// Restore ALL of the LOCAL agent's windows (T335, Mac's `resumeAllSessions`):
-/// pull the agent-owned layout blobs (`GET_LAYOUTS`, T334), probe liveness, and
-/// replay each decoded window through the SAME rebuild launch-time restore uses.
-/// Returns how many windows were rebuilt (0 is a valid answer — the agent may
-/// hold nothing, or everything it holds may already be open here).
+/// GUI thread (T618): rebuild the windows a `RestoreAllLocal` worker pulled —
+/// THIS machine's whole topology, sourced from the layout blobs its own agent
+/// holds (T335, Mac's `resumeAllSessions`). Returns how many windows were
+/// rebuilt (0 is a valid answer — the agent may hold nothing, or everything it
+/// holds may already be open here).
 ///
 /// The point of the exercise is the SOURCE: the topology comes from the AGENT's
 /// copy, not from this box's `session-layout.json`. That is what makes it work
@@ -5767,78 +5768,39 @@ pub const RestoreAllError = error{
 /// their windows back and exactly when launch-time restore can do nothing. Mac
 /// states the same property (`SessionLayoutRestore.swift:586-588`).
 ///
-/// The cross-machine half (rebuild ANOTHER machine's topology here, over the
-/// relay) is `RestoreAllRelay`, which does its dialing on a worker thread and
-/// lands back in `adoptRestoreAll` (T339); this one dials nothing.
-pub fn restoreAllLocalSessions(self: *App) RestoreAllError!usize {
-    // Non-spawning would be wrong here, unlike the push: the user asked for
-    // this, so resolving (and if necessary starting) the agent is the job.
+/// The BLOCKING half already happened, on a worker thread: `GET_LAYOUTS` and the
+/// `LIST_SESSIONS` liveness probe, each carrying a `restore_probe_timeout_ns`
+/// budget, so a wedged agent used to cost ~4 s of stopped message loop right
+/// here (T618 — T339 is the same move for the cross-machine arm). What must
+/// still happen on THIS thread is the deciding: `createWindow` and everything
+/// under it is GUI-thread-only, and the double-attach guard has to be re-applied
+/// against the LIVE panes, because the worker's probe is a snapshot and a pane
+/// can have attached to one of these sessions in between.
+pub fn adoptRestoreAllLocal(self: *App, job: *RestoreAllLocal.Job) RestoreAllError!usize {
+    // The app is on its way out: building windows now would race teardown, and
+    // the user is not going to see them.
+    if (self.quit_requested) {
+        log.info("restore all: reply landed while quitting; dropping the rebuild", .{});
+        return 0;
+    }
+
+    // RE-RESOLVE rather than rebuilding over the pointer the worker borrowed.
+    // The agent can have crashed and been re-dialed while that worker was
+    // blocked, and `LocalAgent.retire` keeps the replaced allocation alive
+    // precisely so the pointer stays safe to HOLD (T145) — not current to use.
+    // Windows attached over a retired connection would be dead on arrival.
     const conn = self.local_agent.sharedConnection() orelse {
-        log.warn("restore all: no local agent connection", .{});
+        log.warn("restore all: the local agent went away while its layouts were being read", .{});
         return error.NoAgent;
     };
 
-    const restored = try self.restoreAllLocalFrom(conn);
-    if (restored > 0) {
-        // The rebuilt windows are this box's again: record them locally so the
-        // NEXT launch restores them from the manifest without the round trip
-        // (Mac's `bindLocal`). Deliberately NOT done for a cross-machine
-        // rebuild — those windows are not ours to promise back, and
-        // `captureSessionLayout` skips them anyway.
-        self.markLayoutDirty();
-    }
-    return restored;
-}
+    // The worker only ever leaves this null alongside an `err` the chooser has
+    // already turned into a sentence; treating it as a failed pull rather than
+    // an empty machine keeps "nothing to restore" honest.
+    const decoded = job.decoded orelse return error.PullFailed;
 
-/// The LOCAL rebuild: pull the agent-owned layout blobs (`GET_LAYOUTS`, T334)
-/// over the shared agent connection, probe liveness, and replay each decoded
-/// window through the SAME helpers launch-time restore uses. Returns how many
-/// windows were rebuilt (0 is a valid answer — the agent may hold nothing, or
-/// everything it holds may already be open here).
-///
-/// The point of the exercise is the SOURCE: the topology comes from the AGENT's
-/// copy, not from any local file. That is what makes it work after the manifest
-/// is gone — a crash, a wiped profile, a machine whose agent outlived its app —
-/// which is exactly when a user wants their windows back and exactly when
-/// launch-time restore can do nothing. Mac states the same property
-/// (`SessionLayoutRestore.swift:586-588`).
-///
-/// It runs synchronously on the GUI thread, and stays that way: every RPC here
-/// is a bounded named-pipe round trip to a daemon on this box. The CROSS-MACHINE
-/// rebuild is the one whose network cannot be trusted to be fast — it dials a
-/// relay N+1 times — and that half lives in `RestoreAllRelay` on a worker thread
-/// (T339), landing back through `adoptRestoreAll`.
-fn restoreAllLocalFrom(
-    self: *App,
-    pull: *remote_connection.Connection,
-) RestoreAllError!usize {
-    const gpa = self.core_app.alloc;
-
-    const payload = pull.requestLayouts(restore_probe_timeout_ns) catch |err| {
-        log.warn("restore all: GET_LAYOUTS failed err={}", .{err});
-        return error.PullFailed;
-    };
-    defer gpa.free(payload);
-
-    const decoded = layout_blobs.decodeLayouts(gpa, payload) catch |err| {
-        log.warn("restore all: layouts payload unreadable err={}", .{err});
-        return error.PullFailed;
-    };
-    defer decoded.deinit();
-    if (decoded.skipped > 0) {
-        // Said out loud rather than silently: "3 of 5 windows" is a different
-        // fact from "3 windows", and only one of them is worth investigating.
-        log.warn("restore all: {d} blob(s) skipped as unreadable", .{decoded.skipped});
-    }
-
-    // T851: the same no-stealing rule launch restore follows. This arm needs no
-    // settle window — the button is pressed long after any crash that orphaned
-    // these sessions, so an ATTACHED flag here is a live viewer, and the one
-    // whose windows are already open HERE is caught by `windowIsOpenOn` below.
-    var probe = AttachProbe.take(gpa, pull, .skip_live_holders);
-    defer probe.deinit();
-    const attach_ptr = probe.attachSet();
-    const held_ptr = probe.heldSet();
+    const attach_ptr = job.probe.attachSet();
+    const held_ptr = job.probe.heldSet();
 
     var restored: usize = 0;
     for (decoded.windows) |win| {
@@ -5866,7 +5828,7 @@ fn restoreAllLocalFrom(
             continue;
         }
         if (!restoreWindowHasAttachableLeaf(win, attach_ptr)) continue;
-        const tr: RestoreTransport = .local(pull);
+        const tr: RestoreTransport = .local(conn);
         self.restoreWindow(win, tr, attach_ptr) catch |err| {
             log.warn("restore all: window '{s}' failed err={}", .{ win.id, err });
             continue;
@@ -5876,6 +5838,12 @@ fn restoreAllLocalFrom(
 
     if (restored > 0) {
         log.info("restore all: rebuilt {d} window(s) from the agent's layouts", .{restored});
+        // The rebuilt windows are this box's again: record them locally so the
+        // NEXT launch restores them from the manifest without the round trip
+        // (Mac's `bindLocal`). Deliberately NOT done for a cross-machine
+        // rebuild — those windows are not ours to promise back, and
+        // `captureSessionLayout` skips them anyway.
+        self.markLayoutDirty();
     } else {
         log.info("restore all: nothing to rebuild ({d} layout(s) held)", .{decoded.windows.len});
     }
@@ -9753,6 +9721,19 @@ fn msgWndProc(
         // (wparam = its entry id). Posted from the connection's reader thread,
         // which may not touch GUI state.
         app.machine_pool.onNotify(wparam, lparam);
+        return 0;
+    }
+
+    if (msg == RestoreAllLocal.WM_APP_RESTORE_ALL_LOCAL) {
+        // wparam = heap *Job owned by the handler (T618: a LOCAL Restore All
+        // whose agent RPCs ran on a worker thread). Same destination rule as the
+        // relay reply below — a chooser that closed first would have the message
+        // DISCARDED with its queue, and with it the decode and roster the job
+        // carries.
+        if (wparam != 0) {
+            const job: *RestoreAllLocal.Job = @ptrFromInt(wparam);
+            MachineChooser.onRestoreAllLocal(app, job);
+        }
         return 0;
     }
 
