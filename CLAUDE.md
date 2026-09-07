@@ -333,6 +333,77 @@ LATER close closes normally. Policy + wording live in `SessionDisconnectPolicy`;
 tests: `SessionDisconnectPolicyTests`, `SessionDetachPinTests`,
 `SessionDetachPinPlanTests`.
 
+#### Signing out revokes THIS machine
+
+An account's **user session** and a machine's **device enrollment** are two
+independent relay credentials, and `POST /oauth/signout` revokes only the
+session — deliberately, because an account may own headless hosts that no app
+is signed in on. That independence was also a hole: signing out in the app
+running ON an enrolled machine left the machine listed, online, and bridgeable
+from every other client on the account, with live sessions still visible
+through "See Activity".
+
+**The rule:** app sign-out is a **hard revocation of the machine the app runs
+on**, when — and only when — that machine's enrollment belongs to the account
+signing out. `RelayAccount.signOut()` reads the local `relay.env`, asks
+`GET /v1/agent/whoami` whose machine it is, and on a match calls `POST
+/v1/agent/deenroll` with the *machine's own* credential: the device row is
+deleted (its token hash gone, so it can never re-authenticate) and every live
+connection — control **and** in-flight bridged data — is severed. Other
+clients lose the row on their next `/v1/client/devices` refresh (the chooser
+polls every 5s while open). Then the local credential file is deleted so a
+restart can't dial with it.
+
+- A machine enrolled to a **different** account is untouched — the app is a
+  guest on that host.
+- A Mac with **no** local enrollment (the common case) has nothing to revoke
+  and sign-out is unchanged.
+- An agent whose credential comes from `GHOSTTY_DEVICE_TOKEN` rather than
+  `relay.env` is invisible to the app and is NOT revoked. Identifying it by
+  hostname was rejected: hostnames collide, and the failure mode would be
+  silently deleting somebody's *other* machine during sign-out. The remedy is
+  the chooser's existing "Remove from Account" (`DELETE
+  /v1/client/devices/{id}`), which is the same hard revocation.
+
+**Failure is never silent.** The revocation is awaited; if the relay can't be
+reached, `signOut` **throws and the account stays signed in** (reporting
+"signed out" while the machine is still reachable is the bug itself). The user
+may sign out anyway, which arms a **pending revocation** — `relay.env` is left
+in place as the retry's own record, and the revocation is retried at every
+launch and on every network-came-back transition until the relay confirms it.
+The retry authenticates as the DEVICE, so it needs no account session.
+
+**Sign-out suspends rather than discards.** The machine's name and relay are
+remembered — recorded **before** the de-enroll POST, because the relay is about
+to delete the only record of that name and a lost response would otherwise lose
+the machine for good — and signing back in with the **same** account re-enrolls
+it (`POST /v1/client/devices`) and writes the fresh credential to `relay.env`,
+which a running agent adopts within one watcher tick and reconnects with
+(`relay_creds.zig`). A different account signing in never inherits it, and
+restore is refused across relays (a session on relay A can't mint a device on
+relay B). This mirrors what sign-out/sign-in already do to the account's remote
+*windows*, and is what makes signing out safe rather than a one-way door. The
+restore is retried at **every launch while signed in**, not just at sign-in: a
+re-enroll can fail transiently (relay 5xx, device quota), and nobody would think
+to fix a missing machine by signing out and back in.
+
+**The two failure paths that look alike are kept apart.** A revocation whose
+POST landed but whose response was lost is indistinguishable from one that
+failed, so neither side guesses: the retry treats a later 401 as "already
+revoked" *without* discarding the suspension the first attempt recorded, and a
+sign-in that would cancel a pending revocation first re-checks the credential —
+cancelling only when it is confirmed alive, dropping it and re-enrolling when it
+is confirmed dead, and staying armed when the relay can't say. An unparseable
+`RELAY_BASE` is likewise not treated as "already revoked": the agent dials the
+base it was *started* with and only ever compares that field, so the machine can
+be perfectly reachable with a broken line in the file — the app falls back to its
+own relay rather than deleting the one credential that could revoke it.
+
+Client: `macos/Sources/Features/Remote/MachineEnrollment.swift`. Tests:
+`MachineEnrollmentTests`, `RelayAccountSignOutTests`, and
+`relay/signout_revoke_test.go` (which pins both halves: `/oauth/signout` alone
+leaves the machine reachable, and de-enroll kills the live bridge).
+
 ### Naming
 
 - `+new-window --target=<name>` registers a **window**

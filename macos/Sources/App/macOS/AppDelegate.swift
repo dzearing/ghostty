@@ -341,6 +341,28 @@ class AppDelegate: NSObject,
                 await MachineRegistry.shared.refreshFromRelay(quiet: true)
             }
 
+            // A sign-out that couldn't reach the relay left THIS machine still
+            // enrolled and reachable by every other client on the account. That
+            // is never allowed to be silent: retry it now, and again on every
+            // network-came-back transition, until the relay confirms it (see
+            // `MachineEnrollmentRevoking`). A no-op when nothing is pending.
+            LocalMachineEnrollment.shared.startPendingRevocationRetries()
+
+            // The mirror image: a sign-in whose re-enrollment of this machine
+            // failed transiently (relay 5xx, device quota, offline right then)
+            // left the machine suspended and OUT of the account. Nobody would
+            // think to fix that by signing out and in again, so retry it at
+            // every launch while signed in. A no-op — two defaults reads, no
+            // network — when there is nothing suspended.
+            Task { @MainActor in
+                await RelayAccount.shared.waitForInitialLoad()
+                guard let email = RelayAccount.shared.email,
+                      let token = await RelayAccount.resolveToken()
+                else { return }
+                await LocalMachineEnrollment.shared.restoreEnrollment(
+                    accountEmail: email, sessionToken: token)
+            }
+
             // Test seam: exercise the local-agent find-or-spawn path without
             // any window plumbing (session persistence is not wired to
             // surfaces yet). Logs the outcome; the orchestrator asserts via
