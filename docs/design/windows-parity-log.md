@@ -23834,3 +23834,45 @@ Green: `floor-lane.ps1 -Lane all` ALL LANES PASS (lib 52s, none 145s, win32
 19, `verdict-exit`, `cleanslate` 21, `stderr-capture` 25, `test-reach` 14,
 `desktop-launch` 29, `command-resolve` 15, `printclient-audit` 8, `viewer-close`
 44, `viewer-nav-pin` 24 - all ALL PASS. P1 25 / P2 20 / P3 16 ALL PASS.
+
+## 2026-09-06 - a viewer that walks itself out of a document is finally held to the same rule (T593)
+
+A viewer pane stops watching its file - and cancels any re-render it had already
+queued for it - when the document it is showing goes away. There are two ways a
+document goes away: you type a new address, or the page itself moves. Only the
+first had a test. Both behave correctly today; the second was one careless
+refactor away from silently regressing, and the regression is invisible to a
+person until a page they opened re-loads itself behind their back.
+
+The two callers share one function (`syncWatcher`), which is exactly why the gap
+was easy to miss: T400 asserted the invariant on `ViewerPane.navigate` and the
+shared function made that look like coverage of both. It is not. Reverting the
+in-page branch alone to a bare `watcher.stop()` leaves every existing test green.
+
+Reaching the in-page path took two findings. A markdown pane cannot host it at
+all: in file mode every new-document http navigation IS a link, so
+`classifyLink` routes it to the browser and it never commits in the pane. A
+rendered `.html` file can - a live page owns its own navigation - but only when
+the PAGE moves rather than a click, so the fixture is an html file whose own
+`setTimeout` assigns `location.href`. Driving that with `ExecuteScript` would
+measure the opposite of what it looks like: `ExecuteScript` carries a transient
+user gesture, which is precisely the "the user clicked" signal
+`routesAsLivePageLink` routes out to the browser.
+
+The oracle is T400's timer rather than a fetch count, for T400's reason. What is
+new is that this path has to be PUMPED - the page must load and then move itself
+- and pumping is the one thing that fires a debounce. So the timer is re-armed
+every 20ms slice (`SetTimer` on a live id restarts it, the same collapse a burst
+of saves gets) and the loop leaves within a slice of the commit: the 100ms
+debounce never has 100ms to itself, so a timer that is gone was killed by the
+code under test and by nothing else.
+
+The mutation is what makes it a test: with `syncWatcher` replaced by
+`watcher.stop()` the timer assertion fails `expected 0, found 1` while
+`watching=false` still reads true - the watch-stopped half cannot see this
+regression, and only the timer says so.
+
+Green: `floor-lane.ps1 -Lane all` ALL LANES PASS (lib, none 324s, win32 407s,
+agent 412s). Re-stamped after the source edit: `viewer-close` 44,
+`viewer-nav-pin` 24, `printclient-audit` 8, `test-reach` 14 - all ALL PASS.
+P1 25 / P2 20 / P3 16 ALL PASS.

@@ -6987,6 +6987,85 @@ test "host floor: a real controller on a real window, on this box" {
     try testing.expect(pane.watcher.isRunning());
 
     // ------------------------------------------------------------------
+    // T593: the DOCUMENT leaving, rather than the address bar
+    // ------------------------------------------------------------------
+    //
+    // Everything above leaves a document through `pane.navigate`. The other
+    // way out is the document moving on its own: a rendered `.html` file whose
+    // script sends the pane to a website. That reaches the SAME `syncCommitted`
+    // web branch, but through `SourceChanged` instead of through `navigate` —
+    // and until T593 nothing asserted the shared invariant on this caller, so
+    // putting a bare `watcher.stop()` back here alone would leave every test
+    // green.
+    //
+    // Why a live page and not the markdown pane: in file mode every
+    // new-document http navigation IS a link (`classifyLink` → `.browser`), so
+    // it is cancelled and handed to the browser and never commits here. A live
+    // page owns its own navigation, and a move the PAGE makes — as opposed to a
+    // click — stays in the pane. Driving it with `executeScript` would measure
+    // the wrong thing for the same reason the popup gate records two slots:
+    // `ExecuteScript` carries a transient user gesture, which is precisely the
+    // "the user clicked" signal `routesAsLivePageLink` routes out. The page has
+    // to move itself.
+    const t593_html = try std.fs.path.join(alloc, &.{ dir_path, "t593.html" });
+    defer alloc.free(t593_html);
+    {
+        const body = try std.fmt.allocPrint(alloc,
+            \\<!doctype html><title>T593</title><h1>Leaving</h1>
+            \\<script>setTimeout(function () {{ location.href = "{s}"; }}, 400);</script>
+        , .{reload_url});
+        defer alloc.free(body);
+        try tmp.dir.writeFile(.{ .sub_path = "t593.html", .data = body });
+    }
+    try pane.navigate(alloc, t593_html);
+    try testing.expectEqual(content.Mode.html, pane.mode);
+    try testing.expect(pane.watcher.isRunning());
+
+    // Positive control on this pane, as in T400: the watcher's message really
+    // does arm a timer on the host window, so the zero asserted below is a
+    // cancellation rather than an arming that quietly stopped working.
+    _ = w32.SendMessageW(t400_host, WM_APP_VIEWER_RELOAD, 0, 0);
+    try testing.expect(w32.KillTimer(t400_host, reload_timer_id) != 0);
+
+    // The page has to be pumped to load and then to move itself — and pumping
+    // is the one thing that would fire a debounce, which is why T400 could
+    // assert without pumping at all and this cannot. So the timer is RE-ARMED
+    // every slice (`SetTimer` on a live id restarts it, the same collapse a
+    // burst of saves gets) and the loop leaves within one slice of the commit.
+    // The 100ms debounce therefore never has 100ms to itself: a timer that is
+    // gone below was killed by the code under test and by nothing else.
+    var t593_flipped = false;
+    {
+        var t593_timer = try std.time.Timer.start();
+        while (t593_timer.read() < 30 * std.time.ns_per_s) {
+            _ = w32.SendMessageW(t400_host, WM_APP_VIEWER_RELOAD, 0, 0);
+            pumpFor(&msg, 20);
+            if (pane.mode == .web) {
+                t593_flipped = true;
+                break;
+            }
+        }
+    }
+    log.warn("t593: page moved itself={} mode={s} watching={} at={?s}", .{
+        t593_flipped,
+        @tagName(pane.mode),
+        pane.watcher.isRunning(),
+        pane.location,
+    });
+    try testing.expect(t593_flipped);
+    try testing.expect(std.mem.startsWith(u8, pane.location.?, "http://127.0.0.1"));
+
+    // The two halves of the invariant, now on the in-page caller: the watch on
+    // the html file is stopped, and the debounce armed a moment ago is gone.
+    // Reverting that branch to a bare `watcher.stop()` turns the second red.
+    try testing.expect(!pane.watcher.isRunning());
+    try testing.expectEqual(@as(i32, 0), w32.KillTimer(t400_host, reload_timer_id));
+
+    // Back onto the markdown file the sections below expect, watching.
+    try pane.navigate(alloc, md_path);
+    try testing.expect(pane.watcher.isRunning());
+
+    // ------------------------------------------------------------------
     // T159: history — the slots, the handler IIDs, and the file<->web
     // boundary
     // ------------------------------------------------------------------
