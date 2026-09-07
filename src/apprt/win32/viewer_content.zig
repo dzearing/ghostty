@@ -1645,6 +1645,51 @@ test "the bundled stylesheet names fonts that resolve on Windows" {
     }
 }
 
+test "T595: the diff stylesheet names fonts that resolve on Windows" {
+    // The sibling of the T386 test above, for the sheet the git-diff pane
+    // renders through. `diff.css` was deliberately skipped by T386 because the
+    // win32 viewer had no diff mode yet (T463 gave it one), so all six of its
+    // declarations still led with the macOS-only families and fell through to
+    // the generic keyword here: Arial for the sans rules, Courier New for the
+    // mono ones. One shared sheet, no fork — `system-ui` leads the sans stacks
+    // and the Windows monospace faces sit ahead of `monospace`.
+    const css = @embedFile("../../viewer/diff.css");
+
+    try testing.expect(std.mem.indexOf(u8, css, "\"Segoe UI\"") != null);
+    try testing.expect(std.mem.indexOf(u8, css, "Consolas") != null);
+    try testing.expect(std.mem.indexOf(u8, css, "\"Cascadia Mono\"") != null);
+
+    // Nothing may lead with the macOS-only spelling again. Every declaration
+    // starts with `system-ui`, `ui-monospace` (which Chromium answers on both
+    // platforms) or `inherit` — and every stack that reaches a generic keyword
+    // offers a resolvable Windows face before it.
+    var i: usize = 0;
+    var decls: usize = 0;
+    while (std.mem.indexOfPos(u8, css, i, "font-family: ")) |at| : (i = at + 1) {
+        decls += 1;
+        const rest = css[at + "font-family: ".len ..];
+        try testing.expect(
+            std.mem.startsWith(u8, rest, "system-ui") or
+                std.mem.startsWith(u8, rest, "ui-monospace") or
+                std.mem.startsWith(u8, rest, "inherit"),
+        );
+        const end = std.mem.indexOfScalar(u8, rest, ';') orelse rest.len;
+        const decl = rest[0..end];
+        if (std.mem.startsWith(u8, decl, "inherit")) continue;
+        if (std.mem.indexOf(u8, decl, "sans-serif") != null) {
+            try testing.expect(std.mem.indexOf(u8, decl, "\"Segoe UI\"") != null);
+        }
+        if (std.mem.indexOf(u8, decl, "monospace") != null and
+            std.mem.indexOf(u8, decl, "sans-serif") == null)
+        {
+            try testing.expect(std.mem.indexOf(u8, decl, "Consolas") != null);
+        }
+    }
+    // A sheet whose declarations all got renamed out from under this test
+    // would otherwise pass it vacuously.
+    try testing.expect(decls >= 6);
+}
+
 test "candidateUnder: resolves inside the root and refuses every way out" {
     const alloc = testing.allocator;
     const root = if (builtin.os.tag == .windows) "C:\\app\\share\\viewer" else "/app/share/viewer";

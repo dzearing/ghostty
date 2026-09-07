@@ -23876,3 +23876,44 @@ Green: `floor-lane.ps1 -Lane all` ALL LANES PASS (lib, none 324s, win32 407s,
 agent 412s). Re-stamped after the source edit: `viewer-close` 44,
 `viewer-nav-pin` 24, `printclient-audit` 8, `test-reach` 14 - all ALL PASS.
 P1 25 / P2 20 / P3 16 ALL PASS.
+
+## 2026-09-07 - a diff pane's text stops falling back to Arial and Courier New (T595)
+
+Open `--view=git-diff:<sha>` on Windows and every word in the pane was set in
+the wrong face. The file paths, the change counts, the status badges and the
+code itself came out in Courier New; the pane's chrome came out in Arial. The
+window around it is Segoe UI and the terminal beside it is Cascadia, so the
+diff read as a web page dropped into the app. It now uses the same faces as
+everything else.
+
+`diff.css` was the one viewer sheet T386 did not fix, and deliberately: back in
+August the win32 viewer had no diff mode, so the sheet shipped and nothing here
+read it. T463 gave it one. All six of its declarations still named only macOS
+families - `-apple-system, BlinkMacSystemFont, "SF Pro Text"` for the two sans
+rules, `ui-monospace, "SF Mono", SFMono-Regular, Menlo` for the four mono ones -
+and behind each sat a bare generic keyword, which on this box is Arial and
+Courier New respectively. The fix is T386's, in the SAME shared sheet with no
+Windows fork: `system-ui` leads the sans stacks (San Francisco on macOS, Segoe
+UI Variable here) and `"Cascadia Mono"`, `Consolas` sit ahead of `monospace`.
+
+The oracle is the one the task asked for and the reason it was told to wait for
+T463: a stylesheet assertion only proves what we typed. The host-floor test
+already renders a real diff over a throwaway git repo through a real WebView2,
+so the T386 canvas-width probe is extended onto that page. Two strings set in
+different families measure to different widths, so each rule's COMPUTED stack is
+compared against the generic answer and against the real Windows faces:
+`T595 diff font probe: "true,true,true,true,true,true"` - not-Arial-and-a-Segoe
+for the two sans rules, not-Courier-New-and-Consolas-or-Cascadia for the four
+mono ones. Five of the six are read off elements the diff renderer actually
+built; `.d-stub` only appears on a binary or empty patch, so the probe makes one
+and lets the same sheet style it.
+
+The unit half is the regression fence, a sibling of T386's for `viewer.css`: it
+fails a declaration that leads with `-apple-system` again, a sans stack with no
+`"Segoe UI"` before its generic, a mono stack with no `Consolas`, and a sheet
+whose declarations were all renamed out from under it.
+
+Green: `floor-lane.ps1 -Lane all` ALL LANES PASS (lib 52s, none 353s, win32
+413s, agent 408s). Re-stamped after the source edit: `viewer-close` 44,
+`viewer-nav-pin` 24, `printclient-audit` 8, `test-reach` 14 - all ALL PASS.
+P1 25 / P2 20 / P3 16 ALL PASS.

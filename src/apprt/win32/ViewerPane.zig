@@ -8472,6 +8472,89 @@ test "host floor: a real controller on a real window, on this box" {
             // The header names the whole diff, not just the open file.
             try testing.expect(std.mem.indexOf(u8, got, "Working tree") != null);
             try testing.expect(std.mem.indexOf(u8, got, "2 files") != null);
+            // ----------------------------------------------------------
+            // T595: the diff sheet's fonts, measured on this rendered page
+            // ----------------------------------------------------------
+            //
+            // `diff.css` was left out of T386 because nothing on Windows read
+            // it yet, and it kept the macOS-only stacks: `-apple-system …
+            // sans-serif` for the chrome and `ui-monospace, "SF Mono", …,
+            // monospace` for the code. None of the named faces resolve here, so
+            // every one of them fell through to the GENERIC keyword — Arial for
+            // the sans rules and Courier New for the mono ones — inside a window
+            // whose chrome is Segoe UI and whose terminal is Cascadia.
+            //
+            // Same oracle as T386, for the same reason: reading the stack back
+            // out of the stylesheet only proves what we typed, so the page
+            // measures each rule's COMPUTED stack on a canvas and compares it
+            // against the generic answer and against the real Windows faces.
+            // The diff above is a live one over a real repo, so five of the six
+            // rules are read off elements the renderer actually built; `.d-stub`
+            // only appears on a binary or empty patch, so the probe makes one
+            // and lets the same sheet style it.
+            {
+                const font_js =
+                    \\(function () {
+                    \\  var root = document.querySelector(".viewer-diff-root");
+                    \\  if (!root) return "no-root";
+                    \\  var c = document.createElement("canvas").getContext("2d");
+                    \\  function width(f) {
+                    \\    c.font = "16px " + f;
+                    \\    return c.measureText("Quote Copy Segoe 12345").width;
+                    \\  }
+                    \\  function stack(sel) {
+                    \\    var el = root.querySelector(sel);
+                    \\    if (!el) {
+                    \\      el = document.createElement("div");
+                    \\      el.className = sel.slice(1);
+                    \\      root.appendChild(el);
+                    \\    }
+                    \\    return getComputedStyle(el).fontFamily;
+                    \\  }
+                    \\  function sans(sel) {
+                    \\    var f = stack(sel);
+                    \\    return width(f) !== width("Arial") && (
+                    \\      width(f) === width('"Segoe UI"') ||
+                    \\      width(f) === width('"Segoe UI Variable Text"') ||
+                    \\      width(f) === width('"Segoe UI Variable"'));
+                    \\  }
+                    \\  function mono(sel) {
+                    \\    var f = stack(sel);
+                    \\    return width(f) !== width('"Courier New"') && (
+                    \\      width(f) === width("Consolas") ||
+                    \\      width(f) === width('"Cascadia Mono"'));
+                    \\  }
+                    \\  return [
+                    \\    sans(".viewer-diff-root"), sans(".d-stub"),
+                    \\    mono(".d-status"), mono(".d-path"),
+                    \\    mono(".d-file-counts"), mono(".d-body")
+                    \\  ].join(",");
+                    \\})()
+                ;
+                const font_wide = try std.unicode.utf8ToUtf16LeAllocZ(alloc, font_js);
+                defer alloc.free(font_wide);
+                var fonts: Probe = .{};
+                const font_handler = try ProbeHandler.create(alloc, &fonts);
+                defer font_handler.release();
+                try testing.expect(web.executeScript(font_wide.ptr, @ptrCast(font_handler)));
+                var font_timer = try std.time.Timer.start();
+                while (font_timer.read() < 15 * std.time.ns_per_s and !fonts.done) {
+                    while (w32.PeekMessageW(&msg, null, 0, 0, w32.PM_REMOVE) != 0) {
+                        _ = w32.TranslateMessage(&msg);
+                        _ = w32.DispatchMessageW(&msg);
+                    }
+                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                }
+                try testing.expect(fonts.done);
+                try testing.expect(fonts.ok);
+                // Loud on success as well as failure, the T386 rule: "the fonts
+                // are right" cannot be read off a pass count.
+                log.warn("T595 diff font probe: {s}", .{fonts.text[0..fonts.len]});
+                try testing.expectEqualStrings(
+                    "\"true,true,true,true,true,true\"",
+                    fonts.text[0..fonts.len],
+                );
+            }
         }
     }
 }
