@@ -48,6 +48,7 @@ const diff = @import("viewer_diff.zig");
 const ViewerPane = @import("ViewerPane.zig");
 
 const log = std.log.scoped(.viewer_toc);
+const paint_probe = @import("paint_probe.zig");
 
 pub const CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyViewerTOC");
 
@@ -1500,6 +1501,12 @@ fn wndProc(
         },
 
         w32.WM_PAINT => {
+            // T1405: the card is the quiet surface the accent-repaint oracle
+            // watches - it repaints only when something invalidated it, and a
+            // child never receives the color-change broadcast itself. Counted
+            // here and deliberately NOT in `WM_PRINTCLIENT` below, which is
+            // the camera (`paint_probe.zig`).
+            paint_probe.record(.viewer_toc);
             var ps: w32.PAINTSTRUCT = undefined;
             const hdc = w32.BeginPaint(hwnd, &ps) orelse return 0;
             defer _ = w32.EndPaint(hwnd, &ps);

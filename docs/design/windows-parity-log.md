@@ -23602,3 +23602,44 @@ turn: the first floor sweep scored none and win32 RED, and both passed alone
 seconds later - a leftover background lane from the dead turn was still running
 over the top of it, which is exactly the T401 overlap the harness rules forbid.
 A resumed turn inherits background jobs as well as a dirty tree.
+
+## 2026-09-06 - the accent repaint is scored at last, by counting paints instead of photographing them (T1405)
+
+T585 measured the hole and this closes it. Every accent assertion in
+`chrome-theme.ps1` reads pixels, and reading pixels here means asking the window
+to draw a frame (`WM_PRINTCLIENT` under `-Sync`, `PrintWindow` otherwise) - so a
+build whose `repaintForColorChange` did no `RedrawWindow` at all passed 129 of
+129. What a user sees when they pick a new accent - the window redrawing while
+they look at it - was scored by nothing.
+
+It is scored now by the app REPORTING its own paints, the shape `drag-perf.ps1`
+uses for the other quantity no cross-process probe can catch.
+`src/apprt/win32/paint_probe.zig` counts `WM_PAINT` cycles per surface and
+prints `paint-probe surface=viewer_toc n=7` under `GHOZTTY_PAINT_PROBE`; the
+`WM_PRINTCLIENT` handlers deliberately do NOT count, so the camera cannot
+advance the counter it is being scored against. Section **G** of
+`chrome-theme.ps1` reads those lines out of the app's stderr: G checks the probe
+is live, **G1 measures a 1.5s quiet** with no notification and no capture, and
+**G2** moves the accent, notifies only the TOP-LEVEL window and asserts the
+child card painted.
+
+Two decisions are the whole design. The surface is the viewer's contents CARD
+rather than the window, because the hero carousel's 150ms thumbnail timer
+repaints the window unprompted - the trap that beat the earlier candidate pixel
+oracle, and it would have beaten a window paint counter identically; G1 is what
+proves the chosen surface is not in that class. And only the OWNER is notified,
+so G2 goes red both on a build with no `RedrawWindow` and on one that drops
+`RDW_ALLCHILDREN` - the behavioral form of what F3 can only assert as source
+text.
+
+Both of those were BUILT AND RUN, not argued (T1133): the bare cache drop scored
+`FAIL G2 ... (3 -> 3)`, the flag-less redraw scored the same, each at
+`2 FAILURE(S) of 136` with every pixel assertion still green. The restored build
+is `ALL PASS (136)` with `G2 ... (4 -> 5)`. `paint_probe.zig` joins the
+chrome-theme coverage row, so a change to the probe re-arms the section that
+depends on it.
+
+Floor: `floor-lane.ps1 -Lane all` lib/none/win32/agent all PASS; ipc-p1/p2/p3
+ALL PASS; the fourteen guard rows this edit made due all green, viewer-close,
+close-confirm-idle, remote-disconnect, viewer-narrow-pane and viewer-diff-tree
+among them (`Window.zig` and `ViewerTOCPanel.zig` each gained one line).

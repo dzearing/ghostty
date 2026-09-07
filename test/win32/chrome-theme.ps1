@@ -32,14 +32,16 @@
 #      `WM_DWMCOLORIZATIONCOLORCHANGED` is posted to the top-level window and
 #      the next panel must paint the NEW one (the invalidation is wired).
 #
-#      Two cases, and only ONE of them is the live-update claim. B3 closes and
+#      Two cases, and NEITHER of them is the live-update claim. B3 closes and
 #      reopens the panel around the message, so it scores the CACHE DROP only -
 #      a panel that repaints because it was freshly constructed passes it, and
 #      that close/reopen was the workaround standing in for the missing
 #      repaint. B4 leaves the panel OPEN across the notification instead, which
-#      is closer to what a user with the panel on screen does - but it is NOT
-#      the live-update claim it was written as, and the measurement that says
-#      so is under WHAT NO CAPTURE IN THIS SCRIPT CAN CLAIM below (T585/T1405).
+#      is closer to what a user with the panel on screen does, and it scores
+#      one more thing: that an open panel keeps no accent of its own. It still
+#      cannot see whether anybody INVALIDATED that panel, because photographing
+#      it repaints it (T585/T1405). Section G scores that, and by counting
+#      paints rather than reading pixels.
 #
 #   C. THE DEBUG BUILD MARKS ITSELF (T43), and the release build does not.
 #      A Debug/ReleaseSafe build drags the chrome background toward warning
@@ -98,18 +100,27 @@
 # message just dropped, so the new color appears whether or not anybody
 # invalidated anything.
 #
-# So every accent claim here - B3, B4, F1, F2 - scores the CACHE and its drop.
-# The repaint that puts a new accent in front of a user who is looking at the
-# window is scored by nothing, and B4's name for itself ("the LIVE-UPDATE
-# claim") over-reads what it can see. Filed as T1405 rather than papered over.
-# An oracle for it has to read pixels the window did not just draw for the
-# camera, which on a background desktop means something other than these two
-# capture paths.
+# So every PIXEL claim about the accent here - B3, B4, F1, F2 - scores the
+# CACHE and its drop, and no capture will ever score more than that.
+#
+#   G. THE REPAINT ITSELF (T1405), which is therefore scored by COUNTING
+#      PAINTS instead of reading pixels. The app counts its own WM_PAINT
+#      cycles (`src/apprt/win32/paint_probe.zig`) and prints one line per
+#      paint under GHOZTTY_PAINT_PROBE; WM_PRINTCLIENT deliberately does not
+#      count, so the camera cannot advance the counter it is being scored
+#      against. The surface is the viewer's contents CARD, which repaints only
+#      when invalidated, and only its OWNER is notified - so G goes red on a
+#      build with no RedrawWindow, and red on one that drops RDW_ALLCHILDREN.
+#      Both were run as negative controls before this section was believed
+#      (T1133). G1 measures the card's quiet first, because a counter that
+#      ticks on its own scores nothing.
 #
 # The candidate that failed for a related reason is written down so the next
-# attempt does not re-derive it: the hero carousel's accent-outlined selected
-# tile measured PASS with the repaint reverted, because its thumbnail refresh
-# timer repaints the band every 150ms unprompted.
+# attempt does not re-derive it, and it is why G watches the card rather than
+# the window: the hero carousel's accent-outlined selected tile measured PASS
+# with the repaint reverted, because its thumbnail refresh timer repaints the
+# band every 150ms unprompted - which would defeat a paint COUNTER on the
+# top-level window just as thoroughly as it defeated a pixel oracle.
 #
 # WHAT THIS SCRIPT DOES NOT CLAIM. T305's validation text asks for the
 # ACTIVE-TAB INDICATOR to track the accent. There is no such pixel: the tab
@@ -162,6 +173,12 @@ $errlog = Join-Path $env:TEMP 'ghoztty-chrome-theme-stderr.log'
 $isDebugBuild = $null   # resolved from `+version` once the helpers are defined
 Remove-Item $errlog -ErrorAction SilentlyContinue
 $env:GHOZTTY_PIPE_SUFFIX = "-chromethemetest$PID"
+
+# T1405: section G reads the app's own paint counter out of its stderr, and
+# this is the switch that makes it print one. Set for the whole run rather
+# than for G's launch alone - every GUI here is started by the same helper,
+# and a line nobody reads costs nothing.
+$env:GHOZTTY_PAINT_PROBE = '1'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 # `+version`'s build mode, which section A's expectation flips on. TestDesktop
@@ -285,6 +302,21 @@ function Start-Gui([string[]]$ExtraArgs) {
 function Invoke-Verb([string[]]$VerbArgs) {
     $out = (& $exe @VerbArgs 2>&1 | ForEach-Object { $_.ToString() } | Out-String)
     return [pscustomobject]@{ Code = $LASTEXITCODE; Out = $out }
+}
+
+# T1405: the app's own count of WM_PAINT cycles for one surface, read out of
+# the stderr log it is printing them to. Returns $null when the app has not
+# printed a single line for that surface - which is exactly what a probe that
+# never turned on looks like, and section G asserts against that rather than
+# quietly reading it as zero.
+function Get-PaintCount([string]$Surface) {
+    if (-not (Test-Path $errlog)) { return $null }
+    $n = $null
+    foreach ($l in @(Get-Content $errlog -ErrorAction SilentlyContinue)) {
+        $m = [regex]::Match($l, "paint-probe surface=$Surface n=(\d+)")
+        if ($m.Success) { $n = [int]$m.Groups[1].Value }
+    }
+    return $n
 }
 
 function Invoke-Palette([IntPtr]$top, [IntPtr]$pane, [string]$filter) {
@@ -588,11 +620,14 @@ try {
         Assert (-not (Test-ShotHasColor $shot $ACCENT_A)) 'B3 and the old accent is gone - the pixel MOVED'
     } finally { Close-TestWindowPixels -Shot $shot }
 
-    # B4: the LIVE-UPDATE claim (T307). B3 above closes and reopens the panel
-    # around the message, so all it can prove is that the CACHE was dropped -
-    # a panel that repaints only because it was just constructed would pass it.
-    # This leaves the panel OPEN across the notification, which is what a user
-    # who picks a new accent with the panel on screen actually does.
+    # B4: an OPEN panel holds no accent of its own (T307). B3 above closes and
+    # reopens the panel around the message, so all it can prove is that the
+    # CACHE was dropped - a panel that repaints only because it was just
+    # constructed would pass it. This leaves the panel OPEN across the
+    # notification, which is what a user who picks a new accent with the panel
+    # on screen actually does. It is still not the live-update claim it was
+    # once labelled as: the capture below repaints the panel, so it cannot see
+    # whether anything invalidated it. Section G scores that.
     #
     # DWM broadcasts to every top-level window, so the message goes to both the
     # main window and the panel; posting only to the main window would test a
@@ -852,6 +887,62 @@ try {
             Assert (-not (Test-ShotHasColor $shot $ACCENT_A)) `
                 'F2 and the accent it painted with is gone - the card holds no accent of its own'
         } finally { Close-TestWindowPixels -Shot $shot }
+
+        # ===================================================================
+        # G. THE REPAINT ITSELF (T1405)
+        # ===================================================================
+        #
+        # Everything above scores the accent CACHE and its drop, because every
+        # capture in this harness is itself a repaint - the measurement under
+        # WHAT NO CAPTURE IN THIS SCRIPT CAN CLAIM in the header. G scores the
+        # half a user actually sees: the window REDREW when the accent moved,
+        # with no camera anywhere near it.
+        #
+        # THE ORACLE. The app counts its own WM_PAINT cycles
+        # (src/apprt/win32/paint_probe.zig) and, under GHOZTTY_PAINT_PROBE,
+        # prints one line per paint to stderr:
+        #
+        #     paint-probe surface=viewer_toc n=7
+        #
+        # WM_PRINTCLIENT deliberately does NOT count, which is the whole point:
+        # the counter cannot be advanced by photographing the window, so it
+        # measures the app's own painting and nothing else. Read from the app
+        # rather than photographed for the same reason drag-perf.ps1 reads its
+        # numbers out of the app - a frame is not a thing a cross-process probe
+        # can catch.
+        #
+        # THE SURFACE is the contents CARD, not the top-level window. The hero
+        # carousel refreshes its thumbnails on a 150ms timer, so a window
+        # counter advances on its own and would pass with the repaint deleted -
+        # the exact shape that defeated the earlier candidate oracle. The card
+        # is quiet, and G1 MEASURES that quiet rather than assuming it: without
+        # it, G2 could be reading a counter that was ticking all along.
+        #
+        # AND ONLY THE OWNER IS NOTIFIED, as in F2 - a child HWND never
+        # receives the broadcast. So G2 goes red on a build that drops the
+        # RedrawWindow, and red on one that keeps it but drops
+        # RDW_ALLCHILDREN: it is the behavioral form of what F3 can only
+        # assert as source text.
+        $g0 = Get-PaintCount 'viewer_toc'
+        Assert ($null -ne $g0 -and $g0 -ge 1) `
+            "G the paint probe is live - the card has printed its own paint count (n=$g0)"
+
+        # G1: a quiet interval, no notification and no capture. Nothing may
+        # repaint the card by itself, or G2 proves nothing.
+        Start-Sleep -Milliseconds 1500
+        $gIdle = Get-PaintCount 'viewer_toc'
+        Assert ($gIdle -eq $g0) `
+            "G1 the card repaints only when something invalidates it - idle for 1.5s and still n=$gIdle"
+
+        # G2: the accent moves back to A and only the OWNER is notified. The
+        # card must paint - which is a fact about the app, measured while the
+        # harness took no picture at all.
+        Set-Accent $ACCENT_A
+        Send-TestRawMessage -Window $vtop -Message $WM_DWMCOLORIZATIONCOLORCHANGED -WParam 0 -LParam 0 | Out-Null
+        Start-Sleep -Milliseconds 1500
+        $gAfter = Get-PaintCount 'viewer_toc'
+        Assert ($gAfter -gt $gIdle) `
+            "G2 the accent change REPAINTED the card ($gIdle -> $gAfter), though only its owner was notified and nothing photographed it"
     } finally {
         Kill-RepoInstances
     }

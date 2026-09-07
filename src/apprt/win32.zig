@@ -32,6 +32,10 @@ test {
     // reference is not checked by any lane, and discovering that in the
     // wiring task is discovering it too late.
     _ = @import("win32/system_colors.zig");
+    // T1405: the paint counter the accent-repaint oracle reads. Its
+    // arithmetic is unit-tested here; the line it prints is scored on the box
+    // by test\win32\chrome-theme.ps1 section G.
+    _ = @import("win32/paint_probe.zig");
     // The split tree's leaf type and the viewer leaf it makes room for
     // (T90c). ViewerPane has no constructor caller until T90d, and the same
     // rule as system_colors applies: a module no lane compiles is a module

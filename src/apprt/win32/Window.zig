@@ -18,6 +18,7 @@ const RenameDialog = @import("RenameDialog.zig");
 const BannerDialog = @import("BannerDialog.zig");
 const Surface = @import("Surface.zig");
 const window_chord = @import("window_chord.zig");
+const paint_probe = @import("paint_probe.zig");
 const PaneView = @import("PaneView.zig");
 const ViewerPane = @import("ViewerPane.zig");
 const viewer_accel = @import("viewer_accel.zig");
@@ -5734,6 +5735,11 @@ fn paintCaptionSlab(
 /// (when hero mode is active) the owner-painted carousel column.
 fn paintWindow(self: *Window) void {
     const hwnd = self.hwnd orelse return;
+
+    // T1405: counted HERE and not in `WM_PRINTCLIENT`, because a frame the
+    // camera asked for is the one thing that must not read as the window
+    // repainting itself. See `paint_probe.zig`.
+    paint_probe.record(.window);
 
     var ps: w32.PAINTSTRUCT = undefined;
     const hdc_screen = w32.BeginPaint(hwnd, &ps) orelse return;

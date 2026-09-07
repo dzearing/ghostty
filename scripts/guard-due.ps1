@@ -2928,6 +2928,11 @@ $GuardTable = @(
             # short of a stale accent inside a child window. It is a painter,
             # but a nearly static one, so it does not make this row always-due.
             'src\apprt\win32\system_colors.zig',
+            # T1405: section G scores the repaint itself by reading the paint
+            # counter this module prints. Same argument as system_colors above -
+            # it is app code, but a tiny and nearly static piece of it, and if it
+            # stops printing that line the section silently measures nothing.
+            'src\apprt\win32\paint_probe.zig',
             'test\win32\lib\ColorMath.ps1',
             'test\win32\chrome-theme.ps1'
         )

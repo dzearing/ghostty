@@ -1,8 +1,8 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-06T17:10:03-07:00",
-    "commit":  "3a4540e7b",
+    "generated":  "2026-09-06T18:14:01-07:00",
+    "commit":  "5aff9cf17",
     "uncommitted":  [
                         "test/win32/chrome-theme.ps1"
                     ],
@@ -60,7 +60,7 @@
                   "test/win32/chooser-session-sort.ps1":  "73c5e9875642f0753d1bb2318db4df67fc3bee92f1ae17accf188b3c63fe71aa",
                   "test/win32/chooser-sessions-remote.ps1":  "93e085a87a435263a88daae49cda98d8232ac98864a537101ddb17c00849cfe9",
                   "test/win32/chrome-merged-row.ps1":  "d33d8e41a1c00c40822433b47ddc00ea9cb572cf42829277c39d3334cd3a8020",
-                  "test/win32/chrome-theme.ps1":  "e132b3b1c9c0fcb1376c6ff68b6a9936a3a40e130b6d46c76836771f6c41e0a9",
+                  "test/win32/chrome-theme.ps1":  "f50b264e05a6f56e3741f8ed280fc150f12b7987b5bd308f8dc3356ae8ecebd6",
                   "test/win32/claude-integration.ps1":  "16d2c597e5b841736107ef63e8f9a76a0331d38dd5320be3a8c6301bad15cde4",
                   "test/win32/cleanslate-audit.ps1":  "a7b050d055c846a95d3a7ed3ba067d832a8b2f6dbeee36cc9d57b780559e66e9",
                   "test/win32/cli-argv-fidelity.ps1":  "8dc75be398dc946aa824a4b083fead479f6fcb2abf810168595413bf42979854",
