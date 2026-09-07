@@ -23694,3 +23694,50 @@ seconds with `failed to check cache: ... file_hash FileNotFound`, and
 `CacheHeal.ps1` does not recognize that shape - it looks for a compile error
 whose file location sits in a cache entry, and this line has no file:line:col at
 all. Deleting the package directory and re-running is the remedy.
+
+## 2026-09-06 - the Kill button on a session card stops advertising itself after you have gone (T588)
+
+Point at the small "x" on a session card in the machine chooser and it lights a
+rounded fill, the way a button should. Move the pointer off it and straight out
+of the window - up past the title bar, or out to the right, which is the short
+way out from where the button sits - and the light used to stay on. The card
+went on looking as though the pointer were still resting on it, sometimes for as
+long as the chooser stayed open.
+
+Same defect class T315 fixed on the account link, on a sibling control in the
+same dialog, and it was known and deferred at the time. The roster's hover was
+driven ONLY by the dialog's `WM_MOUSEMOVE` arm: no move, no news, and
+`roster.hover_kill` kept naming the card it last saw. The dialog now arms a
+`TrackMouseEvent(TME_LEAVE)` on itself and clears the hover in `WM_MOUSELEAVE`.
+
+The tracking belongs on the DIALOG here, which is the opposite of T315's answer
+and for the reason T315 gave: the account link is a child window, so a
+parent-armed leave would fire the moment the pointer entered it and delete the
+hover on entry. The roster's cards are not children - they are painted on the
+dialog itself - so the parent's leave firing when the pointer crosses into the
+listbox, the filter or the link is the CORRECT answer: the pointer is genuinely
+off the card.
+
+Validation is a new `test\win32\chooser-kill-hover.ps1`, which measures the
+first card's Kill box - the pixels in it that differ from the card fill beside
+it - at rest 80, hovered 809, and 80 exactly after the leave. It discriminates:
+built once with both halves of the fix disabled, after-leave stayed at 809 and
+the script reported 2 FAILURES. `-NegativeControl` fails on the fixed build, so
+the metric is not scoring a constant, and a click on Kill still opens its
+confirmation after all the pointer traffic - a leave handler that cleared more
+than the hover would show there.
+
+Two captures, because they answer different questions. A posted `WM_MOUSEMOVE`
+cannot survive to the paint it dirties once a leave tracker is armed (T282), so
+the HOT frame comes from `Get-TestHoverCapture`, which has the app send the move
+and photograph itself inside one handler; the LEFT frame is an ordinary
+synchronous `PrintWindow` after a posted move and a posted leave. That the
+posted move no longer survives is the fix working, not a limitation.
+
+Filed on the way past: T1409. The reference color this script derives came back
+as `(0,0,61)` against a card whose fill is `(50,54,61)` - PowerShell keeps a
+`[byte]` left operand's TYPE through `-shl`, so `$c.R -shl 16` truncates back to
+a byte and every packed pixel key collapses to its blue channel.
+`chooser-link-hover.ps1` packs pixels exactly that way and has been measuring a
+third of what its comment claims; it still discriminates the underline it was
+written for, which is why nothing has been failing.

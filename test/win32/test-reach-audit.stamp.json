@@ -1,13 +1,10 @@
 {
     "guard":  "test-reach",
     "script":  "test/win32/test-reach-audit.ps1",
-    "generated":  "2026-09-06T18:17:54-07:00",
-    "commit":  "5aff9cf17",
+    "generated":  "2026-09-06T20:05:52-07:00",
+    "commit":  "6885bef74",
     "uncommitted":  [
-                        "src/apprt/win32.zig",
-                        "src/apprt/win32/paint_probe.zig",
-                        "src/apprt/win32/ViewerTOCPanel.zig",
-                        "src/apprt/win32/Window.zig"
+                        "src/apprt/win32/MachineChooser.zig"
                     ],
     "files":  {
                   "src/apprt/win32.zig":  "5e2dc3b906c6617012aa666fcf317bc1f786f110e513283f473feef22d5d6326",
@@ -108,7 +105,7 @@
                   "src/apprt/win32/LocalAgent.zig":  "13180f417c6510eb38cf334c666c87bf48cb5fe653b9db50e19f0b1f7acf1ed5",
                   "src/apprt/win32/mac_layout_blob.zig":  "4eea9bca6942db895d7ff185566726199364f30e627703bae31911b3a636f2ad",
                   "src/apprt/win32/machine_pool.zig":  "f0bb879eb2fc8c6c942ccfa1610674863e8e526c5b878a8f39039cc0cc7c9163",
-                  "src/apprt/win32/MachineChooser.zig":  "96e3573242a34c69c355ae7809417aa4a6fb43cbb6a3cb9bf41c50552e8e6e78",
+                  "src/apprt/win32/MachineChooser.zig":  "8de005cc653410d90419e7dc1e509cb129ac58535610916dc7da133d5dacef4a",
                   "src/apprt/win32/MachineConnectionPool.zig":  "052c74533406133ba7945b5f4437b5c0a794896b7162a8e768b754cf8f4405f7",
                   "src/apprt/win32/managed_file.zig":  "986e641e52cf1d8c2e807cd38dbfd6e62e660868d1063b2d6bee1acdb5ed50ac",
                   "src/apprt/win32/managed_marker.zig":  "4f0d8fe0c6bfdd0a7410c3eaa1d810fb1148d943d688bfef4b8eeda1e02d46a5",

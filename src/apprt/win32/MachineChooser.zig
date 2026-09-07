@@ -228,6 +228,11 @@ tracking_leave: bool = false,
 link_proc: ?*const anyopaque = null,
 /// Whether the link currently has a `TrackMouseEvent` leave request in flight.
 link_tracking_leave: bool = false,
+
+/// Whether the DIALOG currently has a `TrackMouseEvent` leave request in
+/// flight, so the roster's Kill hover is dropped when the pointer leaves
+/// (T588). One is armed per entry rather than per mouse-move.
+dialog_tracking_leave: bool = false,
 /// Wrapped line count the footer hint is currently laid out for. The dialog
 /// re-lays-out (and resizes) when a new hint needs a different number.
 hint_lines: i32 = 1,
@@ -2776,8 +2781,30 @@ fn dialogWndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callcon
         // The roster's cards are painted on the dialog itself, not in a child
         // control, so their pointer handling lives here.
         w32.WM_MOUSEMOVE => {
+            // A pointer that goes from a Kill button straight out of the
+            // dialog produces no further `WM_MOUSEMOVE` at all, so the hover
+            // would stay lit until it came back — the defect T315 fixed on the
+            // account link, on a sibling control (T588). Here the tracking
+            // belongs on the DIALOG rather than on a child: the cards are
+            // painted on the dialog itself, so the parent's leave firing when
+            // the pointer enters a child (the listbox, the filter, the link)
+            // is the CORRECT answer — the pointer is genuinely off the card.
+            if (!self.dialog_tracking_leave) {
+                var tme: w32.TRACKMOUSEEVENT = .{
+                    .cbSize = @sizeOf(w32.TRACKMOUSEEVENT),
+                    .dwFlags = w32.TME_LEAVE,
+                    .hwndTrack = hwnd,
+                    .dwHoverTime = 0,
+                };
+                if (w32.TrackMouseEvent(&tme) != 0) self.dialog_tracking_leave = true;
+            }
             self.onSessionHover(loWordSigned(lparam), hiWordSigned(lparam));
             return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+        w32.WM_MOUSELEAVE => {
+            self.dialog_tracking_leave = false;
+            self.setKillHover(-1);
+            return 0;
         },
         w32.WM_LBUTTONDOWN => {
             if (self.onSessionClick(loWordSigned(lparam), hiWordSigned(lparam))) return 0;

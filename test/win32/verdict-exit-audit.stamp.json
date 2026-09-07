@@ -1,12 +1,10 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-09-06T19:23:36-07:00",
-    "commit":  "c9c883e98",
+    "generated":  "2026-09-06T20:01:36-07:00",
+    "commit":  "6885bef74",
     "uncommitted":  [
-                        "test/win32/command-resolve-audit.ps1",
-                        "test/win32/lib/CommandResolveAudit.ps1",
-                        "test/win32/release-artifacts.ps1"
+                        "test/win32/chooser-kill-hover.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "944e54bda392aa61007ee23280c6bb9767ed2e661f77f5157ca035dbe9b6e4ea",
@@ -45,6 +43,7 @@
                   "test/win32/chooser-close-chord.ps1":  "37c31aca341ab4cfd67bad399e9e812a4e2d2b2f83b0769e53794795cf315545",
                   "test/win32/chooser-conn-pool.ps1":  "ab6693a92f6217745b2a4b0da20b679f1f2c9c227980c9dc4aaa9b92741c78a8",
                   "test/win32/chooser-controls.ps1":  "69a8d25a53eba9af41871bfebc202b015c83baebe4df8caa8a33ad7cb991a7d5",
+                  "test/win32/chooser-kill-hover.ps1":  "c4d65e3d549b4be314cb58a4fd445b0d3d1981417ee9af1600bc551fb95e2ec5",
                   "test/win32/chooser-link-hover.ps1":  "9de29beaeb0ae0194f458a30bc0bb10e570decc4610dc3784f9e21629ed1e6d5",
                   "test/win32/chooser-menu.ps1":  "39bf0ac434cc2eb9b69f2d1a569be9be09502e2787cdc3d814516958366c9c5b",
                   "test/win32/chooser-open-chord.ps1":  "fbf6f3281efd358cdd41d49c2bf630e95b559861f0776ea3eb93167adeb7c028",
