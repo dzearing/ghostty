@@ -132,6 +132,7 @@ const atomic_write = @import("atomic_write.zig");
 const keepalive = @import("keepalive.zig");
 const link_control = @import("link_control.zig");
 const relay_creds = @import("relay_creds.zig");
+const revoke_watch = @import("revoke_watch.zig");
 const sharing = @import("sharing.zig");
 const adopt = @import("adopt.zig");
 const single_instance = @import("single_instance.zig");
@@ -2428,6 +2429,23 @@ fn runRelay(
         std.debug.print("ghoztty-agent: relay.env path unavailable ({s}); a re-enroll needs an agent restart\n", .{@errorName(err)});
     }
 
+    // Finish a revocation this machine has been signed out of, and take the
+    // uplink DOWN while one is owed (T1427). The agent is what actually keeps
+    // this machine listed and reachable on the account, so a "Sign Out Anyway"
+    // that only the app remembers leaves the machine there until someone
+    // launches the app again — which, for the sign-out that means "I am done
+    // with this box", is never. Nothing else writes the desired link state in
+    // relay mode, so this watcher owns the resume as well as the park.
+    var revoke_w = revoke_watch.Watcher.init(alloc, &link, true);
+    if (std.Thread.spawn(.{}, revoke_watch.Watcher.run, .{&revoke_w})) |t| {
+        t.detach(); // daemon-lifetime thread; nothing ever joins it
+    } else |err| {
+        // Availability-first, like the creds watcher: losing this costs the
+        // automatic completion, not the daemon. The app's own retry (T1424) is
+        // still there, which is exactly the pre-T1427 behavior.
+        std.debug.print("ghoztty-agent: pending-revocation watch disabled ({s}); a sign-out completes only when the app runs\n", .{@errorName(err)});
+    }
+
     // The relay control loop is the whole daemon and it owns the MAIN thread.
     // Until T550 this branched on a Windows system-tray UI (which also carried
     // the Sign in / Sign out menu, hence a `tray_account` controller on this
@@ -2551,6 +2569,12 @@ const SharingUplink = struct {
     ws_base: ?[]u8 = null,
     creds: ?*relay_creds.Creds = null,
     creds_watch: ?*relay_creds.Watcher = null,
+    /// The pending-revocation watcher (T1427). Its `isHolding` is a VETO on
+    /// this reconciler: a machine that has been signed out of its account
+    /// must not be advertised, whatever sharing.json says. Owned (daemon
+    /// lifetime); null only if it could not be started, which costs the
+    /// automatic completion and nothing else.
+    revoke: ?*revoke_watch.Watcher = null,
     /// One "sharing is on but there is no credential" line per config change,
     /// not one per 5s tick.
     said_unavailable: bool = false,
@@ -2564,6 +2588,18 @@ const SharingUplink = struct {
     /// (an enabled flag with a missing relay.env retries here, so writing
     /// the credential AFTER the flag still converges).
     fn reconcile(self: *SharingUplink) void {
+        // The revocation veto comes FIRST, and it outranks sharing.json
+        // (T1427). While this machine owes a revocation it is not on the
+        // account any more as far as its owner is concerned, so it must not
+        // be raised, and an already-raised link must not be resumed here —
+        // the watcher parks it on its own tick, and this is what stops the
+        // two reconcilers from alternating. The watcher never resumes under
+        // sharing (`owns_resume = false`); the resume is the line below,
+        // once the veto clears.
+        if (self.revoke) |r| {
+            if (r.isHolding()) return;
+        }
+
         const cfg = sharing.load(self.alloc, self.config_path);
         if (!cfg.enabled) {
             self.said_unavailable = false;
@@ -2722,6 +2758,27 @@ fn maybeStartSharingUplink(
         .spawner = spawner,
         .config_path = config_path,
     };
+
+    // The revocation watcher, started BEFORE the first reconcile so a daemon
+    // that comes up with a sign-out already owed never raises the uplink even
+    // once (T1427). It parks; the reconciler above owns the resume, hence
+    // `owns_resume = false`.
+    if (alloc.create(revoke_watch.Watcher)) |w| {
+        w.* = revoke_watch.Watcher.init(alloc, &self.link, false);
+        if (std.Thread.spawn(.{}, revoke_watch.Watcher.run, .{w})) |t| {
+            t.detach(); // daemon-lifetime thread; nothing ever joins it
+            self.revoke = w;
+            // One synchronous tick before the reconcile below, so the veto is
+            // already published rather than racing the reconcile by however
+            // long the new thread takes to get scheduled. `checkOnce` is
+            // idempotent, so the thread's own first tick costs nothing.
+            w.checkOnce();
+        } else |err| {
+            std.debug.print("ghoztty-agent: sharing: pending-revocation watch disabled ({s}); a sign-out completes only when the app runs\n", .{@errorName(err)});
+            alloc.destroy(w);
+        }
+    } else |_| {}
+
     self.reconcile();
     if (std.Thread.spawn(.{}, SharingUplink.run, .{self})) |t| {
         t.detach(); // daemon-lifetime thread; nothing ever joins it
@@ -2971,6 +3028,7 @@ test {
     _ = @import("holder_adopt.zig");
     _ = @import("handoff.zig");
     _ = @import("relay_creds.zig");
+    _ = @import("revoke_watch.zig");
     _ = @import("sharing.zig");
     _ = @import("adopt.zig");
     _ = @import("startup_error.zig");

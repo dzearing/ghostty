@@ -24277,3 +24277,65 @@ and until now that would have been the box's REAL one.
 Green: `floor-lane.ps1 -Lane all` ALL LANES PASS, with 12 new unit tests for the
 pure rules and the on-disk state machine running in both the `none` and `win32`
 lanes. `relay-account.ps1` ALL PASS twice (30 new assertions in section 9).
+
+## 2026-09-07 — the machine you signed out of leaves the account even if you never open Ghoztty again (T1427)
+
+T1424 made a forced sign-out arm a pending revocation and retry it from the
+app. That fixed the record keeping. It did not fix the machine, because the app
+is not what puts this machine on the account — the AGENT is. It holds the same
+relay.env device credential and keeps a control WebSocket up, which is what
+makes the machine listed, reachable and streamable from every other computer on
+the account. It runs when no Ghoztty window is open at all. So between "Sign Out
+Anyway" and the next launch, the machine its owner had just disowned was still
+there — and the sign-out that means "I am done with this box" has no next
+launch.
+
+The agent now watches for the record itself, and the order is the point. It
+**parks the uplink first** — no network, no relay, no de-enroll needed — so the
+window during which a disowned machine is reachable ends at the next five-second
+tick instead of at the next successful revocation. Then it hands the completion
+to T1424's own `relay_revoke_pending.retryAsync`, so `nextAfter`, `backoffMs`
+and the deliberately narrow reading of a 401 stay in exactly one place. A second
+implementation of "what does a 401 mean" is how the Mac seat lost a machine's
+suspension record (`f3b1e5fb5`); there isn't one.
+
+**Parking gives up a signal, deliberately.** The task noted that the agent knows
+when the relay comes back, which the app can only approximate with a backoff. A
+parked link never dials, so it never learns that. That is the right way round:
+the link being up IS the hole this task exists to close, and a reachable
+disowned machine is not a price worth paying for a faster retry. The capped
+backoff already bounds "still enrolled" to minutes.
+
+**The hold is not a one-way trip.** Not every armed record ends in a revocation:
+signing back in on this machine clears it and KEEPS the credential, because the
+machine is theirs again. `verdict` tells that apart from a completed revocation
+by one observation — after a revocation the credential is gone, after a sign-in
+or a re-enroll it is present — so a disarmed record plus a live credential
+releases the hold, and a disarmed record with no credential keeps it rather than
+redialing forever against a dead token.
+
+**Two reconcilers, one veto.** `SharingUplink` already writes the desired link
+state every tick from sharing.json, so a second writer would have produced a
+machine that was online half the time. The revocation check is now the first
+thing that reconciler does and it returns on a hold; the watcher parks but never
+resumes there (`owns_resume = false`), and owns both edges only in `--relay`
+mode where nothing else writes that state.
+
+Local sessions are untouched throughout — a control drop only ever DETACHes
+them.
+
+Acceptance is section 5 of `test\win32\agent-sharing-uplink.ps1`: a live
+sharing-enabled agent stops dialing within a tick of `pending-revoke.json`
+appearing and stays stopped past its backoff, the `POST /v1/agent/deenroll`
+arrives at the loopback relay **from the agent, with no app running anywhere**,
+the record survives a relay that answers nothing, and clearing it brings the
+uplink back. That POST is the deliverable and nothing else on the box observes
+it. Filed T1430 for the one branch this does not reach: the `--relay` daemon's
+release edge, where the watcher makes the reconnect itself.
+
+Green: `floor-lane.ps1` lib / none / win32 / agent ALL LANES PASS, with 8 new
+unit tests for `verdict` and for the `apply` state machine driven over a real
+`LinkControl`. `agent-sharing-uplink.ps1` ALL PASS (25, was 18),
+`agent-relay-session-e2e.ps1` (18), `one-installer.ps1` (25), `ipc-p1` (25),
+`ipc-p2` (20), `ipc-p3` (16), and the eight harness audits that an edit under
+`test\win32\` makes due.

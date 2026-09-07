@@ -8,9 +8,11 @@
 # control); writing {"enabled":true} beside sessions.json raises the uplink
 # hot (a real `GET /v1/agent/control` with the relay.env Bearer token arrives
 # at a loopback listener); {"enabled":false} parks it (the dial stream stops);
-# an agent started with sharing already enabled dials without any toggle; and
-# sharing enabled with NO relay.env credential degrades to local-only with one
-# explanatory line, the pipe still served.
+# an agent started with sharing already enabled dials without any toggle;
+# a pending revocation beside relay.env takes the machine off the relay and is
+# retried BY THE AGENT with no app running, then releases the uplink once it
+# clears (T1427); and sharing enabled with NO relay.env credential degrades to
+# local-only with one explanatory line, the pipe still served.
 #
 # Hermetic: GHOZTTY_AGENT_INSTANCE forks the single-instance guard, the pipe
 # name is test-unique, GHOSTTY_RELAY_ENV points the credential lookup at a
@@ -171,7 +173,49 @@ try {
     Assert 'startup-enabled agent dialed' ((Get-DialCount) -gt $preCount)
     Stop-TestAgents
 
-    "== 5: enabled but no credential - local-only with one explanatory line"
+    "== 5: a pending revocation takes the machine off the relay, and the agent finishes it (T1427)"
+    # The defect this proves gone: after "Sign Out Anyway" only the APP
+    # remembered the revocation, so the AGENT - which is what actually holds
+    # the control link and keeps this machine listed and reachable - carried on
+    # advertising a machine its owner had just disowned, until somebody
+    # happened to launch Ghoztty again. For the sign-out that means "I am done
+    # with this box", that is never.
+    Remove-Item $portFile -ErrorAction SilentlyContinue
+    Set-Content -Path $sharingFile -Value '{"version":1,"enabled":true}' -Encoding ascii
+    $agent4 = Start-TestAgent "$tmp\a4.out" "$tmp\a4.err"
+    Assert 'agent came up sharing-enabled before the sign-out' (Wait-ForText "$tmp\a4.err" 'relay uplink raised' 25)
+
+    # Arm exactly what a forced sign-out writes: the record lives beside
+    # relay.env, so GHOSTTY_RELAY_ENV carries it into this sandbox too.
+    $pendingFile = Join-Path $tmp 'pending-revoke.json'
+    $rec = '{"relay_base":"http://127.0.0.1:' + $relayPort + '","device_token":"' + $token + '","account_email":"t546@example.com","armed_at":1}'
+    Set-Content -Path $pendingFile -Value $rec -Encoding ascii
+
+    Assert 'agent takes the uplink down for the revocation' (Wait-ForText "$tmp\a4.err" 'taking the relay uplink down' 25)
+    Start-Sleep -Seconds 6   # drain a dial already in flight/backoff
+    $revokeCount = Get-DialCount
+    Start-Sleep -Seconds 10  # well past the 3s base backoff AND the 5s reconcile tick
+    Assert 'no new control dials while the revocation is owed' ((Get-DialCount) -eq $revokeCount)
+    # The point of the whole task: the completion is attempted by the AGENT,
+    # with no Ghoztty window running anywhere. The loopback relay answers 404,
+    # which is not a definite answer, so the record stays armed - and staying
+    # armed is what keeps the machine off the relay.
+    Assert 'the agent attempted the de-enroll itself' (Wait-ForText $dialLog 'POST /v1/agent/deenroll' 25)
+    Assert 'the pending record survives a relay that gave no answer' (Test-Path $pendingFile)
+
+    # Signing back in on this machine clears the record and KEEPS the
+    # credential (relay_suspend's keep_machine path). The machine is theirs
+    # again, so the uplink has to come back - nothing else would ever un-park
+    # it.
+    Remove-Item $pendingFile -ErrorAction SilentlyContinue
+    Assert 'agent announces the machine is on an account again' (Wait-ForText "$tmp\a4.err" 'may come back up' 25)
+    $backCount = Get-DialCount
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Get-Date) -lt $deadline -and (Get-DialCount) -le $backCount) { Start-Sleep -Milliseconds 500 }
+    Assert 'the uplink dials again once the revocation is gone' ((Get-DialCount) -gt $backCount)
+    Stop-TestAgents
+
+    "== 6: enabled but no credential - local-only with one explanatory line"
     Remove-Item $portFile -ErrorAction SilentlyContinue
     Remove-Item $relayEnv -ErrorAction SilentlyContinue
     $agent3 = Start-TestAgent "$tmp\a3.out" "$tmp\a3.err"
@@ -195,7 +239,7 @@ try {
 # call, which meant the guard went DUE on the first `main.zig` edit and could
 # never come back - the one shape a staleness gate must not have, since a guard
 # that is permanently red is a guard everybody learns to step over.
-if ($script:failures -eq 0 -and $script:passes -ge 18) {
+if ($script:failures -eq 0 -and $script:passes -ge 25) {
     $repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
     & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
         update -Guard agent-sharing-uplink -Repo $repo 2>&1 | ForEach-Object { "  $_" }
@@ -203,4 +247,4 @@ if ($script:failures -eq 0 -and $script:passes -ge 18) {
 
 # MinPass = the full-run assertion count: an abort (exception past section N
 # jumping to finally) must never score the truncated run as ALL PASS.
-Write-TestVerdict -Label 'T546 SHARING UPLINK' -Pass $script:passes -Fail $script:failures -MinPass 18
+Write-TestVerdict -Label 'T546 SHARING UPLINK' -Pass $script:passes -Fail $script:failures -MinPass 25

@@ -240,6 +240,57 @@ the only version of the test that can tell an armed retry from a lucky first
 attempt. It covers all three: completed with no relaunch, completed at the next
 launch, and cancelled by signing back in.
 
+#### The AGENT completes it, and takes the machine offline first (T1427)
+
+The app is not what keeps this machine on the account. `ghoztty-agent` is: it
+holds the same `relay.env` credential and keeps a control WebSocket up, which is
+what makes the machine listed, reachable and streamable from every other
+computer — and it runs when no Ghoztty window is open at all. So the retry above,
+which only the app drove, left the disowned machine online until somebody
+happened to launch Ghoztty here. For the sign-out that means "I am done with this
+box", that is never.
+
+`src/remote/agent/revoke_watch.zig` is the agent's half. It polls for the record
+on the same 5s cadence the credential watcher uses, and it does two things in
+this order:
+
+1. **Park the uplink** (`LinkControl.disconnect`). No network needed, so the
+   window during which a disowned machine is reachable ends at the next tick
+   rather than at the next successful de-enroll. Local sessions are untouched —
+   a control drop only ever DETACHes them.
+2. **Then hand the completion to `relay_revoke_pending.retryAsync`.** The rules
+   stay in one place; nothing about a 401 is re-decided here.
+
+Parking gives up the one signal the agent had that the app lacks — a live link
+knows when the relay comes back. That is deliberate: the link being up IS the
+hole, and the capped backoff already bounds "still enrolled" to minutes.
+
+- **`verdict` is the pure rule** (armed, held, the credential relay.env now
+  holds). Armed → hold. Not armed and never held → not this module's business.
+  Not armed but held: the credential's presence is what separates a completed
+  revocation (gone — keep holding, a redial against a dead token helps nobody)
+  from a sign-back-in or a re-enroll (present — release). The two release cases
+  collapse on purpose: both leave the machine legitimately on an account, and
+  comparing tokens would buy no decision.
+- **One veto, checked first.** `SharingUplink.reconcile` already writes the
+  desired link state every tick from `sharing.json`; a second writer would have
+  produced a machine online half the time. The revocation check is now the first
+  thing that reconciler does and it returns on a hold, and the watcher parks but
+  never resumes there (`owns_resume = false`). In `--relay` mode nothing else
+  writes that state, so there the watcher owns both edges.
+- **Both processes may retry the same record, safely.** One gets 204 and the
+  other 401, which `nextAfter` already maps to "stop, conclude nothing else";
+  the record delete and the credential delete are both idempotent. No
+  cross-process lock, and "exactly once" still holds where it must — the relay
+  deletes the device once.
+
+Acceptance is section 5 of `test\win32\agent-sharing-uplink.ps1`: the dial
+stream stops within a tick of `pending-revoke.json` appearing, the
+`POST /v1/agent/deenroll` arrives at the loopback relay **from the agent with no
+app running**, the record survives a relay that answers nothing, and clearing it
+brings the uplink back. T1430 covers the one branch it does not reach — the
+`--relay` daemon's release edge.
+
 #### Sign-out SUSPENDS the machine; signing back in restores it (T1425)
 
 Revoking the machine is the half a security review asks for. The half the user

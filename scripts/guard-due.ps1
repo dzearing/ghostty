@@ -1411,6 +1411,13 @@ $GuardTable = @(
             'src\remote\agent\main.zig',
             'src\remote\agent\relay_creds.zig',
             'src\remote\agent\link_control.zig',
+            # The revocation veto on that same reconciler (T1427): an armed
+            # pending revocation must park the uplink and be completed by the
+            # AGENT, with no app running. Section 5 is the only place on the
+            # box that observes either half, and both are edits to the two
+            # files above plus this one.
+            'src\remote\agent\revoke_watch.zig',
+            'src\remote\relay_revoke_pending.zig',
             'test\win32\agent-sharing-uplink.ps1'
         )
     },
