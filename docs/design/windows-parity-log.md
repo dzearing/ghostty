@@ -24339,3 +24339,59 @@ unit tests for `verdict` and for the `apply` state machine driven over a real
 `agent-relay-session-e2e.ps1` (18), `one-installer.ps1` (25), `ipc-p1` (25),
 `ipc-p2` (20), `ipc-p3` (16), and the eight harness audits that an edit under
 `test\win32\` makes due.
+
+## 2026-09-07 — bringing another machine's windows back no longer waits once per window (T616)
+
+Restore All on a remote machine opens one relay connection per window it is
+rebuilding, and it opened them one after another. T339 had already moved that
+work off the GUI thread, so nothing froze — but the wait still grew with the
+number of windows: six windows on a slow link was six round trips before the
+first one appeared. Now the dials go out together and the whole restore costs
+about two round trips whatever the window count is.
+
+**The fan-out.** `RestoreAllRelay.worker`'s decode loop no longer dials at all;
+it only fills a `Prepared` slot per window, with `dialed = null`. `dialAll()`
+then runs those slots across a pool of at most `max_parallel_dials = 8`, sharing
+one atomic cursor, and joins every helper before the job is handed to the GUI
+thread. The dialing thread is ONE OF THE POOL, which is what makes the failure
+mode benign: a `Thread.spawn` that fails costs parallelism and never a dial, and
+with no helper at all this degrades to exactly the serial loop it replaced. The
+ceiling is there because the far end is not ours — a machine holding 40 windows
+must not open 40 simultaneous WebSocket upgrades at a relay that may rate-limit
+them.
+
+**Ownership is unchanged, and that is the point.** Each slot is written by
+exactly one thread, and nothing owns a connection until its own slot is written,
+so a dial that fails while its siblings succeed leaves a `null` that
+`adoptRestoreAll` already skips: it costs its own window and nothing else. The
+old `toOwnedSlice` failure arm that had to free the dials it was holding is gone
+with the dials themselves — at that point the list holds no transports.
+
+**Measured, not asserted.** The fixture T339 built for this
+(`FakeRelay.ps1 -SlowConnectMs`) makes the difference observable, so
+`chooser-restore-all-remote.ps1` gained two assertions that read the relay's own
+log rather than the app's: **F2**, that the per-window CONNECTs land together
+(15–31 ms apart across runs, where serial dialing puts them >= 1500 ms apart),
+and **F3**, that the keypress→`rebuilt` wall clock does not grow with the window
+count (3.6–3.8 s for two windows, against the 4.5 s serial dialing alone would
+spend). **F** — one dial for the pull plus one per window — is unchanged and
+still passes, which is the check that concurrency did not quietly open more
+transports than before.
+
+The whole feature lives in a module no floor lane reaches, so it also gained a
+`guard-due` row (`restore-all-remote`) over `RestoreAllRelay.zig` and the script,
+and the script now writes that stamp on a clean, complete run.
+
+Green: `floor-lane.ps1 -Lane all` (lib / none / win32 / agent), with a unit test
+for the pool arithmetic in the none lane; `chooser-restore-all-remote.ps1` ALL
+PASS (46, was 43); `ipc-p1` (25), `ipc-p2` (20), `ipc-p3` (16), and the ten
+harness audits an edit under `test\win32\` makes due.
+
+The none lane went red once on the way, in `font.Collection.test.add full` — the
+T443 ghost's own victim test, on a diff that touches nothing font-related, green
+on the immediate re-run. It is recorded as a data point on T443 rather than
+treated as this change's: the leak sweep's dump caught the binary LIVE inside
+freetype's autofitter, so this one is a hang rather than the crash that watch is
+armed for, and the task stays parked. T1432 files what the episode exposed —
+a test binary the sweep kills reads as a bare red lane with `crash=0` and
+`leaked test binaries: 0`, and only a hand-read dump says otherwise.

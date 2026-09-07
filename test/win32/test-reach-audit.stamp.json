@@ -1,10 +1,10 @@
 {
     "guard":  "test-reach",
     "script":  "test/win32/test-reach-audit.ps1",
-    "generated":  "2026-09-07T08:52:05-07:00",
-    "commit":  "6a75c26f3",
+    "generated":  "2026-09-07T10:53:49-07:00",
+    "commit":  "e29c98561",
     "uncommitted":  [
-                        "src/apprt/win32/App.zig"
+                        "src/apprt/win32/RestoreAllRelay.zig"
                     ],
     "files":  {
                   "src/apprt/win32.zig":  "5e2dc3b906c6617012aa666fcf317bc1f786f110e513283f473feef22d5d6326",
@@ -142,7 +142,7 @@
                   "src/apprt/win32/restart_manager.zig":  "c8be1378afbd5c174818d6d937b969977f8fbfa0926eef252457533c2161b3df",
                   "src/apprt/win32/restore_frame.zig":  "3bc784601a5c07ff4bd0548114024d85d2c185d42c0a7b629f9a924c6235d9d9",
                   "src/apprt/win32/restore_retry.zig":  "c5c212390938893831ae32751909c471cbc09607b72880fb45a0d8a329e48789",
-                  "src/apprt/win32/RestoreAllRelay.zig":  "935d7fa15722638ed50dee02bfd89de4781ae1dcdaf712758166124d3196c8a4",
+                  "src/apprt/win32/RestoreAllRelay.zig":  "fa016611bac0c70c1b67422e43ba82a1c197ecf4dfa93a7d48acbf4d332459d2",
                   "src/apprt/win32/richedit_tom.zig":  "1cdc66022c7e724d0dd5a3bbd76e83285a9ebcb1b5f4968ac1b4b6e5bacf2523",
                   "src/apprt/win32/runtime_agent.zig":  "e46e400be21297cd8c35bcdfde32e7f132d8b914ad1fe8be193b2d1424ceec25",
                   "src/apprt/win32/runtime_probe.zig":  "e9a8927087558063833d30e15d1cbd1b0f3648ead5f24a8616415e3b3efb6254",

@@ -43,6 +43,12 @@
 #   E  the rebuild: one window, its recorded 3-pane split shape, over the relay
 #   F  per-window transport ownership: the restore spends >= 2 dials (the pull's
 #      own, plus one per window), counted in the relay's request log
+#   F2 those per-window dials are opened TOGETHER (T616). The relay answers every
+#      connect 1.5 s late, so a serial restore can only open window k's dial once
+#      window k-1's was answered - its CONNECT lines land a whole delay apart.
+#      The relay's own log is the witness, so this is not a wall-clock guess
+#   F3 and the wait the user actually sits through therefore does not grow with
+#      the window count: the whole restore costs about two round trips, not 1 + N
 #   I  the app keeps PUMPING while those dials are outstanding (T339). The relay
 #      is told to answer every connect 1.5 s late, so the restore is in flight
 #      for seconds, and the chooser is asked for a WM_NULL every 150 ms
@@ -97,6 +103,7 @@ $env:GHOZTTY_PIPE_SUFFIX = "-t336$PID"
 
 $script:pass = 0
 $script:fail = 0
+$script:bodyComplete = $false
 
 function Assert($cond, $name) {
     if ($cond) { Write-Host "  PASS $name"; $script:pass++ }
@@ -327,6 +334,22 @@ function Count-LogLines($path, $pattern) {
     return @(Select-String -Path $path -Pattern $pattern -ErrorAction SilentlyContinue).Count
 }
 
+# T616: when the relay saw each `/connect` for $device, from $fromIndex on. The
+# log is stamped HH:mm:ss.fff, which is all the resolution a 1.5 s deferral
+# needs. Returns the times in arrival order - the first is the layout pull's own
+# dial, the rest are the windows'.
+function Get-RelayConnectTimes($log, $device, $fromIndex) {
+    if (-not (Test-Path $log)) { return @() }
+    $lines = @(Get-Content $log)
+    $out = @()
+    for ($i = $fromIndex; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match "^(\d{2}:\d{2}:\d{2}\.\d{3}) CONNECT device=$device") {
+            $out += [datetime]::ParseExact($Matches[1], 'HH:mm:ss.fff', $null)
+        }
+    }
+    return $out
+}
+
 function Count-RelayConnects($log, $device) {
     if (-not (Test-Path $log)) { return 0 }
     return @(Select-String -Path $log -Pattern "CONNECT device=$device" -ErrorAction SilentlyContinue).Count
@@ -519,6 +542,10 @@ try {
     $deferBefore = Count-LogLines $relaylog 'DEFER '
     $btn = Get-RestoreAllButton $chooser
     Assert (Focus-RestoreAll $chooser $filter $btn) 'Tab reaches the button again (the positive control)'
+    # T616: where the relay's log stood before this press, and when the press
+    # happened - F2 and F3 measure the dialing phase from these two marks.
+    $relayLinesBefore = if (Test-Path $relaylog) { @(Get-Content $relaylog).Count } else { 0 }
+    $pressAt = Get-Date
     Send-TestKeys -Window $chooser -Target $btn -Key Return | Out-Null
 
     # I: the app keeps pumping while the restore is in flight. Each probe is a
@@ -543,9 +570,14 @@ try {
     Assert ($probes -ge 3) "the restore stayed in flight long enough to measure ($probes probes)"
     Assert ($blocked -eq 0) `
         "I the app kept pumping while the restore dialed ($blocked of $probes probes went unanswered)"
-    Remove-Item $slowConnect -ErrorAction SilentlyContinue
 
     $rebuilt = Wait-LogLine $errlogB 'restore all: rebuilt (\d+) window' 30000
+    # T616: measured before the link is made fast again. Disarming the slow file
+    # here rather than above the wait is the whole point - a restore that is
+    # still dialing when the delay disappears would be timed against a link that
+    # stopped being slow halfway through.
+    $restoreMs = ((Get-Date) - $pressAt).TotalMilliseconds
+    Remove-Item $slowConnect -ErrorAction SilentlyContinue
     Assert ($null -ne $rebuilt) "E Return on the button rebuilds a window ($rebuilt)"
     $rebuiltN = 0
     if ($rebuilt -match 'rebuilt (\d+) window') { $rebuiltN = [int]$Matches[1] }
@@ -579,6 +611,29 @@ try {
     $connectsAfter = Count-RelayConnects $relaylog $DEV
     Assert (($connectsAfter - $connectsBefore) -ge ($rebuiltN + 1)) `
         "F the restore spent its own dial plus one per window ($($connectsAfter - $connectsBefore) connects for $rebuiltN windows)"
+
+    # F2 (T616): and it opened them TOGETHER. Every connect is answered $SlowMs
+    # late, so a serial dialer cannot start window k until window k-1 has been
+    # answered and its CONNECT lines are a whole delay apart; a fan-out opens
+    # them within milliseconds. The relay's log is the witness - our own clock
+    # never enters into it - and F above still pins the COUNT, so concurrency
+    # cannot be bought by sharing a connection.
+    $windowConnects = @(@(Get-RelayConnectTimes $relaylog $DEV $relayLinesBefore) | Select-Object -Skip 1)
+    $spanMs = 0
+    if ($windowConnects.Count -ge 2) {
+        $spanMs = ($windowConnects[$windowConnects.Count - 1] - $windowConnects[0]).TotalMilliseconds
+    }
+    Assert ($windowConnects.Count -ge 2) `
+        "F2 the relay logged a dial per window for this press ($($windowConnects.Count) after the pull's own)"
+    Assert ($windowConnects.Count -ge 2 -and $spanMs -lt ($SlowMs / 2)) `
+        "F2 and they were opened together, not one after the other ($([int]$spanMs) ms apart; serial dialing puts them >= ${SlowMs}ms apart)"
+
+    # F3: what the user actually waits. Serial dialing alone costs (1 + N) x the
+    # link delay before the first window can appear; a fan-out costs about two
+    # round trips whatever N is, so the wait stops growing with the number of
+    # windows being brought back.
+    Assert ($restoreMs -lt ((1 + $rebuiltN) * $SlowMs)) `
+        "F3 the wait did not grow with the window count ($([int]$restoreMs) ms for $rebuiltN windows; serial dialing alone would spend $((1 + $rebuiltN) * $SlowMs) ms)"
 
     # G: the independent oracle. port.json comes back only so the CLI can find
     # the agent; the reading itself never goes through the app.
@@ -650,12 +705,25 @@ try {
         Assert ($shapesFinal.Count -eq $shapesAfter.Count) `
             "the window count did not change ($($shapesFinal.Count))"
     }
+    # The last statement of the body, so an unwind cannot reach it: the stamp
+    # below is only written for a run that got all the way here. (This script
+    # scores itself rather than through lib\TestScore.ps1, so it keeps its own
+    # flag instead of `Complete-TestBody`.)
+    $script:bodyComplete = $true
 } finally {
     Stop-PipeBridge $script:bridge
     if ($null -ne $script:relay) { Stop-FakeRelay $script:relay }
     Copy-Item $portSaved $portFile -Force -ErrorAction SilentlyContinue
     Stop-RepoProcesses @('ghoztty', 'ghoztty-agent')
     Remove-TestDesktop
+}
+
+# --- stamp (T616) ----------------------------------------------------------
+# A clean, complete run records the files the restore-all-remote guard covers,
+# so scripts\guard-due.ps1 stops asking until one of them changes again.
+if ($script:fail -eq 0 -and $script:bodyComplete) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard restore-all-remote -Repo $repo 2>&1 | ForEach-Object { Write-Host "  $_" }
 }
 
 Write-Host ''

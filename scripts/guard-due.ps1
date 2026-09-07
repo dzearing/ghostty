@@ -2327,6 +2327,25 @@ $GuardTable = @(
             'test\win32\layout-capture-cost.ps1'
         )
     },
+    # The cross-machine Restore All (T336/T339/T616). The whole feature lives in
+    # ONE module a floor lane never reaches: `RestoreAllRelay.zig` runs on a
+    # worker thread against a relay, so nothing short of the fixture in this
+    # script (a real agent behind a pipe bridge behind a fake relay) exercises
+    # it. Two properties are only observable there and nowhere else - that the
+    # app keeps pumping while the dials are outstanding (T339's I), and that the
+    # per-window dials are opened together rather than one after the other
+    # (T616's F2/F3) - and both are timing claims read out of the relay's own
+    # log, which no unit test can stand in for. `App.zig` is deliberately NOT
+    # covered for the reason the row above gives.
+    [pscustomobject]@{
+        Name   = 'restore-all-remote'
+        Script = 'test\win32\chooser-restore-all-remote.ps1'
+        Stamp  = 'test\win32\chooser-restore-all-remote.stamp.json'
+        Covers = @(
+            'src\apprt\win32\RestoreAllRelay.zig',
+            'test\win32\chooser-restore-all-remote.ps1'
+        )
+    },
     # The deferred launch restore (T976): the retry only ever runs on a launch
     # that found NO agent within its spawn deadline, which no P1-P3 floor run
     # produces - the floor always reaches a healthy agent first. The row covers

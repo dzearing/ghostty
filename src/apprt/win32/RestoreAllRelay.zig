@@ -31,9 +31,15 @@
 //! app started quitting, or on a window that failed to build cannot leak a
 //! transport, and cannot hand one to a window that no longer exists.
 //!
-//! The dials are SERIAL. Off the GUI thread they no longer block paint, which
-//! is the defect; making them concurrent would additionally collapse N round
-//! trips into one, and is filed separately rather than smuggled in here.
+//! The per-window dials are CONCURRENT (T616). Off the GUI thread they stopped
+//! blocking paint, which was T339's defect, but serially they still cost
+//! `(1 + N) x RTT` before the first window appeared — the wait grew with the
+//! number of windows the user was bringing back. They are independent by
+//! construction (each window owns its transport for life), so they fan out
+//! across a small pool and the whole restore costs about two round trips
+//! whatever N is. The pool is BOUNDED because the far end is not ours: a
+//! machine with 40 windows must not open 40 simultaneous WebSocket upgrades at
+//! a relay that may rate-limit them.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -143,6 +149,42 @@ pub const Job = struct {
     }
 };
 
+/// How many window dials a restore has in flight at once (T616). The dials are
+/// independent, so the only reason for a ceiling is the far end: a relay that
+/// rate-limits, or a machine holding dozens of windows.
+const max_parallel_dials: usize = 8;
+
+/// How many HELPER threads a fan-out over `n` windows wants. The dialing thread
+/// is one of the pool itself, so one window needs no helper at all and the pool
+/// never exceeds `max_parallel_dials`.
+fn helperCount(n: usize) usize {
+    if (n == 0) return 0;
+    return @min(n, max_parallel_dials) - 1;
+}
+
+/// The fan-out: one job, one shared cursor. Every thread — the worker included —
+/// takes the next index and dials into that slot, so a slot is written by
+/// exactly one thread and nothing but the cursor needs synchronising.
+const Fanout = struct {
+    job: *Job,
+    next: std.atomic.Value(usize) = .init(0),
+
+    fn run(self: *Fanout) void {
+        const job = self.job;
+        while (true) {
+            const i = self.next.fetchAdd(1, .monotonic);
+            if (i >= job.prepared.len) return;
+            const p = &job.prepared[i];
+            p.dialed = dialRelay(job.alloc, job.base, job.device, job.token) catch |err| {
+                // A dial that fails costs exactly its own window: the slot stays
+                // null, `adoptRestoreAll` skips it, and its siblings rebuild.
+                log.warn("restore all: window '{s}' dial failed err={}", .{ p.win.id, err });
+                continue;
+            };
+        }
+    }
+};
+
 /// GUI thread: start a cross-machine Restore All. Returns false when nothing was
 /// started (out of memory, no message window, no thread) — the caller then says
 /// so instead of waiting for a reply that will never come.
@@ -243,26 +285,45 @@ fn worker(job: *Job) void {
             continue;
         }
 
-        // Per-window transport. The dial happens BEFORE the rebuild so a
-        // machine that stops answering mid-restore costs a skipped window
-        // rather than a half-built one.
-        const dialed = dialRelay(alloc, job.base, job.device, job.token) catch |err| {
-            log.warn("restore all: window '{s}' dial failed err={}", .{ win.id, err });
-            continue;
-        };
-        list.append(alloc, .{ .win = win, .dialed = dialed }) catch {
-            dialed.deinitDestroy(alloc);
+        // The slot only. Its transport is dialed below, with its siblings'
+        // (T616) — but still BEFORE the rebuild, so a machine that stops
+        // answering mid-restore costs a skipped window rather than a half-built
+        // one.
+        list.append(alloc, .{ .win = win, .dialed = null }) catch break;
+    }
+    // Nothing here owns a connection yet, so a failed hand-off is just an empty
+    // restore rather than a slice of leaked transports.
+    job.prepared = list.toOwnedSlice(alloc) catch &.{};
+
+    dialAll(job);
+    finish(job);
+}
+
+/// Dial every prepared window's transport, at most `max_parallel_dials` at a
+/// time, and return once they have all settled.
+///
+/// THIS thread is one of the pool, so a spawn that fails costs parallelism and
+/// never a dial: with no helper at all this degrades exactly to the serial loop
+/// it replaced. Every helper is joined before returning, which is what makes the
+/// job safe to hand to the GUI thread the instant this returns.
+fn dialAll(job: *Job) void {
+    if (job.prepared.len == 0) return;
+
+    var fan: Fanout = .{ .job = job };
+    var threads: [max_parallel_dials - 1]std.Thread = undefined;
+    var spawned: usize = 0;
+    const helpers = helperCount(job.prepared.len);
+    while (spawned < helpers) : (spawned += 1) {
+        threads[spawned] = std.Thread.spawn(.{}, Fanout.run, .{&fan}) catch |err| {
+            log.warn(
+                "restore all: dial fan-out spawn failed err={}; dialing {d} at a time",
+                .{ err, spawned + 1 },
+            );
             break;
         };
     }
-    job.prepared = list.toOwnedSlice(alloc) catch blk: {
-        // The list still holds the dials, and `deinit` frees the array but not
-        // what is in it. Nothing else will ever see them, so they are freed
-        // here rather than left to an owner that does not exist.
-        for (list.items) |p| if (p.dialed) |d| d.deinitDestroy(alloc);
-        break :blk &.{};
-    };
-    finish(job);
+    fan.run();
+    for (threads[0..spawned]) |t| t.join();
 }
 
 /// Hand the job back to the GUI thread, or free it when there is no longer a
@@ -315,6 +376,20 @@ fn oneLeafWindow(
     nodes[0] = .{ .leaf = .{ .session_id = sid } };
     tabs[0] = .{ .nodes = nodes[0..1] };
     return .{ .id = "w", .tabs = tabs[0..1] };
+}
+
+test "the dial fan-out counts the dialing thread as one of the pool" {
+    // No windows, no threads; one window is dialed by the worker itself.
+    try testing.expectEqual(@as(usize, 0), helperCount(0));
+    try testing.expectEqual(@as(usize, 0), helperCount(1));
+    // N windows below the ceiling all dial at once.
+    try testing.expectEqual(@as(usize, 1), helperCount(2));
+    try testing.expectEqual(@as(usize, max_parallel_dials - 1), helperCount(max_parallel_dials));
+    // And above it the pool stops growing - a 40-window machine must not open
+    // 40 simultaneous upgrades at a relay that may rate-limit them.
+    try testing.expectEqual(@as(usize, max_parallel_dials - 1), helperCount(40));
+    // The helper array is sized off the same ceiling, so this may never exceed it.
+    try testing.expect(helperCount(1000) <= max_parallel_dials - 1);
 }
 
 test "windowIsOpen matches a snapshotted session id" {
