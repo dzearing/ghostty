@@ -1,13 +1,10 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-07T11:27:24-07:00",
-    "commit":  "eff4baa53",
+    "generated":  "2026-09-07T12:42:04-07:00",
+    "commit":  "a394bf118",
     "uncommitted":  [
-                        "test/win32/body-complete-audit.ps1",
-                        "test/win32/build-cache.ps1",
-                        "test/win32/lib/BodyCompleteAudit.ps1",
-                        "test/win32/lib/BuildFresh.ps1"
+                        "test/win32/remote-pill.ps1"
                     ],
     "files":  {
                   "docs/claude/testing.md":  "c62f469cbdb2ef0a41206a05881f1412aac485c20e2e1f14774ab32c7564590f",
@@ -248,7 +245,7 @@
                   "test/win32/release-parity.ps1":  "92babe2c0e154c766dd02f9578073f6a04ec281ee706aa8a8dc83c505d579f9f",
                   "test/win32/remote-disconnect.ps1":  "8f123d9e150de11bb9d27bf03bd43ca84f883ee7c585af13e733db015083028f",
                   "test/win32/remote-inherit.ps1":  "50b2a9d36a10d0e677963fbb7d155e3dbc45261111214c1ab8b6454f025e24da",
-                  "test/win32/remote-pill.ps1":  "997697bcfbecccc6d92e9781e6eb1914777b4e885b2703f6958375b7149953a5",
+                  "test/win32/remote-pill.ps1":  "a764d7123bfd7e36799b6061b9c124bb33f14fa8e786845f714f9c9f0974fc66",
                   "test/win32/remote-reconnect-fresh.ps1":  "57b43deff08f9c6e056ea8eac4d8ced8134fd30f528b81d3b645132b29d971d1",
                   "test/win32/remote-reconnect-relay.ps1":  "b185af19d8563f4151f1b5ec11e5e1084eb755773c208abe4b01a3b1f7cf2c32",
                   "test/win32/reset-context.ps1":  "fea3d6af59f82fe015cbe5ce4fd85fa7c431da0267ecf98e1d33a361c07761ac",
