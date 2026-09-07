@@ -40,6 +40,17 @@
   incrementally to `summary.json`, so a run that is killed half way through
   still leaves the data it bought.
 
+  EVERY RUN IS ANCHORED TO THE CODE IT MEASURED (T617). `summary.json` records
+  `commit`, `branch` and `dirty` alongside `started`, and the header prints them,
+  so a red row has a sha and not merely a date. That is what makes "since when
+  has this script been red" answerable: `compare` names each run by its commit in
+  the same order as the verdict columns, so a DIFFER row reads as a range of
+  history rather than as two timestamps. `chooser-restore-all-remote.ps1` sat red
+  for six days recorded as green, and the thing missing was never the data - it
+  was the anchor. A resumed run KEEPS the commit its rows were measured at and
+  says so when HEAD has moved underneath it, and `confirm` carries that commit
+  through unchanged, because both are reporting on a run that already happened.
+
   WHY IT IS SERIAL, AND STAYS SERIAL. The parallel version is not a matter of
   adding workers. Every script here resolves the app under test as
   `<repo>\zig-out\bin\ghoztty.exe` - 91 of them compute that path internally,
@@ -640,6 +651,48 @@ function Write-NotGreenTable {
     }
 }
 
+<#
+WHICH CODE THIS RUN MEASURED (T617).
+
+A summary that says only WHEN it ran cannot answer the question the sweep exists
+to answer. `chooser-restore-all-remote.ps1` was red for six days and the tracker
+recorded it green, and even with two summaries in hand nobody could name the
+commit that turned it: the runs were dated, not anchored. So every run records
+the sha it ran over, the branch it was on, and whether the tree was dirty at the
+time - the last of those because a red row over a modified tree is a claim about
+somebody's work in progress, not about the commit.
+
+Degrades to empty rather than throwing: the runner's own acceptance test points
+-Repo at a throwaway fixture that is not a git repo at all, and "no commit" is a
+true answer there, not a failure.
+#>
+function Get-RunCommit {
+    param([string]$Repo)
+    $out = [pscustomobject]@{ Commit = ''; Branch = ''; Dirty = $false }
+    try {
+        $sha = (& git -C $Repo rev-parse --short HEAD 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $sha -notmatch '^[0-9a-fA-F]{7,40}$') { return $out }
+        $out.Commit = $sha.ToLowerInvariant()
+        $branch = (& git -C $Repo rev-parse --abbrev-ref HEAD 2>$null | Out-String).Trim()
+        if ($LASTEXITCODE -eq 0) { $out.Branch = $branch }
+        # @() because PS 5.1 unrolls a one-line result and a scalar's .Count is
+        # $null - the exact trap that made T617's original failure unreadable.
+        $status = @(& git -C $Repo status --porcelain 2>$null | Where-Object { $_ })
+        if ($LASTEXITCODE -eq 0) { $out.Dirty = ($status.Count -gt 0) }
+    } catch { }
+    return $out
+}
+
+# One line naming the code a run measured, for the header and for `compare`.
+function Format-RunCommit {
+    param([string]$Commit, [string]$Branch, [bool]$Dirty)
+    if (-not $Commit) { return 'no commit (not a git repo)' }
+    $s = $Commit
+    if ($Branch -and $Branch -ne 'HEAD') { $s += " ($Branch)" }
+    if ($Dirty) { $s += ' +dirty' }
+    return $s
+}
+
 function Save-Summary {
     param([string]$Path, [object]$Meta, [object[]]$Rows)
     $payload = [pscustomobject]@{
@@ -650,6 +703,9 @@ function Save-Summary {
         timeout = $Meta.TimeoutSec
         maxTimeout = $Meta.MaxTimeoutSec
         repo    = $Meta.Repo
+        commit  = $Meta.Commit
+        branch  = $Meta.Branch
+        dirty   = $Meta.Dirty
         results = @($Rows)
     }
     $json = $payload | ConvertTo-Json -Depth 6
@@ -813,6 +869,17 @@ if ($Action -eq 'compare') {
     $diffs = 0
     $missing = 0
     "comparing $($RunsList.Count) runs over $($names.Count) scripts"
+    # Each run is named by the code it measured, in the same left-to-right order
+    # the DIFFER rows use (T617). Without this the rows say a verdict CHANGED and
+    # leave the reader to guess between which two commits, which is the whole
+    # question - a script red for six days had two dated summaries and no answer.
+    for ($i = 0; $i -lt $summaries.Count; $i++) {
+        $s = $summaries[$i]
+        $c = $(if ($s.PSObject.Properties['commit']) { [string]$s.commit } else { '' })
+        $b = $(if ($s.PSObject.Properties['branch']) { [string]$s.branch } else { '' })
+        $d = $(if ($s.PSObject.Properties['dirty']) { [bool]$s.dirty } else { $false })
+        '  [{0}] {1}  started {2}' -f ($i + 1), (Format-RunCommit -Commit $c -Branch $b -Dirty $d), $s.started
+    }
     ''
     foreach ($n in $names) {
         $verdicts = @()
@@ -897,6 +964,11 @@ if ($Action -eq 'confirm') {
     $metaC = [pscustomobject]@{
         Started = $summary.started; Set = $summary.set; Order = $summary.order
         TimeoutSec = $summary.timeout; MaxTimeoutSec = $summary.maxTimeout; Repo = $summary.repo
+        # Carried through verbatim: confirm re-runs the rows of an EXISTING run,
+        # so the commit it is reporting about is that run's, never HEAD's.
+        Commit = $(if ($summary.PSObject.Properties['commit']) { $summary.commit } else { '' })
+        Branch = $(if ($summary.PSObject.Properties['branch']) { $summary.branch } else { '' })
+        Dirty  = $(if ($summary.PSObject.Properties['dirty']) { [bool]$summary.dirty } else { $false })
     }
     Save-Summary -Path $summaryFile -Meta $metaC -Rows $rowsC
 
@@ -923,12 +995,18 @@ if ($Limit -gt 0) { $rows = @($rows | Select-Object -First $Limit) }
 if ($rows.Count -eq 0) { throw "no scripts selected (-Set $Set, -Include $Include)" }
 
 $done = @{}
+$resumedCommit = $null
 if ($Resume) {
     $prev = Import-Summary $Resume
     # Normalised on the way in: a resumed row goes straight into $results and
     # then into the confirm pass, which cannot fill in a property JSON did not
     # carry (see ConvertTo-SummaryRow).
     foreach ($r in $prev.results) { $done[$r.Name] = (ConvertTo-SummaryRow -Row $r) }
+    # The rows already in that summary were measured at the commit it recorded,
+    # so the run KEEPS that commit rather than re-reading HEAD (T617). A resume
+    # after a pull would otherwise re-anchor yesterday's verdicts onto today's
+    # sha, which is the one lie this field exists to prevent.
+    if ($prev.PSObject.Properties['commit'] -and $prev.commit) { $resumedCommit = $prev }
     if (-not $OutDir) {
         $p = $Resume
         if (Test-Path -LiteralPath $p -PathType Container) { $OutDir = $p }
@@ -947,13 +1025,28 @@ Set-Content -LiteralPath $stdinFile -Value '' -Encoding ASCII
 
 $zigOut = Join-Path $Repo 'zig-out'
 
+$runAt = Get-RunCommit -Repo $Repo
+$movedFrom = ''
+if ($resumedCommit) {
+    if ($runAt.Commit -and $resumedCommit.commit -ne $runAt.Commit) { $movedFrom = $runAt.Commit }
+    $runAt = [pscustomobject]@{
+        Commit = $resumedCommit.commit
+        Branch = $(if ($resumedCommit.PSObject.Properties['branch']) { $resumedCommit.branch } else { '' })
+        Dirty  = $(if ($resumedCommit.PSObject.Properties['dirty']) { [bool]$resumedCommit.dirty } else { $false })
+    }
+}
 $meta = [pscustomobject]@{
     Started = (Get-Date).ToString('o'); Set = $Set; Order = $Order
     TimeoutSec = $TimeoutSec; MaxTimeoutSec = $MaxTimeoutSec; Repo = $Repo
+    Commit = $runAt.Commit; Branch = $runAt.Branch; Dirty = $runAt.Dirty
 }
 
 "suite-run: $($rows.Count) script(s), set=$Set order=$Order timeout=${TimeoutSec}s"
 "  out: $OutDir"
+"  commit: $(Format-RunCommit -Commit $runAt.Commit -Branch $runAt.Branch -Dirty $runAt.Dirty)"
+if ($movedFrom) {
+    Write-Host "  NOTE: resuming a run recorded at $($runAt.Commit); HEAD is now $movedFrom, and the rows this run adds are measured there." -ForegroundColor Yellow
+}
 $declared = @($rows | Where-Object { $_.Declared -gt 0 })
 if ($declared.Count -gt 0) {
     $shown = @($declared | ForEach-Object {

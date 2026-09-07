@@ -98,6 +98,10 @@ $env:GHOZTTY_PIPE_SUFFIX = "-t336$PID"
 # T652: the "attached is not alive" oracle. Read its header before adding an
 # assertion about a rebuilt pane.
 . (Join-Path $PSScriptRoot 'lib\PaneLiveness.ps1')
+# T617: this script is where `@($null.session_ids).Count` = 1 was found, and the
+# fix then lived only here. The helper is shared now, so the next fixture that
+# counts a possibly-absent record does not have to re-learn it.
+. (Join-Path $PSScriptRoot 'lib\CountOrZero.ps1')
 . (Join-Path $PSScriptRoot 'lib\FakeRelay.ps1')
 . (Join-Path $PSScriptRoot 'lib\PipeBridge.ps1')
 
@@ -279,7 +283,7 @@ function Wait-BlobIds($name, $n, $timeoutSec = 30) {
     $rec = $null
     while ((Get-Date) -lt $deadline) {
         $rec = Find-BlobFor $name
-        if ($null -ne $rec -and @($rec.session_ids).Count -ge $n) { return $rec }
+        if ((Get-CountOrZero $rec.session_ids) -ge $n) { return $rec }
         Start-Sleep -Milliseconds 500
     }
     return $rec
@@ -429,8 +433,11 @@ try {
         "the fixture window really carries its user-set name before the machine goes away ($(if ($namedBefore) { $namedBefore.Title } else { '<no window>' }))"
 
     $blob = Wait-BlobIds 't336-multi' 3
-    Assert ($null -ne $blob -and @($blob.session_ids).Count -eq 3) `
-        "A the agent holds the window's layout with its three session ids ($(@($blob.session_ids).Count))"
+    # The message says '<absent>' rather than a number when there is no record at
+    # all: printing "1" for that is what made this exact assertion read as a
+    # product capture bug for six days (T617).
+    Assert ((Get-CountOrZero $blob.session_ids) -eq 3) `
+        "A the agent holds the window's layout with its three session ids ($(Format-CountOrAbsent $blob.session_ids))"
     # The other half of the fixture control: if the name never reached the blob
     # this is a CAPTURE bug, and no assertion about the rebuild could tell the
     # two apart.

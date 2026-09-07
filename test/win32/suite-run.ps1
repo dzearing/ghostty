@@ -847,6 +847,119 @@ exit 0
         "exit $($rS2.Exit)"
     Check 'S9 and the skip is not in the not-green table' `
         ($rS2.Text -notmatch '(?m)^\s*skip\s+s-skip\.ps1') $rS2.Text
+    # --- V. the commit a run measured (T617) -------------------------------
+    Write-Host ''
+    Write-Host '-- V. every run is anchored to the code it measured'
+
+    # WHY. A summary that records only WHEN it ran cannot answer the question
+    # the sweep exists for. chooser-restore-all-remote.ps1 was red from
+    # 2026-08-02 and recorded green, and even with two dated summaries in hand
+    # nobody could name the commit that turned it. So the run records the sha.
+
+    # V1 first, over the fixture as sections A-S left it: NOT a git repo. "No
+    # commit" is a true answer there, and a runner that threw or wrote garbage
+    # instead would be unusable in exactly the throwaway trees it is tested in.
+    Check 'V1 a non-repo run records an empty commit rather than failing' `
+        (($sB.PSObject.Properties['commit']) -and ([string]$sB.commit -eq '')) `
+        "commit='$($sB.commit)'"
+
+    # PS 5.1 wraps a native command's stderr in an ErrorRecord when the
+    # redirection happens inside PowerShell, and with $ErrorActionPreference =
+    # 'Stop' a git WARNING ("LF will be replaced by CRLF") then aborts the whole
+    # script. Quieting the preference for the call is the fix; -c autocrlf=false
+    # stops the warning being produced at all.
+    function Invoke-FixtureGit {
+        param([Parameter(ValueFromRemainingArguments = $true)][string[]]$GitArgs)
+        $ErrorActionPreference = 'SilentlyContinue'
+        & git -C $Fixture -c core.autocrlf=false -c core.safecrlf=false @GitArgs 2>&1 | Out-Null
+    }
+
+    $git = (Get-Command git -ErrorAction SilentlyContinue)
+    if (-not $git) {
+        Write-Host '  (git is not on PATH - V2..V11 cannot be answered here)'
+    } else {
+        # A real one-commit repository, built here so the expected sha is known
+        # exactly rather than compared against whatever the live repo says.
+        Invoke-FixtureGit init -q
+        Invoke-FixtureGit checkout -q -B suite-run-fixture
+        # The runner writes its output INTO the tree it is measuring, so without
+        # this every run after the first would report the tree dirty and V4
+        # could not tell a real modification from the runner's own footprints.
+        Set-Content -LiteralPath (Join-Path $Fixture '.gitignore') -Encoding ASCII -Value @'
+run*/
+*.log
+*.err
+invocations.txt
+stdin.empty
+'@
+        Invoke-FixtureGit add -A
+        Invoke-FixtureGit -c user.name='suite-run test' -c user.email='t617@example.invalid' commit -q -m 'fixture'
+        $sha1 = (& git -C $Fixture rev-parse --short HEAD 2>$null | Out-String).Trim().ToLowerInvariant()
+
+        $dirV = Join-Path $Fixture 'runV'
+        $rV = Invoke-Runner @('-Include', 'b-pass.ps1', '-OutDir', $dirV, '-TimeoutSec', '30', '-NoConfirm')
+        $sV = Get-Summary $dirV
+        Check 'V2 the summary records the commit the run measured' `
+            ([string]$sV.commit -eq $sha1) "recorded '$($sV.commit)', HEAD is '$sha1'"
+        Check 'V3 and the branch it was on' ([string]$sV.branch -eq 'suite-run-fixture') "branch='$($sV.branch)'"
+        # A clean tree must read clean, or the dirty flag says nothing when it
+        # is set: a flag that is always true is not a flag.
+        Check 'V4 a clean tree is not reported dirty' (-not [bool]$sV.dirty) "dirty=$($sV.dirty)"
+        Check 'V5 the header names the commit while the run is happening' `
+            ($rV.Text -match [regex]::Escape($sha1)) $rV.Text
+
+        # V6: a red row over a MODIFIED tree is a claim about work in progress,
+        # not about the commit, and the reader has to be able to tell.
+        Set-Content -LiteralPath (Join-Path $FixTests 'dirt.txt') -Value 'edited' -Encoding ASCII
+        $dirV2 = Join-Path $Fixture 'runV2'
+        $rV2 = Invoke-Runner @('-Include', 'b-pass.ps1', '-OutDir', $dirV2, '-TimeoutSec', '30', '-NoConfirm')
+        $sV2 = Get-Summary $dirV2
+        Check 'V6 a modified tree is recorded dirty and says so' `
+            (([bool]$sV2.dirty) -and ($rV2.Text -match '\+dirty')) "dirty=$($sV2.dirty)"
+        Remove-Item -LiteralPath (Join-Path $FixTests 'dirt.txt') -Force -ErrorAction SilentlyContinue
+
+        # V7: confirm re-runs the rows of a run that ALREADY happened, so the
+        # commit it reports about is that run's. Re-reading HEAD here would
+        # re-anchor old verdicts onto whatever is checked out today.
+        $dirV3 = Join-Path $Fixture 'runV3'
+        $null = Invoke-Runner @('-Include', 'c-fail.ps1', '-OutDir', $dirV3, '-TimeoutSec', '30', '-NoConfirm')
+
+        # THE WHOLE SCENARIO, in one commit: a change lands that turns a script
+        # nobody re-ran from green to red. That is T617's opening sentence, and
+        # until now the sweep could record both runs and still not name it.
+        Set-FixtureScript 'b-pass.ps1' @'
+"  FAIL the thing another task changed underneath me"
+"1 FAILURE(S) (0 passed)"
+exit 1
+'@
+        Invoke-FixtureGit add -A
+        Invoke-FixtureGit -c user.name='suite-run test' -c user.email='t617@example.invalid' commit -q -m 'turns b-pass red'
+        $sha2 = (& git -C $Fixture rev-parse --short HEAD 2>$null | Out-String).Trim().ToLowerInvariant()
+        Check 'V7 HEAD really moved' (($sha2 -ne $sha1) -and $sha2) "sha1=$sha1 sha2=$sha2"
+
+        $null = Invoke-Runner @('confirm', '-Resume', $dirV3)
+        $sV3 = Get-Summary $dirV3
+        Check 'V8 confirm carries the run''s own commit through, not today''s HEAD' `
+            ([string]$sV3.commit -eq $sha1) "kept '$($sV3.commit)', HEAD is now '$sha2'"
+
+        # V9-V11: compare is where "since when" is actually read, so it has to
+        # name each run by the code it measured. Two dated summaries and a
+        # DIFFER row is the report that already existed and could not answer the
+        # question; the commit on each column is what turns it into an answer.
+        $dirV4 = Join-Path $Fixture 'runV4'
+        $null = Invoke-Runner @('-Include', 'b-pass.ps1', '-OutDir', $dirV4, '-TimeoutSec', '30', '-NoConfirm')
+        $sV4 = Get-Summary $dirV4
+        Check 'V9 the same script is green at the first commit and red at the second' `
+            (((Get-Verdict $sV 'b-pass.ps1') -eq 'pass') -and ((Get-Verdict $sV4 'b-pass.ps1') -eq 'fail')) `
+            "$(Get-Verdict $sV 'b-pass.ps1') then $(Get-Verdict $sV4 'b-pass.ps1')"
+        $rCmp = Invoke-Runner @('compare', '-Runs', "$dirV,$dirV4")
+        Check 'V10 compare names each run by the commit it measured' `
+            (($rCmp.Text -match "\[1\][^\r\n]*$([regex]::Escape($sha1))") -and
+             ($rCmp.Text -match "\[2\][^\r\n]*$([regex]::Escape($sha2))")) $rCmp.Text
+        Check 'V11 so the verdict that changed is attributable to a range of history' `
+            (($rCmp.Exit -eq 1) -and ($rCmp.Text -match 'DIFFER\s+b-pass\.ps1\s+pass \| fail')) $rCmp.Text
+    }
+
     # --- J. the duration in the report ------------------------------------
     Write-Host ''
     Write-Host '-- J. Format-Duration'

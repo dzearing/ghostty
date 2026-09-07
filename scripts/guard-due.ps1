@@ -2243,6 +2243,20 @@ $GuardTable = @(
             'test\win32\lib\dashboard-dom-selftest.js'
         )
     },
+    # The shared "count a record that might not be there" helper (T617). Its
+    # whole value is one PS 5.1 edge - @($null.field).Count is 1 - and a change
+    # that quietly reintroduced it would not fail anywhere loudly: the fixtures
+    # using it would go on passing, and would start lying in exactly the way
+    # that cost six days. Nothing in the P1-P3 floor reaches it.
+    [pscustomobject]@{
+        Name   = 'count-or-zero'
+        Script = 'test\win32\count-or-zero.ps1'
+        Stamp  = 'test\win32\count-or-zero.stamp.json'
+        Covers = @(
+            'test\win32\lib\CountOrZero.ps1',
+            'test\win32\count-or-zero.ps1'
+        )
+    },
     # The acceptance-suite runner (T361). It is the one tool whose subject is
     # the other 241 scripts, so a regression in it does not fail loudly - it
     # mis-scores a sweep, and a wall of green is exactly what nobody re-reads.

@@ -1,10 +1,13 @@
 {
     "guard":  "launch-preflight",
     "script":  "test/win32/launch-preflight-audit.ps1",
-    "generated":  "2026-09-07T12:41:38-07:00",
-    "commit":  "a394bf118",
+    "generated":  "2026-09-07T13:16:40-07:00",
+    "commit":  "5107dd1cd",
     "uncommitted":  [
-                        "test/win32/remote-pill.ps1"
+                        "test/win32/chooser-restore-all-remote.ps1",
+                        "test/win32/count-or-zero.ps1",
+                        "test/win32/lib/CountOrZero.ps1",
+                        "test/win32/suite-run.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "944e54bda392aa61007ee23280c6bb9767ed2e661f77f5157ca035dbe9b6e4ea",
@@ -50,7 +53,7 @@
                   "test/win32/chooser-orphan-badge.ps1":  "e007a37b50e7093d73a532033f3b282c134748e9ea47d06bb38b7f6b52bf43dc",
                   "test/win32/chooser-restore-all.ps1":  "ced0ad850d422bf42cd4040a41863b5a1a1158d57a2937e485ff60468d716ceb",
                   "test/win32/chooser-restore-all-adopt.ps1":  "d05f84d8d6e52dcd0996ccbe3992b584cb5ba20969b41f3f21943a47361b2241",
-                  "test/win32/chooser-restore-all-remote.ps1":  "c792a24a0a3f50c267a09fe86f3731a53f3447a87d6bfcb3e4da68f19e247dd7",
+                  "test/win32/chooser-restore-all-remote.ps1":  "4ecefe2a0463358718a65095894204efd3df006859c0cda019b6ea73024f4fb1",
                   "test/win32/chooser-resume.ps1":  "399481f261c7e5a1761ba7f60e3b27f0333dfcc1e866b519144c3437c9074080",
                   "test/win32/chooser-resume-remote.ps1":  "53d6417f7b8334aaf2bce8e5e83051697c96cc160eb0a51cf0febcb0d582830a",
                   "test/win32/chooser-roster-refetch.ps1":  "bad4f2ce9924598420d0cff81430db6fb7afc9a220bbaa1f53f8abd98f4faa14",
@@ -80,6 +83,7 @@
                   "test/win32/context-menu.ps1":  "96cd8f69074d080153835cdd04ff18c1239ee835898eaea289cceb680caf12f4",
                   "test/win32/context-menu-real-input.ps1":  "1ed95195613db5481f91e8aa0aef1cd1cfa77d63810c5d0b845e93dfeb482fae",
                   "test/win32/control-char-scan.ps1":  "0e6725c84ae641d646628368de8bfc251f063d56923401c170111928f361f451",
+                  "test/win32/count-or-zero.ps1":  "569947be0dd433056f05a38d16eae3c81cf3a5a02e0710669458650ea6e5e0ad",
                   "test/win32/crash-databreak.ps1":  "59c9648cfff1725ea328f79f5e674ac042eb4109870b61707b8c378e6436f1d6",
                   "test/win32/crash-diagnostics.ps1":  "c09555c22faad0c3914229d756c7df9423369c0e13b2f32422e04d3eeaed8aca",
                   "test/win32/crash-first-chance.ps1":  "f30c24b2753b983c7ec6533559e706ccc099a858d955958b914a92605ae26d8e",
@@ -175,6 +179,7 @@
                   "test/win32/lib/ColorMath.ps1":  "a825f6793a37181cb68b840042fa4403b08a60de696e36e677bb3d3cdda16e04",
                   "test/win32/lib/CommandResolveAudit.ps1":  "9ed2f0925dfee89eb032a932ef0d0b046f5d5ed38a7e1a5c4cef19cb2109e424",
                   "test/win32/lib/ComposerSurface.ps1":  "3e269e939147fbc867aff1824e669642f8c6f752924f0c91e12f501d836d0383",
+                  "test/win32/lib/CountOrZero.ps1":  "becbcdc2dabc0728175ea276fc082a3e270df5637b659c434d93f3e407a9fa9c",
                   "test/win32/lib/DesktopCapability.ps1":  "ee7fa5006f36de6b7290f5b67f77b845366ab4d563ad82bedbeaceb1c6fa0a24",
                   "test/win32/lib/DesktopLaunchAudit.ps1":  "6a520668a22c54f4c5163d5efe9fb3a01bdb8568d60f6cfa5366a1fb2edad86f",
                   "test/win32/lib/ExitCodeAudit.ps1":  "c6aa6eb8adbe8d682bdacc2a0034e4accf17ee1790b5867a856de3105ba6806c",
@@ -281,7 +286,7 @@
                   "test/win32/split-zoom-nav.ps1":  "7ed3a76e0a6abc09573263efa8f7c7d3889ab31d6d8b258040ab7cf5e9882b12",
                   "test/win32/startup-failure.ps1":  "d2ed885900bd7d68765f605a5a94a622df2682d29c6d9fa27a4612b33cce6cb9",
                   "test/win32/stderr-capture-audit.ps1":  "04424b778285df67f2eeed9c8ee354d1446c62a920ab8de56bf8b4475569cf9b",
-                  "test/win32/suite-run.ps1":  "19e1384d17cd3f258b2e9c5f2339b6b3dba8a04114006a342dae98a89676dbee",
+                  "test/win32/suite-run.ps1":  "3c37cfa6e61d92129c9f09d957787b9e1275dc4def354e2785edb38a9d142884",
                   "test/win32/tab-color.ps1":  "af75bcd47eeb68cf93ee056b7aa4e14e147314ab8b4adc3a9c0eb27dfb43f967",
                   "test/win32/tab-strip.ps1":  "bebef6b697c8389c7bf92194380461b93114732f2a4b3cf26aaea6936e46377b",
                   "test/win32/tab-strip-autohide.ps1":  "53655e95850098c972752b1deee1a16488c6c1abd4b46b6734c7500b896bae50",
