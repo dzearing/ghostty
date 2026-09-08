@@ -1,13 +1,13 @@
 {
     "guard":  "command-resolve",
     "script":  "test/win32/command-resolve-audit.ps1",
-    "generated":  "2026-09-08T01:44:28-07:00",
-    "commit":  "47ec981e9",
+    "generated":  "2026-09-08T02:30:43-07:00",
+    "commit":  "0b7526a50",
     "uncommitted":  [
-                        "test/win32/test-filter-guard.ps1"
+                        "test/win32/activity-monitor.ps1"
                     ],
     "files":  {
-                  "test/win32/activity-monitor.ps1":  "944e54bda392aa61007ee23280c6bb9767ed2e661f77f5157ca035dbe9b6e4ea",
+                  "test/win32/activity-monitor.ps1":  "a3f98a551352e27d1ad9c1745e222757dc4b802efc5638fbe6ea4d3f621b6307",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
                   "test/win32/activity-monitor-probe-fail.ps1":  "3ca33b2b1d163db1fe2b2f8d0cb573c0f9d7decd435f61d64bb5906e71dc6aa4",
                   "test/win32/activity-monitor-remote.ps1":  "40def6e6a689de1a4bb7d187d1a5f1faf4ba85ac98f0e403be292e6fac636304",

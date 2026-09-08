@@ -67,10 +67,19 @@ fn killWindows(pid: i64) ProcKillOutcome {
     const w = windows;
     const W = std.os.windows;
 
-    // OpenProcess with PROCESS_TERMINATE. A failure here is access-denied or a
-    // vanished pid; surface it rather than crash.
-    const h = w.OpenProcess(w.PROCESS_TERMINATE, 0, @intCast(pid)) orelse {
-        // GetLastError distinguishes the two common cases for a useful message.
+    // OpenProcess with PROCESS_TERMINATE, plus SYNCHRONIZE so a failed
+    // TerminateProcess can be diagnosed below. Diagnosis must never cost us the
+    // kill, so an access-denied on the pair is retried with PROCESS_TERMINATE
+    // alone and we simply lose the ability to tell "already exited" apart.
+    var synchronized = true;
+    var handle = w.OpenProcess(w.PROCESS_TERMINATE | W.SYNCHRONIZE, 0, @intCast(pid));
+    if (handle == null and W.kernel32.GetLastError() == .ACCESS_DENIED) {
+        handle = w.OpenProcess(w.PROCESS_TERMINATE, 0, @intCast(pid));
+        synchronized = false;
+    }
+    // A failure here is access-denied or a vanished pid; surface it rather than
+    // crash. GetLastError distinguishes the two common cases.
+    const h = handle orelse {
         const e = W.kernel32.GetLastError();
         return .{
             .ok = false,
@@ -86,6 +95,16 @@ fn killWindows(pid: i64) ProcKillOutcome {
     // Windows has no real SIGTERM; "TERM" and "KILL" both TerminateProcess (exit
     // code 1). See the module doc.
     if (w.TerminateProcess(h, 1) == 0) {
+        // A process that has ALREADY exited keeps its process OBJECT alive for
+        // as long as anybody holds a handle to it, so OpenProcess succeeds and
+        // TerminateProcess answers ERROR_ACCESS_DENIED — by error code alone
+        // that is indistinguishable from a live process we are not allowed to
+        // touch, and the panel then tells the user to go find an admin prompt
+        // for a process that is already gone (T632). Ask the object instead of
+        // the error code: a signalled process handle means it has exited.
+        if (synchronized and W.kernel32.WaitForSingleObject(h, 0) == W.WAIT_OBJECT_0) {
+            return .{ .ok = false, .@"error" = "no such process" };
+        }
         return .{ .ok = false, .@"error" = "TerminateProcess failed" };
     }
     return .{ .ok = true };

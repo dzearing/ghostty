@@ -975,7 +975,7 @@ try {
             }
             Start-Sleep -Milliseconds 900
         }
-        Assert ($null -ne (Wait-LogMatch 'activity monitor: kill result total=1 killed=1 failed=0' 6000)) 'I the kill reported one killed, none failed'
+        Assert ($null -ne (Wait-LogMatch 'activity monitor: kill result total=1 killed=1 gone=0 failed=0' 6000)) 'I the kill reported one killed, none failed'
         $gone = $false
         $deadline = (Get-Date).AddSeconds(5)
         while ((Get-Date) -lt $deadline) {
@@ -1673,7 +1673,7 @@ try {
             else { Send-TestWindowClose -Window $confirm | Out-Null }
             Start-Sleep -Milliseconds 900
         }
-        Assert ($null -ne (Wait-LogMatch 'activity monitor: kill result total=3 killed=3 failed=0' 8000)) 'M1 the batch reported three killed, none failed'
+        Assert ($null -ne (Wait-LogMatch 'activity monitor: kill result total=3 killed=3 gone=0 failed=0' 8000)) 'M1 the batch reported three killed, none already gone, none failed'
         $alive = $victims
         $deadline = (Get-Date).AddSeconds(8)
         while ((Get-Date) -lt $deadline) {
@@ -1687,7 +1687,8 @@ try {
 
     # M2. A batch in which one row is already gone takes the AGGREGATED branch -
     # the far side of `killFailureText`'s `total == 1` fork, which a single-row
-    # kill can never reach.
+    # kill can never reach - and it must say the target had ALREADY EXITED
+    # rather than guess at privileges (T632).
     #
     # The lever is T292's own guarantee: `onKill` COPIES the batch out of the
     # snapshot before the dialog opens, so a victim that dies while the dialog is
@@ -1697,6 +1698,12 @@ try {
     # still succeeds and TerminateProcess answers ERROR_ACCESS_DENIED. That makes
     # the failure deterministic AND makes it impossible for Windows to recycle
     # the pid onto a bystander between the two clicks.
+    #
+    # That pin is also exactly why the wrong diagnosis was reachable: the error
+    # code the app sees for a corpse is the same ACCESS_DENIED a live process it
+    # may not touch returns, so `killWindows` asks the process OBJECT (a
+    # signalled handle) instead of the code. This arm is the demonstration - it
+    # used to assert the elevation sentence, which was the defect.
     $victims2 = @()
     if ($batchReady) {
         foreach ($i in 1..3) {
@@ -1754,12 +1761,12 @@ try {
                 else { Send-TestWindowClose -Window $confirm | Out-Null }
                 Start-Sleep -Milliseconds 900
             }
-            Assert ($null -ne (Wait-LogMatch 'activity monitor: kill result total=3 killed=2 failed=1' 8000)) 'M2 the batch reported the two that died AND the one that could not'
-            $mAgg = Wait-LogMatch 'activity monitor: action error: Killed (\d+) of (\d+) \((\d+) failed: ([^)]*)\)' 8000
-            Assert ($null -ne $mAgg) 'M2 the failure became the AGGREGATED banner, not the single-failure sentence'
+            Assert ($null -ne (Wait-LogMatch 'activity monitor: kill result total=3 killed=2 gone=1 failed=0' 8000)) 'M2 the batch reported the two it killed AND the one that was already gone, which is not a failure'
+            $mAgg = Wait-LogMatch 'activity monitor: action error: Killed (\d+) of (\d+); (\d+) had already exited\.' 8000
+            Assert ($null -ne $mAgg) 'M2 the already-exited target became the AGGREGATED banner, not the single-failure sentence'
             if ($mAgg) {
                 Assert ($mAgg.Groups[1].Value -eq '2' -and $mAgg.Groups[2].Value -eq '3' -and $mAgg.Groups[3].Value -eq '1') "M2 the banner tallies the batch (got '$($mAgg.Groups[0].Value)')"
-                Assert ($mAgg.Groups[4].Value -match 'PING') "M2 ...and NAMES what did not die (got '$($mAgg.Groups[4].Value)')"
+                Assert ($mAgg.Groups[0].Value -notmatch 'privileges') "M2 ...and does NOT send the user after an admin prompt for a process that had already exited (got '$($mAgg.Groups[0].Value)')"
             }
         }
 
@@ -1913,7 +1920,7 @@ try {
                 Start-Sleep -Milliseconds 900
             }
             if ($killedByKeyboard) {
-                Assert ($null -ne (Wait-LogMatch 'activity monitor: kill result total=1 killed=1 failed=0' 6000)) `
+                Assert ($null -ne (Wait-LogMatch 'activity monitor: kill result total=1 killed=1 gone=0 failed=0' 6000)) `
                     'O4 the keyboard-driven kill reported one killed, none failed'
                 $goneO = $false
                 $deadlineO = (Get-Date).AddSeconds(5)

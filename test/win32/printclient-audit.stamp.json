@@ -1,13 +1,14 @@
 {
     "guard":  "printclient-audit",
     "script":  "test/win32/printclient-audit.ps1",
-    "generated":  "2026-09-08T00:42:04-07:00",
-    "commit":  "abab185f2",
+    "generated":  "2026-09-08T02:25:45-07:00",
+    "commit":  "0b7526a50",
     "uncommitted":  [
-                        "src/apprt/win32/LocalAgent.zig"
+                        "src/apprt/win32/activity_actions.zig",
+                        "src/apprt/win32/activity_procs.zig"
                     ],
     "files":  {
-                  "src/apprt/win32/activity_actions.zig":  "9f5cfa4c1238fd023d5c8a1d80790ae21751be5f7389662e2fe1b790fef8ad63",
+                  "src/apprt/win32/activity_actions.zig":  "de2cd7a41d7c801b64e4046dd67d04caeaeef94d7ff3959f3566cb94f3630714",
                   "src/apprt/win32/activity_borrow.zig":  "8be5e4ba3e61feeaf28f2d7027fbadb5607c7e5541562795e984c9dc4a2e43a7",
                   "src/apprt/win32/activity_cards.zig":  "d232ad886704e03fce1c0433529b8526a51286c4d54bb7da35a76a92f2a277c0",
                   "src/apprt/win32/activity_dial.zig":  "bfd8c3b58300d3e1233b469872e8e794b72a98ca4b8f19b44e919e5b84cd624e",
@@ -17,7 +18,7 @@
                   "src/apprt/win32/activity_paint.zig":  "24ac067d10dad943de21bd0aad96140cf47688b9cc1ca71a3c97783993c80ebe",
                   "src/apprt/win32/activity_probe.zig":  "dcbc1f2ea24d2603f16258cb77dd04d11ddded12bde8049dc70baa70a867a101",
                   "src/apprt/win32/activity_probe_conn.zig":  "22be77e1904c57e414ac795a7421c73b38b7177ec5bf44df1e1d39779b2dfbdf",
-                  "src/apprt/win32/activity_procs.zig":  "482e114c6982181c7113ec7458516c1365acef95bea68178e0b24019d295385a",
+                  "src/apprt/win32/activity_procs.zig":  "2b26c4affe21d11cbee186ff3b40d6b0e4d6c9d8e60d81e130a466c77a6ccae4",
                   "src/apprt/win32/activity_rows.zig":  "9bcbcc1df9846ed21edbe0dae79de2d981d88858d13e6f7353b86f8c61b51f49",
                   "src/apprt/win32/activity_sample.zig":  "194ba910d9910d9cf82d4af0f71fabe7f12e408b1d9de66b0fc06ac2f3497a3b",
                   "src/apprt/win32/activity_view.zig":  "649b8cfde586dad49a5e48aab5fd7a201ab81537ee89f8ce3c72052875d58070",

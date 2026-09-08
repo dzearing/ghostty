@@ -24938,3 +24938,47 @@ to fail by inverting the tick-count assertion before landing. Also the thirteen
 harnesses the edit came due for (agent-autostart, agent-upgrade,
 registration-sites, restore-late-agent and the nine static audits), all green
 and re-stamped.
+
+## 2026-09-08 — the Activity Monitor stops blaming admin rights for a process that had already exited (T632)
+
+Pick a process in the Activity Monitor, hit Kill, and while you read the
+confirmation the process finishes on its own. The panel used to answer "It may
+require elevated privileges" — sending you after an admin prompt that would not
+have helped, for a process that was already gone. It now says it had already
+exited, and it counts it as neither a kill nor a failure.
+
+The task assumed the two cases were told apart by `OpenProcess` failing with
+`ERROR_INVALID_PARAMETER`, and that is only true once Windows has RELEASED the
+pid. The case this defect actually lives in — the one T292 made ordinary by
+letting the table keep polling behind the dialog, and the one section M2 of the
+acceptance script has been building all along — is a corpse whose handle
+somebody still holds: the process object outlives the process, `OpenProcess`
+succeeds, and `TerminateProcess` answers `ERROR_ACCESS_DENIED`, byte for byte
+what a live process we may not touch returns. So `killWindows` now opens with
+`SYNCHRONIZE` alongside `PROCESS_TERMINATE` and asks the process OBJECT — a
+signalled handle means it has exited — instead of reading the error code. That
+diagnosis never costs the kill: an access-denied on the pair is retried with
+`PROCESS_TERMINATE` alone and simply forgoes the distinction.
+
+Above that, `killOne` returns `ok` / `gone` / `denied` / `other` instead of a
+bool (an unrecognised message from an older agent lands on `other`, because
+reading it as a confident `denied` would be the same class of lie), and the
+banner's tally splits into killed + already-exited + failed, which always sums to
+the batch size — an already-exited target is left out of the "N failed: …" list
+it would otherwise be blamed by, and out of the killed count nothing here earned.
+A denied batch keeps today's sentence; a mixed one says something true of both.
+
+The acceptance arm is M2 retrofitted rather than a new one: it already spawned
+three victims, pinned one pid with a held handle, killed it behind the open
+confirmation and confirmed — and it was asserting the WRONG sentence, which is
+what made this reachable and unnoticed. An unpinned variant would have to race
+Windows pid reuse for no extra coverage, and a recycled pid is a bystander this
+panel would then terminate.
+
+Green: `floor-lane.ps1 -Lane all` (lib / none / win32 / agent), P1–P3, and
+`activity-monitor.ps1` ALL PASS (205) — its first run failed the two single-kill
+arms on the widened log line, which is the harness reading the change rather than
+taking it on trust. Four new unit tests cover the wordings and
+`killOutcomeFor`'s generosity toward an unfamiliar message. The nine static
+audits the script edit came due for are green and re-stamped. T1449 carries the
+same wording to the Mac seat, which has the identical defect.

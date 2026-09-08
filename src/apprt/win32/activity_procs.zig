@@ -109,16 +109,22 @@ pub fn onKill(self: *ActivityMonitor) void {
 
     var failed_buf: [max_rows]actions.Target = undefined;
     var nfail: usize = 0;
+    var ngone: usize = 0;
     for (targets) |t| {
-        if (!killOne(self, t.pid)) {
-            failed_buf[nfail] = t;
-            nfail += 1;
-        }
+        const outcome = killOne(self, t.pid);
+        if (outcome == .ok) continue;
+        if (outcome == .gone) ngone += 1;
+        failed_buf[nfail] = t;
+        failed_buf[nfail].reason = outcome;
+        nfail += 1;
     }
-    log.info("activity monitor: kill result total={d} killed={d} failed={d}", .{
+    // `gone` is reported apart from `killed` and `failed` (T632): the process is
+    // not running, which is what was asked, but nothing here terminated it.
+    log.info("activity monitor: kill result total={d} killed={d} gone={d} failed={d}", .{
         targets.len,
         targets.len - nfail,
-        nfail,
+        ngone,
+        nfail - ngone,
     });
 
     var err_utf8: [256]u8 = undefined;
@@ -137,34 +143,36 @@ pub fn onKill(self: *ActivityMonitor) void {
     self.kickSample();
 }
 
-/// Terminate one pid on THIS panel's source, returning whether it died. The
+/// Terminate one pid on THIS panel's source, reporting WHY it did not die
+/// rather than a bare bool (T632) — the banner's whole sentence turns on the
+/// difference between "you need admin rights" and "it had already exited". The
 /// local and remote calls are the same request to two transports — the agent
 /// answers `PROC_KILL` with the very `proc_control.killProc` the local branch
-/// calls in-process — so a local panel and a remote one cannot drift.
-pub fn killOne(self: *ActivityMonitor, pid: i64) bool {
+/// calls in-process, error string included — so a local panel and a remote one
+/// cannot drift, and an older agent's unfamiliar message lands on `other`.
+pub fn killOne(self: *ActivityMonitor, pid: i64) actions.KillOutcome {
     if (self.remote_conn) |rc| {
         var out = rc.conn.killProc(pid, "TERM", rpc_timeout_ns) catch |err| {
+            // A transport failure says nothing about the process itself.
             log.warn("activity monitor: remote kill pid={d} err={}", .{ pid, err });
-            return false;
+            return .other;
         };
         defer out.deinit();
-        if (!out.ok) {
-            log.warn("activity monitor: remote kill pid={d} failed err={s}", .{
-                pid,
-                out.error_msg orelse "unknown",
-            });
-        }
-        return out.ok;
+        if (out.ok) return .ok;
+        log.warn("activity monitor: remote kill pid={d} failed err={s}", .{
+            pid,
+            out.error_msg orelse "unknown",
+        });
+        return actions.killOutcomeFor(out.error_msg);
     }
 
     const r = proc_control.killProc(pid, "TERM");
-    if (!r.ok) {
-        log.warn("activity monitor: kill pid={d} failed err={s}", .{
-            pid,
-            r.@"error" orelse "unknown",
-        });
-    }
-    return r.ok;
+    if (r.ok) return .ok;
+    log.warn("activity monitor: kill pid={d} failed err={s}", .{
+        pid,
+        r.@"error" orelse "unknown",
+    });
+    return actions.killOutcomeFor(r.@"error");
 }
 
 /// Start a process on this panel's source (Mac's `NewProcessSheet` +

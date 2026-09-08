@@ -23,12 +23,41 @@
 const std = @import("std");
 const rows_mod = @import("activity_rows.zig");
 
+/// Why one kill did not happen. `ok` is the success case; the rest are the
+/// three answers the banner can word differently (T632).
+///
+/// `gone` exists because the panel keeps polling behind the confirmation
+/// (T292), so a target that finishes on its own while the user reads the dialog
+/// is now an ORDINARY outcome rather than bad luck inside one message handler —
+/// and "it may require elevated privileges" is a wrong diagnosis for it, sending
+/// the user after an admin prompt that would not have helped.
+///
+/// `other` is deliberately the catch-all: an older agent answers `PROC_KILL`
+/// with a message string this build has never seen, and reading an unrecognised
+/// one as a confident `denied` would be the same class of lie.
+pub const KillOutcome = enum { ok, gone, denied, other };
+
+/// Classify `proc_control.killProc`'s error string — which arrives verbatim from
+/// the local call and, over the wire, as `PROC_KILL`'s `error_msg`, so a local
+/// panel and a remote one cannot drift.
+pub fn killOutcomeFor(err: ?[]const u8) KillOutcome {
+    const msg = err orelse return .other;
+    if (std.ascii.eqlIgnoreCase(msg, "no such process")) return .gone;
+    if (std.ascii.eqlIgnoreCase(msg, "permission denied")) return .denied;
+    if (std.ascii.eqlIgnoreCase(msg, "access denied")) return .denied;
+    return .other;
+}
+
 /// One process the user asked to kill. `targetsFor` points `name` at the
 /// snapshot the row came from; `copyNames` repoints it at a caller-owned arena,
 /// which is what lets the batch outlive that snapshot (T292).
+///
+/// `reason` is only meaningful for a target that ended up in a FAILED list; a
+/// target on its way into the confirmation carries the default.
 pub const Target = struct {
     pid: i64,
     name: []const u8 = "",
+    reason: KillOutcome = .other,
 };
 
 /// The Kill button's caption: "Kill" for one row, "Kill N" for many
@@ -84,14 +113,51 @@ pub fn killConfirmBody(count: usize) []const u8 {
 ///
 /// One failure names it; several report the tally and list up to three, so the
 /// cause stays concrete without the banner becoming a paragraph.
+///
+/// A target that was ALREADY GONE is reported separately and never carries the
+/// elevation sentence (T632): the user asked for it not to be running and it is
+/// not running, so it is not counted among the failures either — the tally
+/// splits into killed + already-exited + failed, which always sums to `total`,
+/// because a sentence that contradicts its own count is worse than a vague one.
 pub fn killFailureText(buf: []u8, total: usize, failed: []const Target) ?[]const u8 {
     if (failed.len == 0) return null;
+
+    var gone_n: usize = 0;
+    for (failed) |f| {
+        if (f.reason == .gone) gone_n += 1;
+    }
+    const hard_n = failed.len - gone_n;
+
     if (total == 1) {
+        if (hard_n == 0) {
+            return std.fmt.bufPrint(
+                buf,
+                "{s} (PID {d}) had already exited.",
+                .{ displayName(failed[0]), failed[0].pid },
+            ) catch "The process had already exited.";
+        }
         return std.fmt.bufPrint(
             buf,
             "Couldn't kill {s} (PID {d}). It may require elevated privileges.",
             .{ displayName(failed[0]), failed[0].pid },
         ) catch "Couldn't kill the process.";
+    }
+
+    // A batch in which nothing actually resisted: say so, and say nothing about
+    // privileges, which had no part in it.
+    if (hard_n == 0) {
+        if (gone_n >= total) {
+            return std.fmt.bufPrint(
+                buf,
+                "All {d} processes had already exited.",
+                .{total},
+            ) catch "The processes had already exited.";
+        }
+        return std.fmt.bufPrint(
+            buf,
+            "Killed {d} of {d}; {d} had already exited.",
+            .{ total - gone_n, total, gone_n },
+        ) catch "Some processes had already exited.";
     }
 
     // Build the "a, b, c, …" list into the tail of `buf` first, then format the
@@ -102,6 +168,9 @@ pub fn killFailureText(buf: []u8, total: usize, failed: []const Target) ?[]const
     var listed: usize = 0;
     for (failed) |f| {
         if (listed == 3) break;
+        // The list names what RESISTED; an already-exited target gets its own
+        // clause below rather than a slot in "3 failed: …".
+        if (f.reason == .gone) continue;
         var name_buf: [32]u8 = undefined;
         const name = listName(&name_buf, f);
         const sep: []const u8 = if (listed == 0) "" else ", ";
@@ -112,7 +181,7 @@ pub fn killFailureText(buf: []u8, total: usize, failed: []const Target) ?[]const
         list_len += name.len;
         listed += 1;
     }
-    if (failed.len > listed and list_len + 3 <= list_buf.len) {
+    if (hard_n > listed and list_len + 3 <= list_buf.len) {
         const more = ", \u{2026}";
         if (list_len + more.len <= list_buf.len) {
             @memcpy(list_buf[list_len..][0..more.len], more);
@@ -121,10 +190,19 @@ pub fn killFailureText(buf: []u8, total: usize, failed: []const Target) ?[]const
     }
 
     const killed = total - failed.len;
+    // The mixed case has to be true of both halves, so the already-exited ones
+    // get their own clause inside the tally and the elevation sentence stays
+    // attached to the failures it might actually explain.
+    var gone_buf: [48]u8 = undefined;
+    const gone_clause: []const u8 = if (gone_n == 0) "" else (std.fmt.bufPrint(
+        &gone_buf,
+        "; {d} had already exited",
+        .{gone_n},
+    ) catch "");
     return std.fmt.bufPrint(
         buf[0..split],
-        "Killed {d} of {d} ({d} failed: {s}). Some may require elevated privileges.",
-        .{ killed, total, failed.len, list_buf[0..list_len] },
+        "Killed {d} of {d} ({d} failed: {s}{s}). Some may require elevated privileges.",
+        .{ killed, total, hard_n, list_buf[0..list_len], gone_clause },
     ) catch "Some processes could not be killed.";
 }
 
@@ -344,6 +422,76 @@ test "killFailureText: a batch reports the tally and lists at most three" {
         "(4 failed: aa.exe, bb.exe, cc.exe, \u{2026})",
     ) != null);
     try testing.expect(std.mem.indexOf(u8, text, "dd.exe") == null);
+}
+
+test "killOutcomeFor: the agent's own strings classify, anything else is unknown" {
+    try testing.expectEqual(KillOutcome.gone, killOutcomeFor("no such process"));
+    try testing.expectEqual(KillOutcome.denied, killOutcomeFor("permission denied"));
+    try testing.expectEqual(KillOutcome.denied, killOutcomeFor("Access denied"));
+    // An older agent's unfamiliar wording must NOT be read as a confident
+    // diagnosis in either direction.
+    try testing.expectEqual(KillOutcome.other, killOutcomeFor("TerminateProcess failed"));
+    try testing.expectEqual(KillOutcome.other, killOutcomeFor("kill: EPERM"));
+    try testing.expectEqual(KillOutcome.other, killOutcomeFor(null));
+}
+
+test "killFailureText: an already-exited target never mentions privileges (T632)" {
+    var buf: [256]u8 = undefined;
+
+    // One process, gone by the time the user confirmed: say what happened, not
+    // what would have been needed to make it happen.
+    const one = killFailureText(&buf, 1, &.{
+        .{ .pid = 4312, .name = "ping.exe", .reason = .gone },
+    }).?;
+    try testing.expectEqualStrings("ping.exe (PID 4312) had already exited.", one);
+
+    // A whole batch of them.
+    var buf2: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "All 3 processes had already exited.",
+        killFailureText(&buf2, 3, &.{
+            .{ .pid = 1, .name = "a.exe", .reason = .gone },
+            .{ .pid = 2, .name = "b.exe", .reason = .gone },
+            .{ .pid = 3, .name = "c.exe", .reason = .gone },
+        }).?,
+    );
+
+    // Part of a batch: the tally still sums, and privileges stay out of it.
+    var buf3: [256]u8 = undefined;
+    const some = killFailureText(&buf3, 3, &.{
+        .{ .pid = 1, .name = "a.exe", .reason = .gone },
+    }).?;
+    try testing.expectEqualStrings("Killed 2 of 3; 1 had already exited.", some);
+    try testing.expect(std.mem.indexOf(u8, some, "privileges") == null);
+}
+
+test "killFailureText: a denied batch keeps the elevation sentence" {
+    var buf: [256]u8 = undefined;
+    const text = killFailureText(&buf, 3, &.{
+        .{ .pid = 1, .name = "a.exe", .reason = .denied },
+        .{ .pid = 2, .name = "b.exe", .reason = .denied },
+    }).?;
+    try testing.expectEqualStrings(
+        "Killed 1 of 3 (2 failed: a.exe, b.exe). Some may require elevated privileges.",
+        text,
+    );
+}
+
+test "killFailureText: a mixed batch is true of both halves" {
+    var buf: [256]u8 = undefined;
+    const text = killFailureText(&buf, 4, &.{
+        .{ .pid = 1, .name = "a.exe", .reason = .denied },
+        .{ .pid = 2, .name = "b.exe", .reason = .gone },
+        .{ .pid = 3, .name = "c.exe", .reason = .gone },
+    }).?;
+    // killed(1) + failed(1) + gone(2) == total(4), and the gone pair is not in
+    // the "failed:" list they would otherwise be blamed by.
+    try testing.expectEqualStrings(
+        "Killed 1 of 4 (1 failed: a.exe; 2 had already exited). " ++
+            "Some may require elevated privileges.",
+        text,
+    );
+    try testing.expect(std.mem.indexOf(u8, text, "b.exe") == null);
 }
 
 test "killFailureText: a nameless failure is listed by pid" {
