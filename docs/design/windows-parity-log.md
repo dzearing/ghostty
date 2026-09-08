@@ -9,6 +9,41 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-08: T631 - **the shortcut for proving a test runs could only ever
+  say "fine".** `-Dtest-filter` is how a new test is shown to actually execute:
+  break its assertion, run the filter, watch it go red. Measured while
+  validating T188, that run came back GREEN against a deliberately broken
+  `gui_pump` test, and only the unfiltered six-minute lane disagreed. So the
+  cheap proof was not a proof, and the expensive one was the only one.
+
+  **The obvious fix does not work, and would have shipped a guard that never
+  fires.** "Fail when the run executed zero tests" reads as the whole of it,
+  and it is wrong here: an unnamed `test {}` block is compiled into the binary
+  whatever the filter says, and this repo is built out of
+  `test { _ = @import(...); }` aggregators. `zig build test -Dapp-runtime=win32
+  -Dtest-filter=zzz_nonexistent` reports **83/83 tests passed** - a green
+  summary over not one thing the caller asked for. The signal that does work is
+  the test METADATA the runner reports: the binary's test names, checked
+  against the filters the same way the compiler checked them (a filter is a
+  substring of the fully-qualified name).
+
+  `src/build/TestFilterGuard.zig` is that verdict, and `build.zig` hangs one
+  guard step off each of `test`, `test-agent` and `test-lib-vt`. Per top-level
+  step, not per binary: `zig build test` runs two test binaries and an honest
+  filter routinely matches in one and not the other, so a per-binary rule would
+  fail every real filtered run. A cache hit reports no metadata at all, so a
+  filtered run has its caching taken off rather than letting "cannot tell" read
+  as "matched nothing" - and the verdict still treats a metadata-less run as
+  indeterminate, because a guard that guesses is worse than no guard. The
+  unfiltered lane grows no step and is byte-for-byte unchanged.
+
+  Validation: `test\win32\test-filter-guard.ps1` ALL PASS (its section D is the
+  control that ties the failure to the guard - the same run whose test steps
+  report all-passed is the one the guard fails), a nonsense filter run by hand
+  against all three steps, and the four-lane floor green. New `test-filter` row
+  in `scripts/guard-due.ps1`; the rule is written up in `docs/claude/testing.md`
+  beside the other floor-lane rules.
+
 - 2026-09-07: T628 - **a remote machine on the wrong version now says so
   instead of reading as unreachable.** T125 taught the LOCAL agent dial the
   difference between "nobody answered" and "somebody answered and disagreed

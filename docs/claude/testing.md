@@ -47,6 +47,21 @@ WebView2 hosts, log tail) instead of hanging forever with nothing to read. Exit
 0 pass / 1 fail / 2 wedged / 3 wall-clock cap; `-Lane <one>`, `-Repeat N`,
 `-Filter <test-filter>`, `-SelfTest` to prove the detector itself.
 
+**A filtered run that matches NOTHING now fails** (T631). `-Dtest-filter` is
+the cheap way to prove a new test really runs — break it, run the filter, watch
+it go red — and until now it reported green whether the pattern matched or not,
+so it could certify code nobody executed. The reason it looked green is that an
+unnamed `test {}` block (the `_ = @import(…)` aggregators this repo is built
+out of) is compiled in whatever the filter says: `zig build test
+-Dapp-runtime=win32 -Dtest-filter=zzz_nonexistent` reported *83/83 tests
+passed* while running not one thing the caller asked for. So a **test-filter
+guard** step now hangs off `test`, `test-agent` and `test-lib-vt`, reads the
+test names the runner reported, and fails when none of them matched the
+filters, naming the filters. Per top-level step, not per binary — a real filter
+routinely matches in one of a step's binaries and not the others. The
+unfiltered lane grows no step and is unchanged. `src\build\TestFilterGuard.zig`
+carries the rule; acceptance: `test\win32\test-filter-guard.ps1`.
+
 **And a red lane says whether it is the code or the box** (T1170). A lane that
 fails is re-run immediately, narrowed to the tests it blamed, and the summary
 carries the answer: `agent#1=FAIL [alone: PASS alone - NOT reproduced ->

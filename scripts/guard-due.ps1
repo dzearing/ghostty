@@ -2914,6 +2914,21 @@ $GuardTable = @(
     # in front of all 49 scripts that call Assert-GhozttyIsolatedBuild, so an
     # edit that quietly stops it refusing would turn every other stamp into a
     # claim nobody checked. Non-interactive, launches nothing, a few seconds.
+    # The filtered-lane honesty guard (T631). `-Dtest-filter` is the cheap way
+    # to prove a new test actually runs, and before this it reported green
+    # whether the pattern matched or not - so it could certify code nobody
+    # executed. Nothing in the floor lane covers it: the floor runs UNFILTERED,
+    # which is the one shape the guard is inert in. Non-interactive, launches
+    # nothing, cached builds so a few seconds.
+    [pscustomobject]@{
+        Name   = 'test-filter'
+        Script = 'test\win32\test-filter-guard.ps1'
+        Stamp  = 'test\win32\test-filter-guard.stamp.json'
+        Covers = @(
+            'src\build\TestFilterGuard.zig',
+            'test\win32\test-filter-guard.ps1'
+        )
+    },
     [pscustomobject]@{
         Name   = 'build-fresh'
         Script = 'test\win32\build-fresh-guard.ps1'

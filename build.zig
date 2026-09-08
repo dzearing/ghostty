@@ -52,6 +52,17 @@ pub fn build(b: *std.Build) !void {
         "Filter for test. Only applies to Zig tests.",
     ) orelse &[0][]const u8{};
 
+    // T631 — a filtered run that matches NOTHING exits 0, which is
+    // indistinguishable from "matched and passed". One collector per top-level
+    // test step gathers that step's test runs; `attach` at the end of build()
+    // turns the aggregate count into a verdict. Inert without `-Dtest-filter`.
+    var test_filter_guard: buildpkg.TestFilterGuard.Collector =
+        .init(b, "test", test_filters);
+    var test_agent_filter_guard: buildpkg.TestFilterGuard.Collector =
+        .init(b, "test-agent", test_filters);
+    var test_lib_vt_filter_guard: buildpkg.TestFilterGuard.Collector =
+        .init(b, "test-lib-vt", test_filters);
+
     // Two diagnostic knobs for the test binaries (T473). The test exes pin
     // their own optimize mode and codegen backend rather than following
     // `-Doptimize`, which is deliberate — but it also means a crash that looks
@@ -155,6 +166,7 @@ pub fn build(b: *std.Build) !void {
             }).createModule(),
         );
         const agent_test_run = b.addRunArtifact(agent_test);
+        test_agent_filter_guard.add(agent_test_run);
         test_agent_step.dependOn(&agent_test_run.step);
 
         // There is exactly ONE test binary in this lane, on purpose (T434).
@@ -477,6 +489,7 @@ pub fn build(b: *std.Build) !void {
             .filters = test_filters,
         });
         const mod_vt_test_run = b.addRunArtifact(mod_vt_test);
+        test_lib_vt_filter_guard.add(mod_vt_test_run);
         test_lib_vt_step.dependOn(&mod_vt_test_run.step);
 
         const mod_vt_c_test = b.addTest(.{
@@ -484,6 +497,7 @@ pub fn build(b: *std.Build) !void {
             .filters = test_filters,
         });
         const mod_vt_c_test_run = b.addRunArtifact(mod_vt_c_test);
+        test_lib_vt_filter_guard.add(mod_vt_c_test_run);
         test_lib_vt_step.dependOn(&mod_vt_c_test_run.step);
     }
 
@@ -502,7 +516,9 @@ pub fn build(b: *std.Build) !void {
             }),
             .use_llvm = test_llvm,
         });
-        test_step.dependOn(&b.addRunArtifact(build_helpers_test).step);
+        const build_helpers_test_run = b.addRunArtifact(build_helpers_test);
+        test_filter_guard.add(build_helpers_test_run);
+        test_step.dependOn(&build_helpers_test_run.step);
     }
 
     // Tests (skip when building libghostty-vt)
@@ -535,6 +551,7 @@ pub fn build(b: *std.Build) !void {
 
         // Normal test running
         const test_run = b.addRunArtifact(test_exe);
+        test_filter_guard.add(test_run);
         test_step.dependOn(&test_run.step);
 
         // Normal tests always test our libghostty modules
@@ -559,6 +576,12 @@ pub fn build(b: *std.Build) !void {
     } else {
         try translations_step.addError("cannot update translations when i18n is disabled", .{});
     }
+
+    // T631 — last, once every test run above has been registered. Each of
+    // these is a no-op unless `-Dtest-filter` was given.
+    test_filter_guard.attach(test_step);
+    test_agent_filter_guard.attach(test_agent_step);
+    test_lib_vt_filter_guard.attach(test_lib_vt_step);
 }
 
 /// T243: refuse the build when the global cache sits on a different Windows

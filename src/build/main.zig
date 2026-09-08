@@ -35,6 +35,7 @@ pub const UnicodeTables = @import("UnicodeTables.zig");
 pub const LibtoolStep = @import("LibtoolStep.zig");
 pub const LipoStep = @import("LipoStep.zig");
 pub const MetallibStep = @import("MetallibStep.zig");
+pub const TestFilterGuard = @import("TestFilterGuard.zig");
 pub const XCFrameworkStep = @import("XCFrameworkStep.zig");
 
 // Helpers

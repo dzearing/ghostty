@@ -10,4 +10,5 @@
 
 test {
     _ = @import("drive_check.zig");
+    _ = @import("TestFilterGuard.zig");
 }
