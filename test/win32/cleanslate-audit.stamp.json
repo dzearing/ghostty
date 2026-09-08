@@ -1,10 +1,10 @@
 {
     "guard":  "cleanslate",
     "script":  "test/win32/cleanslate-audit.ps1",
-    "generated":  "2026-09-07T23:29:09-07:00",
-    "commit":  "e3bb45f74",
+    "generated":  "2026-09-08T00:42:27-07:00",
+    "commit":  "abab185f2",
     "uncommitted":  [
-                        "test/win32/ipc-remote.ps1"
+                        "test/win32/ipc-startup-latency.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "944e54bda392aa61007ee23280c6bb9767ed2e661f77f5157ca035dbe9b6e4ea",
@@ -147,7 +147,7 @@
                   "test/win32/ipc-relay.ps1":  "7d6837579539a1624fabf31916cfc3923ca91f6db356d1aaae8db7560dcbe02f",
                   "test/win32/ipc-remote.ps1":  "e563787b023e7967e8fbb5efc75aa8500c9295274062130d36e83930fddfcc7d",
                   "test/win32/ipc-send-keys-fidelity.ps1":  "ecd1a63052e0a9c52fdb10003f817026c4b95acd8fe76b4e2cff8a57a1ff2fd8",
-                  "test/win32/ipc-startup-latency.ps1":  "f9696e3e450043659688926efca6912b1ddeb19113e1be8c2581e20a591196a6",
+                  "test/win32/ipc-startup-latency.ps1":  "e05ebff757be728430c252c640fb5bd76cbd2842fbb4b5b572603e3d30daa828",
                   "test/win32/ipc-target-exists-note.ps1":  "b5fdc4b540bd8a16126429725530bc8ca4c88753af22b9ca47c5c4cc5ed8e437",
                   "test/win32/ipc-timeout.ps1":  "1cc28e2c148b1e65b8e4ec719f0cd1e22b936506a49c75581590da11692d5d30",
                   "test/win32/ipc-under-load.ps1":  "e086bb69c413c1cff080a5b54579d37c709e28c54749c00a3359bcb5fd60e6f1",

@@ -1,21 +1,10 @@
 {
     "guard":  "printclient-audit",
     "script":  "test/win32/printclient-audit.ps1",
-    "generated":  "2026-09-07T23:33:50-07:00",
-    "commit":  "e3bb45f74",
+    "generated":  "2026-09-08T00:42:04-07:00",
+    "commit":  "abab185f2",
     "uncommitted":  [
-                        "src/apprt/win32/App.zig",
-                        "src/apprt/win32/chooser_sessions.zig",
-                        "src/apprt/win32/dial_failure.zig",
-                        "src/apprt/win32/IpcHandlers.zig",
-                        "src/apprt/win32/MachineChooser.zig",
-                        "src/apprt/win32/MachineConnectionPool.zig",
-                        "src/apprt/win32/remote_pill.zig",
-                        "src/apprt/win32/remote_reconnect.zig",
-                        "src/apprt/win32/RemoteReconnect.zig",
-                        "src/apprt/win32/RestoreAllRelay.zig",
-                        "src/apprt/win32/SessionRoster.zig",
-                        "src/apprt/win32/Window.zig"
+                        "src/apprt/win32/LocalAgent.zig"
                     ],
     "files":  {
                   "src/apprt/win32/activity_actions.zig":  "9f5cfa4c1238fd023d5c8a1d80790ae21751be5f7389662e2fe1b790fef8ad63",
@@ -114,7 +103,7 @@
                   "src/apprt/win32/layout_cost.zig":  "f6c2b30ef9278ffa2e894c2d0f51649e1be475974ab53c159ddd8ebc3736bcde",
                   "src/apprt/win32/layout_refresh.zig":  "aa275cb7cdaeb39821a60fed42c57ea2928e5b024db5a523ef0e9aed24131f94",
                   "src/apprt/win32/list_selection.zig":  "b7f5720b1a405deacf48309f6b34439b7148e73a19a876ef9c7f38faf5308913",
-                  "src/apprt/win32/LocalAgent.zig":  "13180f417c6510eb38cf334c666c87bf48cb5fe653b9db50e19f0b1f7acf1ed5",
+                  "src/apprt/win32/LocalAgent.zig":  "c9d7453d2bc8ba5123f44b65487d0dbf3fef3cd4c91f9ee9befdb9bd7f8c7580",
                   "src/apprt/win32/mac_layout_blob.zig":  "4eea9bca6942db895d7ff185566726199364f30e627703bae31911b3a636f2ad",
                   "src/apprt/win32/machine_pool.zig":  "f0bb879eb2fc8c6c942ccfa1610674863e8e526c5b878a8f39039cc0cc7c9163",
                   "src/apprt/win32/MachineChooser.zig":  "b8732884bd3828a0ceae0e90fa7b3586778a5e92f7778150b10f84d64d042d1b",
