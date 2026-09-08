@@ -9,6 +9,61 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-08: T640 - **the feedback composer's two round buttons could not be
+  reached from the keyboard, and would not say what they were.** The "+" adds a
+  screenshot and the arrow files the report; both were silent on hover and
+  neither was a tab stop, so the only way to learn what one did was to click
+  it, and the only way to press one was with a mouse. Design system §2.2 is
+  explicit that a missing focus ring is an accessibility defect rather than a
+  polish item, and this control had no focus MODEL to draw one from.
+
+  The focus model went into the pure layout module beside the geometry, where
+  the `none` lane can assert it: a `Stop` of text / snapshot / send, and
+  `nextStop(cur, back, enabled)` that walks it. Two properties are worth naming.
+  It is a CYCLE - Tab off the send button returns to the text - because the
+  composer is a group inside a viewer pane whose own chrome has no tab order to
+  hand focus on to, so there is exactly one sensible destination. And it SKIPS a
+  disabled action the way Windows skips a disabled control in a dialog: the send
+  button is dead while the report is empty, and a ring on a button that cannot
+  be pressed is a dead end.
+
+  Tab and shift+Tab are classified in `viewer_accel.composerChord` as
+  `focus_next` / `focus_prev` rather than handled in the band's WndProc. That is
+  the seam that makes the feature real for the shipped surface: the composer's
+  text is a WebView2 contenteditable since T934, and a Tab left to Chromium
+  moves focus inside the PAGE. Both surfaces already route `composerChord` - the
+  RichEdit fallback through `App.zig`'s message loop, the web composer through
+  its `AcceleratorKeyPressed` hop - so one table entry answers for both, and a
+  new `runChord` gives them one switch instead of two to keep in step.
+
+  The band takes the Win32 focus itself for a button stop (the actions are
+  painted by it, not child controls of it), which is what `WM_SETFOCUS` now
+  branches on instead of unconditionally handing focus to the text.
+  `WM_KILLFOCUS` drops the ring, so it can never outlive the focus it describes.
+  The one place that needed care is the screenshot: the region selector is a
+  full-desktop window that TAKES the keyboard, so the stop is stashed before it
+  goes up and restored when the capture returns - otherwise a capture started
+  from the keyboard would silently drop the user into the text.
+
+  Tooltips follow the pattern T639 established one file over: one comctl32 rect
+  tool per button in `TTF_SUBCLASS` mode, registered on the forgiving HIT box
+  rather than the painted square, themed from the band's own dark/light, and
+  destroyed before the window it subclassed. The strings ("Add a screenshot of
+  the screen (Ctrl+Shift+S)", "Send feedback (Ctrl+Enter)") live in the pure
+  module and are unit-tested there, so a third action added tomorrow fails until
+  it has words.
+
+  Green: `floor-lane.ps1 -Lane all` (lib / none / win32 / agent), P1-P3, and
+  `viewer-feedback.ps1` ALL PASS (86) with a new section J - the tooltips read
+  off a `viewer feedback tips` stderr line (both tools present, each rect
+  covering AND exceeding its paint), the four-step focus walk read off a
+  `viewer feedback focus` line, and Space and Enter each pressing the focused
+  send button into a filed report. Six new unit tests cover the walk, the
+  disabled skip, the ring's geometry at four scales and the label set. The
+  arms are stderr oracles because this runs on the background test desktop,
+  where nothing can rest a pointer on a button or photograph a ring.
+
+
 - 2026-09-08: T639 - **five of the six viewer nav-bar buttons were silent
   icons.** T633 gave the strip its first tooltip, on the feedback button; back,
   forward, reload, home and the contents toggle kept none, so the only way to

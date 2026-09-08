@@ -332,6 +332,13 @@ pub const ComposerChord = enum {
     /// respelled with ctrl. SHIFT is part of it on purpose: a bare ctrl+s in a
     /// text field means "save" to everyone, and there is nothing here to save.
     snapshot,
+    /// tab — move keyboard focus to the next thing inside the composer:
+    /// text → "+" → send → text (T640). A composer whose two actions can only
+    /// be reached with a mouse is an accessibility defect, and Tab is the one
+    /// key every Windows user already tries.
+    focus_next,
+    /// shift+tab — the same walk, backwards.
+    focus_prev,
 };
 
 /// Classify a chord as one of the composer's, or null if it is not one —
@@ -347,10 +354,16 @@ pub fn composerChord(vk: u16, mods: input.Mods) ?ComposerChord {
     const bare = !mods.ctrl and !mods.shift and !mods.alt;
     const ctrl_only = mods.ctrl and !mods.shift and !mods.alt;
     const ctrl_shift = mods.ctrl and mods.shift and !mods.alt;
+    const shift_only = mods.shift and !mods.ctrl and !mods.alt;
     return switch (vk) {
         0x0D => if (ctrl_only) .send else null, // VK_RETURN
         0x1B => if (bare) .close else null, // VK_ESCAPE
         0x53 => if (ctrl_shift) .snapshot else null, // 'S'
+        // VK_TAB. Claimed here rather than left to the text surface because
+        // BOTH surfaces have to answer it the same way: the RichEdit fallback
+        // would swallow it, and the web composer's Chromium would move focus
+        // inside the page instead of onto the two action buttons.
+        0x09 => if (bare) .focus_next else if (shift_only) .focus_prev else null,
         else => null,
     };
 }
@@ -540,6 +553,19 @@ test "composerChord: ctrl+enter sends, plain enter does not" {
     try testing.expect(composerChord(0x53, .{}) == null);
     try testing.expect(composerChord(0x53, .{ .ctrl = true, .shift = true, .alt = true }) == null);
     try testing.expect(composerChord(0x53, .{ .ctrl = true, .shift = true, .super = true }) == null);
+
+    // Tab walks the composer's focus ring, shift+Tab walks it back (T640).
+    // Bare and shift-only, exactly: ctrl+tab is the tab strip's and alt+tab is
+    // the shell's, and neither may be eaten by a text box.
+    try testing.expectEqual(ComposerChord.focus_next, composerChord(0x09, .{}).?);
+    try testing.expectEqual(
+        ComposerChord.focus_prev,
+        composerChord(0x09, .{ .shift = true }).?,
+    );
+    try testing.expect(composerChord(0x09, ctrl) == null);
+    try testing.expect(composerChord(0x09, .{ .ctrl = true, .shift = true }) == null);
+    try testing.expect(composerChord(0x09, .{ .alt = true }) == null);
+    try testing.expect(composerChord(0x09, .{ .super = true }) == null);
 
     // And nothing else is a composer chord — typing must reach the buffer.
     try testing.expect(composerChord(0x41, .{}) == null); // 'A'

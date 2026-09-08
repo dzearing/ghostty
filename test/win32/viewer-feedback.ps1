@@ -22,6 +22,13 @@
 #      itself behind the confirmation.
 #   H. the composer's chords are PANE-SCOPED: Escape and Ctrl+Enter delivered
 #      to a terminal pane produce no composer activity at all.
+#   J. the two circular actions EXPLAIN THEMSELVES and answer the KEYBOARD
+#      (T640): each has a tooltip naming what it does and its chord, registered
+#      on its forgiving hit box; Tab walks text -> "+" -> send -> text and
+#      shift+Tab walks back; and Space or Enter on the focused button does what
+#      a click does. Both halves are accessibility -- before this the only way
+#      to learn what a button did was to press it, and the only way to press
+#      one was with a mouse.
 #
 # ORACLES, and why they are what they are. This runs on the BACKGROUND test
 # desktop, where CopyFromScreen and SendInput are dead (T233), so nothing out
@@ -222,6 +229,86 @@ function Get-LastSendBuffer($errlog, $paneId) {
         }
     }
     return $hit
+}
+
+# The composer's tooltips and its keyboard focus, from the same stderr oracle
+# the rest of this file uses and for the same reason (T640): the two circular
+# actions are owner-painted chrome on a background desktop where nothing can
+# take a screenshot or rest a pointer. The band logs one tips line per CHANGE,
+# so the newest describes the composer as it stands.
+function Get-FeedbackTips($errlog, $paneId) {
+    if (-not (Test-Path $errlog) -or -not $paneId) { return $null }
+    $tail = $null
+    foreach ($line in (Get-Content $errlog -ErrorAction SilentlyContinue)) {
+        if ($line -match "viewer feedback tips pane=$([regex]::Escape($paneId))(.*)$") { $tail = $Matches[1] }
+    }
+    if ($null -eq $tail) { return $null }
+    $tips = @{}
+    $rx = '(\w+):paint=(-?\d+),(-?\d+),(-?\d+),(-?\d+):tool=(-?\d+),(-?\d+),(-?\d+),(-?\d+):text="([^"]*)"'
+    foreach ($m in [regex]::Matches($tail, $rx)) {
+        $g = $m.Groups
+        $tips[$g[1].Value] = [pscustomobject]@{
+            Paint = @([int]$g[2].Value, [int]$g[3].Value, [int]$g[4].Value, [int]$g[5].Value)
+            Tool  = @([int]$g[6].Value, [int]$g[7].Value, [int]$g[8].Value, [int]$g[9].Value)
+            Text  = $g[10].Value
+        }
+    }
+    return $tips
+}
+
+function Wait-FeedbackTips($errlog, $paneId) {
+    for ($t = 0; $t -lt 40; $t++) {
+        $tips = Get-FeedbackTips $errlog $paneId
+        if ($tips -and $tips.ContainsKey('send')) { return $tips }
+        Start-Sleep -Milliseconds 250
+    }
+    return (Get-FeedbackTips $errlog $paneId)
+}
+
+# A tool rect must COVER its painted square and be strictly bigger than it --
+# the design system's hit box exceeds the paint, and a tip registered on the
+# paint would go quiet in exactly the margin a click still lands in. Same
+# assertion the nav bar's tips carry (viewer-worktree.ps1, T639).
+function Test-FeedbackTipIsHitBox($tip) {
+    if (-not $tip) { return $false }
+    $p = $tip.Paint
+    $h = $tip.Tool
+    if ($h[0] -gt $p[0] -or $h[1] -gt $p[1] -or $h[2] -lt $p[2] -or $h[3] -lt $p[3]) { return $false }
+    return (($h[2] - $h[0]) -gt ($p[2] - $p[0])) -and (($h[3] - $h[1]) -gt ($p[3] - $p[1]))
+}
+
+# Where keyboard focus last LANDED inside the composer: text, snapshot or send.
+function Get-FeedbackFocus($errlog, $paneId) {
+    if (-not (Test-Path $errlog) -or -not $paneId) { return $null }
+    $hit = $null
+    foreach ($line in (Get-Content $errlog -ErrorAction SilentlyContinue)) {
+        if ($line -match "viewer feedback focus pane=$([regex]::Escape($paneId)) stop=(\w+)") {
+            $hit = $Matches[1]
+        }
+    }
+    return $hit
+}
+
+# How many sends the pane has reported so far. A COUNT rather than the last
+# `bytes=` value: two different reports can be the same length, and comparing
+# the number would then read a real send as no send at all (which is exactly
+# what 'copyme' and 'tab me' did on the first run of the arm below).
+function Get-FeedbackSendCount($errlog, $paneId) {
+    if (-not (Test-Path $errlog) -or -not $paneId) { return 0 }
+    $n = 0
+    foreach ($line in (Get-Content $errlog -ErrorAction SilentlyContinue)) {
+        if ($line -match "viewer feedback pane=$([regex]::Escape($paneId)) action=send bytes=\d+") { $n++ }
+    }
+    return $n
+}
+
+function Wait-FeedbackFocus($errlog, $paneId, [string]$Stop) {
+    for ($t = 0; $t -lt 40; $t++) {
+        $f = Get-FeedbackFocus $errlog $paneId
+        if ($f -eq $Stop) { return $f }
+        Start-Sleep -Milliseconds 150
+    }
+    return (Get-FeedbackFocus $errlog $paneId)
 }
 
 # Every report folder currently in the queue, with whether it is COMPLETE. A
@@ -702,6 +789,97 @@ try {
     # composer is clearing and closing itself behind the confirmation. Wait it
     # out rather than letting it land in the middle of the next arm, which
     # compares the composer's open state across a terminal-pane chord.
+    [void](Wait-FeedbackState $errlog $paneId $false)
+
+    # --- J. the two actions explain themselves and answer the keyboard ------
+    # T640. Both halves are accessibility, not polish: before this the only way
+    # to learn what a circular button did was to press it, and there was no way
+    # to press either one without a mouse.
+    Assert (Invoke-FeedbackButton $view) 're-opening the composer for the keyboard arms'
+    [void](Wait-FeedbackState $errlog $paneId $true)
+    # Both handles are the ones the earlier arms already resolved: the composer
+    # window and its control are created once and hidden/shown, not rebuilt per
+    # open. Re-derived rather than assumed only where the pane may have been
+    # torn down, which is not the case here.
+    # Text, so the send button is LIVE -- it is disabled while there is nothing
+    # to send, and focus does not stop on a dead control.
+    [void](Send-TestControlText -Control $rich -Text 'tab me')
+    Start-Sleep -Milliseconds 400
+
+    $tips = Wait-FeedbackTips $errlog $paneId
+    Assert ($tips -and $tips.ContainsKey('snapshot') -and $tips.ContainsKey('send')) `
+        "both actions registered a tooltip (got '$(@($tips.Keys) -join ",")')"
+    if ($tips -and $tips.ContainsKey('snapshot') -and $tips.ContainsKey('send')) {
+        Assert ($tips['snapshot'].Text -match 'screenshot' -and $tips['snapshot'].Text -match 'Ctrl\+Shift\+S') `
+            "the '+' names the screenshot and its chord ('$($tips['snapshot'].Text)')"
+        Assert ($tips['send'].Text -match 'Send' -and $tips['send'].Text -match 'Ctrl\+Enter') `
+            "the arrow names the send and its chord ('$($tips['send'].Text)')"
+        Assert (Test-FeedbackTipIsHitBox $tips['snapshot']) `
+            "the '+' tip covers its HIT box, not just its painted square"
+        Assert (Test-FeedbackTipIsHitBox $tips['send']) `
+            'the send tip covers its HIT box too'
+    }
+
+    # The walk. Tab is posted at the TEXT control for the first step (that is
+    # where focus really is) and at the BAND for the rest, because from there
+    # the band itself is the focused window -- the two actions are painted by
+    # it, not child controls of it.
+    [void](Send-TestControlKey -Control $rich -Key Tab)
+    Assert ((Wait-FeedbackFocus $errlog $paneId 'snapshot') -eq 'snapshot') `
+        "Tab from the text reaches the '+' button (focus '$(Get-FeedbackFocus $errlog $paneId)')"
+    [void](Send-TestControlKey -Control $fb -Key Tab)
+    Assert ((Wait-FeedbackFocus $errlog $paneId 'send') -eq 'send') `
+        "...then the send button (focus '$(Get-FeedbackFocus $errlog $paneId)')"
+    [void](Send-TestControlKey -Control $fb -Key Tab)
+    Assert ((Wait-FeedbackFocus $errlog $paneId 'text') -eq 'text') `
+        "...and back to the text, which is where a Tab off the end has to go (focus '$(Get-FeedbackFocus $errlog $paneId)')"
+
+    # Shift+Tab walks it backwards. Sent as a real chord (attached input queue)
+    # rather than a posted modifier: the app reads the shift state with
+    # GetKeyState, which a plain PostMessage cannot arrange.
+    [void](Send-TestViewerChord -Window $view.Top -Target $rich -Key Tab -Modifiers Shift)
+    Assert ((Wait-FeedbackFocus $errlog $paneId 'send') -eq 'send') `
+        "shift+Tab from the text walks back to the send button (focus '$(Get-FeedbackFocus $errlog $paneId)')"
+
+    # Space presses the focused button -- the same action a click does. The
+    # oracle is the send the pane reports, and the focus line is still `send`
+    # when it happens, which is the ring surviving its own activation.
+    $sendsBeforeSpace = Get-FeedbackSendCount $errlog $paneId
+    [void](Send-TestControlKey -Control $fb -Key Space)
+    $sentBySpace = $false
+    for ($t = 0; $t -lt 40; $t++) {
+        if ((Get-FeedbackSendCount $errlog $paneId) -gt $sendsBeforeSpace) { $sentBySpace = $true; break }
+        Start-Sleep -Milliseconds 250
+    }
+    Assert $sentBySpace 'Space on the focused send button files the report, the way a click does'
+    Assert ((Get-FeedbackFocus $errlog $paneId) -eq 'send') `
+        'the send fired with focus still on the send button (nothing dropped the ring first)'
+    [void](Wait-FeedbackState $errlog $paneId $false)
+
+    # And Enter is the other key every Windows button answers. Same walk, same
+    # oracle -- what is being proved is the second half of the branch, not the
+    # walk again.
+    Assert (Invoke-FeedbackButton $view) 're-opening the composer for the Enter arm'
+    [void](Wait-FeedbackState $errlog $paneId $true)
+    # Both handles are the ones the earlier arms already resolved: the composer
+    # window and its control are created once and hidden/shown, not rebuilt per
+    # open. Re-derived rather than assumed only where the pane may have been
+    # torn down, which is not the case here.
+    [void](Send-TestControlText -Control $rich -Text 'enter me')
+    Start-Sleep -Milliseconds 400
+    [void](Send-TestControlKey -Control $rich -Key Tab)
+    [void](Wait-FeedbackFocus $errlog $paneId 'snapshot')
+    [void](Send-TestControlKey -Control $fb -Key Tab)
+    Assert ((Wait-FeedbackFocus $errlog $paneId 'send') -eq 'send') `
+        'two Tabs reach the send button again'
+    $sendsBeforeEnter = Get-FeedbackSendCount $errlog $paneId
+    [void](Send-TestControlKey -Control $fb -Key Enter)
+    $sentByEnter = $false
+    for ($t = 0; $t -lt 40; $t++) {
+        if ((Get-FeedbackSendCount $errlog $paneId) -gt $sendsBeforeEnter) { $sentByEnter = $true; break }
+        Start-Sleep -Milliseconds 250
+    }
+    Assert $sentByEnter 'Enter on the focused send button files the report too'
     [void](Wait-FeedbackState $errlog $paneId $false)
 
     # --- H. the chords are pane-scoped ---------------------------------------

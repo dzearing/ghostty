@@ -71,6 +71,96 @@ pub const max_lines: u32 = 6;
 pub const Button = enum { snapshot, send };
 pub const button_count = std.enums.values(Button).len;
 
+/// What a button SAYS when you hover it (T640), and what a screen reader would
+/// have to be told. Mac's `.help` strings with their chords respelled for
+/// Windows — the chord belongs in the label because it is the only place the
+/// composer ever names it (Mac does the same).
+pub fn label(b: Button) []const u8 {
+    return switch (b) {
+        .snapshot => "Add a screenshot of the screen (Ctrl+Shift+S)",
+        .send => "Send feedback (Ctrl+Enter)",
+    };
+}
+
+/// Where keyboard focus can be inside the composer (T640). `text` is the text
+/// surface — the RichEdit, or the web composer's editor — and is where focus
+/// starts and returns to; the other two are the circular actions.
+///
+/// A CYCLE rather than a chain that tabs out of the band: the composer is a
+/// modal-feeling group inside a viewer pane, and the pane's own chrome has no
+/// tab order to hand focus on to. Tabbing off the end therefore has exactly
+/// one sensible destination, which is where the user was typing.
+pub const Stop = enum { text, snapshot, send };
+
+pub fn stopOf(b: Button) Stop {
+    return switch (b) {
+        .snapshot => .snapshot,
+        .send => .send,
+    };
+}
+
+/// The button a stop names, or null for the text surface.
+pub fn buttonOf(s: Stop) ?Button {
+    return switch (s) {
+        .text => null,
+        .snapshot => .snapshot,
+        .send => .send,
+    };
+}
+
+/// The next stop after `cur`, walking forward (Tab) or back (shift+Tab).
+///
+/// A DISABLED action is skipped, the way Windows skips a disabled control in a
+/// dialog's tab order — the send button is dead while the report is empty, and
+/// a focus ring on a button that cannot be pressed is a dead end. `text` is
+/// always a stop, so the walk always terminates.
+pub fn nextStop(cur: Stop, back: bool, enabled: [button_count]bool) Stop {
+    const ring = [_]Stop{ .text, .snapshot, .send };
+    var i: usize = for (ring, 0..) |s, idx| {
+        if (s == cur) break idx;
+    } else 0;
+    var steps: usize = 0;
+    while (steps < ring.len) : (steps += 1) {
+        i = if (back)
+            (i + ring.len - 1) % ring.len
+        else
+            (i + 1) % ring.len;
+        const s = ring[i];
+        const b = buttonOf(s) orelse return s;
+        if (enabled[@intFromEnum(b)]) return s;
+    }
+    return .text;
+}
+
+/// The 2 DIP accent focus ring, inset 1 DIP inside the button's painted square
+/// (design system §2.2). Returned as the ellipse a GDI pen is stroked ALONG,
+/// so the inset already accounts for the pen straddling the path — a ring
+/// drawn on the deflated square itself would spill half its width back over
+/// the button's edge.
+pub const focus_ring_dip: f32 = 2.0;
+pub const focus_inset_dip: f32 = 1.0;
+
+pub const FocusRing = struct {
+    /// The path the pen follows.
+    path: Rect,
+    /// Pen width, at least one physical pixel.
+    width: i32,
+};
+
+pub fn focusRing(scale: f32, painted: Rect) FocusRing {
+    const w = @max(px(focus_ring_dip, scale), 1);
+    const inset = px(focus_inset_dip, scale) + @divTrunc(w, 2);
+    return .{
+        .path = .{
+            .left = painted.left + inset,
+            .top = painted.top + inset,
+            .right = painted.right - inset,
+            .bottom = painted.bottom - inset,
+        },
+        .width = w,
+    };
+}
+
 /// What the bar is being asked to lay out. A struct rather than five
 /// positional arguments so a call site cannot silently swap two i32s.
 pub const Input = struct {
@@ -770,4 +860,71 @@ test "fitInto letterboxes rather than crops, and never yields a zero side" {
     try testing.expectEqual(@as(i32, 0), fitInto(0, 10, 56).w);
     try testing.expectEqual(@as(i32, 0), fitInto(10, 0, 56).h);
     try testing.expectEqual(@as(i32, 0), fitInto(10, 10, 0).w);
+}
+
+// T640: the composer's keyboard focus model. The walk is the whole feature —
+// a button nobody can reach is a button nobody can use — so it is asserted
+// here, in a lane with no window in it, rather than only on the box.
+test "nextStop walks text -> snapshot -> send -> text, and back" {
+    const all = [_]bool{ true, true };
+
+    try testing.expectEqual(Stop.snapshot, nextStop(.text, false, all));
+    try testing.expectEqual(Stop.send, nextStop(.snapshot, false, all));
+    try testing.expectEqual(Stop.text, nextStop(.send, false, all));
+
+    try testing.expectEqual(Stop.send, nextStop(.text, true, all));
+    try testing.expectEqual(Stop.snapshot, nextStop(.send, true, all));
+    try testing.expectEqual(Stop.text, nextStop(.snapshot, true, all));
+}
+
+test "nextStop skips a disabled action rather than parking focus on it" {
+    // The shipped case: an empty report, so send is dead. Tab from the text
+    // reaches "+" and the next Tab goes back to the text — never onto a
+    // button that cannot be pressed.
+    var enabled = [_]bool{ true, true };
+    enabled[@intFromEnum(Button.send)] = false;
+    try testing.expectEqual(Stop.snapshot, nextStop(.text, false, enabled));
+    try testing.expectEqual(Stop.text, nextStop(.snapshot, false, enabled));
+    try testing.expectEqual(Stop.snapshot, nextStop(.text, true, enabled));
+
+    // And with neither action live the walk still terminates on the text
+    // rather than spinning.
+    const none = [_]bool{ false, false };
+    try testing.expectEqual(Stop.text, nextStop(.text, false, none));
+    try testing.expectEqual(Stop.text, nextStop(.send, false, none));
+}
+
+test "the focus ring stays inside the button's painted square at every scale" {
+    for (scales) |s| {
+        const m = icon_button.Metrics.init(s);
+        const painted: Rect = .{
+            .left = 100,
+            .top = 40,
+            .right = 100 + m.target,
+            .bottom = 40 + m.target,
+        };
+        const ring = focusRing(s, painted);
+        try testing.expect(ring.width >= 1);
+        // The stroke straddles the path, so the OUTER edge is what has to
+        // clear the button's own square — a ring bleeding over the edge reads
+        // as a rendering fault, not as focus.
+        const half = @divTrunc(ring.width, 2);
+        try testing.expect(ring.path.left - half >= painted.left);
+        try testing.expect(ring.path.top - half >= painted.top);
+        try testing.expect(ring.path.right + half <= painted.right);
+        try testing.expect(ring.path.bottom + half <= painted.bottom);
+        // And it is still a ring, not a dot.
+        try testing.expect(ring.path.width() > ring.width * 2);
+    }
+}
+
+test "every action has a label naming what it does and its chord" {
+    for (std.enums.values(Button)) |b| {
+        const text = label(b);
+        try testing.expect(text.len > 0);
+        // The chord is the half a user cannot discover any other way.
+        try testing.expect(std.mem.indexOf(u8, text, "Ctrl+") != null);
+        try testing.expectEqual(stopOf(b), stopOf(buttonOf(stopOf(b)).?));
+    }
+    try testing.expect(buttonOf(.text) == null);
 }

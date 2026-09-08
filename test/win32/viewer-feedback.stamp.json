@@ -1,8 +1,8 @@
 {
     "guard":  "viewer-feedback",
     "script":  "test/win32/viewer-feedback.ps1",
-    "generated":  "2026-09-06T12:12:40-07:00",
-    "commit":  "b8bf50c45",
+    "generated":  "2026-09-08T04:04:08-07:00",
+    "commit":  "ca5cf7358",
     "uncommitted":  [
                         "src/apprt/win32/ViewerFeedbackBar.zig",
                         "test/win32/viewer-feedback.ps1"
@@ -10,7 +10,7 @@
     "files":  {
                   "src/apprt/win32/richedit_tom.zig":  "1cdc66022c7e724d0dd5a3bbd76e83285a9ebcb1b5f4968ac1b4b6e5bacf2523",
                   "src/apprt/win32/viewer_feedback_doc.zig":  "e934bd536bb22be7484e66de00060f32832243928b733350a07828083d22573b",
-                  "src/apprt/win32/ViewerFeedbackBar.zig":  "1b1bb6eba9ae9a6fe5a63bf0342d8d278fbda65cc697eaf353a864a2493fa1f4",
-                  "test/win32/viewer-feedback.ps1":  "4bd5ab83567b58e7bcf4e7ba8f9c9281dc4c0b94a54cdbd741dd07335e7b794b"
+                  "src/apprt/win32/ViewerFeedbackBar.zig":  "e18fda1ad8e2babafe2722ed3db6e15c01e25814b06e110fd654b266720d309c",
+                  "test/win32/viewer-feedback.ps1":  "12dd36a0b74f6fcd16597d1838c58bfd965b5a08e28c20aadce3eabf550a3ed9"
               }
 }

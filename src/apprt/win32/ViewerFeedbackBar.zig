@@ -128,6 +128,15 @@ const placeholder_w = std.unicode.utf8ToUtf16LeStringLiteral(placeholder_utf8);
 /// chords, which is the whole reason it is not Mac's string.
 const hints = "Ctrl+Enter send  ·  Esc close";
 
+/// UTF-16 units one action's tooltip may hold. The labels are fixed strings
+/// (`viewer_feedback_layout.label`) and the longest is under 50, so this is
+/// headroom rather than a limit anything is near.
+const tip_text_cap: usize = 128;
+
+/// Bytes the tooltip log line may hold: two buttons, each a name, two rects
+/// and its label.
+const tip_log_cap: usize = 320;
+
 hwnd: w32.HWND,
 /// The RichEdit. The FALLBACK surface since T934 — hidden and inert whenever
 /// `web` is non-null. See "Which text control this IS".
@@ -157,6 +166,31 @@ hover: ?layout_mod.Button = null,
 pressed: ?layout_mod.Button = null,
 tracking: bool = false,
 focused: bool = false,
+
+/// Which of the composer's three stops holds keyboard focus (T640). `.text`
+/// means the text surface has it — the RichEdit or the web composer — and is
+/// the only value for which this window hands focus straight on; the other two
+/// mean the BAND itself holds the Win32 focus and is drawing a ring on that
+/// button.
+key_focus: layout_mod.Stop = .text,
+
+/// The stop that had focus when a screenshot capture started. The selector is
+/// a full-desktop window and TAKES the keyboard, so the band's `WM_KILLFOCUS`
+/// has already reset `key_focus` by the time the capture finishes — this is
+/// what the ring is restored from.
+capture_focus: layout_mod.Stop = .text,
+
+/// The two actions' tooltips, and the one control that shows them both. Same
+/// arrangement as `ViewerNavBar`: ONE tool per button, added once and then
+/// only moved, with the text living in a buffer comctl32 reads on demand.
+tip: ?w32.HWND = null,
+tip_text: [layout_mod.button_count][tip_text_cap:0]u16 = undefined,
+tip_added: [layout_mod.button_count]bool = [_]bool{false} ** layout_mod.button_count,
+
+/// The last tooltip line handed to the log, so a bounds sync that changes
+/// nothing says nothing.
+tip_log: [tip_log_cap]u8 = undefined,
+tip_log_len: usize = 0,
 
 /// Wrapped lines the control is currently showing, clamped by the layout's own
 /// cap. Cached rather than queried per layout pass: `place` is called from
@@ -384,6 +418,10 @@ pub fn create(
         "viewer feedback composer has no ITextDocument; formatting stays on the undo stack",
         .{},
     );
+    // `tip_text` is `undefined` in the initializer above (it is a pair of
+    // 128-unit buffers, not a value worth zeroing wholesale); what has to be
+    // true before anything reads one is that it terminates.
+    for (&self.tip_text) |*t| t[0] = 0;
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
     // Subclassed LAST, and only once the bar is reachable from the parent:
     // `editProc` finds its bar through `owningEdit`, so a message arriving
@@ -430,6 +468,13 @@ pub fn destroy(self: *ViewerFeedbackBar) void {
     // would reach a proc that can no longer route it.
     if (self.prev_edit_proc) |p| {
         _ = w32.SetWindowLongPtrW(self.edit, w32.GWLP_WNDPROC, @bitCast(@intFromPtr(p)));
+    }
+    // The tooltip is a POPUP owned by the band, not a child of it, so it does
+    // NOT go down with the band — and it subclassed the band to get its hover,
+    // so it has to go first. Same ordering trap the nav bar's tip documents.
+    if (self.tip) |t| {
+        _ = w32.DestroyWindow(t);
+        self.tip = null;
     }
     // Clear the back-pointer FIRST: DestroyWindow delivers messages
     // synchronously, and they must not find a half-dead object.
@@ -898,10 +943,20 @@ pub fn claimsComposerKey(self: *const ViewerFeedbackBar, vk: u16, mods: input.Mo
 /// the controller down and it must not happen under its own callback frame.
 fn runComposerChord(self: *ViewerFeedbackBar, vk: u16, mods: input.Mods) void {
     const chord = viewer_accel.composerChord(vk, mods) orelse return;
+    self.runChord(chord);
+}
+
+/// One place both keyboard surfaces end up: the band's own `WM_KEYDOWN` (via
+/// `handleKey`) and the web composer's accelerator hop (via
+/// `runComposerChord`). A chord added to the table therefore reaches BOTH
+/// without a second switch to keep in step.
+fn runChord(self: *ViewerFeedbackBar, chord: viewer_accel.ComposerChord) void {
     switch (chord) {
         .send => self.pane.sendFeedback(self.alloc),
         .close => self.pane.setFeedbackOpen(false),
         .snapshot => self.beginSnapshot(),
+        .focus_next => self.walkFocus(false),
+        .focus_prev => self.walkFocus(true),
     }
 }
 
@@ -1029,6 +1084,11 @@ pub fn place(self: *ViewerFeedbackBar, top: i32, width: i32, scale: f32) void {
     // back into it here would re-enter it. The correction converges after one
     // pass, because the text rect's WIDTH does not depend on the line count.
     if (self.syncLines()) _ = w32.PostMessageW(self.hwnd, WM_APP_RELAYOUT, 0, 0);
+
+    // Re-synced HERE rather than only at creation: a tool is a RECTANGLE in
+    // this window's client space, so every reposition, DPI change and re-wrap
+    // moves the two buttons out from under their tips.
+    self.syncTip(l);
 }
 
 /// Push the pane's buffer into the control — what opening the composer does,
@@ -1908,6 +1968,207 @@ fn currentLayout(self: *ViewerFeedbackBar) layout_mod.Layout {
 }
 
 // -------------------------------------------------------------------------
+// Tooltips (T640)
+// -------------------------------------------------------------------------
+
+/// A tool id in this bar's own tool space. Keyed on the button so a tool never
+/// has to be renumbered, exactly as `ViewerNavBar.tipId` does it.
+fn tipId(b: layout_mod.Button) usize {
+    return 0x200 + @as(usize, @intFromEnum(b));
+}
+
+/// One tooltip control for both actions, created on demand and kept for the
+/// bar's life. A rect tool in `TTF_SUBCLASS` mode — the delay, the placement
+/// and the dismissal are then comctl32's, which is the same trade the nav bar
+/// makes and for the same reason: this band has no hover machinery of its own
+/// worth driving a tip by hand from.
+fn tipEnsure(self: *ViewerFeedbackBar) ?w32.HWND {
+    if (self.tip) |h| return h;
+
+    var icc = w32.INITCOMMONCONTROLSEX{
+        .dwSize = @sizeOf(w32.INITCOMMONCONTROLSEX),
+        .dwICC = w32.ICC_TAB_CLASSES,
+    };
+    _ = w32.InitCommonControlsEx(&icc);
+
+    const tip = w32.CreateWindowExW(
+        w32.WS_EX_TOPMOST | w32.WS_EX_TOOLWINDOW | w32.WS_EX_NOACTIVATE,
+        w32.TOOLTIPS_CLASS,
+        std.unicode.utf8ToUtf16LeStringLiteral(""),
+        w32.WS_POPUP | w32.TTS_ALWAYSTIP | w32.TTS_NOPREFIX,
+        w32.CW_USEDEFAULT,
+        w32.CW_USEDEFAULT,
+        w32.CW_USEDEFAULT,
+        w32.CW_USEDEFAULT,
+        self.hwnd,
+        null,
+        null,
+        null,
+    ) orelse return null;
+
+    // The composer's own theme decides the tip's: this band is already dark or
+    // light for the page it sits over, and a light tip over a dark composer is
+    // the seam the nav bar's tips do not have.
+    if (self.dark) {
+        _ = w32.SetWindowTheme(
+            tip,
+            std.unicode.utf8ToUtf16LeStringLiteral("DarkMode_Explorer"),
+            null,
+        );
+    }
+    self.tip = tip;
+    return tip;
+}
+
+fn tipToolInfo(
+    self: *ViewerFeedbackBar,
+    b: layout_mod.Button,
+    rect: w32.RECT,
+) w32.TOOLINFOW {
+    return .{
+        .cbSize = @sizeOf(w32.TOOLINFOW),
+        .uFlags = w32.TTF_SUBCLASS,
+        .hwnd = self.hwnd,
+        .uId = tipId(b),
+        .rect = rect,
+        .hinst = null,
+        .lpszText = @ptrCast(&self.tip_text[@intFromEnum(b)]),
+        .lParam = 0,
+        .lpReserved = null,
+    };
+}
+
+/// Bring both tooltips in line with the composer's current rects. Idempotent,
+/// and safe before the tip control exists.
+///
+/// A button the layout has squeezed to nothing has its tool DELETED rather
+/// than left pointing at a rectangle nothing paints — a violently narrow pane
+/// does exactly that to the actions.
+fn syncTip(self: *ViewerFeedbackBar, l: layout_mod.Layout) void {
+    const m = icon_button.Metrics.init(self.scale);
+    var line: [tip_log_cap]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&line);
+    const w = fbs.writer();
+    for (std.enums.values(layout_mod.Button)) |b| {
+        const i = @intFromEnum(b);
+        const box = l.button(b);
+        if (box.width() <= 0) {
+            self.tipDelete(b);
+            continue;
+        }
+
+        const text = layout_mod.label(b);
+        const n = std.unicode.utf8ToUtf16Le(self.tip_text[i][0 .. tip_text_cap - 1], text) catch 0;
+        self.tip_text[i][n] = 0;
+        if (n == 0) {
+            self.tipDelete(b);
+            continue;
+        }
+
+        const tip = self.tipEnsure() orelse return;
+        // The HIT box, not the paint: a tip should follow the same forgiving
+        // target the click does (design system — a hit box may exceed its
+        // paint), or the two disagree at the edges.
+        const hit = icon_button.hitBox(m, box);
+        var ti = self.tipToolInfo(b, .{
+            .left = hit.left,
+            .top = hit.top,
+            .right = hit.right,
+            .bottom = hit.bottom,
+        });
+        if (!self.tip_added[i]) {
+            if (w32.SendMessageW(tip, w32.TTM_ADDTOOLW, 0, @bitCast(@intFromPtr(&ti))) == 0) continue;
+            self.tip_added[i] = true;
+        } else {
+            _ = w32.SendMessageW(tip, w32.TTM_NEWTOOLRECTW, 0, @bitCast(@intFromPtr(&ti)));
+            _ = w32.SendMessageW(tip, w32.TTM_UPDATETIPTEXTW, 0, @bitCast(@intFromPtr(&ti)));
+        }
+        w.print(" {s}:paint={d},{d},{d},{d}:tool={d},{d},{d},{d}:text=\"{s}\"", .{
+            @tagName(b),
+            box.left, box.top,  box.right,  box.bottom,
+            hit.left, hit.top,  hit.right,  hit.bottom,
+            text,
+        }) catch {};
+    }
+
+    self.logTips(line[0..fbs.pos]);
+}
+
+/// State the composer's tooltips in the GUI's own stderr, once per CHANGE.
+///
+/// The band is owner-painted chrome on a desktop nothing can screenshot, so
+/// this line is the acceptance script's only view of which tools exist and
+/// where they sit — the same oracle, for the same reason, as the nav bar's
+/// (T639). Once per change rather than per sync: `place` runs on every bounds
+/// pass, and a line per pass would bury the one that changed.
+fn logTips(self: *ViewerFeedbackBar, line: []const u8) void {
+    if (line.len > self.tip_log.len) return;
+    if (std.mem.eql(u8, self.tip_log[0..self.tip_log_len], line)) return;
+    @memcpy(self.tip_log[0..line.len], line);
+    self.tip_log_len = line.len;
+    log.info("viewer feedback tips pane={s}{s}", .{ self.pane.paneId(), line });
+}
+
+fn tipDelete(self: *ViewerFeedbackBar, b: layout_mod.Button) void {
+    const i = @intFromEnum(b);
+    if (!self.tip_added[i]) return;
+    var ti = self.tipToolInfo(b, .{ .left = 0, .top = 0, .right = 0, .bottom = 0 });
+    if (self.tip) |t| _ = w32.SendMessageW(t, w32.TTM_DELTOOLW, 0, @bitCast(@intFromPtr(&ti)));
+    self.tip_added[i] = false;
+}
+
+// -------------------------------------------------------------------------
+// Keyboard focus (T640)
+// -------------------------------------------------------------------------
+
+/// Which actions a Tab may land on right now — the send button is dead while
+/// there is nothing to send, and focus does not stop on a dead control.
+fn enabledActions(self: *const ViewerFeedbackBar) [layout_mod.button_count]bool {
+    var out: [layout_mod.button_count]bool = undefined;
+    for (std.enums.values(layout_mod.Button)) |b| {
+        out[@intFromEnum(b)] = self.buttonEnabled(b);
+    }
+    return out;
+}
+
+/// Move keyboard focus to `stop` and show it.
+///
+/// The band itself takes the Win32 focus for a BUTTON stop — there is no child
+/// window to focus, the actions are painted by this window — and hands focus
+/// straight on to the text surface for `.text`, which is what `WM_SETFOCUS`
+/// has always done.
+fn focusStop(self: *ViewerFeedbackBar, stop: layout_mod.Stop) void {
+    self.key_focus = stop;
+    if (stop == .text) {
+        self.takeFocus();
+    } else if (w32.GetFocus() != self.hwnd) {
+        _ = w32.SetFocus(self.hwnd);
+    }
+    _ = w32.InvalidateRect(self.hwnd, null, 1);
+    // The acceptance oracle for the tab order (T640): the ring is painted
+    // chrome on a desktop nothing can screenshot, so where focus LANDED is
+    // stated rather than looked at.
+    log.info("viewer feedback focus pane={s} stop={s}", .{ self.pane.paneId(), @tagName(stop) });
+}
+
+/// Tab / shift+Tab.
+fn walkFocus(self: *ViewerFeedbackBar, back: bool) void {
+    self.focusStop(layout_mod.nextStop(self.key_focus, back, self.enabledActions()));
+}
+
+/// Space or Enter on a focused action — the same thing a click does.
+///
+/// Only ever reached while a BUTTON holds focus, which is the guard that keeps
+/// a bare Enter in the text surface a newline (the one behavior this composer
+/// must never lose) and a space a space.
+fn activateFocused(self: *ViewerFeedbackBar) bool {
+    const b = layout_mod.buttonOf(self.key_focus) orelse return false;
+    if (!self.buttonEnabled(b)) return true;
+    self.activate(b);
+    return true;
+}
+
+// -------------------------------------------------------------------------
 // Painting
 // -------------------------------------------------------------------------
 
@@ -2102,6 +2363,24 @@ fn paintButtons(self: *ViewerFeedbackBar, hdc: w32.HDC, l: layout_mod.Layout) vo
             if (pen) |p| _ = w32.DeleteObject(p);
         }
 
+        // Design system §2.2: a control that can be tabbed to draws a 2 DIP
+        // accent ring inset 1 DIP inside its painted square whenever it holds
+        // keyboard focus — a CIRCLE here, for the same reason the fill above
+        // is one. Drawn under the glyph so the mark stays legible over it.
+        if (layout_mod.buttonOf(self.key_focus) == b) {
+            const ring = layout_mod.focusRing(self.scale, icon_button.targetBox(m, box));
+            const pen = w32.CreatePen(w32.PS_SOLID, ring.width, self.accent_ref);
+            const hollow = w32.GetStockObject(w32.NULL_BRUSH);
+            if (pen) |p| {
+                const prev_pen = w32.SelectObject(hdc, p);
+                const prev_brush = if (hollow) |h| w32.SelectObject(hdc, h) else null;
+                _ = w32.Ellipse(hdc, ring.path.left, ring.path.top, ring.path.right, ring.path.bottom);
+                if (prev_brush) |pb| _ = w32.SelectObject(hdc, pb);
+                _ = w32.SelectObject(hdc, prev_pen);
+                _ = w32.DeleteObject(p);
+            }
+        }
+
         const glyph = buttonGlyph(b);
         const color = if (enabled) self.text_ref else self.secondary_ref;
         icon_paint.glyph(hdc, m, icon_button.glyphTarget(m, box, glyph), glyph, color);
@@ -2209,6 +2488,8 @@ fn activate(self: *ViewerFeedbackBar, b: layout_mod.Button) void {
 /// not a second screenshot, it is a stuck screen.
 fn beginSnapshot(self: *ViewerFeedbackBar) void {
     if (self.selector != null) return;
+    // Before the overlay takes the keyboard — see `capture_focus`.
+    self.capture_focus = self.key_focus;
     const hinstance: ?w32.HINSTANCE = @ptrCast(w32.GetModuleHandleW(null));
     self.selector = RegionSelector.begin(
         self.alloc,
@@ -2238,8 +2519,11 @@ fn captureDone(ctx: *anyopaque, png: ?[]const u8) void {
         _ = self.attachImage(bytes);
     }
     // The overlay took the keyboard to get its Escape; the composer is where
-    // the user was typing, and where the chip just landed.
-    _ = w32.SetFocus(self.edit);
+    // the user was typing, and where the chip just landed. Back to whichever
+    // stop had focus, so a capture started from the keyboard leaves the ring
+    // on the button that started it rather than silently dropping into the
+    // text (T640).
+    self.focusStop(self.capture_focus);
 }
 
 /// Repaint the composer's own chrome — what the pane calls when something it
@@ -2263,12 +2547,17 @@ pub fn handleKey(self: *ViewerFeedbackBar, vk: u16) bool {
             w32.GetKeyState(@as(i32, w32.VK_RWIN)) < 0,
     };
     if (viewer_accel.composerChord(vk, mods)) |chord| {
-        switch (chord) {
-            .send => self.pane.sendFeedback(self.alloc),
-            .close => self.pane.setFeedbackOpen(false),
-            .snapshot => self.beginSnapshot(),
-        }
+        self.runChord(chord);
         return true;
+    }
+    // Space and Enter press the action that has keyboard focus (T640) — the
+    // same two keys every Windows button answers. Guarded on a BUTTON holding
+    // focus, which is what keeps a bare Enter in the text a newline and a
+    // space a space; the guard is exact, so a chorded Space still falls
+    // through to whatever else claims it.
+    const bare = !mods.ctrl and !mods.shift and !mods.alt and !mods.super;
+    if (bare and (vk == w32.VK_SPACE or vk == w32.VK_RETURN)) {
+        if (self.activateFocused()) return true;
     }
     return false;
 }
@@ -2455,12 +2744,25 @@ fn wndProc(
         // somewhere the user cannot type.
         w32.WM_SETFOCUS => {
             self.focused = true;
-            self.takeFocus();
+            // A BUTTON stop means the band itself is the focused control and
+            // is drawing the ring — handing focus on to the text there would
+            // undo the Tab that just arrived. Every other case is the old
+            // behavior: focus lands on the text, never on the band.
+            if (self.key_focus == .text) {
+                self.takeFocus();
+            } else {
+                _ = w32.InvalidateRect(hwnd, null, 1);
+            }
             return 0;
         },
 
         w32.WM_KILLFOCUS => {
             self.focused = false;
+            // Focus left the band — to the text surface, or out of the
+            // composer entirely. Either way no action holds it any more, so
+            // the ring goes with it rather than lingering on a control the
+            // keyboard no longer reaches.
+            self.key_focus = .text;
             _ = w32.InvalidateRect(hwnd, null, 1);
             return 0;
         },
