@@ -1,8 +1,8 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-07T21:43:42-07:00",
-    "commit":  "aee15d5ef",
+    "generated":  "2026-09-07T22:32:57-07:00",
+    "commit":  "7585bbcd8",
     "uncommitted":  [
                         "test/win32/agent-upgrade.ps1"
                     ],
@@ -29,7 +29,7 @@
                   "test/win32/agent-session-cap.ps1":  "1c90f39debadea2b3312dd9c887d8eafaadfc8caf2ac5892ba5aaffaaf5fee66",
                   "test/win32/agent-sharing-uplink.ps1":  "c54931d12271843b23de4d51f661facdbcde4ee80e95bd31c3b8cbb9e1aa7828",
                   "test/win32/agent-shell-integration.ps1":  "ebc70342790916e10144a3a565cc02675bbc7665ed48aaf46f0e5e331ca96611",
-                  "test/win32/agent-upgrade.ps1":  "b6b8574164a29f271e0de3018b5869d7e51131816d31fc5dd6501f0fcdec22d8",
+                  "test/win32/agent-upgrade.ps1":  "7d1c9b04a135cffe176c6b14d804a597f24dea93fa140ba9c7bfc2867f9f4fc1",
                   "test/win32/agent-user-env.ps1":  "7ea19bc9332a520cec15cf4ff3c2b40a2c1daa7968c5a6bf9951d4c3151e9df3",
                   "test/win32/asserted-nothing.ps1":  "3a930fa9a26bdf5ed95254373cb55c047d3f803d5cc413059ed94391d19126ed",
                   "test/win32/auto-launch-cwd.ps1":  "eec10c5396d125e017edde1280851d1fce687337742a64ca5f34da9eee36bec3",
