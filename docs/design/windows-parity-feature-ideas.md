@@ -251,3 +251,14 @@ as the digest that showed them.
 - Tell me when this finishes, whatever I am doing (per-pane toast on command exit, click to focus)
 - A test that cannot pass while switched off (harness rule: prove a live-update assertion can fail)
 - Say how far behind the installed build is (surface the commits-since-release gap in About)
+
+## 2026-09-08
+
+- Paste that shows you what you are about to paste (preview card for multi-line/long clipboard)
+- A pane that tells you when it stopped needing you ("waiting on me" mark that clears at the prompt)
+- Reopen the file I just saw scroll past (recent-paths tray built from pane output)
+- Session names you did not have to invent (auto-named persistent sessions from cwd + command)
+- Dim the panes that are not yours right now (contrast falloff on unfocused panes)
+- A release the loop cannot forget to cut (publish on the day's last good commit, supervisor as backstop)
+- Tell me the gap in the app, not the digest (About names commits and headline fixes waiting)
+- A harness that has never gone red is not a harness (extend the demonstration rule to acceptance scripts)
