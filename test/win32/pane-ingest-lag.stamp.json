@@ -1,8 +1,8 @@
 {
     "guard":  "pane-ingest-lag",
     "script":  "test/win32/pane-ingest-lag.ps1",
-    "generated":  "2026-09-07T16:51:09-07:00",
-    "commit":  "897e3d7dc",
+    "generated":  "2026-09-08T12:43:39-07:00",
+    "commit":  "d46034d5b",
     "uncommitted":  [
                         "src/termio/Remote.zig"
                     ],
@@ -10,7 +10,7 @@
                   "src/remote/inbound_ring.zig":  "7cdc4d17070ea22458dfe96552220960bc0dbff98303505ceab02eb12a89ff9c",
                   "src/renderer/State.zig":  "0bc28495dd625a103c494364d4e67ea03857acb6ea6a427eddb2410e9ab4b4a0",
                   "src/termio/Exec.zig":  "9a7474e31ed51ef9384056af9089c0dcc38dcd63374f5cc89701d674474bd6cd",
-                  "src/termio/Remote.zig":  "6aac60d98254e884aea0e1e8c014f8768271d45e40c5d641ffaea8225e89f764",
+                  "src/termio/Remote.zig":  "6079d06072d56f036bf91a823321b9e91202d0db626f5cd1fea32494d62222e3",
                   "test/win32/pane-ingest-lag.ps1":  "a5c9ffcbdeae28c26b54d98d09586137bcba9be70691c2b2634c781b3fdf9768"
               }
 }

@@ -438,13 +438,31 @@ pub fn drawFrameEnd(self: *OpenGL) void {
     }
 
     const hdc = gl_loader.active().getCurrentDC();
-    if (hdc != null) _ = gl_loader.active().swapBuffers(hdc);
-    perf.frame(self.rt_surface);
+    var swap_ns: u64 = 0;
+    if (hdc != null) {
+        // T1458: time the present itself, not just the gap between presents.
+        // `max_gap_ms` below cannot tell "idle, nothing to draw" from "the
+        // present blocked", and on a streamed/virtual display the present is
+        // the leading suspect: the frame renders on one adapter and has to
+        // reach a virtual display owned by another driver. `perf.now()` is a
+        // no-op when telemetry is off, so this costs one branch per frame.
+        const swap_start = perf.now();
+        _ = gl_loader.active().swapBuffers(hdc);
+        if (swap_start) |start| {
+            if (perf.now()) |end| swap_ns = end.since(start);
+        }
+    }
+    perf.frame(self.rt_surface, swap_ns);
 }
 
 /// Win32 frame-pacing telemetry (T40/T48): when GHOZTTY_PERF is set in
-/// the environment, log frames-per-second, the longest inter-frame gap,
-/// and the max SwapBuffers-to-SwapBuffers stall once per second. Costs
+/// the environment, log frames-per-second, the longest inter-frame gap, and
+/// (T1458) the cost of the present itself - `swap_max_ms` and `swap_avg_us` -
+/// once per second. The gap and the swap answer different questions and only
+/// the pair is diagnostic: a large `max_gap_ms` with a small `swap_avg_us` is
+/// a renderer that had nothing to draw, while a `swap_avg_us` that dominates
+/// the frame budget is a present that is blocking, which is what a virtual /
+/// streamed display is expected to look like. Costs
 /// one branch per frame when disabled. Renderer-thread only (each
 /// surface has its own renderer thread; state is threadlocal so panes
 /// don't interleave).
@@ -463,37 +481,60 @@ const perf = struct {
     threadlocal var last_frame: ?std.time.Instant = null;
     threadlocal var frames: u32 = 0;
     threadlocal var max_gap_ns: u64 = 0;
+    threadlocal var swap_total_ns: u64 = 0;
+    threadlocal var swap_max_ns: u64 = 0;
 
-    fn frame(surface: *apprt.Surface) void {
-        const on = enabled orelse on: {
+    fn isOn() bool {
+        return enabled orelse on: {
             const on = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_PERF");
             enabled = on;
             break :on on;
         };
-        if (!on) return;
+    }
 
-        const now = std.time.Instant.now() catch return;
+    /// A clock that only ticks when telemetry is on, so the caller can bracket
+    /// a call site without paying for a timestamp on every frame in a normal
+    /// build.
+    fn now() ?std.time.Instant {
+        if (!isOn()) return null;
+        return std.time.Instant.now() catch null;
+    }
+
+    fn frame(surface: *apprt.Surface, swap_ns: u64) void {
+        if (!isOn()) return;
+
+        const tick = std.time.Instant.now() catch return;
         if (last_frame) |last| {
-            const gap = now.since(last);
+            const gap = tick.since(last);
             if (gap > max_gap_ns) max_gap_ns = gap;
         }
-        last_frame = now;
+        last_frame = tick;
         frames += 1;
+        swap_total_ns += swap_ns;
+        if (swap_ns > swap_max_ns) swap_max_ns = swap_ns;
 
         const start = window_start orelse {
-            window_start = now;
+            window_start = tick;
             return;
         };
-        const elapsed = now.since(start);
+        const elapsed = tick.since(start);
         if (elapsed >= std.time.ns_per_s) {
             const fps = @as(u64, frames) * std.time.ns_per_s / @max(elapsed, 1);
             log.info(
-                "perf pane={s} fps={d} max_gap_ms={d}",
-                .{ surface.paneId(), fps, max_gap_ns / std.time.ns_per_ms },
+                "perf pane={s} fps={d} max_gap_ms={d} swap_max_ms={d} swap_avg_us={d}",
+                .{
+                    surface.paneId(),
+                    fps,
+                    max_gap_ns / std.time.ns_per_ms,
+                    swap_max_ns / std.time.ns_per_ms,
+                    swap_total_ns / @max(frames, 1) / std.time.ns_per_us,
+                },
             );
-            window_start = now;
+            window_start = tick;
             frames = 0;
             max_gap_ns = 0;
+            swap_total_ns = 0;
+            swap_max_ns = 0;
         }
     }
 };

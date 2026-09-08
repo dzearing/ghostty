@@ -25380,3 +25380,67 @@ first reply rather than spending the deadline waiting for an installer to run
 itself, and the `inline for` over the enum means a new failure variant cannot
 arrive without deciding. The host floor loop is its one caller, so the shipped
 behaviour and the tested behaviour cannot drift apart.
+
+## 2026-09-08 - T1458: the pane-lag report gets numbers, and they kill the leading theory
+
+The user reported that Claude Code inside a Ghoztty pane feels laggy where the
+same work in conhost feels light. The card came with a strong hypothesis - the
+box runs a streamed console session with Parsec and Virtual Desktop adapters
+alongside the 4090, so an OpenGL frame rendered on one adapter and presented to a
+virtual display owned by another would pay a per-frame cross-adapter trip that
+conhost never pays. It also came with a warning that the hypothesis was a
+hypothesis. It is now dead, and the way it died is the point.
+
+The instrument it needed did not exist. `renderer/OpenGL.zig` logged `fps` and
+`max_gap_ms`, and the card believed `max_gap_ms` was a SwapBuffers stall - but it
+is the gap between presents, which is the same number whether the present blocked
+for 600 ms or the renderer simply had nothing to draw for 600 ms. Those are
+opposite diagnoses and one number could not tell them apart, so the first change
+here times `swapBuffers` itself: `swap_max_ms` and `swap_avg_us` on the same
+per-second line. The answer is 15-194 microseconds, with `swap_max_ms` reading 0
+in all 1,240 samples across two runs. A present that costs 0.03 ms cannot be
+behind a lag anyone can feel, and the proposed follow-up - drag the window
+between the physical and virtual displays and compare - is moot, because no
+comparison can rescue it.
+
+Then the A/B, which is what the whole report rests on. One workload, shaped like
+what Claude Code actually emits (streaming tokens, a spinner, a full-width CR
+status repaint every seventh write), timing itself so the number does not depend
+on the harness, run byte for byte in both terminals on the reporting desktop. At
+4,000 chunks Ghoztty wins, 57 ms to 76 ms - both terminals just swallow the burst
+into the pipe. At 400,000 chunks it is 9,088 ms against conhost's 6,087, and the
+writer's clock flatters us: the pane was still parsing its backlog more than
+twenty seconds after the writer was released, at a sustained ~50 KB/s where
+conhost had done the whole 8 MB at ~1.3 MB/s. The gap the user feels is not 1.5x.
+
+Finding where that second goes turned up the gap worth writing down. The capture
+came back with `reads_per_s NO SAMPLES` and no `io_exec` scope in the log at all,
+because a pane whose PTY is held by `ghoztty-agent` never enters `Exec.zig`'s
+ConPTY reader - it arrives through `termio/Remote.zig`. Every "is the terminal
+keeping up?" number we have instruments a path the shipped build does not take.
+So the busiest code in the program had no throughput telemetry whatsoever, and
+the second change gives it some: `perf agent_feed` reports KB/s, slices, and -
+the two clocks the comments in that file are arguments about, neither ever read -
+time spent inside the parser under the renderer mutex, and time spent handing
+that mutex to a priority waiter between slices.
+
+The handoff, which T111b bounded so carefully, costs zero: `yield_ms_per_s` was 0
+in every sustained second. What is left is ~500 ms of every wall-clock second
+inside `processOutputTracked` while moving 50 KB - about 10 ms per KB, which no
+parser is. That call self-locks, so the clock covers lock wait plus work and
+cannot yet say which. The arithmetic points hard at the first: the renderer ran
+at 12 fps in those same seconds, and 12 frames times roughly 40 ms of held mutex
+is ~480 ms/s. That is a very good match and it is still an inference, so it is
+filed as the next measurement (T1460) rather than written down as a cause -
+`IpcHandlers.zig` already splits lock wait from work under the lock and is the
+pattern to copy. The throughput deficit itself is T1461, and a separate
+observation that a short burst presents at 421-514 fps - one present per wakeup,
+for a screen that shows 60 - is T1462.
+
+One process note, because it nearly cost more than the task. The first version of
+the measurement script did not dot-source `test\win32\lib\Isolation.ps1`, so its
+CLI calls inherited `$GHOZTTY_IPC_SOCKET` from the pane they ran in and a `+split`
+aimed at a private debug instance landed in the user's installed release, splitting
+the live go-loop window. That is T441's exact defect, and the lib exists precisely
+so it is a solved problem. A hand-rolled measurement script is not exempt from the
+harness rules just because it is not an acceptance script.

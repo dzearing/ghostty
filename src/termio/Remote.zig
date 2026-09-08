@@ -1924,10 +1924,13 @@ const max_parse_slice = 4 * 1024;
 /// slicing only makes the (grid, offset) pair advance in finer steps.
 fn feedSliced(rd: *ThreadData, bytes: []const u8) void {
     var it: SliceIter = .{ .rest = bytes };
+    feed_telemetry.bytes(bytes.len);
     while (it.next()) |slice| {
+        const parse_start = feed_telemetry.now();
         @call(.always_inline, termio.Termio.processOutputTracked, .{
             rd.io, slice, &rd.io.backend.remote.applied_bytes,
         });
+        feed_telemetry.parsed(parse_start);
         // T111b/T114/T115: bounding the HOLD (above) is not enough on its own,
         // because nothing bounds how often we re-take it. `processOutputTracked`
         // self-locks and unlocks, and the next iteration re-locks after
@@ -1946,9 +1949,101 @@ fn feedSliced(rd: *ThreadData, bytes: []const u8) void {
         // So the waiter now announces itself (`lockPriority`) and we keep the
         // mutex UNLOCKED until it is in — a real handoff, bounded so a stream
         // of waiters cannot starve the drain in turn.
-        if (it.rest.len > 0) rd.io.renderer_state.yieldToPriorityWaiters();
+        if (it.rest.len > 0) {
+            const yield_start = feed_telemetry.now();
+            rd.io.renderer_state.yieldToPriorityWaiters();
+            feed_telemetry.yielded(yield_start);
+        }
     }
+    feed_telemetry.report();
 }
+
+/// Env-gated telemetry (GHOZTTY_PERF) for the AGENT data path, added by T1458.
+///
+/// `Exec.zig` has logged `reads_per_s`/`kb_per_s` for the local-ConPTY reader
+/// for a long time, and every measurement of "is the terminal keeping up?"
+/// leaned on it. But a pane whose PTY is held by `ghoztty-agent` never enters
+/// that loop at all, so on the build we ship the busiest path in the program
+/// had no throughput number whatsoever: a capture of a 9-second storm came back
+/// with `reads_per_s NO SAMPLES` and nothing to put in its place.
+///
+/// The two clocks here are the ones the comments above are arguments about, and
+/// neither had ever been read. `parse_ms_per_s` is time spent inside the parser
+/// under the renderer mutex; `yield_ms_per_s` is time spent handing that mutex
+/// to a priority waiter between slices - the T111b handoff, which is bounded by
+/// construction but whose actual cost per second of stream was never measured.
+/// Together with the renderer's `fps`/`swap_avg_us` they say which thread the
+/// second went to.
+///
+/// Threadlocal, like every other counter in this family: one pane, one thread.
+const feed_telemetry = struct {
+    threadlocal var enabled: ?bool = null;
+    threadlocal var window_start: ?std.time.Instant = null;
+    threadlocal var total_bytes: u64 = 0;
+    threadlocal var total_slices: u64 = 0;
+    threadlocal var total_feeds: u64 = 0;
+    threadlocal var parse_ns: u64 = 0;
+    threadlocal var yield_ns: u64 = 0;
+
+    fn isOn() bool {
+        return enabled orelse on: {
+            const on = std.process.hasNonEmptyEnvVarConstant("GHOZTTY_PERF");
+            enabled = on;
+            break :on on;
+        };
+    }
+
+    fn now() ?std.time.Instant {
+        if (!isOn()) return null;
+        return std.time.Instant.now() catch null;
+    }
+
+    fn bytes(n: usize) void {
+        if (!isOn()) return;
+        total_bytes += n;
+        total_feeds += 1;
+    }
+
+    fn parsed(start: ?std.time.Instant) void {
+        const s = start orelse return;
+        total_slices += 1;
+        const end = std.time.Instant.now() catch return;
+        parse_ns += end.since(s);
+    }
+
+    fn yielded(start: ?std.time.Instant) void {
+        const s = start orelse return;
+        const end = std.time.Instant.now() catch return;
+        yield_ns += end.since(s);
+    }
+
+    fn report() void {
+        if (!isOn()) return;
+        const tick = std.time.Instant.now() catch return;
+        const start = window_start orelse {
+            window_start = tick;
+            return;
+        };
+        const elapsed = tick.since(start);
+        if (elapsed < std.time.ns_per_s) return;
+        log.info(
+            "perf agent_feed kb_per_s={d} slices_per_s={d} feeds_per_s={d} parse_ms_per_s={d} yield_ms_per_s={d}",
+            .{
+                (total_bytes * std.time.ns_per_s / @max(elapsed, 1)) / 1024,
+                total_slices * std.time.ns_per_s / @max(elapsed, 1),
+                total_feeds * std.time.ns_per_s / @max(elapsed, 1),
+                (parse_ns * std.time.ns_per_s / @max(elapsed, 1)) / std.time.ns_per_ms,
+                (yield_ns * std.time.ns_per_s / @max(elapsed, 1)) / std.time.ns_per_ms,
+            },
+        );
+        window_start = tick;
+        total_bytes = 0;
+        total_slices = 0;
+        total_feeds = 0;
+        parse_ns = 0;
+        yield_ns = 0;
+    }
+};
 
 /// The pure half of `feedSliced`: hands out the input in `max_parse_slice`
 /// pieces, in order, covering every byte exactly once. Split out so the
