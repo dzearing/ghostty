@@ -871,12 +871,20 @@ pub fn threadEnter(
             // below then pulls back, skipping whatever sat in between). Logged
             // unconditionally because there is no way to read either number from
             // outside the app, and the pane looks identical whichever way it went.
-            log.info("attach: requested={d} head={d} resumed_at={d} repaints={} labeled={}", .{
+            //
+            // T621: `scrollback=` is the third thing that cannot be read from
+            // outside — with it true and `requested=0` the agent sends ONE
+            // reflowed repaint carrying this session's history and skips the raw
+            // ring entirely, which on the cross-machine paths is the difference
+            // between a pane that is usable at once and one that waits for up to
+            // a ring's worth of geometry-bound VT to cross a relay.
+            log.info("attach: requested={d} head={d} resumed_at={d} repaints={} labeled={} scrollback={}", .{
                 self.attach_offset,
                 outcome.snapshot_at_offset,
                 outcome.resume_offset,
                 self.conn.peerRepaintsOnAttach(),
                 self.conn.peerLabelsRepaints(),
+                self.conn.peerSendsScrollbackOnAttach(),
             });
             attach_replay_rows = outcome.replay_rows;
             attach_replay_cols = outcome.replay_cols;

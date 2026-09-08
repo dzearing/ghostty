@@ -56,6 +56,12 @@
 #      one of those probes would time out
 #   G  independent oracle - the agent, asked directly over its pipe, reports all
 #      three original sessions ATTACHED
+#   J  which re-attach a blob-sourced pane takes: offset=0, no WP-D3 delta the
+#      blob cannot carry, and the pane's own output readable afterwards
+#   J2 and what it COSTS (T621): the fresh attach takes a scrollback-bearing
+#      repaint reflowed to this pane's size, not the agent's whole raw ring -
+#      asserted across the relay, so the capability survives the hop
+#   K  a rebuilt remote pane is LIVE, not a replayed picture
 #   H  pressing it again rebuilds nothing: the machine-scoped double-attach
 #      guard holds across the relay too
 #
@@ -652,31 +658,46 @@ try {
 
     # --- J: WHICH re-attach a blob-sourced pane takes, and what it costs ----
     # T413 resolved this deliberately: layout blobs carry no WP-D3 snapshot, so
-    # every pane rebuilt from one attaches at offset 0 and takes the agent's ring
-    # replay. Asserting the log line pins the decision (a future change that put
-    # snapshots back into the topology mirror - and re-uploaded every window on
-    # every layout mutation - would flip these numbers and fail here), and the
-    # marker read-back is the other half: the replay path must still deliver the
-    # pane's CONTENT, which is what T106's capture-geometry reflow plus the
-    # agent's own grid snapshot are there to guarantee.
+    # every pane rebuilt from one attaches at offset 0. Asserting the log line
+    # pins the decision (a future change that put snapshots back into the topology
+    # mirror - and re-uploaded every window on every layout mutation - would flip
+    # these numbers and fail here), and the marker read-back is the other half:
+    # whatever path carries the history must still deliver the pane's CONTENT.
     $deltaAttaches = 0
-    $replayAttaches = 0
+    $freshAttaches = 0
     foreach ($sid in $multiIds) {
         $line = Wait-LogLine $errlogB "attach: session=$sid offset=(\d+) snapshot=(\d+)" 5000
         if ($null -eq $line) { continue }
         if ($line -match 'offset=(\d+) snapshot=(\d+)') {
             if ([int64]$Matches[1] -gt 0 -or [int64]$Matches[2] -gt 0) { $deltaAttaches++ }
-            else { $replayAttaches++ }
+            else { $freshAttaches++ }
         }
     }
-    Assert ($replayAttaches -eq 3) `
-        "J every blob-sourced pane attached at offset=0 snapshot=0, the documented replay path ($replayAttaches of 3)"
+    Assert ($freshAttaches -eq 3) `
+        "J every blob-sourced pane attached at offset=0 snapshot=0, the documented fresh-attach path ($freshAttaches of 3)"
     Assert ($deltaAttaches -eq 0) `
         "and none claimed a WP-D3 delta the blob cannot carry ($deltaAttaches)"
 
+    # J2 (T621): and what that fresh attach now COSTS. Until T621 an offset=0
+    # attach was the expensive one - the agent's repaint covered the visible
+    # screen only, so the client's history could come from nothing but the raw
+    # ring: up to 2 MB per pane, over the relay, drawn at geometries that are no
+    # longer this pane's. With `grid_scrollback` negotiated the repaint carries
+    # the scrollback instead, reflowed to the size THIS pane just asked for, and
+    # the ring is not sent at all.
+    #
+    # `scrollback=true` on the attach line is the app saying it negotiated that
+    # pairing with the agent it is talking to - which here is an agent reached
+    # over the relay, so this is also the assertion that the capability survives
+    # the hop rather than being a same-process handshake. The pre-T621 build logs
+    # no `scrollback=` field at all, so this section fails against it.
+    $scrollbackAttaches = Count-LogLines $errlogB 'attach: requested=0 .*scrollback=true'
+    Assert ($scrollbackAttaches -ge 3) `
+        "J2 every rebuilt pane took the scrollback-bearing repaint, not the raw ring ($scrollbackAttaches of 3)"
+
     $paneIds = @(Get-WindowPaneIds 't336-multi')
     Assert (Wait-PaneText $paneIds $T413MARK) `
-        "J the replay still brought the machine's own output back ('$T413MARK' readable in $($paneIds.Count) rebuilt pane(s))"
+        "J the repaint still brought the machine's own output back ('$T413MARK' readable in $($paneIds.Count) rebuilt pane(s))"
 
     # K (T652): ATTACHED IS NOT ALIVE - and the replay assertion directly above
     # is the sharpest case of it, because a replayed marker is BY DEFINITION a

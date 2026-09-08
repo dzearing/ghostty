@@ -886,14 +886,24 @@ pub const Session = struct {
         emu.feed(bytes);
     }
 
-    /// Serialize the current visible screen as a self-contained VT repaint owned
-    /// by `gpa` (caller frees), sized to the session's current geometry. Returns
-    /// null when there is no emulator yet (a session that produced no output) — the
-    /// caller then falls back to ring-only replay. See `grid_snapshot.zig`.
-    pub fn gridSnapshotAlloc(self: *Session, gpa: Allocator) ?[]u8 {
+    /// Serialize the current screen as a self-contained VT repaint owned by `gpa`
+    /// (caller frees), sized to the session's current geometry — plus, when
+    /// `opts.scrollback` is set, the emulator's retained history above it (T621).
+    /// Returns null when there is no emulator yet (a session that produced no
+    /// output) — the caller then falls back to ring-only replay. See
+    /// `grid_snapshot.zig`.
+    pub fn gridSnapshotAlloc(
+        self: *Session,
+        gpa: Allocator,
+        opts: grid_snapshot.SnapshotOptions,
+    ) ?[]u8 {
         const emu = self.emulator orelse return null;
+        // Reflow to the geometry the ATTACHING client asked for BEFORE
+        // serializing: this is the property a stored, app-side snapshot can never
+        // have, and it is why the scrollback in this payload is worth more than
+        // the raw ring it replaces.
         emu.ensureSize(self.rows, self.cols);
-        return emu.snapshotAlloc(gpa) catch null;
+        return emu.snapshotAlloc(gpa, opts) catch null;
     }
 
     /// True when the emulator shows the child is on the ALTERNATE screen. False

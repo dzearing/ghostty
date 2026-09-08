@@ -9,6 +9,69 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-07: T621 - **taking over a machine's windows, or resuming a session this
+  viewer has never had open, no longer makes every pane re-send its whole recent
+  history before it is usable.** Those two paths ("Restore All" from an agent-held
+  layout blob, and resume-one from the chooser's roster) both arrive at the agent
+  with no resume point of their own, and until now the only thing that carried
+  history to them was the raw output ring: up to 2 MB per pane, over a relay for
+  the cross-machine case, and a concatenation of segments drawn at geometries
+  that are no longer that pane's - which is why the scrollback above the fold
+  came back looking mangled even though the visible screen was exact.
+
+  The agent already runs a headless emulator per session for the attach repaint
+  (FIX 2), and it ran with `max_scrollback = 0`, so that repaint could only ever
+  cover the visible screen. It now retains a **bounded** 1 MiB of scrollback
+  (`grid_snapshot.max_scrollback_bytes`, chosen against the 2 MB ring beside it,
+  so the agent's per-session ceiling is a stated ~3 MB rather than an emergent
+  one), and `snapshotAlloc` takes a `SnapshotOptions` saying whether to serialize
+  it. On a snapshot-less attach the agent sends that scrollback-bearing repaint
+  and **skips the ring replay entirely** - and because `ensureSize` reflows to
+  the geometry the client just asked for BEFORE serializing, the history arrives
+  at the right width, which is the one thing a ring of mixed-geometry segments
+  can never do.
+
+  Three things make it a fix rather than a trade. **A delta re-attach is
+  untouched**: `scrollback` defaults off and the formatter range is then pinned
+  to the active area, so a client that already holds this history is not sent it
+  twice and still gets its gap-fill. **The skip follows the snapshot, not the
+  intent** - `handleAttach` serializes before deciding what to replay, so a
+  session with no emulator (no output yet, or a ring restored from disk into a
+  fresh process) or a failed serialization keeps the ring; skipping on intent
+  alone would have turned a degraded snapshot into a blank pane. And **it is
+  negotiated as a pair**: the payload growing and the replay disappearing are one
+  change, so `capability.grid_scrollback` gates both halves and every skew
+  combination lands on exactly today's behavior. The "N bytes of scrollback lost
+  during disconnect" marker is suppressed on the new path, where it reported the
+  whole ring base as lost during a disconnect that never happened.
+
+  The app logs which path each attach took (`attach: ... scrollback=<bool>`,
+  `termio/Remote.zig`), because the two are indistinguishable from outside and
+  cost very differently - and that line is what the on-box assertion reads.
+
+  One validation criterion was met differently than the card wrote it. It asked
+  for an on-box "the replay byte count drops"; the app exposes no such counter,
+  and adding one to the pane's inbound data path - the thread the user's output
+  flows through - to satisfy a test is the wrong trade. The drop is asserted
+  where it is exact and free instead: at the server, where the test reads the
+  actual frames and proves the repaint is the FIRST one, since a ring replay
+  would necessarily precede it anchored below S. What the acceptance script is
+  uniquely able to say, it says - J2 of `chooser-restore-all-remote.ps1` asserts
+  every rebuilt pane took the scrollback path ACROSS THE RELAY, so the capability
+  is shown to survive the hop rather than being a same-process handshake.
+
+  Green: `floor-lane.ps1 -Lane all` (lib / none / win32 / agent), with 8 new unit
+  tests - 4 on the emulator (retention, the reflow, the alt screen having no
+  history to carry, and the scrolled-fully-into-history guard), 3 at the server
+  (fresh / delta / skew), 1 on the negotiation. On box, all sequential:
+  `chooser-restore-all-remote` 47 (J2 new), `session-snapshot-reattach` 33,
+  `holder-volume` 17, `session-vanished` 18, `pane-ingest-lag` 11,
+  `session-relaunch-notify` 129, `agent-relay-session-e2e` 18,
+  `sessions-running-cmd` 16, `ipc-p1/p2/p3` 25/20/16, and the static audits.
+  `go-loop-guard` (ALL PASS) and `upgrade-no-fork` (131) were made due by
+  897e3d7dc, the other window's commit rather than this work, and were run green
+  as well.
+
 - 2026-09-07: T1436 closed, T1438 filed - **A half-unpacked dependency now heals itself instead of taking the box down for an hour.** Yesterday every build and all four floor lanes went red at once with `error: failed to check cache: '...\JetBrainsMono-Regular.ttf' file_hash FileNotFound`, and the repair that exists for exactly this class of failure sat there and said nothing. `scripts\lib\CacheHeal.ps1` has recognised torn cache entries since T494, but only ones a COMPILER blamed, from a line shaped `path:line:col: error:`. This message comes from the cache layer, carries neither a line nor a column, and points into `p\<package-hash>` - a directory named for a base64url package hash rather than a hex digest, which `Resolve-CachePath` also refused. Two misses, one outage, and a human had to read an unfamiliar message to get the box back.
 
   Both are closed. A `failed to check cache: '<path>' <field> <reason>` line is now parsed on its own terms and heals the PACKAGE directory the named file falls inside (rule `torn-package`, deleted whole, so the next build re-fetches it), and `Test-PackageEntryName` is the shape test for the `p` bucket - used by the resolver AND by `Invoke-CacheHeal`'s re-verification, so the two cannot drift on what a package looks like. It rejects the `<hash>.torn-20260907` copy set aside on this box, which is the negative that matters: healing that one would destroy the evidence. Splitting on the last hyphen was the first attempt and is wrong - base64url uses `-` as a digit, so the anonymous hash ends `...-66x`; the rule is that the final 40 characters are pure base64url with no dot in them.

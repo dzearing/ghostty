@@ -1079,6 +1079,12 @@ pub const Connection = struct {
     /// `grid_snapshot` asks a modern agent to append a visible-screen repaint on
     /// re-attach (FIX 2); an older agent that never advertises it just replays its
     /// ring as before.
+    /// `grid_scrollback` says we would rather have that repaint carry the
+    /// session's scrollback than receive the raw ring for it — which is what makes
+    /// a from-nothing attach (a rebuilt pane, a session this viewer has never had
+    /// open) come up immediately, with history reflowed to OUR pane size. An older
+    /// agent leaves the flag false and sends today's screen-only repaint plus the
+    /// ring replay, so nothing is lost, only slower.
     /// `session_cpu` asks a modern agent for the pushed per-session CPU roll-up
     /// the chooser's meters render; an older agent never advertises it, the
     /// negotiated flag stays false, and we never send the opcode (which that agent
@@ -1090,6 +1096,7 @@ pub const Connection = struct {
     pub const client_capabilities = [_][]const u8{
         protocol.capability.close_session,
         protocol.capability.grid_snapshot,
+        protocol.capability.grid_scrollback,
         protocol.capability.session_cpu,
         protocol.capability.sessions_push,
         protocol.capability.cpu_units,
@@ -2633,6 +2640,21 @@ pub const Connection = struct {
     /// promised, so nothing is parked.
     pub fn peerRepaintsOnAttach(self: *Connection) bool {
         if (self.negotiated) |n| return n.grid_snapshot else |_| return false;
+    }
+
+    /// True iff the negotiated peer advertised `capability.grid_scrollback` —
+    /// i.e. on a SNAPSHOT-LESS attach (`last_byte_offset == 0`) the repaint above
+    /// carries the session's scrollback as well as its visible screen, and the
+    /// agent therefore sends no raw ring replay at all (T621).
+    ///
+    /// Nothing on the client has to act on this: the repaint is plain VT either
+    /// way and the stream position comes from the frames' own anchors, so both
+    /// paths are correct. It is logged on attach because the two are
+    /// indistinguishable from outside the app and cost very differently — a whole
+    /// ring over the relay versus one reflowed repaint — which is exactly the
+    /// question a re-attach investigation starts from.
+    pub fn peerSendsScrollbackOnAttach(self: *Connection) bool {
+        if (self.negotiated) |n| return n.grid_scrollback else |_| return false;
     }
 
     /// True iff the peer negotiated `capability.repaint_data` — i.e. it FRAMES

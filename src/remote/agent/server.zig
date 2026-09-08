@@ -402,6 +402,11 @@ pub const Server = struct {
         protocol.capability.flow,
         protocol.capability.close_session,
         protocol.capability.grid_snapshot,
+        // ...and that snapshot carries SCROLLBACK, so a client attaching with no
+        // resume point of its own (a rebuilt pane, a session it has never had
+        // open) gets its history from the reflowed snapshot instead of a whole
+        // raw ring over the wire (T621).
+        protocol.capability.grid_scrollback,
         protocol.capability.session_cpu,
         protocol.capability.sessions_push,
         // This build's `proc.zig` converts macOS mach ticks to nanoseconds,
@@ -1281,21 +1286,62 @@ pub const Server = struct {
         // predates the ring (deep scrollback evicted, or a full-screen app whose
         // `?1049h` enter-alt scrolled out). Live DATA then resumes from offset > S.
         const want_snapshot = if (self.negotiated) |n| n.grid_snapshot else |_| false;
+        const want_scrollback = if (self.negotiated) |n| n.grid_scrollback else |_| false;
 
-        // On the ALTERNATE screen the raw ring tail is alt-screen paint written
-        // WITHOUT its (evicted) `?1049h` enter — replaying it onto the client's
-        // primary screen is exactly what smeared/blanked the pane. With a snapshot
-        // in hand we SKIP that replay for alt sessions and let the snapshot (which
-        // re-enters alt and repaints) stand alone. A primary session still gets its
-        // raw replay for scrollback continuity, with the snapshot then repainting
-        // the visible rows over it. Without a snapshot we keep today's replay for
-        // both (an older/ring-only peer).
-        const skip_replay = want_snapshot and s.gridOnAltScreen();
+        // A SNAPSHOT-LESS attach: the client brings no resume point, because it
+        // has never held this session's output at all — a pane rebuilt from an
+        // agent-held layout blob ("Restore All"), or one resumed from the chooser
+        // for a session this viewer has never had open (T621). Its history can
+        // only come from us, and until `grid_scrollback` the only thing that
+        // carried history was the raw ring: up to 2 MB per pane on the wire, over
+        // a relay for the cross-machine case, and a concatenation of segments
+        // drawn at geometries that are no longer this client's.
+        //
+        // With the capability negotiated the snapshot carries that history
+        // instead, reflowed to the size THIS client just asked for, so the ring
+        // replay below has nothing left to contribute.
+        const fresh_attach = att.last_byte_offset == 0;
+        const snapshot_scrollback = want_snapshot and want_scrollback and fresh_attach;
+
+        // Take the snapshot BEFORE deciding what to replay: the decision to skip
+        // the ring is only safe if we actually have a repaint to send instead.
+        // `gridSnapshotAlloc` returns null for a session with no emulator (one
+        // that has produced no output, or whose ring was restored from disk into a
+        // fresh process), and a serialization failure degrades to null too — in
+        // either case the ring is once again the only thing that knows anything,
+        // and skipping it would have left the pane blank.
+        const snapshot: ?[]u8 = if (want_snapshot)
+            s.gridSnapshotAlloc(self.alloc, .{ .scrollback = snapshot_scrollback })
+        else
+            null;
+        defer if (snapshot) |b| self.alloc.free(b);
+        const have_snapshot = if (snapshot) |b| b.len > 0 else false;
+
+        // Two reasons to skip the raw replay, both requiring a snapshot in hand:
+        //
+        //   * ALTERNATE screen — the ring tail is alt-screen paint written WITHOUT
+        //     its (evicted) `?1049h` enter, and replaying it onto the client's
+        //     primary screen is exactly what smeared/blanked the pane. The
+        //     snapshot re-enters alt and repaints, so it stands alone.
+        //   * SCROLLBACK-BEARING snapshot on a fresh attach — the replay would be
+        //     a second, worse copy of what the snapshot already carries.
+        //
+        // A DELTA re-attach on the primary screen still gets its raw replay: that
+        // is the gap-fill for output produced while the client was gone, and the
+        // snapshot deliberately omits scrollback there so the two do not overlap.
+        const skip_replay = have_snapshot and (s.gridOnAltScreen() or snapshot_scrollback);
 
         if (att.last_byte_offset < snapshot_at) {
             const base = s.ring.base_offset;
             var replay_from = att.last_byte_offset;
-            if (replay_from < base) {
+            // T621: not on a scrollback-bearing fresh attach. The client is not
+            // resuming from a point we lost — it never had one — and the number
+            // this would print is the whole ring base, a "lost during disconnect"
+            // sentence about a disconnect that never happened. What that pane is
+            // getting is the emulator's retained history, whose depth the ring
+            // base does not describe. (It was invisible in practice anyway: the
+            // repaint's own ED2 erases the two lines it writes.)
+            if (replay_from < base and !snapshot_scrollback) {
                 // The exact resume point was evicted. Emit a marker for the
                 // genuinely-lost deep scrollback ABOVE the visible screen, then
                 // replay from the oldest byte we still have.
@@ -1311,8 +1357,8 @@ pub const Server = struct {
                 // as stream, it pushes the client's recorded offset past a
                 // position the session never produced.
                 if (marker.len > 0) self.sendRepaint(s.channel, att.last_byte_offset, marker) catch {};
-                replay_from = base;
             }
+            if (replay_from < base) replay_from = base;
             if (!skip_replay) {
                 const want: usize = @intCast(snapshot_at - replay_from);
                 if (want > 0) {
@@ -1338,19 +1384,19 @@ pub const Server = struct {
         // S unless we say which it is, which is what `sendRepaint` does (and
         // degrades to `sendData` for a peer that cannot be told).
         if (want_snapshot) {
-            const snap = s.gridSnapshotAlloc(self.alloc);
-            defer if (snap) |b| self.alloc.free(b);
             // The size of what we INJECT, which is exactly the error a client
             // that counts it will carry (T739) — and the only place that number
             // is visible from, since this frame looks like ordinary output on
             // the wire. 0 means a session with no emulator yet: nothing to
             // repaint, the ring replay above stands alone.
-            std.log.info("ATTACH ch={x}: grid snapshot {d} byte(s) at {d}", .{
+            std.log.info("ATTACH ch={x}: grid snapshot {d} byte(s) at {d} (scrollback={}, ring replay {s})", .{
                 s.channel,
-                if (snap) |b| b.len else 0,
+                if (snapshot) |b| b.len else 0,
                 snapshot_at,
+                snapshot_scrollback,
+                if (skip_replay) "skipped" else "sent",
             });
-            if (snap) |b| {
+            if (snapshot) |b| {
                 if (b.len > 0) self.sendRepaint(s.channel, snapshot_at, b) catch {};
             }
         }
@@ -4265,6 +4311,178 @@ test "T739: the ATTACH repaint is framed as DATA_REPAINT, and only for a peer th
             d.type,
         );
     }
+}
+
+test "T621: a snapshot-less ATTACH gets scrollback in the repaint and no ring replay" {
+    // The two cross-machine paths ("Restore All" from an agent-held layout blob,
+    // and resume-one for a session this viewer has never had open) both arrive
+    // here with last_byte_offset = 0 and no history of their own. With
+    // grid_scrollback negotiated the repaint carries the scrollback, so the raw
+    // ring — up to 2 MB per pane, over a relay — is not sent at all.
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(21);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshakeCaps(&.{
+        protocol.capability.grid_snapshot,
+        protocol.capability.grid_scrollback,
+    });
+    const neg = try h.server.waitHandshake();
+    try testing.expect(neg.grid_snapshot);
+    try testing.expect(neg.grid_scrollback);
+
+    // A five-row pane with twenty lines through it: fifteen rows of scrollback
+    // above the visible screen, on the PRIMARY screen (the alt-screen case
+    // already skipped the replay before T621, so it would prove nothing here).
+    const o = try doOpen(&h, .{ .rows = 5, .cols = 40 });
+    var i: usize = 1;
+    while (i <= 20) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        h.server.onChildOutput(o.channel, std.fmt.bufPrint(&buf, "line-{d}\r\n", .{i}) catch unreachable);
+        _ = try h.client.nextData(); // drain the live DATA
+    }
+
+    var id_buf: [32]u8 = o.id;
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = id_buf[0..],
+        .rows = 5,
+        .cols = 40,
+        .last_byte_offset = 0,
+    });
+    const af = try h.client.waitControl(.attached);
+    var ap = try protocol.parseJson(protocol.Attached, alloc, af.payload);
+    defer ap.deinit();
+    const at = ap.value.snapshot_at_offset;
+
+    // Exactly ONE post-attach frame — the repaint, at S. If the ring had been
+    // replayed there would be a DATA frame anchored below S ahead of it.
+    const d = (try h.client.nextData()) orelse return error.NoSnapshot;
+    const dp = try protocol.DataPayload.decode(d.payload);
+    try testing.expectEqual(at, dp.byte_offset);
+    // ...and it carries the scrollback, in order, not just the visible five rows.
+    const first = std.mem.indexOf(u8, dp.bytes, "line-1\r\n") orelse return error.NoScrollback;
+    const last = std.mem.indexOf(u8, dp.bytes, "line-20") orelse return error.NoScreen;
+    try testing.expect(first < last);
+    // (That the repaint is the FIRST frame is the proof the ring was skipped: a
+    // replay would have arrived ahead of it, anchored BELOW S. The harness's
+    // reader blocks, so there is no "and nothing else" assertion to make here.)
+}
+
+test "T621: a DELTA re-attach keeps its gap-fill and gets no duplicate scrollback" {
+    // The other half of the same switch. A client that DOES have a resume point
+    // already holds this history; repainting it would duplicate it, and the ring
+    // gap-fill is still the only thing that carries what it missed.
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(22);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    try h.client.handshakeCaps(&.{
+        protocol.capability.grid_snapshot,
+        protocol.capability.grid_scrollback,
+    });
+    _ = try h.server.waitHandshake();
+
+    const o = try doOpen(&h, .{ .rows = 5, .cols = 40 });
+    var seen: u64 = 0;
+    var i: usize = 1;
+    while (i <= 20) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        const line = std.fmt.bufPrint(&buf, "line-{d}\r\n", .{i}) catch unreachable;
+        h.server.onChildOutput(o.channel, line);
+        _ = try h.client.nextData();
+        // Pretend the client disconnected after line-15: that is its resume point.
+        if (i <= 15) seen += line.len;
+    }
+
+    var id_buf: [32]u8 = o.id;
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = id_buf[0..],
+        .rows = 5,
+        .cols = 40,
+        .last_byte_offset = seen,
+    });
+    const af = try h.client.waitControl(.attached);
+    var ap = try protocol.parseJson(protocol.Attached, alloc, af.payload);
+    defer ap.deinit();
+
+    // First the gap-fill, anchored at the resume point and carrying lines 16-20.
+    const gap = (try h.client.nextData()) orelse return error.NoGapFill;
+    const gp = try protocol.DataPayload.decode(gap.payload);
+    try testing.expectEqual(seen, gp.byte_offset);
+    try testing.expect(std.mem.indexOf(u8, gp.bytes, "line-16") != null);
+
+    // Then the repaint of the visible screen ONLY — line-1 scrolled off long
+    // before this client's resume point and must not come back.
+    const snap = (try h.client.nextData()) orelse return error.NoSnapshot;
+    const sp2 = try protocol.DataPayload.decode(snap.payload);
+    try testing.expectEqual(ap.value.snapshot_at_offset, sp2.byte_offset);
+    try testing.expect(std.mem.indexOf(u8, sp2.bytes, "line-1\r\n") == null);
+    try testing.expect(std.mem.indexOf(u8, sp2.bytes, "line-20") != null);
+}
+
+test "T621: without grid_scrollback an older peer gets today's payload byte-for-byte" {
+    // Skew safety: the payload growing and the ring replay disappearing are ONE
+    // change, and a peer that did not negotiate it must get neither half.
+    const alloc = testing.allocator;
+    var clock: TestClock = .{ .ms = 100 };
+    var fc: FakeChild = .{ .alloc = alloc };
+    defer fc.deinit();
+    var kids = [_]*FakeChild{&fc};
+    var sp: FakeSpawner = .{ .children = &kids };
+    var prng = std.Random.DefaultPrng.init(23);
+
+    var h = try Harness.init(alloc, .raw, &clock, &sp, 4096, prng.random());
+    defer h.deinit();
+    try h.server.start();
+    // An app of the pre-T621 generation: grid_snapshot, but no grid_scrollback.
+    try h.client.handshakeCaps(&.{protocol.capability.grid_snapshot});
+    const neg = try h.server.waitHandshake();
+    try testing.expect(neg.grid_snapshot);
+    try testing.expect(!neg.grid_scrollback);
+
+    const o = try doOpen(&h, .{ .rows = 5, .cols = 40 });
+    var i: usize = 1;
+    while (i <= 20) : (i += 1) {
+        var buf: [32]u8 = undefined;
+        h.server.onChildOutput(o.channel, std.fmt.bufPrint(&buf, "line-{d}\r\n", .{i}) catch unreachable);
+        _ = try h.client.nextData();
+    }
+
+    var id_buf: [32]u8 = o.id;
+    try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
+        .session_id = id_buf[0..],
+        .rows = 5,
+        .cols = 40,
+        .last_byte_offset = 0,
+    });
+    const af = try h.client.waitControl(.attached);
+    var ap = try protocol.parseJson(protocol.Attached, alloc, af.payload);
+    defer ap.deinit();
+
+    // The raw ring replay is still sent, from the ring base...
+    const replay = (try h.client.nextData()) orelse return error.NoReplay;
+    const rp = try protocol.DataPayload.decode(replay.payload);
+    try testing.expect(std.mem.indexOf(u8, rp.bytes, "line-1\r\n") != null);
+    // ...and the repaint that follows it is the visible screen only.
+    const snap = (try h.client.nextData()) orelse return error.NoSnapshot;
+    const sp2 = try protocol.DataPayload.decode(snap.payload);
+    try testing.expectEqual(ap.value.snapshot_at_offset, sp2.byte_offset);
+    try testing.expect(std.mem.indexOf(u8, sp2.bytes, "line-1\r\n") == null);
+    try testing.expect(std.mem.indexOf(u8, sp2.bytes, "line-20") != null);
 }
 
 test "ATTACH without grid_snapshot falls back to raw ring replay (skew safety, FIX 2)" {

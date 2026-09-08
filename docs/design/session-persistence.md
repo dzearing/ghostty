@@ -466,7 +466,7 @@ for the replay and back to the live grid once it is applied, and FIX 2 has the
 agent append a self-contained VT repaint of the visible screen **generated at
 the geometry the attaching client just asked for** (`server.zig` `want_snapshot`
 → `session.zig gridSnapshotAlloc`). A blob-sourced pane therefore comes up with
-an exact visible screen. What remains is the replay's wire cost (up to the ring
+an exact visible screen. What remained was the replay's wire cost (up to the ring
 size per pane, over a relay for the cross-machine case) and imperfect scrollback
 for ring segments drawn at older geometries.
 
@@ -474,15 +474,41 @@ for ring segments drawn at older geometries.
 whatever viewer last pushed it, at that viewer's geometry and offset — stale by
 construction for a machine still in use, and a stale offset makes the agent emit
 its "bytes of scrollback lost" marker for bytes it still holds. The agent's own
-snapshot is fresh, correctly sized, and free. The single thing it lacks is
-scrollback, because its emulator runs `max_scrollback = 0` (`grid_snapshot.zig`).
+snapshot is fresh, correctly sized, and free. The single thing it lacked was
+scrollback.
 
-So the remaining gap belongs to the **agent**: giving that emulator bounded
-scrollback lets the raw ring replay be skipped outright and fixes every
-snapshot-less attach at once — including a cross-machine resume of a single
-session, which has no local manifest entry either and which no blob change could
-ever have helped. Tracked separately; T413 is the decision not to solve it in
-the topology mirror.
+So the remaining gap belonged to the **agent**, and **T621 closed it there**.
+The emulator now runs with a bounded `max_scrollback`
+(`grid_snapshot.max_scrollback_bytes`, 1 MiB — a deliberate second per-session
+allocation beside the 2 MB raw ring, which puts the agent's per-session ceiling
+at ~3 MB), and `snapshotAlloc` takes a `SnapshotOptions` saying whether to
+serialize that history ahead of the visible screen. On a **snapshot-less attach**
+(`last_byte_offset == 0` — a blob-rebuilt pane, or a cross-machine resume of a
+single session, which has no local manifest entry either and which no blob change
+could ever have helped) the agent sends the scrollback-bearing repaint and
+**skips the raw ring replay entirely**. The history is therefore reflowed to the
+geometry the client just asked for, which is the one thing a concatenation of
+ring segments can never be.
+
+Three properties are load-bearing:
+
+- **A delta re-attach is unchanged.** `opts.scrollback` defaults to false and the
+  formatter range is then pinned to the ACTIVE area, so a client that already
+  holds this history is not sent it a second time and still gets its gap-fill.
+- **The skip follows the snapshot, not the intent.** `handleAttach` serializes
+  BEFORE deciding what to replay; a session with no emulator (one that has
+  produced no output, or whose ring was restored from disk into a fresh process)
+  yields no repaint, and the ring replay stands as it always did. Skipping on
+  intent alone would have turned a failed serialization into a blank pane.
+- **It is negotiated as a PAIR.** The payload growing and the ring replay
+  disappearing are one change, so `capability.grid_scrollback` gates both halves
+  (`Negotiated.grid_scrollback`, requiring `grid_snapshot`). Every skew
+  combination degrades to exactly today's behavior: an older app keeps the
+  screen-only repaint AND the ring it depends on. The app logs which path it took
+  — `attach: … scrollback=<bool>` in `termio/Remote.zig` — because the two are
+  indistinguishable from outside and cost very differently.
+
+T413 remains the decision not to solve any of this in the topology mirror.
 
 #### 5.4.2 The layout blob has TWO schemas, and the reader reconciles them (T337)
 

@@ -46,6 +46,7 @@
 //! | v1 | `tunnel` | port-forward tunneling (§8) | no tunnels |
 //! | v1 | `close_session` | `CLOSE_SESSION` 0x2c (kill by session id) | channel-scoped `close` only |
 //! | v1 | `grid_snapshot` | visible-screen repaint appended on ATTACH | ring-only replay |
+//! | v1 | `grid_scrollback` | that repaint carries scrollback; no raw ring replay | screen-only repaint + ring replay |
 //! | v1 | `session_cpu` | pushed per-session CPU 0x79-0x7b | chooser shows no meter |
 //! | v1 | `sessions_push` | pushed session roster 0x7c-0x7d | client polls `LIST_SESSIONS` |
 //! | v1 | `cpu_units` | `cpu_pct` carries CORRECTED units everywhere | `% CPU` marked unverifiable |
@@ -640,6 +641,24 @@ pub const capability = struct {
     /// combination degrades gracefully to today's behavior — no garble, no wedge.
     pub const grid_snapshot = "grid_snapshot";
 
+    /// The ATTACH grid snapshot carries **scrollback**, not just the visible
+    /// screen — so a snapshot-less attach (a pane this viewer has never had open,
+    /// or one rebuilt from a layout blob, both of which arrive at `offset = 0`)
+    /// gets its history from the reflowed snapshot and the agent SKIPS the raw
+    /// ring replay entirely.
+    ///
+    /// Purely additive, and again no new opcode: the scrollback rides the same
+    /// `DATA`/repaint frames as the screen repaint it is prefixed to. What has to
+    /// be negotiated is the PAIRING — the payload growing and the ring replay
+    /// disappearing are one change, and an older peer must get neither half:
+    ///   * a new AGENT against an older CLIENT keeps replaying the ring, because
+    ///     that client is the only thing that would carry the history otherwise,
+    ///   * a new CLIENT against an older AGENT gets today's screen-only snapshot
+    ///     plus today's ring replay, which is exactly what it expects.
+    /// Requires `grid_snapshot`; alone it means nothing, since the snapshot is the
+    /// thing that would carry the scrollback.
+    pub const grid_scrollback = "grid_scrollback";
+
     /// `RELAUNCH.notice`: the agent appends the viewer's text to the ring before
     /// replaying, putting it in the stream between the restored scrollback and
     /// the respawned child's first output.
@@ -927,6 +946,12 @@ pub const Negotiated = struct {
     /// ring-only replay and the client just renders whatever DATA arrives.
     grid_snapshot: bool = false,
 
+    /// True iff BOTH peers advertised `capability.grid_scrollback` — i.e. the
+    /// ATTACH snapshot may carry scrollback and the agent may therefore skip the
+    /// raw ring replay on a snapshot-less attach. False against any older peer,
+    /// which keeps the screen-only snapshot AND the ring replay it depends on.
+    grid_scrollback: bool = false,
+
     /// True iff BOTH peers advertised `capability.relaunch_notice` — i.e. the
     /// agent will append `Relaunch.notice` to the ring ahead of the replay. False
     /// against any older peer, in which case the client injects those bytes into
@@ -1023,6 +1048,8 @@ pub fn negotiate(local: Hello, remote: Hello) ProtocolError!Negotiated {
             hasCapability(remote.capabilities, capability.close_session),
         .grid_snapshot = hasCapability(local.capabilities, capability.grid_snapshot) and
             hasCapability(remote.capabilities, capability.grid_snapshot),
+        .grid_scrollback = hasCapability(local.capabilities, capability.grid_scrollback) and
+            hasCapability(remote.capabilities, capability.grid_scrollback),
         .relaunch_notice = hasCapability(local.capabilities, capability.relaunch_notice) and
             hasCapability(remote.capabilities, capability.relaunch_notice),
         .session_cpu = hasCapability(local.capabilities, capability.session_cpu) and
@@ -2745,6 +2772,56 @@ test "T403: the RPC reply set is the frames a parked caller can be woken by" {
         .ping,         .pong,          .flow,          .rpc,
         .rpc_result,
     }) |t| try testing.expect(!isRpcReply(t));
+}
+
+test "T621: grid_scrollback is the intersection, and never outruns grid_snapshot" {
+    const both = [_][]const u8{ capability.grid_snapshot, capability.grid_scrollback };
+    const old_peer = [_][]const u8{capability.grid_snapshot};
+
+    // Both advertise → the ATTACH repaint carries scrollback and the agent skips
+    // the raw ring replay on a snapshot-less attach.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+        );
+        try testing.expect(n.grid_snapshot);
+        try testing.expect(n.grid_scrollback);
+    }
+
+    // Either side missing → disabled, in BOTH directions. The two halves of this
+    // change (a bigger payload, and no ring replay behind it) must arrive
+    // together or not at all: a peer that got only the second would be left with
+    // no history at all.
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+            .{ .transfer_encoding = .raw, .capabilities = &old_peer },
+        );
+        try testing.expect(n.grid_snapshot);
+        try testing.expect(!n.grid_scrollback);
+    }
+    {
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &old_peer },
+            .{ .transfer_encoding = .raw, .capabilities = &both },
+        );
+        try testing.expect(!n.grid_scrollback);
+    }
+
+    // And the pairing itself: the scrollback rides the SNAPSHOT, so a peer that
+    // somehow advertised the tail without the head gets nothing. The agent reads
+    // `grid_snapshot` first (`server.zig handleAttach`), so this is belt to that
+    // brace rather than the only guard.
+    {
+        const tail_only = [_][]const u8{capability.grid_scrollback};
+        const n = try negotiate(
+            .{ .transfer_encoding = .raw, .capabilities = &tail_only },
+            .{ .transfer_encoding = .raw, .capabilities = &tail_only },
+        );
+        try testing.expect(!n.grid_snapshot);
+        try testing.expect(n.grid_scrollback); // negotiated, but inert without the snapshot
+    }
 }
 
 test "negotiate: repaint_data capability is the intersection of both HELLOs" {
