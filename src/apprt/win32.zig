@@ -122,6 +122,7 @@ test {
     _ = @import("win32/AgentIntegrationsDialog.zig");
     _ = @import("win32/ipc_agent_integration.zig");
     _ = @import("win32/ipc_whats_new.zig");
+    _ = @import("win32/whats_new_notes.zig");
     _ = @import("win32/provenance.zig");
     _ = @import("win32/restore_retry.zig");
 }

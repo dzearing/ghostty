@@ -348,6 +348,27 @@ function Wait-Panes($tmp, $tag, $target, $timeoutSec = 40) {
 # never-downgrade rule can't quietly turn the test into a no-op.
 $FAKE_NEW = '29991231-t147fake'
 
+# --- T625: the What's New accessory on the restart dialog --------------------
+# The accessory shows the AGENT-scoped notes this user has not seen yet, split
+# on the same anchor the What's New window uses. Both halves of that split are
+# arranged here from the REPO's own bundled notes rather than from literals, so
+# the arm keeps measuring the accessory rather than a version string that fell
+# out of date the next time a release landed.
+$notesDir = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) 'release-notes\agent'
+$agentNoteVersions = @(Get-ChildItem -Path $notesDir -Filter '*.json' -ErrorAction SilentlyContinue |
+    ForEach-Object { [System.Version]($_.BaseName) } | Sort-Object)
+$notesCurrent = if ($agentNoteVersions.Count -gt 0) { $agentNoteVersions[-1].ToString() } else { $null }
+$notesAnchor = if ($agentNoteVersions.Count -gt 1) { $agentNoteVersions[-2].ToString() } else { $null }
+$savedNotesVersion = $env:GHOZTTY_WHATS_NEW_VERSION
+
+# The debug build's own seen-version store, under this run's redirected
+# LOCALAPPDATA (set below) - never the release app's.
+function Set-SeenNotesVersion([string]$version) {
+    $dir = Join-Path $env:LOCALAPPDATA 'ghoztty'
+    if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    [System.IO.File]::WriteAllText((Join-Path $dir 'whats-new-seen-debug'), $version)
+}
+
 Stop-TestProcs
 New-Item -ItemType Directory -Force $root | Out-Null
 $savedLocalAppData = $env:LOCALAPPDATA
@@ -710,6 +731,17 @@ Say "== J: T125 - a PROTOCOL SKEW takes the mandatory-update path"
 # proto_version is 1, so 0 is an agent from the past.
 $env:GHOZTTY_AGENT_BUNDLED_VERSION = $null
 $env:GHOZTTY_AGENT_PROTO_VERSION = '0'
+# T625: the What's New ACCESSORY hangs off this dialog, so this arm is also
+# where it is measured. It only has something to show when the bundled AGENT
+# notes contain a release this user has not seen, which is a state the harness
+# has to arrange: seed the debug anchor store one release below the newest
+# bundled agent notes, and tell the build to call itself that newest version.
+# (A dev build's own version comes from the branch's git description and sits
+# below every bundled file, so without the override the cap correctly drops
+# them all and the accessory would be absent for a reason that has nothing to
+# do with the code under test.)
+Set-SeenNotesVersion $notesAnchor
+$env:GHOZTTY_WHATS_NEW_VERSION = $notesCurrent
 $appPidJ = Start-App $tmp 't125-skew-old'
 $logJ = $script:AppLog
 $topJ = $script:AppTop
@@ -724,6 +756,35 @@ if ($dlgJ -ne [IntPtr]::Zero) {
         ((Get-TestWindowText -Window $dlgJ) -like '*background terminal process*')
     Assert "J5 the owner is disabled while it is up (mandatory, not advisory)" `
         (($topJ -ne [IntPtr]::Zero) -and (-not (Test-TestWindowEnabled -Window $topJ)))
+    # --- T625: the What's New accessory ------------------------------------
+    # The dialog names the COST ("this closes your sessions"). Mac hangs the
+    # release notes off the same alert so the answer can be an informed one;
+    # until T625 the win32 dialog offered the cost and nothing else.
+    $notesJ = Get-TestChildWindow -Window $dlgJ -Class 'GhozttyWhatsNewNotes'
+    Assert "J5a the restart dialog carries the What's new accessory" `
+        ($notesJ -ne [IntPtr]::Zero)
+    if ($notesJ -ne [IntPtr]::Zero) {
+        # The control publishes the model it is showing as its window text, so
+        # the notes can be asserted to be the RIGHT ones without photographing
+        # them.
+        $modelJ = Get-TestWindowText -Window $notesJ
+        Say "    accessory model: $modelJ"
+        Assert "J5b it is showing the release the user has not seen yet" `
+            ($modelJ -match 'releases=([1-9]\d*) ' )
+        Assert "J5c it is showing that release's actual notes, not an empty band" `
+            ($modelJ -match 'notes=([1-9]\d*) ')
+        # A fixed band: the notes scroll inside it, so a release with twelve
+        # bullets and one with two produce the same dialog and the buttons the
+        # user is reaching for never move.
+        $rectJ = @(Get-TestChildWindows -Window $dlgJ -Class 'GhozttyWhatsNewNotes')[0]
+        Assert "J5d the band is a real region, not a sliver" `
+            ($rectJ.Height -ge 150 -and $rectJ.Width -ge 300)
+        # And the accessory sits ABOVE the buttons rather than over them: the
+        # OK button is still findable and enabled with the notes in place.
+        $okJ = Get-TestChildWindow -Window $dlgJ -Class 'Button'
+        Assert "J5e the buttons are still there with the notes in place" `
+            (($okJ -ne [IntPtr]::Zero) -and (Test-TestWindowEnabled -Window $okJ))
+    }
 }
 # Same contract as C5: consent comes BEFORE the destruction.
 Assert "J6 nothing was killed while the dialog was up" ((Agent-Pid $tmp) -eq $agentJ)
@@ -823,6 +884,8 @@ $escapedJ = $logTextJ -match 'spawned local agent pid \d+ \(job escape=(breakawa
 $loudJ = $logTextJ -match 'local agent pid \d+ is INSIDE this app''s job object'
 Assert "J24 T426: it either escaped, or said out loud that it did not" `
     ($escapedJ -or $loudJ)
+# The notes overrides belong to this arm; arm N sets its own.
+$env:GHOZTTY_WHATS_NEW_VERSION = $null
 Stop-TestProcs
 
 # ============================================================================
@@ -849,6 +912,43 @@ Assert "K5 the newer agent was NOT touched (same pid)" ((Agent-Pid $tmp) -eq $ag
 Assert "K6 the app is still running (degraded, not broken)" `
     (@(Get-Process -Id $appPidK -ErrorAction SilentlyContinue).Count -eq 1)
 $env:GHOZTTY_AGENT_PROTO_VERSION = $null
+Stop-TestProcs
+
+# ============================================================================
+Say "== N: T625 negative control - nothing new to show means no accessory"
+# ============================================================================
+# The accessory is EVIDENCE, and evidence you do not have must not be faked
+# with an empty band: a user who is up to date should get the dialog exactly as
+# it was before T625, not a blank rectangle between the question and the
+# buttons. Same skew, same dialog, one thing changed - the anchor is seeded at
+# the newest bundled agent release, so the split has no fresh half at all.
+#
+# This is the control that gives arm J's J5a its meaning: the same
+# Get-TestChildWindow call, against the same build on the same desktop, is
+# known to find the accessory a few arms earlier.
+Set-SeenNotesVersion $notesCurrent
+$env:GHOZTTY_WHATS_NEW_VERSION = $notesCurrent
+$env:GHOZTTY_AGENT_BUNDLED_VERSION = $null
+$env:GHOZTTY_AGENT_PROTO_VERSION = '0'
+$appPidN = Start-App $tmp 't625-noneW'
+$logN = $script:AppLog
+Assert "N1 the GUI came up" ($appPidN -ne 0)
+$agentN = Wait-AgentPid $tmp 30
+Assert "N2 the skewed agent is running" ($agentN -ne 0)
+$dlgN = Wait-Dialog $appPidN 60
+Assert "N3 the question is still asked (the dialog is not conditional on notes)" `
+    ($dlgN -ne [IntPtr]::Zero)
+if ($dlgN -ne [IntPtr]::Zero) {
+    Assert "N4 no accessory when there is nothing new to say" `
+        ((Get-TestChildWindow -Window $dlgN -Class 'GhozttyWhatsNewNotes') -eq [IntPtr]::Zero)
+    Assert "N5 it is still the mandatory-update dialog" `
+        ((Get-TestWindowText -Window $dlgN) -like '*background terminal process*')
+    # Answer it Later: this arm is about what the dialog SHOWS, and declining
+    # leaves the agent alone for the arms after it.
+    Send-TestControlKey -Control $dlgN -Key Escape | Out-Null
+}
+$env:GHOZTTY_AGENT_PROTO_VERSION = $null
+$env:GHOZTTY_WHATS_NEW_VERSION = $null
 Stop-TestProcs
 
 # ============================================================================
@@ -997,6 +1097,7 @@ Stop-TestProcs
     $env:GHOSTTY_LOCAL_AGENT_BIN = $savedAgentBin
     $env:GHOZTTY_AGENT_BUNDLED_VERSION = $savedOverride
     $env:GHOZTTY_AGENT_PROTO_VERSION = $savedProto
+    $env:GHOZTTY_WHATS_NEW_VERSION = $savedNotesVersion
     $env:GHOZTTY_PIPE_SUFFIX = $savedPipe
     $env:GHOSTTY_AGENT_SUPPRESS_CAPS = $savedSuppress
     $env:GHOZTTY_AGENT_PTY_HOLDER = $savedHolder

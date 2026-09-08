@@ -76,6 +76,7 @@ const agent_recovery = @import("agent_recovery.zig");
 const restore_retry = @import("restore_retry.zig");
 const RemoteReconnect = @import("RemoteReconnect.zig");
 const agent_upgrade = @import("agent_upgrade.zig");
+const release_notes_bundle = @import("release_notes_bundle.zig");
 const job_escape = @import("job_escape.zig");
 const relaunch_guard = @import("relaunch_guard.zig");
 const job_spawn = @import("job_spawn.zig");
@@ -4597,6 +4598,35 @@ fn handleAgentProtocolSkew(self: *App, skew: LocalAgent.Skew, reason: []const u8
 
     const owner: ?*Window = if (self.windows.items.len > 0) self.windows.items[0] else null;
 
+    // The What's New accessory (T625): what the restart the user is being
+    // asked to accept actually buys them. AGENT-scoped notes only — this
+    // dialog's cost is "your live sessions end", so the evidence beside it
+    // must be the session-persistence news, never viewer or banner items
+    // (release-notes/README.md). The model is stack-owned and lives across
+    // the modal, which is exactly the lifetime `ConfirmDialog.Notes` borrows
+    // for; nothing is shown when the split has no fresh releases, so a build
+    // with no bundled agent notes gets the dialog it had before.
+    var notes_model: ?WhatsNewWindow.Model = WhatsNewWindow.Model.init(
+        alloc,
+        release_notes_bundle.agent,
+    ) catch |err| blk: {
+        log.warn("agent upgrade: bundled agent notes could not be read err={}", .{err});
+        break :blk null;
+    };
+    defer if (notes_model) |*m| m.deinit(alloc);
+    const notes: ?ConfirmDialog.Notes = if (notes_model) |m|
+        (if (m.split.fresh.len > 0) .{ .split = m.split } else null)
+    else
+        null;
+
+    // Said out loud, because "the dialog had no notes" and "the dialog could
+    // not read its notes" look identical from outside and only one of them is
+    // a defect (T625).
+    log.info("agent upgrade: what's new accessory: {d} fresh agent release(s) (anchor={?s} current={s})", .{
+        if (notes_model) |m| m.split.fresh.len else 0,
+        WhatsNewWindow.previousSeen(),
+        WhatsNewWindow.currentVersion(),
+    });
     log.info("agent upgrade: showing mandatory protocol-skew confirmation; waiting for the user", .{});
     const result = ConfirmDialog.show(
         self,
@@ -4609,6 +4639,7 @@ fn handleAgentProtocolSkew(self: *App, skew: LocalAgent.Skew, reason: []const u8
             .icon = .warning,
             .ok_label = std.unicode.utf8ToUtf16LeStringLiteral("Update Now"),
             .cancel_label = std.unicode.utf8ToUtf16LeStringLiteral("Later"),
+            .notes = notes,
         },
     );
     if (result != .ok) {

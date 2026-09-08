@@ -24714,3 +24714,46 @@ and T461's connection pool here, the already-written probe there.
 
 Green: `floor-lane.ps1 -Lane all` (lib / none / win32 / agent). No source file
 changed, so no acceptance harness came due.
+## 2026-09-07 — the restart that ends your sessions now says what it buys you (T625)
+
+When Ghoztty on Windows has to restart the background process that holds your
+terminal sessions, it asks first — and until now the question named only the
+cost: *this closes your sessions*. The benefit was invisible, so the only
+honest answer was a guess. macOS has never had that gap: it hangs its What's
+New notes off the same alert, so the person being asked can read what the
+update actually changed before agreeing to lose their work.
+
+The Windows dialog now carries the same evidence. Under the message sits a
+scrolling band of the AGENT-scoped release notes this user has not seen yet —
+session-persistence news only, never viewer or banner items, because those are
+not reasons to restart an agent. The band is a FIXED height and the notes
+scroll inside it: a release with twelve bullets and one with two produce the
+same dialog, so the evidence never moves the buttons the user is reaching for.
+When there is nothing new to say the dialog is exactly what it was before —
+an empty band is not evidence, it is furniture.
+
+The renderer is the one the What's New window paints with, extracted rather
+than copied (`whats_new_notes.Renderer`, at a new `.compact` density beside the
+window's `.spacious`). That sharing is the point: a second renderer would drift,
+and what it would drift about is the only part of this anybody ever sees. The
+accessory itself is a child control (`GhozttyWhatsNewNotes`) because the notes
+scroll — offset, wheel, thumb and link hit-testing are a control, not more
+paint code in a dialog — and because it gives the harness something to find:
+it publishes the model it is showing as its window text, so a script can assert
+the notes are the RIGHT ones without photographing them.
+
+`App.handleAgentProtocolSkew` splits the bundled agent notes on the SAME anchor
+the window uses (`WhatsNewWindow.Model`, public now for exactly this) and
+passes them only when the fresh half is non-empty. It says out loud what it
+found, because "no notes to show" and "could not read the notes" look identical
+from outside and only one of them is a defect.
+
+Green: `floor-lane.ps1 -Lane all` (lib / none / win32 / agent), P1–P3, and the
+harnesses the change came due for — `agent-upgrade.ps1` ALL PASS (129) with the
+new arm J5a–J5e (`releases=1 notes=4 height=902`) and its control, arm N (same
+skew, anchor at the newest release: the question is still asked and there is no
+accessory); `whats-new.ps1` (46), `remote-disconnect.ps1` (49),
+`startup-failure.ps1` (42), plus the ten static audits an edit here re-opens.
+Six new `ConfirmDialog.layoutFor` tests cover the band at 1.0/1.25/1.5/2.0 and
+prove a caller that asks for no notes lays out byte-identically to before.
+

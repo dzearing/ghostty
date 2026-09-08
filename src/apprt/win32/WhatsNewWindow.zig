@@ -32,15 +32,13 @@ const Allocator = std.mem.Allocator;
 const App = @import("App.zig");
 const Window = @import("Window.zig");
 const build_config = @import("../../build_config.zig");
-const brush_cache = @import("brush_cache.zig");
-const markdown = @import("banner_markdown.zig");
 const layout = @import("whats_new_layout.zig");
 const panel_theme = @import("panel_theme.zig");
 const provenance = @import("provenance.zig");
 const release_notes = @import("release_notes.zig");
+const notes_render = @import("whats_new_notes.zig");
 const bundle = @import("release_notes_bundle.zig");
 const system_colors = @import("system_colors.zig");
-const type_ramp = @import("type_ramp.zig");
 const seen = @import("whats_new_seen.zig");
 const w32 = @import("win32.zig");
 
@@ -52,7 +50,6 @@ const CLASS_NAME = std.unicode.utf8ToUtf16LeStringLiteral("GhozttyWhatsNew");
 const TITLE = std.unicode.utf8ToUtf16LeStringLiteral("What\u{2019}s New in Ghoztty");
 
 var class_registered: bool = false;
-var bg_brush: brush_cache.CachedBrush = .{};
 
 /// The open window, if any. GUI thread only.
 var active: ?*WhatsNewWindow = null;
@@ -171,42 +168,29 @@ fn writeStore(path: []const u8, version: []const u8) !void {
 const Tab = layout.Tab;
 const tab_count = Tab.count;
 
-const Link = struct {
-    rect: w32.RECT,
-    url: []const u8,
-};
-
-/// One tab's decoded notes and the split it is showing.
-const TabModel = struct {
+/// One scope's decoded notes and the split it is showing.
+///
+/// Public since T625: the agent-restart confirmation shows the AGENT scope's
+/// fresh half as an accessory, and it must split on the same anchor this
+/// window does. A second `Store.parse` + `partition` pair in `App.zig` would
+/// be the same three lines today and a different answer the first time the
+/// anchor rule changes.
+pub const Model = struct {
     store: release_notes.Store,
     split: release_notes.Partitioned,
 
-    fn init(gpa: Allocator, entries: []const release_notes.Entry) !TabModel {
+    pub fn init(gpa: Allocator, entries: []const release_notes.Entry) !Model {
         var store = try release_notes.Store.parse(gpa, entries);
         errdefer store.deinit();
         const split = try store.partition(gpa, previousSeen(), currentVersion());
         return .{ .store = store, .split = split };
     }
 
-    fn deinit(self: *TabModel, gpa: Allocator) void {
+    pub fn deinit(self: *Model, gpa: Allocator) void {
         self.split.deinit(gpa);
         self.store.deinit();
     }
 };
-
-/// Text size classes, in the order `fontFor` indexes them.
-const SizeClass = enum(usize) {
-    /// A release's version banner: the ramp's subtitle.
-    version = 0,
-    /// A section heading and a bullet's bold lead.
-    strong = 1,
-    /// Body copy.
-    body = 2,
-    /// The divider label and other de-emphasized text.
-    caption = 3,
-};
-const size_class_count = 4;
-const font_slots = size_class_count * 8;
 
 app: *App,
 hwnd: w32.HWND,
@@ -215,14 +199,10 @@ selected: Tab = .client,
 /// Scroll offset per tab, so switching back returns you where you were.
 scroll: [tab_count]i32 = .{ 0, 0 },
 content_h: [tab_count]i32 = .{ 0, 0 },
-models: [tab_count]TabModel,
-fonts: [font_slots]?*anyopaque = @splat(null),
-links: std.ArrayList(Link) = .empty,
-/// Owns the URL text in `links`. The markdown is re-parsed into a throwaway
-/// arena on every paint, so a recorded link cannot borrow from it: the click
-/// that follows the link happens long after that arena is gone. Reset at the
-/// top of each paint, which is also when `links` is cleared.
-link_text: std.heap.ArenaAllocator,
+models: [tab_count]Model,
+/// The shared release-notes renderer (T625) — the SAME one the agent-restart
+/// dialog's accessory paints with, at this window's spacious density.
+notes: notes_render.Renderer,
 hover_link: ?[*]const u8 = null,
 /// Grab offset while dragging the scroll thumb; -1 when not dragging.
 thumb_drag_dy: i32 = -1,
@@ -252,12 +232,12 @@ pub fn openFor(app: *App, owner: ?w32.HWND, scale: f32) void {
     };
     errdefer alloc.destroy(self);
 
-    var client_model = TabModel.init(alloc, bundle.client) catch |err| {
+    var client_model = Model.init(alloc, bundle.client) catch |err| {
         log.warn("what's new: client notes failed err={}", .{err});
         alloc.destroy(self);
         return;
     };
-    const agent_model = TabModel.init(alloc, bundle.agent) catch |err| {
+    const agent_model = Model.init(alloc, bundle.agent) catch |err| {
         log.warn("what's new: agent notes failed err={}", .{err});
         client_model.deinit(alloc);
         alloc.destroy(self);
@@ -269,7 +249,7 @@ pub fn openFor(app: *App, owner: ?w32.HWND, scale: f32) void {
         .hwnd = undefined,
         .scale = scale,
         .models = .{ client_model, agent_model },
-        .link_text = .init(alloc),
+        .notes = .init(alloc, scale, .spacious, system_colors.panelFor(app)),
     };
 
     const style: u32 = w32.WS_OVERLAPPEDWINDOW;
@@ -325,9 +305,7 @@ fn close(self: *WhatsNewWindow) void {
     active = null;
     _ = w32.SetWindowLongPtrW(self.hwnd, w32.GWLP_USERDATA, 0);
     _ = w32.DestroyWindow(self.hwnd);
-    self.clearFonts();
-    self.links.deinit(alloc);
-    self.link_text.deinit();
+    self.notes.deinit();
     self.models[0].deinit(alloc);
     self.models[1].deinit(alloc);
     alloc.destroy(self);
@@ -383,68 +361,11 @@ fn registerClass(app: *App) ?void {
 // Theme + fonts
 // ---------------------------------------------------------------------
 
+const fillRect = notes_render.fillRect;
+const cr = notes_render.cr;
+
 fn pal(self: *const WhatsNewWindow) panel_theme.Panel {
     return system_colors.panelFor(self.app);
-}
-
-fn cr(c: panel_theme.Rgb) u32 {
-    return w32.RGB(c.r, c.g, c.b);
-}
-
-fn px(self: *const WhatsNewWindow, v: f32) i32 {
-    return @intFromFloat(@round(v * self.scale));
-}
-
-fn clearFonts(self: *WhatsNewWindow) void {
-    for (&self.fonts) |*f| {
-        if (f.*) |h| _ = w32.DeleteObject(h);
-        f.* = null;
-    }
-}
-
-fn rampFor(self: *const WhatsNewWindow, class: SizeClass) type_ramp.Font {
-    return switch (class) {
-        .version => type_ramp.subtitle(self.scale),
-        .strong => type_ramp.bodyStrong(self.scale),
-        .body => type_ramp.body(self.scale),
-        .caption => type_ramp.caption(self.scale),
-    };
-}
-
-fn lineHeight(self: *const WhatsNewWindow, class: SizeClass) i32 {
-    return type_ramp.lineBox(self.rampFor(class), self.scale);
-}
-
-/// The GDI font for a style at a size class, cached for the window's life.
-fn fontFor(self: *WhatsNewWindow, style: markdown.Style, class: SizeClass) ?*anyopaque {
-    const ramp = self.rampFor(class);
-    const bold = style.bold or class == .version or class == .strong;
-    const bits: usize = @as(usize, @intFromBool(bold)) |
-        (@as(usize, @intFromBool(style.italic)) << 1) |
-        (@as(usize, @intFromBool(style.code)) << 2);
-    const idx = @intFromEnum(class) * 8 + bits;
-    if (self.fonts[idx]) |f| return f;
-    const face = if (style.code)
-        std.unicode.utf8ToUtf16LeStringLiteral("Consolas")
-    else
-        std.unicode.utf8ToUtf16LeStringLiteral(type_ramp.face);
-    self.fonts[idx] = w32.CreateFontW(
-        -ramp.height,
-        0,
-        0,
-        0,
-        if (bold) type_ramp.weight_semibold else ramp.weight,
-        @intFromBool(style.italic),
-        0,
-        0,
-        w32.DEFAULT_CHARSET,
-        0,
-        0,
-        0,
-        0,
-        face,
-    );
-    return self.fonts[idx];
 }
 
 // ---------------------------------------------------------------------
@@ -461,7 +382,7 @@ fn labelWidths(self: *WhatsNewWindow, hdc: w32.HDC) [tab_count]i32 {
     var out: [tab_count]i32 = .{ 0, 0 };
     for (0..tab_count) |i| {
         const tab: Tab = @enumFromInt(@as(u8, @intCast(i)));
-        out[i] = self.measure(hdc, tab.label(), .{}, .body).cx;
+        out[i] = self.notes.measure(hdc, tab.label(), .{}, .body).cx;
     }
     return out;
 }
@@ -477,16 +398,6 @@ fn frame(self: *WhatsNewWindow, hdc: w32.HDC) layout.Frame {
     );
 }
 
-fn fillRect(hdc: w32.HDC, r: layout.Rect, color: u32) void {
-    var rc: w32.RECT = .{
-        .left = r.x,
-        .top = r.y,
-        .right = r.x + r.w,
-        .bottom = r.y + r.h,
-    };
-    if (bg_brush.get(color)) |b| _ = w32.FillRect(hdc, &rc, b);
-}
-
 fn paint(self: *WhatsNewWindow, hdc: w32.HDC) void {
     const p = self.pal();
     const rc = self.clientRect();
@@ -496,6 +407,7 @@ fn paint(self: *WhatsNewWindow, hdc: w32.HDC) void {
         .w = rc.right - rc.left,
         .h = rc.bottom - rc.top,
     };
+    self.notes.palette = p;
     fillRect(hdc, client, cr(p.bg));
     _ = w32.SetBkMode(hdc, w32.TRANSPARENT);
 
@@ -508,8 +420,8 @@ fn paint(self: *WhatsNewWindow, hdc: w32.HDC) void {
     for (f.tabs, 0..) |r, i| {
         const tab: Tab = @enumFromInt(@as(u8, @intCast(i)));
         const on = tab == self.selected;
-        const line_h = self.lineHeight(.body);
-        _ = self.drawText(
+        const line_h = self.notes.lineHeight(.body);
+        _ = self.notes.drawText(
             hdc,
             r.x + m.tab_pad_x,
             r.y + @divTrunc(r.h - line_h, 2),
@@ -525,8 +437,7 @@ fn paint(self: *WhatsNewWindow, hdc: w32.HDC) void {
 
     // The notes, clipped to the viewport and offset by the scroll.
     const idx = @intFromEnum(self.selected);
-    self.links.clearRetainingCapacity();
-    _ = self.link_text.reset(.retain_capacity);
+    self.notes.beginPaint();
     const saved = w32.SaveDC(hdc);
     _ = w32.IntersectClipRect(
         hdc,
@@ -535,11 +446,12 @@ fn paint(self: *WhatsNewWindow, hdc: w32.HDC) void {
         f.viewport.x + f.viewport.w,
         f.viewport.y + f.viewport.h,
     );
-    const total = self.renderNotes(
+    const total = self.notes.render(
         hdc,
         f.viewport.x + m.margin,
         f.viewport.y - self.scroll[idx],
         f.text_w,
+        self.models[idx].split,
         true,
     );
     _ = w32.RestoreDC(hdc, saved);
@@ -558,340 +470,14 @@ fn measureContent(self: *WhatsNewWindow) void {
     const f = self.frame(hdc);
     const m = layout.metrics(self.scale);
     const idx = @intFromEnum(self.selected);
-    self.content_h[idx] = self.renderNotes(hdc, f.viewport.x + m.margin, 0, f.text_w, false);
-}
-
-/// The one walker: `draw = false` measures, `draw = true` paints. Height and
-/// pixels come from the same code, so they cannot disagree.
-fn renderNotes(
-    self: *WhatsNewWindow,
-    hdc: w32.HDC,
-    x: i32,
-    top: i32,
-    width: i32,
-    draw: bool,
-) i32 {
-    const p = self.pal();
-    const m = layout.metrics(self.scale);
-    const split = self.models[@intFromEnum(self.selected)].split;
-
-    var y = top + m.margin;
-    if (split.fresh.len == 0) {
-        y += self.drawWrapped(
-            hdc,
-            x,
-            y,
-            width,
-            release_notes.no_new_notes_label,
-            .{},
-            .body,
-            cr(p.secondary),
-            draw,
-        );
-    } else {
-        for (split.fresh, 0..) |notes, i| {
-            if (i > 0) y += m.release_gap;
-            y += self.renderVersion(hdc, x, y, width, notes, draw);
-        }
-    }
-
-    if (split.installed.len > 0) {
-        y += m.rule_gap;
-        y += self.renderLabelledRule(hdc, x, y, width, draw);
-        y += m.rule_gap;
-        for (split.installed, 0..) |notes, i| {
-            if (i > 0) y += m.release_gap;
-            y += self.renderVersion(hdc, x, y, width, notes, draw);
-        }
-    }
-
-    y += m.margin;
-    return y - top;
-}
-
-/// Mac's `labelledRule`: a hairline, the label, a hairline.
-fn renderLabelledRule(
-    self: *WhatsNewWindow,
-    hdc: w32.HDC,
-    x: i32,
-    y: i32,
-    width: i32,
-    draw: bool,
-) i32 {
-    const p = self.pal();
-    const m = layout.metrics(self.scale);
-    const label = release_notes.installed_divider_label;
-    const line_h = self.lineHeight(.caption);
-    const text_w = self.measure(hdc, label, .{}, .caption).cx;
-    const side = @max(0, @divTrunc(width - text_w - 2 * m.item_gap, 2));
-    if (draw) {
-        const mid = y + @divTrunc(line_h, 2);
-        fillRect(hdc, .{ .x = x, .y = mid, .w = side, .h = m.rule_h }, cr(p.divider));
-        fillRect(hdc, .{
-            .x = x + width - side,
-            .y = mid,
-            .w = side,
-            .h = m.rule_h,
-        }, cr(p.divider));
-        _ = self.drawText(
-            hdc,
-            x + side + m.item_gap,
-            y,
-            label,
-            .{},
-            .caption,
-            cr(p.secondary),
-            true,
-        );
-    }
-    return line_h;
-}
-
-fn renderVersion(
-    self: *WhatsNewWindow,
-    hdc: w32.HDC,
-    x: i32,
-    y0: i32,
-    width: i32,
-    notes: release_notes.VersionNotes,
-    draw: bool,
-) i32 {
-    const p = self.pal();
-    const m = layout.metrics(self.scale);
-    var y = y0;
-
-    // The version banners its release block, not a footnote to it.
-    if (draw) {
-        _ = self.drawText(hdc, x, y, notes.version, .{}, .version, cr(p.text), true);
-    }
-    y += self.lineHeight(.version);
-    y += m.section_gap;
-
-    const titles = release_notes.showsSectionTitles(notes);
-    for (notes.sections, 0..) |section, si| {
-        if (si > 0) y += m.section_gap;
-        if (titles) {
-            if (draw) {
-                _ = self.drawText(hdc, x, y, section.title, .{}, .strong, cr(p.text), true);
-            }
-            y += self.lineHeight(.strong) + m.item_gap;
-        }
-        for (section.items, 0..) |item, ii| {
-            if (ii > 0) y += m.item_gap;
-            y += self.renderItem(hdc, x, y, width, item, draw);
-        }
-    }
-    return y - y0;
-}
-
-fn renderItem(
-    self: *WhatsNewWindow,
-    hdc: w32.HDC,
-    x: i32,
-    y0: i32,
-    width: i32,
-    item: release_notes.Note,
-    draw: bool,
-) i32 {
-    const p = self.pal();
-    const m = layout.metrics(self.scale);
-    const text_x = x + m.bullet_indent;
-    const text_w = @max(1, width - m.bullet_indent);
-    var y = y0;
-
-    // The bullet sits in the gutter, so wrapped lines align under the first.
-    if (draw) {
-        _ = self.drawText(hdc, x, y, "\u{2022}", .{}, .body, cr(p.secondary), true);
-    }
-
-    if (item.title) |title| {
-        y += self.drawWrapped(hdc, text_x, y, text_w, title, .{ .bold = true }, .strong, cr(p.text), draw);
-        y += m.item_line_gap;
-        y += self.drawWrapped(hdc, text_x, y, text_w, item.text, .{}, .body, cr(p.secondary), draw);
-    } else {
-        y += self.drawWrapped(hdc, text_x, y, text_w, item.text, .{}, .body, cr(p.text), draw);
-    }
-    return y - y0;
-}
-
-// ---------------------------------------------------------------------
-// Text: measure, wrap, draw
-// ---------------------------------------------------------------------
-
-fn measure(
-    self: *WhatsNewWindow,
-    hdc: w32.HDC,
-    text: []const u8,
-    style: markdown.Style,
-    class: SizeClass,
-) w32.SIZE {
-    var wbuf: [512]u16 = undefined;
-    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, text) catch return .{ .cx = 0, .cy = 0 };
-    if (wlen == 0) return .{ .cx = 0, .cy = 0 };
-    const font = self.fontFor(style, class);
-    const prev = w32.SelectObject(hdc, font);
-    defer _ = w32.SelectObject(hdc, prev);
-    var size: w32.SIZE = .{ .cx = 0, .cy = 0 };
-    _ = w32.GetTextExtentPoint32W(hdc, &wbuf, @intCast(wlen), &size);
-    return size;
-}
-
-/// Draw one run at (x, y); returns its width. Never wraps.
-fn drawText(
-    self: *WhatsNewWindow,
-    hdc: w32.HDC,
-    x: i32,
-    y: i32,
-    text: []const u8,
-    style: markdown.Style,
-    class: SizeClass,
-    color: u32,
-    draw: bool,
-) i32 {
-    var wbuf: [512]u16 = undefined;
-    const wlen = std.unicode.utf8ToUtf16Le(&wbuf, text) catch return 0;
-    if (wlen == 0) return 0;
-    const font = self.fontFor(style, class);
-    const prev = w32.SelectObject(hdc, font);
-    defer _ = w32.SelectObject(hdc, prev);
-    var size: w32.SIZE = .{ .cx = 0, .cy = 0 };
-    _ = w32.GetTextExtentPoint32W(hdc, &wbuf, @intCast(wlen), &size);
-    if (draw) {
-        _ = w32.SetTextColor(hdc, color);
-        _ = w32.TextOutW(hdc, x, y, &wbuf, @intCast(wlen));
-    }
-    return size.cx;
-}
-
-/// One measured word (or run of whitespace) of a styled inline run.
-const Token = struct {
-    text: []const u8,
-    style: markdown.Style,
-    link: ?[]const u8,
-    width: i32,
-    is_space: bool,
-};
-
-/// Parse `source` as inline markdown, wrap it to `width`, and draw it (or
-/// just measure it). Returns the height consumed.
-///
-/// `base` is the style every run inherits — a bullet's bold lead is bold
-/// markdown or not, and either way it renders bold.
-fn drawWrapped(
-    self: *WhatsNewWindow,
-    hdc: w32.HDC,
-    x: i32,
-    y: i32,
-    width: i32,
-    source: []const u8,
-    base: markdown.Style,
-    class: SizeClass,
-    color: u32,
-    draw: bool,
-) i32 {
-    const line_h = self.lineHeight(class);
-    var arena_state: std.heap.ArenaAllocator = .init(self.app.core_app.alloc);
-    defer arena_state.deinit();
-    const arena = arena_state.allocator();
-
-    const segs = markdown.parseSegs(arena, .{}, source, false) catch {
-        // Out of memory mid-parse: fall back to the raw string rather than
-        // dropping the note entirely.
-        if (draw) _ = self.drawText(hdc, x, y, source, base, class, color, true);
-        return line_h;
-    };
-
-    var tokens: std.ArrayList(Token) = .empty;
-    for (segs) |item| {
-        const seg: markdown.Seg = switch (item) {
-            .seg => |s| s,
-            // The banner draws these natively; a release note is prose, so
-            // the glyph fallback is right here.
-            .checkbox => |on| .{ .text = if (on) "\u{2611}" else "\u{2610}" },
-        };
-        var style = seg.style;
-        if (base.bold) style.bold = true;
-        if (base.italic) style.italic = true;
-        // A link's rule is drawn by its color; GDI's own underline is only
-        // ever solid and would read as permanently hovered.
-        style.underline = false;
-        self.tokenize(hdc, arena, &tokens, seg.text, style, seg.link, class) catch break;
-    }
-    if (tokens.items.len == 0) return line_h;
-
-    var widths: std.ArrayList(f32) = .empty;
-    var spaces: std.ArrayList(bool) = .empty;
-    for (tokens.items) |t| {
-        widths.append(arena, @floatFromInt(t.width)) catch break;
-        spaces.append(arena, t.is_space) catch break;
-    }
-    if (widths.items.len != tokens.items.len) return line_h;
-
-    const lines = markdown.wrapTokens(
-        arena,
-        widths.items,
-        spaces.items,
-        @floatFromInt(@max(1, width)),
-    ) catch return line_h;
-
-    const p = self.pal();
-    var ly = y;
-    for (lines) |line| {
-        var lx = x;
-        for (tokens.items[line.start..line.end]) |t| {
-            const c = if (t.link != null) cr(p.accent) else color;
-            const w = self.drawText(hdc, lx, ly, t.text, t.style, class, c, draw);
-            if (draw and t.link != null and !t.is_space) {
-                // Copied, not borrowed: `t.link` lives in this call's arena.
-                if (self.link_text.allocator().dupe(u8, t.link.?)) |url| {
-                    self.links.append(self.app.core_app.alloc, .{
-                        .rect = .{
-                            .left = lx,
-                            .top = ly,
-                            .right = lx + w,
-                            .bottom = ly + line_h,
-                        },
-                        .url = url,
-                    }) catch {};
-                } else |_| {}
-            }
-            lx += w;
-        }
-        ly += line_h;
-    }
-    return ly - y;
-}
-
-/// Split `text` into words and whitespace runs, measuring each. The link and
-/// style ride along so a wrapped line can re-select the right font.
-fn tokenize(
-    self: *WhatsNewWindow,
-    hdc: w32.HDC,
-    arena: Allocator,
-    out: *std.ArrayList(Token),
-    text: []const u8,
-    style: markdown.Style,
-    link: ?[]const u8,
-    class: SizeClass,
-) !void {
-    var i: usize = 0;
-    while (i < text.len) {
-        const space = text[i] == ' ' or text[i] == '\t' or text[i] == '\n';
-        var j = i + 1;
-        while (j < text.len) : (j += 1) {
-            const s = text[j] == ' ' or text[j] == '\t' or text[j] == '\n';
-            if (s != space) break;
-        }
-        const slice = text[i..j];
-        try out.append(arena, .{
-            .text = slice,
-            .style = style,
-            .link = link,
-            .width = self.measure(hdc, slice, style, class).cx,
-            .is_space = space,
-        });
-        i = j;
-    }
+    self.content_h[idx] = self.notes.render(
+        hdc,
+        f.viewport.x + m.margin,
+        0,
+        f.text_w,
+        self.models[idx].split,
+        false,
+    );
 }
 
 // ---------------------------------------------------------------------
@@ -948,13 +534,9 @@ fn onLeftDown(self: *WhatsNewWindow, x: i32, y: i32) void {
     }
 
     // A link under the pointer wins over a drag.
-    for (self.links.items) |l| {
-        if (x >= l.rect.left and x < l.rect.right and
-            y >= l.rect.top and y < l.rect.bottom)
-        {
-            self.app.openUrl(l.url);
-            return;
-        }
+    if (self.notes.linkAt(x, y)) |url| {
+        self.app.openUrl(url);
+        return;
     }
 
     const idx = @intFromEnum(self.selected);
@@ -989,15 +571,7 @@ fn onMouseMove(self: *WhatsNewWindow, x: i32, y: i32) void {
 
     // The hand cursor is the only hover affordance here: the notes are prose,
     // not a list of rows, so nothing else lights up.
-    var over: ?[*]const u8 = null;
-    for (self.links.items) |l| {
-        if (x >= l.rect.left and x < l.rect.right and
-            y >= l.rect.top and y < l.rect.bottom)
-        {
-            over = l.url.ptr;
-            break;
-        }
-    }
+    const over: ?[*]const u8 = if (self.notes.linkAt(x, y)) |url| url.ptr else null;
     if (over != self.hover_link) {
         self.hover_link = over;
         _ = w32.SetCursor(w32.LoadCursorW(
@@ -1008,15 +582,15 @@ fn onMouseMove(self: *WhatsNewWindow, x: i32, y: i32) void {
 }
 
 fn onKey(self: *WhatsNewWindow, vk: u16) bool {
-    const page: i32 = @max(1, self.viewportHeight() - self.lineHeight(.body));
+    const page: i32 = @max(1, self.viewportHeight() - self.notes.lineHeight(.body));
     const idx = @intFromEnum(self.selected);
     switch (vk) {
         w32.VK_ESCAPE => {
             self.close();
             return true;
         },
-        w32.VK_DOWN => self.scrollBy(self.lineHeight(.body)),
-        w32.VK_UP => self.scrollBy(-self.lineHeight(.body)),
+        w32.VK_DOWN => self.scrollBy(self.notes.lineHeight(.body)),
+        w32.VK_UP => self.scrollBy(-self.notes.lineHeight(.body)),
         w32.VK_NEXT => self.scrollBy(page),
         w32.VK_PRIOR => self.scrollBy(-page),
         w32.VK_HOME => self.scrollTo(0),
@@ -1089,7 +663,7 @@ fn wndProc(hwnd: w32.HWND, msg: u32, wparam: usize, lparam: isize) callconv(.win
                 suggested.bottom - suggested.top,
                 w32.SWP_NOZORDER | w32.SWP_NOACTIVATE,
             );
-            self.clearFonts();
+            self.notes.setScale(self.scale);
             self.measureContent();
             _ = w32.InvalidateRect(hwnd, null, 0);
             return 0;

@@ -63,6 +63,18 @@ const dip_lg: f32 = 12;
 const dip_xl: f32 = 16;
 const dip_xxl: f32 = 24;
 
+/// How much air the notes get (T625). Mac's `WhatsNewNotesContent` takes the
+/// same knob: one renderer, two spacings, so the window and the alert
+/// accessory cannot drift about what a release note looks like.
+///
+/// `spacious` is the window — the reader has a whole window and is browsing.
+/// `compact` is an accessory inside a dialog, where the notes are the evidence
+/// for a decision the user is being asked to make right now and every step on
+/// the scale drops one notch. Only the SPACING changes: the type ramp, the
+/// bullet shape and the order are the window's, which is what makes the
+/// accessory recognisable as the same thing.
+pub const Density = enum { spacious, compact };
+
 /// Every number the window draws with, resolved for one DPI scale.
 pub const Metrics = struct {
     /// Dialog content inset (xl).
@@ -101,22 +113,36 @@ pub const Metrics = struct {
     scrollbar_w: i32,
 };
 
+/// The window's spacing — `metricsFor(scale, .spacious)`, kept as the bare
+/// name because the window is what every existing caller means.
 pub fn metrics(scale: f32) Metrics {
+    return metricsFor(scale, .spacious);
+}
+
+pub fn metricsFor(scale: f32, density: Density) Metrics {
     const line = type_ramp.lineBox(type_ramp.body(scale), scale);
+    // One notch down the scale per step, so the compact block stays legible
+    // and keeps the same ORDER (a release break wider than a section break,
+    // wider than a bullet gap) — the thing the eye actually reads.
+    const compact = density == .compact;
+    const dip_margin: f32 = if (compact) dip_lg else dip_xl;
+    const dip_release: f32 = if (compact) dip_xl else dip_xxl;
+    const dip_section: f32 = if (compact) dip_md else dip_lg;
+    const dip_item: f32 = if (compact) dip_sm else dip_md;
     return .{
-        .margin = px(dip_xl, scale),
+        .margin = px(dip_margin, scale),
         .tab_h = line + 2 * px(dip_md, scale),
         .tab_pad_x = px(dip_lg, scale),
         .tab_gap = px(dip_sm, scale),
         .underline_h = px(dip_xs, scale),
         .rule_h = @max(1, px(1, scale)),
-        .release_gap = px(dip_xxl, scale),
-        .section_gap = px(dip_lg, scale),
-        .item_gap = px(dip_md, scale),
+        .release_gap = px(dip_release, scale),
+        .section_gap = px(dip_section, scale),
+        .item_gap = px(dip_item, scale),
         .item_line_gap = px(dip_xs, scale),
         .bullet_gap = px(dip_md, scale),
         .bullet_indent = px(dip_lg, scale),
-        .rule_gap = px(dip_lg, scale),
+        .rule_gap = px(if (compact) dip_md else dip_lg, scale),
         .wheel_step = 3 * line,
         .scrollbar_w = px(dip_lg, scale),
     };
@@ -126,6 +152,15 @@ pub fn metrics(scale: f32) Metrics {
 /// work area — Mac's `defaultContentSize`, in physical pixels.
 pub fn defaultSize(scale: f32) struct { w: i32, h: i32 } {
     return .{ .w = px(700, scale), .h = px(740, scale) };
+}
+
+/// The height a dialog accessory's scroll area gets (T625), in physical
+/// pixels. Fixed on purpose: the notes scroll INSIDE it, so a release with
+/// twelve bullets and one with two produce the same dialog. A dialog that
+/// resized itself around its evidence would move the buttons the user is
+/// reaching for.
+pub fn accessoryHeight(scale: f32) i32 {
+    return px(196, scale);
 }
 
 /// How far down the window may be dragged — Mac's `minimumContentSize`.
@@ -302,6 +337,65 @@ test "metrics: 100% resolves the design system's scale exactly" {
     try testing.expectEqual(@as(i32, 24), m.release_gap); // xxl
     try testing.expectEqual(@as(i32, 12), m.section_gap); // lg
     try testing.expectEqual(@as(i32, 8), m.item_gap); // md
+}
+
+test "metricsFor: compact is tighter than spacious, and still ordered" {
+    for (scales) |s| {
+        const spacious = metricsFor(s, .spacious);
+        const compact = metricsFor(s, .compact);
+
+        // Every step the density touches gives ground, and none of them
+        // collapse to nothing — an accessory with zero gap between releases is
+        // a wall of text, not a denser list.
+        try testing.expect(compact.margin < spacious.margin);
+        try testing.expect(compact.release_gap < spacious.release_gap);
+        try testing.expect(compact.section_gap < spacious.section_gap);
+        try testing.expect(compact.item_gap < spacious.item_gap);
+        try testing.expect(compact.item_gap > 0);
+        try testing.expect(compact.margin > 0);
+
+        // The ORDER is what the eye reads, and it survives the squeeze.
+        try testing.expect(compact.release_gap > compact.section_gap);
+        try testing.expect(compact.section_gap > compact.item_gap);
+        try testing.expect(compact.item_gap > compact.item_line_gap);
+
+        // The type ramp is NOT a density knob: the accessory is the same
+        // renderer at the same sizes, which is why it reads as the window's
+        // notes rather than a summary of them.
+        try testing.expectEqual(spacious.bullet_indent, compact.bullet_indent);
+        try testing.expectEqual(spacious.item_line_gap, compact.item_line_gap);
+    }
+}
+
+test "metricsFor: the bare metrics() is the window's spacing" {
+    for (scales) |s| {
+        const bare = metrics(s);
+        const spacious = metricsFor(s, .spacious);
+        try testing.expectEqual(spacious.margin, bare.margin);
+        try testing.expectEqual(spacious.release_gap, bare.release_gap);
+        try testing.expectEqual(spacious.section_gap, bare.section_gap);
+        try testing.expectEqual(spacious.item_gap, bare.item_gap);
+    }
+}
+
+test "metricsFor: compact resolves the design system's scale exactly at 100%" {
+    const m = metricsFor(1.0, .compact);
+    try testing.expectEqual(@as(i32, 12), m.margin); // lg
+    try testing.expectEqual(@as(i32, 16), m.release_gap); // xl
+    try testing.expectEqual(@as(i32, 8), m.section_gap); // md
+    try testing.expectEqual(@as(i32, 4), m.item_gap); // sm
+}
+
+test "accessoryHeight: a fixed band that grows with DPI and holds real notes" {
+    var prev: i32 = 0;
+    for (scales) |s| {
+        const h = accessoryHeight(s);
+        // Tall enough for a version banner plus a couple of bullets, or the
+        // accessory is a peephole rather than an answer.
+        try testing.expect(h > 4 * type_ramp.lineBox(type_ramp.body(s), s));
+        try testing.expect(h >= prev);
+        prev = h;
+    }
 }
 
 test "frameFor: tabs run leading-aligned and the underline tracks selection" {

@@ -672,7 +672,12 @@ $GuardTable = @(
         Covers = @(
             'test\win32\agent-upgrade.ps1',
             'src\apprt\win32\agent_upgrade.zig',
-            'src\apprt\win32\LocalAgent.zig'
+            'src\apprt\win32\LocalAgent.zig',
+            # T625: the What's New accessory hangs off this harness's skew
+            # dialog (arm J), and its absence is arm N - so an edit to the
+            # accessory, or to the dialog band it sits in, is due here.
+            'src\apprt\win32\WhatsNewNotesView.zig',
+            'src\apprt\win32\ConfirmDialog.zig'
         )
     },
     # Cross-lineage layout blobs (T337/T623): the only harness that proves the
@@ -1921,6 +1926,10 @@ $GuardTable = @(
             'src\apprt\win32\release_notes_bundle.zig',
             'src\apprt\win32\whats_new_seen.zig',
             'src\apprt\win32\whats_new_layout.zig',
+            # The renderer both the window and the dialog accessory paint with
+            # (T625) - shared on purpose, so it is covered by the harness that
+            # drives the real notes.
+            'src\apprt\win32\whats_new_notes.zig',
             'src\build\GhosttyReleaseNotes.zig',
             'test\win32\whats-new.ps1'
         )
