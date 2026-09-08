@@ -1,0 +1,14 @@
+{
+    "guard":  "test-filter",
+    "script":  "test/win32/test-filter-guard.ps1",
+    "generated":  "2026-09-08T01:22:29-07:00",
+    "commit":  "47ec981e9",
+    "uncommitted":  [
+                        "src/build/TestFilterGuard.zig",
+                        "test/win32/test-filter-guard.ps1"
+                    ],
+    "files":  {
+                  "src/build/TestFilterGuard.zig":  "7ad9896e0d2d638ddb4ca5192fe9257e71c9df63c83e4c93671a0f4f5aafd1cc",
+                  "test/win32/test-filter-guard.ps1":  "acc3723dfbbaec62341d3593a2e41af3d0cdb026391289d4e6412ae4ff1ac69f"
+              }
+}

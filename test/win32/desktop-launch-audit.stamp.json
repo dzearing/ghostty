@@ -1,10 +1,10 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-08T00:46:43-07:00",
-    "commit":  "abab185f2",
+    "generated":  "2026-09-08T01:44:02-07:00",
+    "commit":  "47ec981e9",
     "uncommitted":  [
-                        "test/win32/ipc-startup-latency.ps1"
+                        "test/win32/test-filter-guard.ps1"
                     ],
     "files":  {
                   "src/cli/ghostty.zig":  "ef54b501298cfda9306cfb958c1094db24ee30f355b25865656b3e2bc713bcd7",
@@ -257,6 +257,7 @@
                   "test/win32/test-client-build.ps1":  "4151eff034e0de3acacf2e176c97702fd757f2c83f863476a115da9dc34e7b2b",
                   "test/win32/test-desktop-harness.ps1":  "e4fb2e7aa54684ef7745dbad908342df608c2bf32cb37d6b429a20b6cfc08e8d",
                   "test/win32/test-desktop-spike.ps1":  "fe210e65c149640f7641882b23be4f13d9ec43be05d0b1347de88576950d7b54",
+                  "test/win32/test-filter-guard.ps1":  "acc3723dfbbaec62341d3593a2e41af3d0cdb026391289d4e6412ae4ff1ac69f",
                   "test/win32/test-reach-audit.ps1":  "9987988dde78037ac8545dd70de97e50d2d9312bca3e9c0ee89d0be955eb638e",
                   "test/win32/title-font.ps1":  "946fd12880bb0433a535283fb6146fb7d2a8fd1b2d1f0f74e00fa7ce1720dcb8",
                   "test/win32/title-jitter.ps1":  "305bd304faf09988c8852f7fa69f2c780212b639fb837085b5869ab5457acab7",
