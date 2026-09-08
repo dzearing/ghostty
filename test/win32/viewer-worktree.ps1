@@ -15,6 +15,11 @@
 #     itself is T634, so what it reaches is a logged intent).
 #   - the address field still shows the file's path with the trailing button
 #     present, i.e. adding it did not eat the field.
+#   - EVERY present button has a tooltip whose tool rect is its HIT box, and an
+#     absent one has no tool at all (T639). Before it, one button of six
+#     explained itself; the strings themselves are unit-tested in the none lane
+#     (`viewer_nav_layout.label`), so what is left to prove on the box is the
+#     registration -- which buttons got a tool, and where it sits.
 #
 # ORACLE, and why it is the log. The nav bar is native owner-painted chrome
 # inside a WebView2-hosting child window, and this runs on the BACKGROUND test
@@ -127,6 +132,54 @@ function Get-WorktreeState($errlog, $paneId) {
     return $hit
 }
 
+# The pane's nav-bar tooltips, from the same stderr oracle and for the same
+# reason (T639): owner-painted chrome on a desktop nothing can screenshot. The
+# bar logs one line per CHANGE, so the newest describes the strip as it stands.
+# Each present button reports both its painted square and the rect its tooltip
+# tool was registered with, which is what lets this check the tip follows the
+# forgiving HIT box rather than merely existing.
+function Get-NavTips($errlog, $paneId) {
+    if (-not (Test-Path $errlog)) { return $null }
+    if (-not $paneId) { return $null }
+    $tail = $null
+    foreach ($line in (Get-Content $errlog -ErrorAction SilentlyContinue)) {
+        if ($line -match "viewer nav tips pane=$([regex]::Escape($paneId))(.*)$") { $tail = $Matches[1] }
+    }
+    if ($null -eq $tail) { return $null }
+    $tips = @{}
+    $rx = '(\w+):paint=(-?\d+),(-?\d+),(-?\d+),(-?\d+):tool=(-?\d+),(-?\d+),(-?\d+),(-?\d+)'
+    foreach ($m in [regex]::Matches($tail, $rx)) {
+        $g = $m.Groups
+        $tips[$g[1].Value] = [pscustomobject]@{
+            Paint = @([int]$g[2].Value, [int]$g[3].Value, [int]$g[4].Value, [int]$g[5].Value)
+            Tool  = @([int]$g[6].Value, [int]$g[7].Value, [int]$g[8].Value, [int]$g[9].Value)
+        }
+    }
+    return $tips
+}
+
+# The bar syncs its tips from `place`, which follows the pane's own bounds, so
+# like the worktree state this waits for the answer rather than sampling once.
+function Wait-NavTips($errlog, $paneId) {
+    for ($t = 0; $t -lt 40; $t++) {
+        $tips = Get-NavTips $errlog $paneId
+        if ($tips -and $tips.ContainsKey('back')) { return $tips }
+        Start-Sleep -Milliseconds 250
+    }
+    return (Get-NavTips $errlog $paneId)
+}
+
+# A tool rect must COVER its painted square and be strictly bigger than it: the
+# design system's hit box exceeds the paint, and a tip that used the paint
+# would go quiet in exactly the margin a click still lands in.
+function Test-TipIsHitBox($tip) {
+    if (-not $tip) { return $false }
+    $p = $tip.Paint
+    $h = $tip.Tool
+    if ($h[0] -gt $p[0] -or $h[1] -gt $p[1] -or $h[2] -lt $p[2] -or $h[3] -lt $p[3]) { return $false }
+    return (($h[2] - $h[0]) -gt ($p[2] - $p[0])) -and (($h[3] - $h[1]) -gt ($p[3] - $p[1]))
+}
+
 # Resolution is asynchronous by design (a `git` spawn off the UI thread), so
 # every read of it waits for a line rather than sampling once.
 function Wait-WorktreeState($errlog, $paneId, [bool]$Shown) {
@@ -200,6 +253,26 @@ try {
     Assert (@($addrs | Where-Object { $_ -eq $viewFile }).Count -ge 1) `
         "the address field still shows the file's path beside the button (got '$($addrs -join "','")')"
 
+    # --- 2b. every present button carries a tooltip (T639) -------------------
+    # The defect: back/forward/reload/home were silent icons while the newest
+    # button, feedback, explained itself. The positive control for the
+    # "absent buttons have no tool" half is right here in the same reading --
+    # this pane HAS a feedback tool, and section 4's pane does not.
+    $tips = Wait-NavTips $errlog $filePane
+    Assert ($null -ne $tips) 'the file pane reported its nav-bar tooltips'
+    foreach ($b in @('back', 'forward', 'reload', 'home')) {
+        Assert ($tips -and $tips.ContainsKey($b)) "the '$b' button has a tooltip"
+        Assert ($tips -and (Test-TipIsHitBox $tips[$b])) `
+            "...whose tool rect is '$b's hit box, not its paint"
+    }
+    Assert ($tips -and $tips.ContainsKey('feedback')) `
+        'the feedback button kept the tooltip T633 gave it'
+    # The contents toggle exists only in the COMPACT card layout; a full-width
+    # window is not one, so its absence here is the "no tool for an absent
+    # button" case rather than a missing label.
+    Assert ($tips -and -not $tips.ContainsKey('contents')) `
+        'a button the strip is not showing has no tooltip tool at all'
+
     # --- 3. clicking is live (the action reaches the pane) -------------------
     # What T633 owes is a button that is WIRED, and since T634 what it is wired
     # to is the composer: the pane reports the open transition with the worktree
@@ -259,6 +332,16 @@ try {
     $s = Wait-WorktreeState $errlog $webPane $false
     Assert ($null -ne $s) 'the no-repo pane reported a worktree resolution'
     Assert ($s -and -not $s.Shown) "a pane opened outside any repository shows NO feedback button (state '$($s.Shown)')"
+    # ...and no tooltip for it either (T639), while the five that ARE on the
+    # strip still have theirs -- the negative and its control in one reading.
+    $webTips = Wait-NavTips $errlog $webPane
+    Assert ($null -ne $webTips) 'the no-repo pane reported its nav-bar tooltips'
+    Assert ($webTips -and -not $webTips.ContainsKey('feedback')) `
+        'the absent feedback button registers no tooltip tool'
+    foreach ($b in @('back', 'forward', 'reload', 'home')) {
+        Assert ($webTips -and $webTips.ContainsKey($b)) `
+            "...while '$b' still has one on the same bar"
+    }
 
     # --- 5. leg 3, populated: a remote URL opened FROM the repo shows it -----
     # The fallback's whole reason to exist: a dev server or a doc site is still

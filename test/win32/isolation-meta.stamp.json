@@ -1,10 +1,10 @@
 {
     "guard":  "isolation-meta",
     "script":  "test/win32/isolation-meta.ps1",
-    "generated":  "2026-09-08T02:25:48-07:00",
-    "commit":  "0b7526a50",
+    "generated":  "2026-09-08T03:12:11-07:00",
+    "commit":  "4f91f8a6c",
     "uncommitted":  [
-                        "test/win32/activity-monitor.ps1"
+                        "test/win32/viewer-worktree.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "a3f98a551352e27d1ad9c1745e222757dc4b802efc5638fbe6ea4d3f621b6307",
@@ -290,7 +290,7 @@
                   "test/win32/viewer-popup.ps1":  "207d22eddae6f4326f1c25a3d64e1e745b705bf53651526519b596318b8de890",
                   "test/win32/viewer-restore.ps1":  "28bca34940c13598967468ac5b4f5b7353f980a17b50d4a32be007bbc753c576",
                   "test/win32/viewer-window-chords.ps1":  "f8a4613094f1ff5449211e6c3bddee67c8ee3ed3050f95b02e61717744fba7eb",
-                  "test/win32/viewer-worktree.ps1":  "b58c40302cdc8cd34690887d581cd2763eef490c3e9387145884a313caee01fd",
+                  "test/win32/viewer-worktree.ps1":  "1d8091bad18fee1a104e7629267bd4599975812e5d222f0f15428c9d8742f3c7",
                   "test/win32/viewer-worktree-port.ps1":  "74df2c3c92ef08ce58bed2f4ad1912b9f72058f4990c42b84b6039a2fc4a2cea",
                   "test/win32/website-windows-download.ps1":  "32701ddb1259d19533c96c283b936da56ef165175577a34188b8b022e291a941",
                   "test/win32/whats-new.ps1":  "2dd7e75d9014532aa4be67f64269147a6245630877a8b1ff3b4e54660a7609d2",

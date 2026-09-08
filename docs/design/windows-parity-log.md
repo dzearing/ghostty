@@ -9,6 +9,50 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-08: T639 - **five of the six viewer nav-bar buttons were silent
+  icons.** T633 gave the strip its first tooltip, on the feedback button; back,
+  forward, reload, home and the contents toggle kept none, so the only way to
+  learn what an icon meant was to press it. Each button looked fine in
+  isolation, which is exactly the shape the design system's
+  one-treatment-per-control-class rule exists to catch.
+
+  The words now live in `viewer_nav_layout.label(Button, Labels)` - pure,
+  beside the geometry, unit-tested in the `none` lane - rather than inside the
+  paint code. That is what makes Mac's two interesting cases testable: the
+  contents toggle names the ACTION it would perform and calls the card "files"
+  in a diff pane, and Home names its DESTINATION ("Home - back to <where>"),
+  which is the question a Home button raises in a pane that has browsed away
+  from where it started. A home too long to hold, or a pane with none, gets an
+  unadorned "Home" rather than a truncated path pointing somewhere it would not
+  go. One of the four tests walks the whole enum, so a button added tomorrow
+  (T817's diff controls) fails until it has words.
+
+  `ViewerNavBar` keeps one comctl32 tool per PRESENT button now instead of one
+  tool for one button: ids keyed on the enum tag, a text buffer each, and a
+  `tipDelete` for a button the strip is not showing - the contents toggle
+  outside the compact card layout, the feedback button outside a working tree,
+  anything the overflow menu swallowed. Each tool is registered on the button's
+  HIT box, not its paint, so the tip follows the same forgiving target a click
+  does. The pane pushes the two things the bar cannot derive: where Home would
+  go (`setHome`, replayed at `ensureNav` because a pane is told where to go long
+  before its bar exists) and whether the card is open / this is a diff
+  (`setContentsButton` now carries both).
+
+  A real defect the floor caught rather than the reviewer: `tipId` computed
+  `@intFromEnum(b) + 2` on a **u3** tag, which overflows on the last button -
+  the win32 lane crashed in `syncTip` with an integer-overflow panic and a full
+  stack. Widened before the offset.
+
+  Validation: `test\win32\viewer-worktree.ps1` ALL PASS (42). Its nav-bar walk
+  reads a new stderr oracle - `viewer nav tips pane=<id> <button>:paint=...
+  :tool=...`, logged once per change - and asserts the tool rect both COVERS
+  and EXCEEDS the painted square, so a tip registered on the paint box fails
+  rather than passing for being present; the absent-button half is paired with
+  a present-button control in the same reading. Floor: win32 / none / agent /
+  lib lanes PASS, ipc-p1..p3 ALL PASS, `viewer-panes.ps1` ALL PASS (195), and
+  `guard-due.ps1 check` back to 0 after the nine static audits plus
+  viewer-close / viewer-narrow-pane / viewer-nav-pin that these files made due.
+
 - 2026-09-08: T631 - **the shortcut for proving a test runs could only ever
   say "fine".** `-Dtest-filter` is how a new test is shown to actually execute:
   break its assertion, run the filter, watch it go red. Measured while

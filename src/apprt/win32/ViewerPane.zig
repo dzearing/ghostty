@@ -1044,6 +1044,10 @@ fn ensureNav(self: *ViewerPane, alloc: Allocator, hinstance: ?w32.HINSTANCE, hwn
     self.nav = ViewerNavBar.create(alloc, self, hinstance, hwnd);
     if (self.nav == null) log.warn("viewer nav bar could not be created; pane has no chrome", .{});
     self.pushAddress();
+    // A pane is normally told where to go long before its bar exists, so the
+    // home it recorded then is replayed here -- the same rule `pushAddress`
+    // above already follows.
+    self.pushHome();
     // The worktree probe needs the same two halves and lands with the bar it
     // puts a button on. Its first resolution runs for wherever `navigate`
     // already put the pane, which is normally before either half exists.
@@ -1549,6 +1553,7 @@ pub fn navigate(self: *ViewerPane, alloc: Allocator, requested: []const u8) Allo
     if (self.home_location == null) {
         self.home_location = alloc.dupeZ(u8, url) catch null;
     }
+    self.pushHome();
 
     // Re-derived on EVERY navigation rather than fixed at construction: the
     // same pane moves between a file and the web over its life (the address
@@ -1972,6 +1977,7 @@ pub fn applyOpenMetadata(self: *ViewerPane, alloc: Allocator, opts: Open) void {
             if (self.home_location) |l| alloc.free(l);
             self.home_location = dup;
         } else |_| log.warn("viewer home location could not be recorded", .{});
+        self.pushHome();
     }
     if (opts.origin_directory) |dir| {
         if (alloc.dupe(u8, dir)) |dup| {
@@ -2661,7 +2667,7 @@ fn clearHeadings(self: *ViewerPane, alloc: Allocator) void {
     self.toc_mode = .hidden;
     self.toc_open = false;
     self.toc_gutter_css = 0;
-    if (self.nav) |nav| nav.setContentsButton(false);
+    self.pushContentsButton(false);
 }
 
 fn setActiveHeading(self: *ViewerPane, alloc: Allocator, id: ?[]const u8) void {
@@ -2725,7 +2731,7 @@ fn updateTOC(self: *ViewerPane, alloc: Allocator) void {
         self.toc_mode = .hidden;
         self.toc_open = false;
         if (self.toc) |panel| panel.hide();
-        if (self.nav) |nav| nav.setContentsButton(false);
+        self.pushContentsButton(false);
         self.pushGutter(alloc, 0);
         return;
     }
@@ -2748,7 +2754,7 @@ fn updateTOC(self: *ViewerPane, alloc: Allocator) void {
     if (wanted == .compact and self.toc_mode != .compact) self.toc_open = false;
     self.logPanelLayout(wanted, items);
     self.toc_mode = wanted;
-    if (self.nav) |nav| nav.setContentsButton(wanted == .compact);
+    self.pushContentsButton(wanted == .compact);
 
     const visible = wanted == .gutter or self.toc_open;
     const placement = panel.place(
@@ -5226,6 +5232,24 @@ fn pushAddress(self: *ViewerPane) void {
 fn pushHistory(self: *ViewerPane) void {
     const nav = self.nav orelse return;
     nav.setHistory(self.can_go_back, self.can_go_forward);
+}
+
+/// The contents toggle's presence AND what it would say (T639). One place, so
+/// the toggle's tooltip cannot fall behind the card it opens: every site that
+/// changes the card's layout goes through here, and `toc_open` and the pane's
+/// mode are read here rather than passed in.
+fn pushContentsButton(self: *ViewerPane, show: bool) void {
+    const nav = self.nav orelse return;
+    nav.setContentsButton(show, self.toc_open, self.mode == .diff);
+}
+
+/// Where the Home button would go, mirrored to the bar so its tooltip can name
+/// the destination (T639, Mac's `"Home \u{2014} back to \(homeLocation)"`). The
+/// pane owns `home_location`, and it is set in two places: seeded by the first
+/// `navigate`, then overridden by a restore's recorded home.
+fn pushHome(self: *ViewerPane) void {
+    const nav = self.nav orelse return;
+    nav.setHome(self.home_location);
 }
 
 /// The bar's back button: one entry back in the view's own history. The

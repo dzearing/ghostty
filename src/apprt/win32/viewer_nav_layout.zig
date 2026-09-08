@@ -9,6 +9,10 @@
 //! screen, so the only question left is where its controls go.
 const std = @import("std");
 const icon_button = @import("icon_button.zig");
+// The feedback button's tooltip is already worded (and tested) beside the
+// provenance that decides whether the button exists at all, so `label` reads
+// it from there rather than keeping a second copy of the same sentence.
+const viewer_worktree = @import("viewer_worktree.zig");
 
 pub const Rect = icon_button.Rect;
 
@@ -277,6 +281,61 @@ pub const Layout = struct {
         return null;
     }
 };
+
+/// Everything outside the geometry a tooltip needs to name its button. A
+/// struct rather than positional flags so a second bool cannot silently swap
+/// with a third at a call site (the same rule `Shown` follows).
+pub const Labels = struct {
+    /// Whether the compact contents card is currently OPEN. The toggle names
+    /// the action it would perform, not the state it is in (Mac's
+    /// `sidePanelOpen`).
+    contents_open: bool = false,
+    /// A diff pane's card lists changed FILES rather than headings, and the
+    /// toggle is renamed to match (Mac's `isDiffMode`).
+    diff: bool = false,
+    /// Where Home would go. Empty => the pane has no recorded home, and the
+    /// label drops the destination clause rather than naming nowhere.
+    home: []const u8 = "",
+    /// The working tree a report would file into. Empty => the feedback button
+    /// is ABSENT rather than disabled, so it has no tooltip at all.
+    worktree: []const u8 = "",
+};
+
+/// The tooltip for one button, into `buf`. Mac's `.help(...)` on the chrome
+/// bar (`ViewerSplitLeaf.swift`), string for string -- Home's destination
+/// clause included, because "back to where?" is the question a Home button
+/// raises in a pane that has browsed away from where it started.
+///
+/// A disabled back/forward still gets one, which is why this takes no enabled
+/// flag: Mac's `.help` survives `.disabled`, and "why can I not press this" is
+/// the moment a label is worth most.
+///
+/// An empty answer means "this button has no tooltip" -- today only the
+/// feedback button with no working tree, which is absent rather than silent.
+pub fn label(buf: []u8, which: Button, state: Labels) []const u8 {
+    return switch (which) {
+        .contents => if (state.diff)
+            (if (state.contents_open) "Hide files" else "Show files")
+        else
+            (if (state.contents_open) "Hide contents" else "Show contents"),
+        .back => "Back",
+        .forward => "Forward",
+        .reload => "Reload",
+        // A home too long to name is still a Home button: the clause is
+        // dropped rather than truncated to a path that points somewhere else.
+        .home => if (state.home.len == 0)
+            "Home"
+        else
+            std.fmt.bufPrint(buf, "Home \u{2014} back to {s}", .{state.home}) catch "Home",
+        // Mac has no overflow control; this is the strip's own, and its menu
+        // already words itself the same way (`ViewerNavBar.overflowTitle`).
+        .overflow => "More",
+        .feedback => if (state.worktree.len == 0)
+            ""
+        else
+            viewer_worktree.tooltipText(buf, state.worktree),
+    };
+}
 
 fn px(dip: f32, scale: f32) i32 {
     return @intFromFloat(@round(dip * scale));
@@ -637,4 +696,72 @@ test "hit testing answers on the hit box, not the paint" {
     _ = l.hitButton(scale, back.right + m.hit_pad + 1, -50);
     // Far outside is nobody's.
     try testing.expectEqual(@as(?Button, null), l.hitButton(scale, 0, l.bar_h * 3));
+}
+
+test "every button says what it does (T639)" {
+    var buf: [512]u8 = undefined;
+
+    // The five Mac labels, string for string.
+    try testing.expectEqualStrings("Back", label(&buf, .back, .{}));
+    try testing.expectEqualStrings("Forward", label(&buf, .forward, .{}));
+    try testing.expectEqualStrings("Reload", label(&buf, .reload, .{}));
+    try testing.expectEqualStrings("More", label(&buf, .overflow, .{}));
+
+    // The toggle names the action, not the state, and a diff pane's card is a
+    // list of FILES rather than a table of contents.
+    try testing.expectEqualStrings("Show contents", label(&buf, .contents, .{}));
+    try testing.expectEqualStrings(
+        "Hide contents",
+        label(&buf, .contents, .{ .contents_open = true }),
+    );
+    try testing.expectEqualStrings("Show files", label(&buf, .contents, .{ .diff = true }));
+    try testing.expectEqualStrings(
+        "Hide files",
+        label(&buf, .contents, .{ .diff = true, .contents_open = true }),
+    );
+}
+
+test "Home names its destination, and stays a label without one (T639)" {
+    var buf: [512]u8 = undefined;
+
+    try testing.expectEqualStrings(
+        "Home \u{2014} back to D:\\git\\ghoztty\\README.md",
+        label(&buf, .home, .{ .home = "D:\\git\\ghoztty\\README.md" }),
+    );
+    try testing.expectEqualStrings(
+        "Home \u{2014} back to https://example.org/docs",
+        label(&buf, .home, .{ .home = "https://example.org/docs" }),
+    );
+
+    // A pane with no recorded home drops the clause rather than naming
+    // nowhere -- the button is still there and still goes somewhere.
+    try testing.expectEqualStrings("Home", label(&buf, .home, .{}));
+
+    // And a destination that cannot FIT is the same case: better an unadorned
+    // label than a path truncated to one that points somewhere else.
+    var small: [8]u8 = undefined;
+    try testing.expectEqualStrings("Home", label(&small, .home, .{ .home = "D:\\git\\ghoztty" }));
+}
+
+test "the feedback button's tooltip names its worktree, or does not exist (T639)" {
+    var buf: [512]u8 = undefined;
+
+    try testing.expectEqualStrings(
+        "Send feedback to D:\\git\\ghoztty",
+        label(&buf, .feedback, .{ .worktree = "D:\\git\\ghoztty" }),
+    );
+    // Outside a working tree the button is ABSENT, so it is asked for no
+    // label at all; an empty answer is how the bar hears that.
+    try testing.expectEqualStrings("", label(&buf, .feedback, .{}));
+}
+
+test "no button is left unlabelled (T639)" {
+    var buf: [512]u8 = undefined;
+    const state: Labels = .{ .home = "D:\\git\\ghoztty", .worktree = "D:\\git\\ghoztty" };
+    // The defect this task exists for was one labelled button out of six, and
+    // it was invisible because nothing asked the question of the whole enum.
+    // A button added tomorrow fails here until it has words.
+    for (std.enums.values(Button)) |b| {
+        try testing.expect(label(&buf, b, state).len > 0);
+    }
 }

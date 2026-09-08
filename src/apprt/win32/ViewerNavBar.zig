@@ -65,12 +65,27 @@ pub const WM_APP_OVERFLOW_MENU: u32 = w32.WM_APP + 2;
 
 const edit_id: usize = 1;
 
-/// The feedback tooltip's tool id, in this bar's own tool space.
-const tip_id: usize = 2;
+/// Bytes the tooltip log line may hold: seven buttons, each a name and two
+/// rects.
+const tip_log_cap: usize = 512;
 
-/// UTF-16 units the tooltip text may hold. "Send feedback to " plus a full
+/// A button's tooltip tool id, in this bar's own tool space. Keyed on the
+/// button so the strip's shape can change without renumbering anything: the
+/// contents toggle and the feedback button both come and go.
+fn tipId(b: layout_mod.Button) usize {
+    // Widened BEFORE the offset: the enum's tag is a u3, and `+ 2` on the last
+    // button overflows it rather than producing 8.
+    return @as(usize, @intFromEnum(b)) + 2;
+}
+
+/// UTF-16 units one tooltip's text may hold. "Send feedback to " plus a full
 /// path, with room to spare.
 const tip_text_cap: usize = 320;
+
+/// Bytes of home location the bar keeps for Home's tooltip. A destination too
+/// long to hold is dropped rather than truncated (`setHome`), the same rule
+/// `setWorktree` already applies to an over-long root.
+const home_cap: usize = 512;
 
 hwnd: w32.HWND,
 edit: w32.HWND,
@@ -93,12 +108,33 @@ show_contents: bool = false,
 worktree: [std.fs.max_path_bytes]u8 = undefined,
 worktree_len: usize = 0,
 
-/// The feedback button's tooltip, and the control that shows it. Created on
-/// first use and kept for the bar's life; `tip_text` is the buffer comctl32
-/// reads through, so it must outlive every message the control sends itself.
+/// Where the Home button would go (T639), pushed by the pane whenever its
+/// recorded home changes. Empty => no recorded home, and Home's tooltip drops
+/// its destination clause.
+home: [home_cap]u8 = undefined,
+home_len: usize = 0,
+
+/// Whether the compact contents card is open, and whether this pane is a diff
+/// (T639). Both are the contents toggle's tooltip talking: the toggle names
+/// the action it would perform, and a diff pane's card lists files.
+contents_open: bool = false,
+diff_mode: bool = false,
+
+/// The bar's tooltips, and the one control that shows them all. ONE TOOL PER
+/// PRESENT BUTTON (T639): a strip where one of six buttons explains itself and
+/// five do not is a defect by the design system's one-treatment-per-control
+/// rule, even though each button in isolation looked fine. Created on first
+/// use and kept for the bar's life; `tip_text` is the buffer comctl32 reads
+/// through, so it must outlive every message the control sends itself.
 tip: ?w32.HWND = null,
-tip_text: [tip_text_cap:0]u16 = undefined,
-tip_added: bool = false,
+tip_text: [layout_mod.button_count][tip_text_cap:0]u16 = undefined,
+tip_added: [layout_mod.button_count]bool = [_]bool{false} ** layout_mod.button_count,
+
+/// The last tooltip line handed to the log, so a bounds sync that changes
+/// nothing does not repeat it. The line is the acceptance script's only oracle
+/// (the same reason `ViewerPane.pushWorktree` has one).
+tip_log: [tip_log_cap]u8 = undefined,
+tip_log_len: usize = 0,
 
 hover: ?layout_mod.Button = null,
 pressed: ?layout_mod.Button = null,
@@ -227,7 +263,7 @@ pub fn create(
         .pane = pane,
         .alloc = alloc,
     };
-    self.tip_text[0] = 0;
+    for (&self.tip_text) |*t| t[0] = 0;
     _ = w32.SetWindowLongPtrW(hwnd, w32.GWLP_USERDATA, @bitCast(@intFromPtr(self)));
     self.applyTheme();
     return self;
@@ -385,12 +421,38 @@ pub fn setHistory(self: *ViewerNavBar, back: bool, forward: bool) void {
     _ = w32.InvalidateRect(self.hwnd, null, 1);
 }
 
-/// Show or drop the leading contents toggle (T160). The pane follows with a
-/// bounds sync, whose `place` re-lays the strip around the change.
-pub fn setContentsButton(self: *ViewerNavBar, show: bool) void {
-    if (self.show_contents == show) return;
+/// Show or drop the leading contents toggle (T160), and say what it would do
+/// (T639): `open` is whether the card is showing, `diff` whether this pane's
+/// card lists changed files rather than headings. The pane follows a presence
+/// change with a bounds sync, whose `place` re-lays the strip around it; the
+/// other two only re-word the tooltip, so they are synced here.
+pub fn setContentsButton(self: *ViewerNavBar, show: bool, open: bool, diff: bool) void {
+    if (self.show_contents == show and self.contents_open == open and
+        self.diff_mode == diff) return;
     self.show_contents = show;
+    self.contents_open = open;
+    self.diff_mode = diff;
+    self.syncTip(self.currentLayout());
     _ = w32.InvalidateRect(self.hwnd, null, 1);
+}
+
+/// Point the Home button's tooltip at where Home would go (T639), or take the
+/// destination away. Pushed by the pane the way `setWorktree` is, and for the
+/// same reason: the bar cannot derive it, and a pane that browses away from
+/// its home keeps the button while only the ANSWER changes.
+///
+/// A home too long to hold reads as none — an unadorned "Home" is honest,
+/// while a truncated path names somewhere the button would not go.
+pub fn setHome(self: *ViewerNavBar, home: ?[]const u8) void {
+    const next: []const u8 = if (home) |h|
+        (if (h.len <= self.home.len) h else "")
+    else
+        "";
+    if (next.len == self.home_len and
+        std.mem.eql(u8, self.home[0..self.home_len], next)) return;
+    @memcpy(self.home[0..next.len], next);
+    self.home_len = next.len;
+    self.syncTip(self.currentLayout());
 }
 
 /// Point the trailing feedback button at `root`, or take it away (null / a
@@ -422,7 +484,7 @@ pub fn setWorktree(self: *ViewerNavBar, root: ?[]const u8) bool {
 }
 
 // -------------------------------------------------------------------------
-// The feedback button's tooltip
+// Tooltips
 // -------------------------------------------------------------------------
 
 /// A rect tool in SUBCLASS mode, not the track mode the tab strip uses
@@ -468,56 +530,130 @@ fn tipEnsure(self: *ViewerNavBar) ?w32.HWND {
     return tip;
 }
 
-fn tipToolInfo(self: *ViewerNavBar, rect: w32.RECT) w32.TOOLINFOW {
+fn tipToolInfo(
+    self: *ViewerNavBar,
+    b: layout_mod.Button,
+    rect: w32.RECT,
+) w32.TOOLINFOW {
     return .{
         .cbSize = @sizeOf(w32.TOOLINFOW),
         .uFlags = w32.TTF_SUBCLASS,
         .hwnd = self.hwnd,
-        .uId = tip_id,
+        .uId = tipId(b),
         .rect = rect,
         .hinst = null,
-        .lpszText = @ptrCast(&self.tip_text),
+        .lpszText = @ptrCast(&self.tip_text[@intFromEnum(b)]),
         .lParam = 0,
         .lpReserved = null,
     };
 }
 
-/// Bring the tooltip in line with the button's presence, rect and destination.
-/// Idempotent, and safe to call before the tip exists.
+/// What the labels need beyond the geometry. Assembled here so the strings
+/// themselves stay in the pure module, where they are unit-tested.
+fn labelState(self: *const ViewerNavBar) layout_mod.Labels {
+    return .{
+        .contents_open = self.contents_open,
+        .diff = self.diff_mode,
+        .home = self.home[0..self.home_len],
+        .worktree = self.worktree[0..self.worktree_len],
+    };
+}
+
+/// Bring every button's tooltip in line with the strip's shape, rects and
+/// wording. Idempotent, and safe to call before the tip control exists.
+///
+/// One pass over the whole enum rather than a call per button: the two
+/// conditional buttons come and go, and the overflow control takes whichever
+/// commands this width could not pay for, so "which buttons exist" is the
+/// layout's answer and not a thing to track separately. An absent button has
+/// an empty rect, and its tool is DELETED rather than left pointing at a
+/// rectangle nothing paints.
 fn syncTip(self: *ViewerNavBar, l: layout_mod.Layout) void {
-    const box = l.button(.feedback);
-    if (self.worktree_len == 0 or box.width() <= 0) {
-        if (self.tip_added) {
-            var ti = self.tipToolInfo(.{ .left = 0, .top = 0, .right = 0, .bottom = 0 });
-            if (self.tip) |t| _ = w32.SendMessageW(t, w32.TTM_DELTOOLW, 0, @bitCast(@intFromPtr(&ti)));
-            self.tip_added = false;
-        }
-        return;
-    }
-
-    var text_buf: [tip_text_cap]u8 = undefined;
-    const text = viewer_worktree.tooltipText(&text_buf, self.worktree[0..self.worktree_len]);
-    const n = std.unicode.utf8ToUtf16Le(self.tip_text[0 .. self.tip_text.len - 1], text) catch 0;
-    self.tip_text[n] = 0;
-
-    const tip = self.tipEnsure() orelse return;
-    // The HIT box, not the paint: the tip should follow the same forgiving
-    // target a click does (design system — a hit box may exceed its paint).
+    const state = self.labelState();
     const m = icon_button.Metrics.init(self.scale);
-    const hit = icon_button.hitBox(m, box);
-    var ti = self.tipToolInfo(.{
-        .left = hit.left,
-        .top = hit.top,
-        .right = hit.right,
-        .bottom = hit.bottom,
-    });
-    if (!self.tip_added) {
-        if (w32.SendMessageW(tip, w32.TTM_ADDTOOLW, 0, @bitCast(@intFromPtr(&ti))) == 0) return;
-        self.tip_added = true;
-        return;
+
+    var line: [tip_log_cap]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&line);
+    const w = fbs.writer();
+
+    for (std.enums.values(layout_mod.Button)) |b| {
+        const i = @intFromEnum(b);
+        const box = l.button(b);
+        var text_buf: [tip_text_cap]u8 = undefined;
+        const text: []const u8 = if (box.width() <= 0)
+            ""
+        else
+            layout_mod.label(&text_buf, b, state);
+
+        if (text.len == 0) {
+            self.tipDelete(b);
+            continue;
+        }
+
+        const n = std.unicode.utf8ToUtf16Le(self.tip_text[i][0 .. tip_text_cap - 1], text) catch 0;
+        self.tip_text[i][n] = 0;
+        // A label that would not fit is no label: an empty tip pops an empty
+        // box, which reads as a rendering fault rather than as a quiet button.
+        if (n == 0) {
+            self.tipDelete(b);
+            continue;
+        }
+
+        const tip = self.tipEnsure() orelse return;
+        // The HIT box, not the paint: the tip should follow the same forgiving
+        // target a click does (design system — a hit box may exceed its paint).
+        const hit = icon_button.hitBox(m, box);
+        var ti = self.tipToolInfo(b, .{
+            .left = hit.left,
+            .top = hit.top,
+            .right = hit.right,
+            .bottom = hit.bottom,
+        });
+        if (!self.tip_added[i]) {
+            if (w32.SendMessageW(tip, w32.TTM_ADDTOOLW, 0, @bitCast(@intFromPtr(&ti))) == 0) continue;
+            self.tip_added[i] = true;
+        } else {
+            _ = w32.SendMessageW(tip, w32.TTM_NEWTOOLRECTW, 0, @bitCast(@intFromPtr(&ti)));
+            _ = w32.SendMessageW(tip, w32.TTM_UPDATETIPTEXTW, 0, @bitCast(@intFromPtr(&ti)));
+        }
+        w.print(" {s}:paint={d},{d},{d},{d}:tool={d},{d},{d},{d}", .{
+            @tagName(b),
+            box.left,    box.top,  box.right,  box.bottom,
+            hit.left,    hit.top,  hit.right,  hit.bottom,
+        }) catch {};
     }
-    _ = w32.SendMessageW(tip, w32.TTM_NEWTOOLRECTW, 0, @bitCast(@intFromPtr(&ti)));
-    _ = w32.SendMessageW(tip, w32.TTM_UPDATETIPTEXTW, 0, @bitCast(@intFromPtr(&ti)));
+
+    self.logTips(line[0..fbs.pos]);
+}
+
+/// Drop `b`'s tool, if it has one. The half that keeps an absent button from
+/// answering a hover over the rectangle it used to occupy.
+fn tipDelete(self: *ViewerNavBar, b: layout_mod.Button) void {
+    const i = @intFromEnum(b);
+    if (!self.tip_added[i]) return;
+    var ti = self.tipToolInfo(b, .{ .left = 0, .top = 0, .right = 0, .bottom = 0 });
+    if (self.tip) |t| _ = w32.SendMessageW(t, w32.TTM_DELTOOLW, 0, @bitCast(@intFromPtr(&ti)));
+    self.tip_added[i] = false;
+}
+
+/// State this bar's tooltips in the GUI's own stderr, once per CHANGE.
+///
+/// The acceptance script's only oracle, for the reason `pushWorktree` has one:
+/// the bar is native owner-painted chrome inside a WebView2 host, running on
+/// the background test desktop where nothing can screenshot it. The paint box
+/// is logged beside the tool rect so the script can check the tip follows the
+/// HIT box rather than merely being present. Every `place` re-syncs, so this
+/// is de-duplicated against the last line or a pane resize would flood the log.
+fn logTips(self: *ViewerNavBar, line: []const u8) void {
+    if (line.len == self.tip_log_len and
+        std.mem.eql(u8, self.tip_log[0..self.tip_log_len], line)) return;
+    if (line.len <= self.tip_log.len) {
+        @memcpy(self.tip_log[0..line.len], line);
+        self.tip_log_len = line.len;
+    } else {
+        self.tip_log_len = 0;
+    }
+    log.info("viewer nav tips pane={s}{s}", .{ self.pane.paneId(), line });
 }
 
 /// Show `text` in the address field — unless the user is EDITING it, whose
