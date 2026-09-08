@@ -1,4 +1,4 @@
-# T638 acceptance: leg 2 of viewer worktree provenance -- localhost:PORT ->
+# T638/T650 acceptance: leg 2 of viewer worktree provenance -- localhost:PORT ->
 # the listening process -> that process's working directory.
 #
 # What is asserted:
@@ -14,6 +14,10 @@
 #     (`ViewerWorktree.candidateDirectory` returns the cwd and lets git decide),
 #     not a fall-through to the origin, and it is the third distinct outcome the
 #     same URL shape can produce.
+#   - a pane opened on a port with NO listener picks up a dev server started
+#     afterwards, on its own, with no navigation and no reopen (T650). This is
+#     what the provenance cache's 15s TTL exists for, and it is the one arm the
+#     TTL -- rather than the lookup -- is load-bearing in.
 #   - the resolution never wedges the UI: every case answers inside the poll
 #     window and the app is still alive and serving IPC at the end.
 #
@@ -123,6 +127,20 @@ function Wait-WorktreeState($errlog, $paneId, [bool]$Shown) {
         $s = Get-WorktreeState $errlog $paneId
         if ($s -and $s.Shown -eq $Shown) { return $s }
         Start-Sleep -Milliseconds 250
+    }
+    return (Get-WorktreeState $errlog $paneId)
+}
+
+# Wait for a pane's LOGGED worktree to become $Want -- the transition case,
+# where the pane is already answering (with the origin) and the answer has to
+# move on its own. Longer-fused than Wait-WorktreeState because the poll it is
+# watching for is deliberately slow: one re-ask per cache TTL.
+function Wait-WorktreeMoved($errlog, $paneId, [string]$Want, [int]$TimeoutSec) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $s = Get-WorktreeState $errlog $paneId
+        if ($s -and $s.Worktree -ieq $Want) { return $s }
+        Start-Sleep -Milliseconds 500
     }
     return (Get-WorktreeState $errlog $paneId)
 }
@@ -273,8 +291,22 @@ try {
     Assert ($s -and -not $s.Shown) `
         "a server running out of no repository shows NO button, even from a repo pane (state '$($s.Shown)')"
 
-    # --- 4. the app is still healthy ----------------------------------------
-    # Three port lookups ran on worker threads; the message loop must be
+    # --- 4. a server started AFTER the pane makes the button move (T650) -----
+    # The transition, which is the only part that depends on the provenance
+    # cache's TTL rather than on the lookup. The dead-port pane from case 2 is
+    # still open and still attributed to its origin; a listener now comes up on
+    # that same port out of the OTHER working tree, and the pane must notice on
+    # its own -- no navigation, no reopen, nobody touching it.
+    $late = Start-Listener -Port $deadPort -Directory $serverRepo
+    $listeners += $late
+    Assert (-not $late.Failed) "a dev server came up on the pane's port after the fact (port $deadPort)"
+    $s = Wait-WorktreeMoved $errlog $deadPane $serverRoot 60
+    Assert ($s -and $s.Worktree -ieq $serverRoot) `
+        "...and the pane re-resolved to the new listener's tree unprompted (got '$($s.Worktree)', want '$serverRoot')"
+    Assert ($s -and $s.Shown) "...with the feedback button still shown (state '$($s.Shown)')"
+
+    # --- 5. the app is still healthy ----------------------------------------
+    # Four port lookups ran on worker threads; the message loop must be
     # untouched by them, which is observable as the app still answering IPC.
     $r = Invoke-Verb @('+list')
     Assert ($r.Code -eq 0) '+list still answers after every lookup (the UI thread never blocked)'
@@ -298,6 +330,15 @@ try {
 $fgSeen = @(Stop-TestForegroundWatch)
 $leaked = @(Get-TestLaunchedPids | Where-Object { $fgSeen -contains $_ })
 Assert ($leaked.Count -eq 0) "no test-desktop app ever became foreground on the interactive desktop (saw $($leaked -join ','))"
+
+# A clean green run stamps the covered files (T783/T650) so scripts\guard-due.ps1
+# can answer "has this harness been run against the code as it now stands?" --
+# and this is the only thing on the box that runs the provenance strategy
+# against a real listener. Red leaves the stamp alone, so red stays due.
+if ($script:fail -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard viewer-worktree-port -Repo $repo 2>&1 | ForEach-Object { "  $_" }
+}
 
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass)" }

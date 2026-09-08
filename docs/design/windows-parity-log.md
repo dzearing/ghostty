@@ -25150,3 +25150,39 @@ ALL PASS (10) for the docs edit. Five new unit tests in the `none` lane cover
 stage/prune/publish-with-stem, and a negative control confirmed they can go red.
 The Explorer launch itself is manual - a `ShellExecute` is not something to fire
 from a background test desktop.
+
+## 2026-09-08 - T650: a viewer pane on localhost notices a dev server that starts after it
+
+Open a viewer pane on `http://localhost:3000` before your dev server is up, then
+start the server. The feedback button should appear on its own within a few
+seconds, without reopening the pane - that is what the provenance cache's 15s TTL
+is FOR, and both CLAUDE.md and the module's own comment say so. It never
+happened. T650 was filed as an acceptance arm and asked the honest question
+first: what re-asks? Nothing did. All four `refreshWorktree` call sites in
+`ViewerPane` are navigations, Mac's `ViewerView` has exactly the same shape, and
+a pane watching a dev server does not navigate - so the entry expired and no one
+was left to ask. A missing test turned out to be sitting on a real defect, and
+the fix rode with it.
+
+`ViewerPane` now arms a repeating `WM_TIMER` at `Cache.ttl_ms`, and only while
+the pane's location is a loopback URL: a file's directory and a remote site's
+origin cannot move while the location sits still, so no other pane can change
+its answer without navigating. It is armed and disarmed from `refreshWorktree`
+itself, so it follows the location the way the resolution does, and the tick is
+skipped entirely while the pane's window is not visible - a stack of background
+tabs costs nothing. `ViewerWorktreeProbe` grew a five-minute directory memo, so
+the steady state of a watched dev server is the two syscalls that establish the
+listener has not moved and no `git` process at all; the memo expires rather than
+living for the pane's life, because `git init` under a running server does change
+the answer.
+
+Validation: all four floor lanes PASS. `test\win32\viewer-worktree-port.ps1`
+grows a fourth case - the dead-port pane from case 2, already resolved to its
+origin, gets a listener on its port out of the OTHER working tree and must move
+there unprompted - and is ALL PASS (23). Negative control: with the poll
+disabled the same run is 1 FAILURE, the pane still reading `D:\git\ghoztty`, so
+the arm is load-bearing. A new win32-lane test asserts the memo answers a second
+resolution of the same directory without a spawn, and that an aged-out memo asks
+again. That harness also gains a `guard-due` row, since nothing tied a
+provenance edit to the only script that runs the strategy against a real
+listener. The Mac half is filed as T1452 (`seat: mac`).

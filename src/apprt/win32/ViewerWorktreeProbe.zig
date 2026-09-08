@@ -62,15 +62,44 @@ const Job = struct {
     /// The resolved worktree root, written by the worker. Owned; null when the
     /// directory is in no repository at all.
     root: ?[]u8 = null,
+    /// The directory the previous resolution actually asked git about, and the
+    /// answer it got (null root = "that directory is in no repository"). Owned.
+    /// Present only when that memo is still young enough to trust — see
+    /// `dir_memo_ttl_ms`.
+    known_dir: ?[]u8 = null,
+    known_root: ?[]u8 = null,
+    /// The directory this job ended up asking about, written by the worker so
+    /// the completion can memoize it. Owned.
+    dir_used: ?[]u8 = null,
+    /// The worker answered from `known_root` instead of spawning git. Read by
+    /// the tests, which is how "the poll costs a syscall, not a process" is
+    /// asserted rather than asserted about.
+    reused: bool = false,
 
     fn destroy(self: *Job) void {
         const alloc = self.alloc;
         alloc.free(self.key);
         if (self.dir) |d| alloc.free(d);
         if (self.root) |r| alloc.free(r);
+        if (self.known_dir) |d| alloc.free(d);
+        if (self.known_root) |r| alloc.free(r);
+        if (self.dir_used) |d| alloc.free(d);
         alloc.destroy(self);
     }
 };
+
+/// How long the directory->root memo above stays good.
+///
+/// The memo exists because of the poll (`ViewerPane.syncWorktreePoll`): a pane
+/// on `localhost:PORT` re-asks every `Cache.ttl_ms` forever, and the part of
+/// the answer that can actually move on that timescale is WHICH process is
+/// listening, not which repository its directory is in. So an unmoved listener
+/// costs the two syscalls that establish that and no process at all.
+///
+/// It expires rather than living for the pane's life because the mapping is not
+/// truly immutable: `git init` in the server's directory changes it, and a memo
+/// with no clock would hide that until the pane navigated.
+pub const dir_memo_ttl_ms: u64 = 300_000;
 
 alloc: Allocator,
 cache: worktree.Cache,
@@ -93,6 +122,19 @@ want_origin: ?[]u8 = null,
 thread: ?std.Thread = null,
 job: ?*Job = null,
 dirty: bool = false,
+
+/// The directory the last completed resolution asked git about, the root it
+/// answered, and when. Owned. This is the memo `dir_memo_ttl_ms` describes; it
+/// is written only by `complete` and read only by `kick`, both on the GUI
+/// thread with no worker out, so it is never shared with one.
+memo_dir: ?[]u8 = null,
+memo_root: ?[]u8 = null,
+memo_at_ms: u64 = 0,
+
+/// Whether the last completed resolution answered from the memo instead of
+/// spawning git. Diagnostics only — the tests assert on it, so "the poll does
+/// not cost a process" is a checked claim rather than a comment.
+last_reused: bool = false,
 
 /// How the strategy's impure edges are reached. Overridden by tests; `init`
 /// installs the real ones, leg 2's port lookup included (T638).
@@ -151,6 +193,7 @@ pub fn deinit(self: *Probe) void {
         self.job = null;
     }
     self.cache.deinit();
+    self.forgetMemo();
     if (self.current) |c| self.alloc.free(c);
     if (self.want_location) |l| self.alloc.free(l);
     if (self.want_origin) |o| self.alloc.free(o);
@@ -260,6 +303,7 @@ fn kick(self: *Probe) Outcome {
         }) else null,
         .port = port,
     };
+    self.attachMemo(job, now);
 
     self.job = job;
     self.thread = std.Thread.spawn(.{}, work, .{ self, job }) catch |err| {
@@ -269,6 +313,55 @@ fn kick(self: *Probe) Outcome {
         return self.apply(null);
     };
     return .pending;
+}
+
+/// Hand the job whatever the last resolution learned about a directory, when
+/// that memo is still young. A job with no memo always spawns git, which is
+/// what makes a first resolution — and one made after the memo aged out —
+/// answer from the filesystem rather than from history.
+fn attachMemo(self: *Probe, job: *Job, now_ms: u64) void {
+    const dir = self.memo_dir orelse return;
+    if (now_ms -% self.memo_at_ms >= dir_memo_ttl_ms) return;
+    job.known_dir = self.alloc.dupe(u8, dir) catch return;
+    if (self.memo_root) |r| {
+        job.known_root = self.alloc.dupe(u8, r) catch {
+            self.alloc.free(job.known_dir.?);
+            job.known_dir = null;
+            return;
+        };
+    }
+}
+
+/// Record what a completed job learned, so the next poll can skip the spawn.
+fn rememberMemo(self: *Probe, job: *Job, now_ms: u64) void {
+    const dir = job.dir_used orelse {
+        // The job never got as far as a directory (an unattributable port with
+        // no origin behind it). Nothing to memoize, and the old memo is about
+        // some other directory, so it goes.
+        self.forgetMemo();
+        return;
+    };
+    const dir_dup = self.alloc.dupe(u8, dir) catch return;
+    const root_dup: ?[]u8 = if (job.root) |r|
+        (self.alloc.dupe(u8, r) catch {
+            self.alloc.free(dir_dup);
+            return;
+        })
+    else
+        null;
+    self.forgetMemo();
+    self.memo_dir = dir_dup;
+    self.memo_root = root_dup;
+    // A reused answer keeps the ORIGINAL timestamp, so the memo still ages out
+    // on schedule instead of renewing itself every poll and never expiring.
+    self.memo_at_ms = if (job.reused) self.memo_at_ms else now_ms;
+}
+
+fn forgetMemo(self: *Probe) void {
+    if (self.memo_dir) |d| self.alloc.free(d);
+    if (self.memo_root) |r| self.alloc.free(r);
+    self.memo_dir = null;
+    self.memo_root = null;
 }
 
 /// The worker: leg 2's port lookup when the job carries one, then one
@@ -287,8 +380,18 @@ fn work(self: *Probe, job: *Job) void {
 
     var buf: [path_cap]u8 = undefined;
     if (dir) |d| {
-        if (repositoryRoot(job.alloc, d, &buf)) |root| {
-            job.root = job.alloc.dupe(u8, root) catch null;
+        job.dir_used = job.alloc.dupe(u8, d) catch null;
+        if (job.known_dir) |known| if (std.mem.eql(u8, known, d)) {
+            // The listener has not moved, and neither has the repository its
+            // directory is in — that is what the memo says and what its ttl
+            // bounds. So the poll costs its two syscalls and no process.
+            job.reused = true;
+            if (job.known_root) |r| job.root = job.alloc.dupe(u8, r) catch null;
+        };
+        if (!job.reused) {
+            if (repositoryRoot(job.alloc, d, &buf)) |root| {
+                job.root = job.alloc.dupe(u8, root) catch null;
+            }
         }
     }
     if (self.hwnd) |h| {
@@ -308,7 +411,10 @@ pub fn complete(self: *Probe) Outcome {
     var changed = false;
     if (self.job) |job| {
         self.job = null;
-        self.cache.put(job.key, job.root, w32.GetTickCount64());
+        const now = w32.GetTickCount64();
+        self.cache.put(job.key, job.root, now);
+        self.last_reused = job.reused;
+        self.rememberMemo(job, now);
         changed = self.apply(job.root) == .changed;
         job.destroy();
     }
@@ -488,4 +594,38 @@ test "a directory in no repository resolves to no worktree" {
     _ = p.refresh("https://example.com/", tmp);
     if (p.thread != null) _ = p.complete();
     try testing.expect(p.worktreePath() == null);
+}
+
+test "a second resolution of the same directory answers from the memo" {
+    var p = Probe.init(testing.allocator);
+    defer p.deinit();
+
+    if (!worktree.realDirExists("D:\\git\\ghoztty")) return error.SkipZigTest;
+    const a = "D:\\git\\ghoztty\\src\\apprt\\win32\\ViewerWorktreeProbe.zig";
+    const b = "D:\\git\\ghoztty\\src\\apprt\\win32\\ViewerPane.zig";
+
+    try testing.expectEqual(Outcome.pending, p.refresh(a, null));
+    _ = p.complete();
+    try testing.expect(!p.last_reused); // nothing to reuse yet: git ran
+    const root = try testing.allocator.dupe(u8, p.worktreePath().?);
+    defer testing.allocator.free(root);
+
+    // A DIFFERENT location — so the cache cannot answer it — in the SAME
+    // directory. That is the poll's steady state: a fresh question whose
+    // directory has not moved, which must not cost another `git rev-parse`.
+    try testing.expectEqual(Outcome.pending, p.refresh(b, null));
+    _ = p.complete();
+    try testing.expect(p.last_reused);
+    try testing.expectEqualStrings(root, p.worktreePath().?);
+
+    // An aged-out memo asks the filesystem again, so `git init` under a live
+    // dev server is not hidden for the pane's whole life.
+    // A third location, for the same reason `b` was a second one: `a` is still
+    // in the cache and would answer without a worker at all.
+    const c = "D:\\git\\ghoztty\\src\\apprt\\win32\\ViewerNavBar.zig";
+    p.memo_at_ms -%= dir_memo_ttl_ms;
+    try testing.expectEqual(Outcome.pending, p.refresh(c, null));
+    _ = p.complete();
+    try testing.expect(!p.last_reused);
+    try testing.expectEqualStrings(root, p.worktreePath().?);
 }

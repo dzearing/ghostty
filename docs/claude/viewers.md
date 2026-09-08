@@ -509,6 +509,15 @@ ship, in `GhosttyAssets.zig`'s none-lane tests and
   or the main checkout). No repo ⇒ no feedback button. Resolutions are cached
   per (location, origin) for 15s so navigation never stutters and a dev server
   started later still makes the button appear.
+  That last half was a promise the cache alone could not keep (T650): every
+  re-resolution is triggered by a NAVIGATION, and a pane watching a dev server
+  does not navigate, so the entry expired with nobody left to ask. **Windows
+  polls** for it — a repeating timer at the cache's own TTL, armed only while
+  the location is a loopback URL (nothing else can change answer while the
+  location sits still), skipped while the pane is not visible, and answered
+  without a `git` process while the listener's directory has not moved
+  (`ViewerWorktreeProbe`'s five-minute directory memo). **Mac does not yet**;
+  that is T1452.
   **Windows has all three legs and the button** (T633, T638): the strategy, the
   classification and the 15s cache are `src/apprt/win32/viewer_worktree.zig`
   (pure, asserted in the none lane), and the `git rev-parse` runs on a worker

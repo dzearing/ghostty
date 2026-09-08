@@ -184,6 +184,26 @@ const reload_timer_id: usize = 1;
 /// (T463).
 const diff_timer_id: usize = 4;
 
+/// The worktree re-resolve poll's timer id, in the host window's own timer
+/// space (T650).
+const worktree_timer_id: usize = 5;
+
+/// How often a pane pointed at a loopback port re-asks who is listening.
+///
+/// The provenance cache expires an entry after `Cache.ttl_ms` precisely so that
+/// "start your dev server and the feedback button appears, without reopening
+/// the pane" can be true (docs/claude/viewers.md). Nothing made it true: every
+/// call into `refreshWorktree` is a NAVIGATION, and a pane watching a dev
+/// server does not navigate — so the entry expired and nobody re-asked.
+///
+/// Only loopback panes poll, because they are the only ones whose answer can
+/// move while the location does not: a file's directory and a remote site's
+/// origin are fixed for as long as the pane sits still. And the poll costs a
+/// process only when the listener actually moves — `ViewerWorktreeProbe`'s
+/// directory memo answers the unchanged case from the two syscalls that
+/// established it. A pane in a background tab skips the tick entirely.
+const worktree_poll_ms: u32 = @intCast(viewer_worktree.Cache.ttl_ms);
+
 /// How often a `git-status:` pane re-checks the working tree, matching Mac's
 /// `diffRefreshInterval`.
 ///
@@ -1113,10 +1133,24 @@ fn ensureNav(self: *ViewerPane, alloc: Allocator, hinstance: ?w32.HINSTANCE, hwn
 /// that is already cached lands synchronously here; anything else arrives later
 /// on `WM_APP_VIEWER_WORKTREE`.
 fn refreshWorktree(self: *ViewerPane) void {
+    self.syncWorktreePoll();
     const probe = if (self.worktree) |*p| p else return;
     if (probe.refresh(self.location orelse "", self.origin_directory) != .pending) {
         self.pushWorktree();
     }
+}
+
+/// Start (or stop) the loopback re-resolve poll for wherever the pane now is.
+///
+/// Driven from `refreshWorktree`, so it follows the location the same way the
+/// resolution itself does: a pane that navigates from a dev server to a file
+/// stops polling in the same breath that it re-resolves.
+fn syncWorktreePoll(self: *ViewerPane) void {
+    const hwnd = self.hwnd orelse return;
+    _ = w32.KillTimer(hwnd, worktree_timer_id);
+    const location = self.location orelse return;
+    if (viewer_worktree.loopbackPort(location) == null) return;
+    _ = w32.SetTimer(hwnd, worktree_timer_id, worktree_poll_ms, null);
 }
 
 /// A resolution settled: push it at the bar, and say so in the log.
@@ -6067,6 +6101,16 @@ pub fn wndProc(
                 // gives the pane its band back.
                 _ = w32.KillTimer(hwnd, feedback_close_timer_id);
                 self.setFeedbackOpen(false);
+                return 0;
+            }
+            if (wparam == worktree_timer_id) {
+                // The loopback re-resolve poll (T650). Repeating: the question
+                // "who is listening on this port now" never stops being worth
+                // asking while such a pane is open. A pane the user cannot see
+                // is not asked at all — the answer would only be needed once it
+                // came back, and this is what keeps a stack of background tabs
+                // from costing a lookup apiece every fifteen seconds.
+                if (w32.IsWindowVisible(hwnd) != 0) self.refreshWorktree();
                 return 0;
             }
             if (wparam == diff_timer_id) {

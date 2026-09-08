@@ -302,6 +302,26 @@ $GuardTable = @(
             'src\apprt\win32\viewer_error_card.zig'
         )
     },
+    # Viewer worktree provenance (T633/T638/T650): the only thing on the box that
+    # runs all three legs of the strategy against a REAL listener, and since T650
+    # the only thing that watches a pane pick up a dev server started after it -
+    # the transition the provenance cache's ttl exists for, which no unit test can
+    # reach because what re-asks is a window timer. Covers the strategy, the
+    # worker that runs it, the two syscalls leg 2 is built on, and the pane that
+    # arms the poll.
+    [pscustomobject]@{
+        Name   = 'viewer-worktree-port'
+        Script = 'test\win32\viewer-worktree-port.ps1'
+        Stamp  = 'test\win32\viewer-worktree-port.stamp.json'
+        Covers = @(
+            'test\win32\viewer-worktree-port.ps1',
+            'src\apprt\win32\viewer_worktree.zig',
+            'src\apprt\win32\ViewerWorktreeProbe.zig',
+            'src\apprt\win32\ViewerPane.zig',
+            'src\os\listening_pid.zig',
+            'src\os\process_cwd.zig'
+        )
+    },
     # Closing a viewer, and the window around one (T1356): the only thing that
     # closes a window holding a viewer pane and then keeps asserting. Every
     # other viewer harness opens viewers and lets the desktop teardown reap the
