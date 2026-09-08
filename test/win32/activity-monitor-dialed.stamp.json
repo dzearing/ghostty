@@ -1,16 +1,15 @@
 {
     "guard":  "activity-monitor-dialed",
     "script":  "test/win32/activity-monitor-dialed.ps1",
-    "generated":  "2026-09-07T04:10:22-07:00",
-    "commit":  "5bbab5834",
+    "generated":  "2026-09-07T23:43:30-07:00",
+    "commit":  "e3bb45f74",
     "uncommitted":  [
-                        "src/apprt/win32/activity_dial.zig",
-                        "src/apprt/win32/ActivityMonitor.zig"
+                        "src/remote/relay_dial.zig"
                     ],
     "files":  {
                   "src/apprt/win32/activity_dial.zig":  "bfd8c3b58300d3e1233b469872e8e794b72a98ca4b8f19b44e919e5b84cd624e",
                   "src/apprt/win32/ActivityMonitor.zig":  "f7f620c4d9a3e609b240c0ca5a12266e1abe5d5d27b921efb16d1efdeff809d9",
-                  "src/remote/relay_dial.zig":  "40cbec97db1f9cb0b6849fb61ddd1d5305114d7287e3687010ec79c4003fc838",
+                  "src/remote/relay_dial.zig":  "f7d24bc69e8063100a4dc5a1b72f417e22265410bd9fb915efb704e7d5c6f137",
                   "test/win32/activity-monitor-dialed.ps1":  "22c50b90ea589cbdc20643268bae5bec148658210f4f191c1d22ed6771c24629",
                   "test/win32/lib/FakeRelay.ps1":  "e30d00b4c6d6d58bbdc23d82fa76b586a84143111b8d00bcd5a7777736088075"
               }

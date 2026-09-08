@@ -1,15 +1,17 @@
 {
     "guard":  "remote-reconnect-relay",
     "script":  "test/win32/remote-reconnect-relay.ps1",
-    "generated":  "2026-09-07T04:10:59-07:00",
-    "commit":  "5bbab5834",
+    "generated":  "2026-09-07T23:36:36-07:00",
+    "commit":  "e3bb45f74",
     "uncommitted":  [
-                        "src/apprt/win32/RemoteReconnect.zig"
+                        "src/apprt/win32/remote_reconnect.zig",
+                        "src/apprt/win32/RemoteReconnect.zig",
+                        "src/remote/relay_dial.zig"
                     ],
     "files":  {
-                  "src/apprt/win32/remote_reconnect.zig":  "87d187f1b7db4d6f0aac25048afd6dcfedc8df253d0594c45de7a83e9adf9c3a",
-                  "src/apprt/win32/RemoteReconnect.zig":  "dec1e58951ac0b7fc4d542a82cd0ce64174d27f5cf56951598e588e043492c18",
-                  "src/remote/relay_dial.zig":  "40cbec97db1f9cb0b6849fb61ddd1d5305114d7287e3687010ec79c4003fc838",
+                  "src/apprt/win32/remote_reconnect.zig":  "9d6a394fad06de85157f2c3615fce271ce7841c6b9c8ea82c47c6385d03538a4",
+                  "src/apprt/win32/RemoteReconnect.zig":  "e6d8c713bcf62325134f244262962ff94da85cb5cb68b54ceb7848c5a2f7f316",
+                  "src/remote/relay_dial.zig":  "f7d24bc69e8063100a4dc5a1b72f417e22265410bd9fb915efb704e7d5c6f137",
                   "test/win32/lib/FakeRelay.ps1":  "e30d00b4c6d6d58bbdc23d82fa76b586a84143111b8d00bcd5a7777736088075",
                   "test/win32/remote-reconnect-relay.ps1":  "b185af19d8563f4151f1b5ec11e5e1084eb755773c208abe4b01a3b1f7cf2c32"
               }
