@@ -25491,3 +25491,39 @@ T1461. The awkward part is real and is written into that card: the standing
 safety rule forbids release-mode dev builds precisely because they derive the
 user's own IPC and agent endpoints, so the first deliverable there is a proof of
 isolation, not a build.
+
+## 2026-09-08 - the parser was never the problem; the relay is (T1463)
+
+T1463 asked the one question the previous three turns had not: is any of this
+true of the build people actually install? It is not. Every rate in the
+T1458 -> T1460 chain came off a Debug build, and re-running the identical A/B on
+a **ReleaseFast** build - same mode and same `x86_64-windows-gnu` target the
+installer uses - moves the parse cost from ~9.7 us per byte to **0.06**, and
+`parse_ms_per_s` from ~500-600 to **41**. The pane that used to trail the writer
+by twenty seconds now finishes with it. T1461, whose whole premise was "a pane
+drains at ~50 KB/s and the parser is the cost", is closed as superseded: on the
+shipped build the parser is about four percent of a wall-clock second and could
+not move what the user feels.
+
+The deficit they reported is still there, and the accident that found it is the
+best part of the turn. A cold release sandbox has no agent, and the app waits
+only two seconds for the one it spawns before giving up for the whole session -
+so the first run silently measured a pane holding its **own** ConPTY instead of
+the shipped agent-held one. That mistake produced a control nobody had thought to
+build: the same binary, the same workload, **6.1-6.5 s local versus 12.7-12.9 s
+agent-held**, against conhost's 7.9-8.5 s. Ghoztty is 1.3x *faster* than the
+terminal Windows ships with when it owns the PTY and 1.6x slower when the agent
+does, with the parse cost identical in both. The relay carries the stream about
+sixty bytes at a time, ten to twenty-two thousand times a second. That is T1464,
+and it is where T1458's report actually lives.
+
+Two things worth keeping beyond the numbers. First, the isolation this needed
+already existed and only had to be *used*: `-ReleaseSandbox` sets all three knobs
+and `Assert-GhozttyIsolatedBuild` refused this turn's first run for missing the
+opt-in - the gate demonstrating itself, unprompted, which is exactly what T1133
+asks new gates to do. The user's own terminal read identically before and after
+every run. Second, a measurement is only as honest as the build under it. Three
+turns of good instrumentation, a correct hypothesis-killing, and a clean
+lock-versus-work split all pointed confidently at the wrong component, because
+nobody asked what `-Doptimize=Debug` was doing to the absolute numbers. The
+ratio survived that; nothing else did.
