@@ -9,6 +9,43 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-08: T642 - **the composer's IME support was a claim about RichEdit,
+  not a measurement — and the measurement found a hole.** T635 swapped the
+  feedback composer onto a RichEdit precisely so that caret, selection, undo,
+  clipboard and IME would come from the OS. The first four have had acceptance
+  arms since that turn. IME had none, because this box has exactly one input
+  method installed (en-US) and adding a Japanese one needs elevation and a
+  language download that permanently changes the user's language bar.
+
+  The way in was to stop assuming an IME is needed to drive one. A settled
+  composition reaches a Unicode window as `WM_IME_CHAR`, and RichEdit inserts
+  that character itself without reading any input context — measured on this
+  box with a standalone probe before a line of the section was written. So
+  `test/win32/viewer-feedback.ps1` section K posts the real sequence,
+  `WM_IME_STARTCOMPOSITION` → three composed characters → `WM_IME_ENDCOMPOSITION`,
+  and asserts what this side of the boundary owns: the text lands, ordinary
+  typing still inserts afterwards, and the pane's mirrored buffer is byte-exact
+  once the composition has ENDED — compared against the UTF-8 encoding of what
+  the control holds, so an arm counting UTF-16 units would have passed on ASCII
+  and lied here.
+
+  The hole it found is in our code, not the control's. `editProc` resets the
+  caret's typing attributes before every message that puts text there —
+  `WM_CHAR`, `WM_PASTE`, Enter/Backspace/Delete — and listed neither IME
+  message, because IME text never arrives as a `WM_CHAR`. A Japanese, Chinese or
+  Korean user composing the first word straight after a quoted block would have
+  got it wearing the quote's tint and indent (T641). `win32.WM_IME_CHAR` is now
+  a named constant and both IME messages take the same reset.
+
+  What genuinely cannot run here — the candidate window, the underlined
+  intermediate string (`GCS_COMPSTR`, which RichEdit reads from the input
+  context), reconversion, and where the caret rests after a real commit — is now
+  a manual pre-release checklist in `docs/design/windows-parity-ime-manual.md`
+  rather than an unproven sentence in a task file. The section says so at its
+  head, so the next reader does not have to rediscover the boundary.
+
+  Green: `viewer-feedback.ps1` ALL PASS (91), floor lanes all four.
+
 - 2026-09-08: T640 - **the feedback composer's two round buttons could not be
   reached from the keyboard, and would not say what they were.** The "+" adds a
   screenshot and the arrow files the report; both were silent on hover and

@@ -67,6 +67,12 @@
 //! - **RichEdit sends no notifications by default.** Without the
 //!   `EM_SETEVENTMASK`/`ENM_CHANGE` in `create`, `EN_CHANGE` never arrives and
 //!   the mirror above silently never runs.
+//! - **An IME's text never arrives as `WM_CHAR`.** RichEdit inserts it itself
+//!   from `WM_IME_CHAR`, so every path that has to run before text lands at
+//!   the caret has to list that message too (T642) — `editProc` does. What
+//!   that side of the boundary can be proved to do without an installed IME,
+//!   and what has to be checked by hand with one, is
+//!   `docs/design/windows-parity-ime-manual.md`.
 //!
 //! Geometry lives in `viewer_feedback_layout.zig`, where it asserts at
 //! 1.0/1.25/1.5/2.0 without a window.
@@ -2620,6 +2626,16 @@ fn editProc(
                 self.swallow_paste_char = false;
                 if (wparam & 0xFFFF == 0x16) return 0;
             }
+            self.ensurePlainAtCaret();
+        },
+        // An IME's composed text arrives here, never through WM_CHAR (T642):
+        // RichEdit inserts the character itself from WM_IME_CHAR, and the
+        // composition that produced it opens with WM_IME_STARTCOMPOSITION.
+        // Both are "text is about to land at the caret", so both need the
+        // same typing-attribute reset a keystroke gets — without it the first
+        // word a Japanese, Chinese or Korean user composes just after a quote
+        // block is inserted wearing the quote's tint and indent.
+        w32.WM_IME_STARTCOMPOSITION, w32.WM_IME_CHAR => {
             self.ensurePlainAtCaret();
         },
         w32.WM_KEYDOWN => {

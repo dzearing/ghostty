@@ -284,6 +284,10 @@ pub const WM_IME_STARTCOMPOSITION: u32 = 0x010D;
 pub const WM_IME_ENDCOMPOSITION: u32 = 0x010E;
 pub const WM_IME_COMPOSITION: u32 = 0x010F;
 pub const WM_IME_SETCONTEXT: u32 = 0x0281;
+/// The composed character an IME hands a Unicode window once a composition
+/// settles. RichEdit inserts it itself, which is why the composer only has to
+/// treat it as "text is about to land at the caret" (T642).
+pub const WM_IME_CHAR: u32 = 0x0286;
 // WM_IME_SETCONTEXT lparam bit: show the default composition window.
 pub const ISC_SHOWUICOMPOSITIONWINDOW: isize = 0x80000000;
 

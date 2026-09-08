@@ -882,6 +882,96 @@ try {
     Assert $sentByEnter 'Enter on the focused send button files the report too'
     [void](Wait-FeedbackState $errlog $paneId $false)
 
+    # --- K. an IME's composed text lands, and the mirror ends correct (T642) --
+    # T635's whole argument for a RichEdit is that IME comes from the OS. That
+    # claim went unproven for a month because this box has ONE input method
+    # installed (en-US 0409:00000409) and no way to add a Japanese one without
+    # elevation and a language download -- a system-wide change to the user's
+    # daily-driver machine that no acceptance run gets to make.
+    #
+    # What CAN be driven without an IME, measured on this box, is the message
+    # an IME actually delivers its result with: RichEdit inserts the character
+    # from WM_IME_CHAR itself, inside a composition bracket or outside one,
+    # with no composition context to read. So the arms below post the real
+    # sequence -- WM_IME_STARTCOMPOSITION, the composed characters, then
+    # WM_IME_ENDCOMPOSITION -- and assert the two things this side of the
+    # boundary owns: the text reaches the control, and the pane's mirrored
+    # buffer is correct AFTER the composition ends rather than merely non-empty
+    # during it.
+    #
+    # What this canNOT prove, and where that check lives instead, is written
+    # down in docs/design/windows-parity-ime-manual.md: the candidate window,
+    # the underlined intermediate string (GCS_COMPSTR), and reconversion all
+    # need a real IME behind the control, because RichEdit reads them from the
+    # input context rather than from the message.
+    Assert (Invoke-FeedbackButton $view) 're-opening the composer for the IME arms'
+    [void](Wait-FeedbackState $errlog $paneId $true)
+    [void](Send-TestKeys -Window $view.Top -Target $rich -Key A -Modifiers Ctrl)
+    [void](Send-TestControlKey -Control $rich -Key Delete)
+    Start-Sleep -Milliseconds 250
+
+    # ASCII source for a non-ASCII string: this file stays ASCII-only, because
+    # PowerShell 5.1 reads a UTF-8 script as ANSI and would mojibake a literal.
+    $imeChars = @(0x65E5, 0x672C, 0x8A9E)   # JA "nihongo"
+    $imeText = -join ($imeChars | ForEach-Object { [char]$_ })
+
+    $WM_IME_STARTCOMPOSITION = 0x010D
+    $WM_IME_ENDCOMPOSITION = 0x010E
+    $WM_IME_CHAR = 0x0286
+
+    Assert (Send-TestRawMessage -Window $rich -Message $WM_IME_STARTCOMPOSITION) `
+        'the control accepted the start of an IME composition'
+    foreach ($c in $imeChars) {
+        [void](Send-TestRawMessage -Window $rich -Message $WM_IME_CHAR -WParam ([IntPtr][int]$c) -LParam ([IntPtr]1))
+    }
+    [void](Send-TestRawMessage -Window $rich -Message $WM_IME_ENDCOMPOSITION)
+    Start-Sleep -Milliseconds 500
+    $imeGot = Get-TestControlText $rich
+    Assert ($imeGot -eq $imeText) `
+        "a composed string lands in the composer (got $($imeGot.Length) char(s), want $($imeText.Length))"
+
+    # Typing continues normally afterwards, in the same field -- the failure
+    # this catches is a composition that ends leaving the control in a state
+    # where ordinary WM_CHAR stops inserting.
+    #
+    # End first, and that is a HARNESS artifact rather than a behaviour: a real
+    # WM_IME_ENDCOMPOSITION carries a result string RichEdit reads out of the
+    # input context and replaces the composition span with, leaving the caret
+    # after it. Ours finds an empty context, so the control collapses the
+    # selection back to where the composition STARTED and the next character
+    # would land in front of the composed text. Nothing on this side of the
+    # boundary can change that, and the caret's real resting place is one of
+    # the things docs/design/windows-parity-ime-manual.md checks by hand.
+    [void](Send-TestControlKey -Control $rich -Key End)
+    [void](Send-TestControlText -Control $rich -Text 'ok')
+    Start-Sleep -Milliseconds 300
+    $imeMixed = Get-TestControlText $rich
+    # Codepoints, not the string: this file is ASCII and a failure message that
+    # printed the text itself would arrive as mojibake in the transcript.
+    function Show-Codepoints([string]$s) { return (([char[]]$s | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ' ') }
+    Assert ($imeMixed -eq ($imeText + 'ok')) `
+        "ordinary typing continues after the composition ends (got '$(Show-Codepoints $imeMixed)', want '$(Show-Codepoints ($imeText + 'ok'))')"
+
+    # And the mirror. EN_CHANGE fires DURING an open composition, so the pane's
+    # buffer sees partial text on the way through; what has to be true is that
+    # it is right at the end. The oracle is the byte length the pane reports at
+    # send time, and it is deliberately compared against the UTF-8 encoding of
+    # what the control holds -- three CJK characters are nine bytes, so an
+    # arm that counted UTF-16 units would pass on ASCII and lie here.
+    $imeWantBytes = [System.Text.Encoding]::UTF8.GetByteCount(
+        ($imeMixed -replace "`r`n", "`n" -replace "`r", "`n"))
+    $bufBeforeIme = Get-LastSendBuffer $errlog $paneId
+    [void](Send-TestViewerChord -Window $view.Top -Target $rich -Key Enter -Modifiers Ctrl)
+    $bufAfterIme = $null
+    for ($t = 0; $t -lt 20; $t++) {
+        $bufAfterIme = Get-LastSendBuffer $errlog $paneId
+        if ($bufAfterIme -ne $bufBeforeIme) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    Assert ($bufAfterIme -eq $imeWantBytes) `
+        "the pane's buffer mirrors the composed text exactly (buffer=$bufAfterIme bytes, control holds $imeWantBytes)"
+    [void](Wait-FeedbackState $errlog $paneId $false)
+
     # --- H. the chords are pane-scoped ---------------------------------------
     # A terminal pane gets the same two chords. Nothing composer-shaped may
     # happen: no open/close transition, no send.

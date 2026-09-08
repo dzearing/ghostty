@@ -1,8 +1,8 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-09-08T04:22:48-07:00",
-    "commit":  "ca5cf7358",
+    "generated":  "2026-09-08T05:06:49-07:00",
+    "commit":  "8af1bcab1",
     "uncommitted":  [
                         "test/win32/viewer-feedback.ps1"
                     ],
@@ -317,7 +317,7 @@
                   "test/win32/viewer-diff.ps1":  "15b282dfeed59d7764b4b427aa85978ec2c0275188d4c2e3c931e415050765a3",
                   "test/win32/viewer-diff-tree.ps1":  "5877f359c51ec7de7fdd91e626c11f008e99dac36fcece9733eafad7302a2661",
                   "test/win32/viewer-error-card.ps1":  "bc486ca60cf4eaed7e2bb772a8e6dc80818ef04696f86ea7ea054238dacf2f4c",
-                  "test/win32/viewer-feedback.ps1":  "12dd36a0b74f6fcd16597d1838c58bfd965b5a08e28c20aadce3eabf550a3ed9",
+                  "test/win32/viewer-feedback.ps1":  "dfd4f253e832e82ea02393808a507a0a4c90214ed77f65492b36c84d97564068",
                   "test/win32/viewer-feedback-capture.ps1":  "a365fbd675721a913c7b2e28cdf2a8c789c1da541da66e3bc2c88e2df709d294",
                   "test/win32/viewer-feedback-carousel.ps1":  "297c9cb0c58d64c24fd7c8395354f0c99666fe5a7db67abed4ed5022c91a39d5",
                   "test/win32/viewer-feedback-images.ps1":  "b334be7252128c2579fddf833a338f2a52e5321e8b80e5a863fe7af0fa26e954",
