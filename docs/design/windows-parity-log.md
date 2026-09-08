@@ -25444,3 +25444,50 @@ aimed at a private debug instance landed in the user's installed release, splitt
 the live go-loop window. That is T441's exact defect, and the lib exists precisely
 so it is a solved problem. A hand-rolled measurement script is not exempt from the
 harness rules just because it is not an acceptance script.
+
+## 2026-09-08 - T1460: the half-second is the parser, not a lock
+
+Yesterday's measurement left the pane-lag report one inference short of a cause.
+Half of every wall-clock second was disappearing inside `processOutputTracked`
+while the pane moved only 50 KB, and that call takes the renderer mutex itself -
+so the clock around it covered lock wait plus work and could not say which. The
+arithmetic pointed hard at lock wait: the renderer ran at 12 fps in the same
+seconds, and 12 frames times roughly 40 ms of held mutex is ~480 ms/s, which
+matched almost exactly.
+
+It was a coincidence. The split now exists - `perf agent_feed` carries
+`lock_ms_per_s` and `work_ms_per_s` beside the total it partitions - and across
+the 28 sustained seconds of the same 400,000-chunk workload, lock wait is 12 ms
+and work under the lock is 14,450. **One millisecond per second, 0.08% of the
+cost.** The io thread is not being starved by the renderer at all; it is inside
+the parser, doing work, for half of every second. Two numbers that both happen to
+be about half a second matched, and nothing in the instrument could tell that
+from causation.
+
+So the ruled-out list for T1461 grows by one - present, wakeup coalescing, the
+T111b handoff, and now renderer-mutex starvation - and what is left to explain is
+why a 4 KiB slice takes ~40 ms to parse.
+
+The mechanism is a twin rather than a flag. `Termio.processOutputTrackedTimed`
+brackets its own mutex acquire; `Remote.feedSliced` calls it only when
+`GHOZTTY_PERF` is set and otherwise calls the untouched original, so the shipped
+path keeps its exact instruction stream, lock order and hold duration. That
+restraint is the point on this particular mutex: three prior tasks (T111b, T114,
+T115) are about starvation under it, and a probe that perturbs what it measures
+would have been worse than no probe. The telemetry-off run came back at 8,860 ms
+against 8,927 with it on and 9,088 for the original baseline - a spread that runs
+the wrong way for a telemetry cost - and emitted zero counter lines, which is the
+proof it was actually off rather than merely quiet.
+
+One thing this turn found and did not fix: every number in this chain, T1458's
+A/B table included, came off a **Debug** build whose own startup log says
+performance will be very poor. The lock-versus-work *ratio* does not care - it is
+0.08% whatever the parser costs - but the ~500 ms/s rate and the 26x gap against
+conhost very much do, and Zig's Debug mode is worst case for a byte-at-a-time
+state machine with every safety check live. Optimising the parser against that
+number risks spending a whole task recovering overhead the shipped build never
+pays, so T1463 re-establishes the baseline on an optimized build and now blocks
+T1461. The awkward part is real and is written into that card: the standing
+safety rule forbids release-mode dev builds precisely because they derive the
+user's own IPC and agent endpoints, so the first deliverable there is a proof of
+isolation, not a build.

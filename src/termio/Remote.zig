@@ -1927,9 +1927,20 @@ fn feedSliced(rd: *ThreadData, bytes: []const u8) void {
     feed_telemetry.bytes(bytes.len);
     while (it.next()) |slice| {
         const parse_start = feed_telemetry.now();
-        @call(.always_inline, termio.Termio.processOutputTracked, .{
-            rd.io, slice, &rd.io.backend.remote.applied_bytes,
-        });
+        // T1460: when telemetry is on, take the twin that reports its own
+        // mutex acquire time, so `parse_ms_per_s` is split into the wait and
+        // the work rather than being a number nobody can act on. When it is
+        // off this is the original call, unchanged — see the twin's comment
+        // for why that matters on this particular mutex.
+        if (feed_telemetry.timing()) |t| {
+            @call(.always_inline, termio.Termio.processOutputTrackedTimed, .{
+                rd.io, slice, &rd.io.backend.remote.applied_bytes, t,
+            });
+        } else {
+            @call(.always_inline, termio.Termio.processOutputTracked, .{
+                rd.io, slice, &rd.io.backend.remote.applied_bytes,
+            });
+        }
         feed_telemetry.parsed(parse_start);
         // T111b/T114/T115: bounding the HOLD (above) is not enough on its own,
         // because nothing bounds how often we re-take it. `processOutputTracked`
@@ -1975,6 +1986,13 @@ fn feedSliced(rd: *ThreadData, bytes: []const u8) void {
 /// Together with the renderer's `fps`/`swap_avg_us` they say which thread the
 /// second went to.
 ///
+/// T1460 split `parse_ms_per_s` in two. It brackets a call that SELF-LOCKS the
+/// renderer mutex, so the ~500 ms/s it reported was lock wait PLUS parse and
+/// could not say which — and the two have opposite fixes (starve the drain less
+/// vs parse faster). `lock_ms_per_s` and `work_ms_per_s` are those halves; the
+/// old number stays on the line as their sum, because a partition you cannot
+/// check against a total is just two more numbers.
+///
 /// Threadlocal, like every other counter in this family: one pane, one thread.
 const feed_telemetry = struct {
     threadlocal var enabled: ?bool = null;
@@ -1984,6 +2002,7 @@ const feed_telemetry = struct {
     threadlocal var total_feeds: u64 = 0;
     threadlocal var parse_ns: u64 = 0;
     threadlocal var yield_ns: u64 = 0;
+    threadlocal var lock_split: termio.Termio.TrackedTiming = .{};
 
     fn isOn() bool {
         return enabled orelse on: {
@@ -1996,6 +2015,14 @@ const feed_telemetry = struct {
     fn now() ?std.time.Instant {
         if (!isOn()) return null;
         return std.time.Instant.now() catch null;
+    }
+
+    /// The accumulator to hand `processOutputTrackedTimed`, or null when
+    /// telemetry is off — which is also the signal to call the untimed
+    /// original instead.
+    fn timing() ?*termio.Termio.TrackedTiming {
+        if (!isOn()) return null;
+        return &lock_split;
     }
 
     fn bytes(n: usize) void {
@@ -2027,13 +2054,16 @@ const feed_telemetry = struct {
         const elapsed = tick.since(start);
         if (elapsed < std.time.ns_per_s) return;
         log.info(
-            "perf agent_feed kb_per_s={d} slices_per_s={d} feeds_per_s={d} parse_ms_per_s={d} yield_ms_per_s={d}",
+            "perf agent_feed kb_per_s={d} slices_per_s={d} feeds_per_s={d} " ++
+                "parse_ms_per_s={d} lock_ms_per_s={d} work_ms_per_s={d} yield_ms_per_s={d}",
             .{
                 (total_bytes * std.time.ns_per_s / @max(elapsed, 1)) / 1024,
                 total_slices * std.time.ns_per_s / @max(elapsed, 1),
                 total_feeds * std.time.ns_per_s / @max(elapsed, 1),
-                (parse_ns * std.time.ns_per_s / @max(elapsed, 1)) / std.time.ns_per_ms,
-                (yield_ns * std.time.ns_per_s / @max(elapsed, 1)) / std.time.ns_per_ms,
+                msPerSecond(parse_ns, elapsed),
+                msPerSecond(lock_split.lock_ns, elapsed),
+                msPerSecond(lock_split.work_ns, elapsed),
+                msPerSecond(yield_ns, elapsed),
             },
         );
         window_start = tick;
@@ -2042,8 +2072,23 @@ const feed_telemetry = struct {
         total_feeds = 0;
         parse_ns = 0;
         yield_ns = 0;
+        lock_split = .{};
     }
 };
+
+/// Scale a nanosecond total accumulated over `elapsed_ns` into milliseconds per
+/// wall-clock second — the unit every duration on the `perf agent_feed` line is
+/// in, so 500 reads as "half of every second went here".
+///
+/// Split out and unit tested (T1460) because the report line now carries a
+/// PARTITION — `lock_ms_per_s` + `work_ms_per_s` should reconstruct
+/// `parse_ms_per_s` — and that claim only holds if all four go through the same
+/// scaling. It is also the one piece of the telemetry that can be checked
+/// without a live pane: the counters themselves are threadlocal and only mean
+/// anything on an io thread with an agent-held ConPTY behind it.
+fn msPerSecond(total_ns: u64, elapsed_ns: u64) u64 {
+    return (total_ns * std.time.ns_per_s / @max(elapsed_ns, 1)) / std.time.ns_per_ms;
+}
 
 /// The pure half of `feedSliced`: hands out the input in `max_parse_slice`
 /// pieces, in order, covering every byte exactly once. Split out so the
@@ -2449,6 +2494,51 @@ test "T111 slice bound stays at or under the drain buffer it slices" {
     // dead code and would silently re-widen the mutex hold this bounds.
     try std.testing.expect(max_parse_slice <= 16 * 1024);
     try std.testing.expect(max_parse_slice > 0);
+}
+
+test "T1460 msPerSecond scales a nanosecond total into ms per wall-clock second" {
+    const testing = std.testing;
+
+    // Half of a one-second window is 500 ms/s — the shape of the number T1458
+    // measured, and the reason this task exists.
+    try testing.expectEqual(
+        @as(u64, 500),
+        msPerSecond(500 * std.time.ns_per_ms, std.time.ns_per_s),
+    );
+
+    // The window is rarely exactly a second: the report fires on the first
+    // slice after one has elapsed, so a 2 s window with 500 ms in it is
+    // 250 ms/s, not 500.
+    try testing.expectEqual(
+        @as(u64, 250),
+        msPerSecond(500 * std.time.ns_per_ms, 2 * std.time.ns_per_s),
+    );
+
+    // A zero-length window cannot divide by zero (the clock is allowed to
+    // return the same instant twice).
+    try testing.expectEqual(@as(u64, 0), msPerSecond(0, 0));
+}
+
+test "T1460 the lock/work halves reconstruct the total they partition" {
+    const testing = std.testing;
+
+    // The whole point of the split: `lock_ms_per_s` + `work_ms_per_s` must
+    // come back to `parse_ms_per_s`, because the timed twin brackets the same
+    // call the outer clock does. Rounding to whole milliseconds is the only
+    // slack, and it is per-term, so the sum can trail the total by at most one
+    // ms per term — assert that bound rather than exact equality, which is
+    // what a reader of the log line is allowed to conclude.
+    const elapsed = 3 * std.time.ns_per_s;
+    const lock_ns: u64 = 1_234_567_890;
+    const work_ns: u64 = 210_987_654;
+    const parse_ns_total = lock_ns + work_ns;
+
+    const parse = msPerSecond(parse_ns_total, elapsed);
+    const lock = msPerSecond(lock_ns, elapsed);
+    const work = msPerSecond(work_ns, elapsed);
+
+    try testing.expect(lock + work <= parse);
+    try testing.expect(parse - (lock + work) <= 2);
 }
 
 test "T144 openWorkingDirectory: local agent falls back to the local resolved cwd" {

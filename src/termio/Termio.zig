@@ -846,6 +846,54 @@ pub fn processOutputTracked(
     _ = applied.fetchAdd(buf.len, .monotonic);
 }
 
+/// The two halves of one `processOutputTracked` call (T1460), in nanoseconds:
+/// `lock_ns` is time spent WAITING for the renderer mutex, `work_ns` is time
+/// spent parsing with it held. A caller accumulates across many calls and
+/// reports both, because either one alone is unreadable — the sum is what a
+/// bracket around the whole call already measures, and the question is always
+/// which half it is.
+pub const TrackedTiming = struct {
+    lock_ns: u64 = 0,
+    work_ns: u64 = 0,
+};
+
+/// Like `processOutputTracked`, but attributes the call to lock wait vs work
+/// under the lock (T1460).
+///
+/// This exists as a TWIN rather than an optional out-parameter on
+/// `processOutputTracked` because that function is the hottest thing on the
+/// remote drain path, and a measurement that perturbs what it measures is
+/// worse than none: three prior tasks (T111b, T114, T115) are about starvation
+/// on exactly this mutex. Callers select the twin only when their telemetry is
+/// on, so the ordinary path keeps the original's instruction stream, lock
+/// order and hold duration untouched.
+///
+/// A clock that will not read is not an error worth failing a drain over — the
+/// timings simply do not advance for that call, which shows up as a slightly
+/// low total rather than a lost byte.
+pub fn processOutputTrackedTimed(
+    self: *Termio,
+    buf: []const u8,
+    applied: *std.atomic.Value(u64),
+    timing: *TrackedTiming,
+) void {
+    const t_enter: ?std.time.Instant = std.time.Instant.now() catch null;
+    self.renderer_state.mutex.lock();
+    const t_locked: ?std.time.Instant = std.time.Instant.now() catch null;
+    {
+        defer self.renderer_state.mutex.unlock();
+        self.processOutputLocked(buf);
+        _ = applied.fetchAdd(buf.len, .monotonic);
+    }
+    const t_done: ?std.time.Instant = std.time.Instant.now() catch null;
+
+    const enter = t_enter orelse return;
+    const locked = t_locked orelse return;
+    timing.lock_ns += locked.since(enter);
+    const done = t_done orelse return;
+    timing.work_ns += done.since(locked);
+}
+
 /// The absolute agent-stream byte offset this pane has applied to its terminal
 /// so far (WP-D3), or null for a non-remote backend. Read under the renderer
 /// mutex alongside a grid dump to persist a consistent (screen, offset) pair
