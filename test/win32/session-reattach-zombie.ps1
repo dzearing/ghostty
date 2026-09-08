@@ -76,6 +76,9 @@ $root = Join-Path $env:TEMP "ghoztty-alt-reattach-$PID"
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 . (Join-Path $PSScriptRoot 'lib\BuildMode.ps1')
+# T655: Manifest-Path / Read-Manifest / Wait-Manifest / Manifest-Leaves /
+# First-Snapshot-Leaf, shared rather than copied a fourth time.
+. (Join-Path $PSScriptRoot 'lib\SessionManifest.ps1')
 
 function Assert($name, $cond) {
     if ($cond) { Write-Host "  PASS $name"; $script:passes++ }
@@ -132,40 +135,6 @@ function Wait-AliveCount($tmp, $tag, $target, $timeoutSec = 25) {
     return $rows
 }
 
-function Manifest-Path($tmp) { return (Join-Path $tmp 'ghoztty\session-layout-debug.json') }
-function Read-Manifest($tmp) {
-    $p = Manifest-Path $tmp
-    if (-not (Test-Path $p)) { return $null }
-    try { return (Get-Content $p -Raw | ConvertFrom-Json) } catch { return $null }
-}
-function Wait-Manifest($tmp, $pred, $timeoutSec = 25) {
-    $deadline = (Get-Date).AddSeconds($timeoutSec)
-    $m = $null
-    while ((Get-Date) -lt $deadline) {
-        $m = Read-Manifest $tmp
-        if ($null -ne $m) { try { if (& $pred $m) { return $m } } catch {} }
-        Start-Sleep -Milliseconds 400
-    }
-    return $m
-}
-function All-Leaves($m) {
-    $leaves = @()
-    foreach ($w in @($m.windows)) {
-        foreach ($t in @($w.tabs)) {
-            foreach ($n in @($t.nodes)) {
-                if ($null -ne $n.leaf) { $leaves += $n.leaf }
-            }
-        }
-    }
-    return , $leaves
-}
-function First-Snapshot-Leaf($m) {
-    if ($null -eq $m) { return $null }
-    foreach ($leaf in @(All-Leaves $m)) {
-        if ($leaf.screen_snapshot -and $leaf.screen_snapshot_offset) { return $leaf }
-    }
-    return $null
-}
 function Decode-Snapshot($b64) {
     try { return [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($b64)) }
     catch { return $null }

@@ -1,11 +1,11 @@
 {
     "guard":  "desktop-launch",
     "script":  "test/win32/desktop-launch-audit.ps1",
-    "generated":  "2026-09-08T07:59:32-07:00",
-    "commit":  "2129cb43a",
+    "generated":  "2026-09-08T09:50:07-07:00",
+    "commit":  "ccf59cfed",
     "uncommitted":  [
-                        "test/win32/gate-negatives.ps1",
-                        "test/win32/parity-tasks-seat.ps1"
+                        "test/win32/session-reattach-zombie.ps1",
+                        "test/win32/session-relaunch-notify.ps1"
                     ],
     "files":  {
                   "src/cli/ghostty.zig":  "ef54b501298cfda9306cfb958c1094db24ee30f355b25865656b3e2bc713bcd7",
@@ -226,9 +226,9 @@
                   "test/win32/session-open.ps1":  "88b39dc5412b2afa6d8eb77dc651ce989074e1d56f8c09f4020a7c6e58255fc1",
                   "test/win32/session-persistence.ps1":  "f3c1e45d764a320f9f5a97979350697c1556fcc26a1b9ea71c1824abbd080a9c",
                   "test/win32/session-reattach.ps1":  "cb73635c3f3503ffc470a75e9a65ef39a5adb30496149ed22c92bfd360a4a1ea",
-                  "test/win32/session-reattach-zombie.ps1":  "182b955a0eef9125ff18b57e946d890d9d91797a590d4b943e603465baef61e6",
+                  "test/win32/session-reattach-zombie.ps1":  "c485c51ae3333ce5c130dbf8c7b698a8bcdce5648b97ed6461763bcafc5b2afa",
                   "test/win32/session-relaunch.ps1":  "2463fcfa34a6875b1ce2d1f3eda42abf642b05588835efed4e3258af45f08a28",
-                  "test/win32/session-relaunch-notify.ps1":  "2164bd5e229f69b9751a01a2e1232c3a5747b7fc52c258d1e9a99bd4737051d4",
+                  "test/win32/session-relaunch-notify.ps1":  "b684c88601cbbb46b321187e9a34d8734e09d8b347ddc0fa8eede74f221f7de2",
                   "test/win32/session-restore-maximized.ps1":  "5af0d5334fc5974b4bf643c69addfb503c6f35b8f161691c729ad704ffafddf7",
                   "test/win32/session-resume-offset.ps1":  "afda54cfd0df1b0163c489618689744e41ac6ad2b24a2e1a506607ad0d5ccb87",
                   "test/win32/sessions-agent-build.ps1":  "4ddcd1913f07dfb9c177312382493b5a0e6f69d126ebec1ce3522c6908299eea",

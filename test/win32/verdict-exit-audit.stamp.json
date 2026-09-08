@@ -1,11 +1,12 @@
 {
     "guard":  "verdict-exit",
     "script":  "test/win32/verdict-exit-audit.ps1",
-    "generated":  "2026-09-08T07:59:10-07:00",
-    "commit":  "2129cb43a",
+    "generated":  "2026-09-08T09:49:45-07:00",
+    "commit":  "ccf59cfed",
     "uncommitted":  [
-                        "test/win32/gate-negatives.ps1",
-                        "test/win32/parity-tasks-seat.ps1"
+                        "test/win32/lib/SessionManifest.ps1",
+                        "test/win32/session-reattach-zombie.ps1",
+                        "test/win32/session-relaunch-notify.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "a3f98a551352e27d1ad9c1745e222757dc4b802efc5638fbe6ea4d3f621b6307",
@@ -196,6 +197,7 @@
                   "test/win32/lib/PaneLiveness.ps1":  "d6e189f9d6336ccf01f67a4c971f82c2ef65833f99250200e7f7655ac54f52fd",
                   "test/win32/lib/PersistenceSweep.ps1":  "457ebb568f855f9b60f0922ee948acd231c6663690dbaef8e7c783397f65e5b5",
                   "test/win32/lib/PipeBridge.ps1":  "5ae297c7cf5206a4533f905501158607d360fe6e87308048a6838e3f3b35a4b1",
+                  "test/win32/lib/SessionManifest.ps1":  "036a06be7a96044c6a5185dfa8e18f68ad0fdd22db8b8ee79db64a0d3cba635b",
                   "test/win32/lib/SkipAudit.ps1":  "1f144bf0f762eebc385656df1fa39d7629363d44164393de241248c4a231eade",
                   "test/win32/lib/StderrCaptureAudit.ps1":  "69d0a25615d35acc06bf6c1471016186163ae1881ae70a12461425546ac4b7d8",
                   "test/win32/lib/TestClient.ps1":  "98b5449096d7103ec31d8eb19b2d0d84985c48fddc88a5871eeb641ec43091f8",
@@ -264,9 +266,9 @@
                   "test/win32/session-open.ps1":  "88b39dc5412b2afa6d8eb77dc651ce989074e1d56f8c09f4020a7c6e58255fc1",
                   "test/win32/session-persistence.ps1":  "f3c1e45d764a320f9f5a97979350697c1556fcc26a1b9ea71c1824abbd080a9c",
                   "test/win32/session-reattach.ps1":  "cb73635c3f3503ffc470a75e9a65ef39a5adb30496149ed22c92bfd360a4a1ea",
-                  "test/win32/session-reattach-zombie.ps1":  "182b955a0eef9125ff18b57e946d890d9d91797a590d4b943e603465baef61e6",
+                  "test/win32/session-reattach-zombie.ps1":  "c485c51ae3333ce5c130dbf8c7b698a8bcdce5648b97ed6461763bcafc5b2afa",
                   "test/win32/session-relaunch.ps1":  "2463fcfa34a6875b1ce2d1f3eda42abf642b05588835efed4e3258af45f08a28",
-                  "test/win32/session-relaunch-notify.ps1":  "2164bd5e229f69b9751a01a2e1232c3a5747b7fc52c258d1e9a99bd4737051d4",
+                  "test/win32/session-relaunch-notify.ps1":  "b684c88601cbbb46b321187e9a34d8734e09d8b347ddc0fa8eede74f221f7de2",
                   "test/win32/session-restore-maximized.ps1":  "5af0d5334fc5974b4bf643c69addfb503c6f35b8f161691c729ad704ffafddf7",
                   "test/win32/session-resume-offset.ps1":  "afda54cfd0df1b0163c489618689744e41ac6ad2b24a2e1a506607ad0d5ccb87",
                   "test/win32/sessions-agent-build.ps1":  "4ddcd1913f07dfb9c177312382493b5a0e6f69d126ebec1ce3522c6908299eea",

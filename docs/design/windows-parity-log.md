@@ -25271,3 +25271,56 @@ green.
 No decision file: all three options are indistinguishable from inside the app -
 under each, a restored pane is live - so it fails the experience test and was a
 mechanism call to make and record.
+
+## 2026-09-08 - T655: the OTHER half of the stale-resume-point fix now has a red/green proof
+
+T532 fixed the dead-restored-windows bug on both sides: a reader half that
+refuses to trust a resume point pointing past the agent's head, and a writer
+half that stops such a point being recorded in the first place. Only the reader
+had a test. The writer was three words in a conditional -
+`self.attach_offset = 0` on the paths that begin a brand-new byte stream - and
+deleting it broke nothing that anyone could see, because the reader's clamp
+absorbs the bad record it produces. That is the exact shape that gets tidied
+away in two years by someone who reads the line and cannot find anything that
+needs it.
+
+The invariant is observable in the session-layout manifest, which is the file a
+restore is built from: after a restore-policy relaunch, the byte offset a pane
+records has to belong to the stream it is actually on. So arm A of
+`test\win32\session-relaunch-notify.ps1` - which already kills the agent,
+relaunches, and proves the recorded commands were not re-run - now also
+remembers what each pane recorded against the stream that is about to die, and
+requires the number written after the restore to be strictly BELOW it. Without
+the reset it is that same number PLUS whatever the fresh shell has printed, so
+the comparison is one-sided and cannot pass by luck. Verified by neutering the
+reset and rebuilding: `A19 (0/3)` red, the other 130 assertions green, and the
+recorded points exactly pre-plus-fresh (`2254->2864`, `36298->37197`,
+`2665->3549`). Restored, the same run reads `36288->895 | 2254->880 |
+2476->607`.
+
+The comparison is keyed on `pane_id` - the one identity that survives a restore,
+since a restore-policy relaunch mints a fresh session id - and it refuses to read
+a manifest older than the moment the new app launched, so the dead app's copy
+cannot satisfy it. The plain pane got a 28 KB filler burst before its history
+marker: its margin was 921 against 895, twenty-six bytes on an assertion that is
+supposed to be decisive.
+
+Two defects surfaced on the way, neither of them the writer half. The manifest
+readers being lifted into `test\win32\lib\SessionManifest.ps1` (shared now with
+`session-reattach-zombie.ps1`, which lost its copies) carried a latent bug from
+the day they were written: `@(All-Leaves $m)` KEEPS the single-element wrapper
+that a `return , $arr` helper hands back instead of unrolling it, so the loop ran
+once with the whole array as its item and PowerShell's member enumeration turned
+one offset into an `Object[]` of all of them. It had only ever been pointed at
+one-leaf manifests. And when that cast threw, it took the run with it: the
+script's top-level `try`/`finally` has no `catch`, so the unwind ran the cleanup
+and fell through to the verdict with the failure count untouched - **ALL PASS
+(12)**, arms A through F and M never executed, and the `session-relaunch` guard
+STAMPED over a body that had skipped nine tenths of itself. The script now scores
+its own throw. The suite-wide form of that rule is `lib\BodyCompleteAudit.ps1`
+and it only reaches scripts scored by `lib\TestScore.ps1`; converting this one is
+T775.
+
+Filed: T1455 (a static audit for the `@()`-around-a-comma-returning-helper
+shape, which is mechanical and greppable) and T1456 (the twenty-odd scripts
+still hand-rolling their own manifest readers).

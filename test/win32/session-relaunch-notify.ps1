@@ -94,6 +94,11 @@ $root = Join-Path $env:TEMP "ghoztty-relaunch-notify-$PID"
 # T652: the "attached is not alive" oracle. Read its header before adding an
 # assertion about a restored pane.
 . (Join-Path $PSScriptRoot 'lib\PaneLiveness.ps1')
+# T655: the session-layout manifest readers (Read-Manifest / Wait-Manifest /
+# Manifest-Leaves / Snapshot-Offsets), shared with session-reattach-zombie.ps1.
+# Deliberately NOT named `All-Leaves`: this script has its own function by that
+# name for the `+list --json` tree, and the two walk different documents.
+. (Join-Path $PSScriptRoot 'lib\SessionManifest.ps1')
 # T1033: this script launches the app itself (Start-Process, not the test
 # desktop's helper), so it asks the pre-flight question the helper asks: are
 # these bytes ours to drive, or the ones the user's installed Ghoztty owns?
@@ -532,6 +537,23 @@ function Build-AndKill($cwdA, $withBanners = $false) {
     # to land BEFORE the manifest debounce below: the snapshot the restore
     # paints is whatever the app had captured when the layout was last written.
     if ($script:plainPane -ne '') {
+        # T655: bulk output FIRST, so this pane's recorded resume point is a
+        # number a fresh shell's opening paint cannot come near. A18/A19 compare
+        # the offset recorded after the restore against the one recorded here,
+        # and the plain pane is the quiet one - it prints a prompt and a marker
+        # where the commanded panes print a ping line a second. Measured before
+        # this: 921 bytes before the kill against 895 after it, a 26-byte margin
+        # on an assertion that is supposed to be decisive. `type` of a filler
+        # file costs a second and puts the margin in five figures. The marker
+        # below still lands LAST, so the persisted SCREEN - which is what A15
+        # scores - is unchanged.
+        $filler = Join-Path $cwdA 'filler.txt'
+        if (-not (Test-Path $filler)) {
+            $line = ('T655FILLER' * 7)
+            [IO.File]::WriteAllLines($filler, @(1..400 | ForEach-Object { "$line $_" }))
+        }
+        Run-CliArgs @('+send-keys', "--target=$($script:plainPane)", 'type', 'Space', $filler, 'Enter') "$tmp\fill.txt" 15 | Out-Null
+        Start-Sleep -Seconds 2
         Run-CliArgs @('+send-keys', "--target=$($script:plainPane)", 'echo', 'Space', $HIST_MARK, 'Enter') "$tmp\hist.txt" 15 | Out-Null
         Assert "setup: the plain pane printed the history marker before the kill" `
             (Wait-PaneTextTight $script:plainPane 'hist' $HIST_MARK 2 25)
@@ -543,6 +565,14 @@ function Build-AndKill($cwdA, $withBanners = $false) {
     }
 
     Start-Sleep -Seconds 3   # let the session-layout manifest debounce out
+
+    # T655: the resume point each pane recorded against the stream that is about
+    # to die. This is the LAST moment it exists - the kill below ends that byte
+    # stream, and arm A's A18/A19 ask whether the number the app writes down
+    # after the restore belongs to the new one or is still counting from this
+    # one. Keyed by `pane_id`, the only identity that survives a restore.
+    $script:preKillOffsets = Snapshot-Offsets (Read-Manifest $script:tmp)
+
     Stop-AppOnly
     $ownersLeft = Stop-AgentAndHolders $agent
     Assert "setup: no session manager or PTY holder survived the reboot shape ($ownersLeft)" `
@@ -600,6 +630,10 @@ Say "== A: the default (restore) - the recorded commands are NOT re-run"
 Reset-State 'a'
 Build-AndKill $workA | Out-Null
 
+# T655: everything the manifest says before this instant was written by the app
+# that just died, so A19 must refuse to read it. Taken BEFORE the launch, which
+# is the only side of the race that cannot pass by accident.
+$restoreAtA = Get-Date
 $appPidA = Start-App 'restore'
 Assert "A1 the GUI came back" ($appPidA -ne 0)
 $treeA = Wait-Leaves 'a0' 3 60
@@ -732,6 +766,55 @@ $respA = 0
 foreach ($leaf in $leavesA) { if (Test-PaneResponsive $leaf.id "a$($leaf.id.Substring(0,4))") { $respA++ } }
 Assert "A9 every restored pane is on a live, interactive shell ($respA/$($leavesA.Count))" `
     ($respA -eq $leavesA.Count)
+
+# T532's WRITER half, which until T655 was covered by reasoning alone.
+#
+# The reader half - the clamp in `attachChannel` - has had a red/green proof
+# since T532 (session-reattach-zombie.ps1 section D ages the recorded offset to
+# a phantom value and requires the pane to come back live). The half that stops
+# the bad number being WRITTEN had none, and it is the half that mints the
+# record: a restore-policy pane starts a BRAND-NEW byte stream at 0, so
+# `termio.Remote` has to drop the offset it attached at, or `appliedOffset()`
+# keeps counting from the dead stream and the next manifest records a resume
+# point into a stream that no longer exists. That is the 43 MB offset against a
+# minutes-old agent seen on 2026-08-06, and with the reader clamp in place it is
+# SILENT: the pane still comes back live, so nothing here would notice the reset
+# being deleted.
+#
+# The invariant is directly observable in the manifest: after this restore, each
+# pane's recorded resume point must be a small number belonging to the new
+# stream - strictly BELOW the one the same pane recorded against the dead one.
+# Without the reset it is that number PLUS whatever the fresh shell has printed,
+# so the comparison is one-sided and cannot pass by luck.
+$postMA = Wait-Manifest $tmp {
+    param($m)
+    $f = Manifest-Path $tmp
+    if (-not (Test-Path $f)) { return $false }
+    if ((Get-Item $f).LastWriteTime -lt $restoreAtA) { return $false }
+    $o = Snapshot-Offsets $m
+    $seen = 0
+    foreach ($k in $script:preKillOffsets.Keys) { if ($o.ContainsKey($k)) { $seen++ } }
+    return ($seen -ge 2)
+} 60
+$postOffA = Snapshot-Offsets $postMA
+$cmpA = 0; $belowA = 0; $preOkA = 0; $shownA = @()
+foreach ($k in $script:preKillOffsets.Keys) {
+    if (-not $postOffA.ContainsKey($k)) { continue }
+    $cmpA++
+    $preOff = $script:preKillOffsets[$k]
+    $postOff = $postOffA[$k]
+    if ($preOff -gt 0) { $preOkA++ }
+    if ($postOff -lt $preOff) { $belowA++ }
+    $shownA += ("{0} {1}->{2}" -f $k.Substring(0, [Math]::Min(8, $k.Length)), $preOff, $postOff)
+}
+Say "  resume points across the restore: $($shownA -join ' | ')"
+# The positive control for A19, and it is not a formality: if the manifest were
+# never re-written, or the panes came back under fresh ids, every comparison
+# would vanish and A19 would be green over an empty set.
+Assert "A18 the restored panes recorded a resume point again, against a non-zero one before the kill ($cmpA panes, $preOkA non-zero)" `
+    ($cmpA -ge 2 -and $preOkA -eq $cmpA)
+Assert "A19 every restored pane's resume point belongs to the NEW stream, below its pre-kill one ($belowA/$cmpA)" `
+    ($cmpA -ge 2 -and $belowA -eq $cmpA)
 
 # T237: the restore policy must also RETIRE the dead tombstone it replaced -
 # the fire-and-forget CLOSE_SESSION (`closeSessionNoWait`, Remote.zig) - or
@@ -1155,6 +1238,20 @@ Assert "M18 the plain pane is on the SAME session ('$($sidBefore[$paneM])' -> '$
 Assert "M19 the plain pane still takes input" (Test-PaneResponsive $paneM 'm-post')
 Stop-TestProcs
 
+} catch {
+    # T655: score the run's own throw, or a green verdict is reachable over a
+    # body that never finished. `$ErrorActionPreference = 'Continue'` does not
+    # cover a statement-TERMINATING error (a failed cast in a helper, say): it
+    # unwinds this try, runs the finally, and then falls through to the stamp
+    # and the verdict below with `$script:failures` still 0. Measured on this
+    # file, on T655's first run - a bad cast in a manifest helper skipped arms
+    # A-F and M outright and the script printed "ALL PASS (12)" and STAMPED the
+    # session-relaunch guard. The suite-wide rule and its sweep live in
+    # lib\BodyCompleteAudit.ps1, but they only reach scripts scored by
+    # lib\TestScore.ps1 and this one still hand-rolls its verdict (T775), so it
+    # scores its own throw here.
+    Assert "RUN COMPLETED (the body threw: $($_.Exception.Message))" $false
+    Say ($_.ScriptStackTrace)
 } finally {
     Remove-TestDesktop
     Stop-TestProcs
