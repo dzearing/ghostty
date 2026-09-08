@@ -171,6 +171,18 @@ test {
     // no-OS-imports deal.
     _ = @import("apprt/win32/window_memory.zig");
 
+    // Pure win32 bundled release-notes parse + the new-since-your-last-
+    // version split behind the What's New window (T624), same no-OS-imports
+    // deal.
+    _ = @import("apprt/win32/release_notes.zig");
+
+    // Pure win32 last-seen-version tracking — the snapshot-once-at-launch
+    // anchor the What's New split reads (T624), same no-OS-imports deal.
+    _ = @import("apprt/win32/whats_new_seen.zig");
+
+    // Pure win32 What's New window geometry (T624), same no-OS-imports deal.
+    _ = @import("apprt/win32/whats_new_layout.zig");
+
     // Pure win32 banner-markdown parser (T35), same no-OS-imports deal.
     _ = @import("apprt/win32/banner_markdown.zig");
 

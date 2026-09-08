@@ -19,6 +19,7 @@ const gl_loader = @import("../../renderer/gl_loader.zig");
 const App = @import("App.zig");
 const AgentIntegration = @import("AgentIntegration.zig");
 const AgentIntegrationsDialog = @import("AgentIntegrationsDialog.zig");
+const WhatsNewWindow = @import("WhatsNewWindow.zig");
 const ActivityMonitor = @import("ActivityMonitor.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
 const PaneView = @import("PaneView.zig");
@@ -2918,6 +2919,11 @@ pub fn performCommand(self: *Surface, id: commands.Id) void {
 
         // Build provenance of this running instance (T52).
         .about => self.showAboutDialog(),
+
+        // The bundled release notes for everything that landed since the
+        // version this user was last running (T624). Mac's menu entry opens
+        // the same window (AppDelegate.showWhatsNew).
+        .whats_new => WhatsNewWindow.open(self.parent_window),
 
         // The Agent Integrations management window (T871): per-agent state
         // rows with Set Up / Update / Uninstall, probing off-thread. Mac's

@@ -14,6 +14,7 @@ const CoreSurface = @import("../../Surface.zig");
 const internal_os = @import("../../os/main.zig");
 
 const AgentIntegration = @import("AgentIntegration.zig");
+const WhatsNewWindow = @import("WhatsNewWindow.zig");
 const relay_suspend = @import("../../remote/relay_suspend.zig");
 const AgentIntegrationsDialog = @import("AgentIntegrationsDialog.zig");
 const ConfirmDialog = @import("ConfirmDialog.zig");
@@ -882,6 +883,13 @@ pub fn init(
         if (self.msg_hwnd) |mh|
             _ = w32.SetTimer(mh, LAYOUT_REFRESH_TIMER_ID, LAYOUT_REFRESH_MS, null);
     }
+
+    // Anchor "what's new" on the version the user was running BEFORE this
+    // launch, then advance the store (T624). Synchronous and early on
+    // purpose: the moment the stored version is advanced the old one is gone,
+    // so anything that could show notes — the menu window, the agent-restart
+    // dialog — must not be able to run first and read the new value.
+    WhatsNewWindow.snapshotAtLaunch(self.core_app.alloc);
 
     // Keep the `ghoztty` CLI resolvable from any shell (T70). Background
     // thread; only acts when running from the canonical install dir.
@@ -1772,6 +1780,10 @@ pub fn terminate(self: *App) void {
     // are not torn down with any terminal window. Close them here so a sampling
     // thread can never outlive the allocator it is writing into.
     ActivityMonitor.closeAll();
+
+    // Same argument for the What's New window (T624): its own top-level
+    // window holding notes parsed out of the app allocator.
+    WhatsNewWindow.closeAll();
 
     // Flush the session-layout manifest while every window/surface is still
     // alive (T89f). Quit DETACHES sessions (they survive under the agent), so

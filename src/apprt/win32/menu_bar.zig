@@ -225,6 +225,10 @@ const help_menu = [_]Node{
     .{ .item = .{ .cmd = .claude_integration, .title = u16lit("Set Up Agent &Integrations…") } },
     .separator,
     .{ .item = .{ .cmd = .about, .title = u16lit("&About Ghoztty") } },
+    // Mac puts this directly under About in the application menu
+    // (MainMenu.xib). Windows has no application menu, so About's neighbour
+    // in Help is the same neighbour here. `W` is free at this level.
+    .{ .item = .{ .cmd = .whats_new, .title = u16lit("&What’s New in Ghoztty…") } },
 };
 
 /// The root popup, opened from the tab-strip menu button.

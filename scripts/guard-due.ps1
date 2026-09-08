@@ -1905,6 +1905,26 @@ $GuardTable = @(
             'test\win32\readonly-badge.ps1'
         )
     },
+    # The What's New window (T624). `whats-new.ps1` is the only thing that
+    # drives the real anchor store, launches the real app and reads the split
+    # back out of the store the window paints - which bundled version counts
+    # as "new" is a decision no unit test can make against the REPO's own
+    # notes, and no screenshot can check at all.
+    [pscustomobject]@{
+        Name   = 'whats-new'
+        Script = 'test\win32\whats-new.ps1'
+        Stamp  = 'test\win32\whats-new.stamp.json'
+        Covers = @(
+            'src\apprt\win32\WhatsNewWindow.zig',
+            'src\apprt\win32\ipc_whats_new.zig',
+            'src\apprt\win32\release_notes.zig',
+            'src\apprt\win32\release_notes_bundle.zig',
+            'src\apprt\win32\whats_new_seen.zig',
+            'src\apprt\win32\whats_new_layout.zig',
+            'src\build\GhosttyReleaseNotes.zig',
+            'test\win32\whats-new.ps1'
+        )
+    },
     # The key-state pill (T446) and its explainer (T576). `key-state-pill.ps1`
     # is the only thing that drives a real key table on a live GUI and reads
     # the pill's anchor, its content deltas, its per-point click-through and

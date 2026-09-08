@@ -36,6 +36,8 @@ pub const Kind = enum {
     activity,
     /// Show the About box (T52).
     about,
+    /// Open the "What's New in Ghoztty" window (T624).
+    whats_new,
     /// Install the agent integrations for every detected agent (T870).
     claude,
     /// Open the documentation in the default browser (macOS "Ghoztty Help").
@@ -131,6 +133,7 @@ pub const Id = enum {
     check_for_updates,
     help,
     about,
+    whats_new,
     claude_integration,
     quit,
     viewer_open_file,
@@ -250,6 +253,10 @@ pub const registry = [_]Command{
     .{ .id = .check_for_updates, .name = "Check for Updates…", .action = .check_for_updates },
     .{ .id = .help, .name = "Ghoztty Help", .action = .new_window, .kind = .help },
     .{ .id = .about, .name = "About Ghoztty", .action = .new_window, .kind = .about },
+    // Mac lists this in the application menu directly under About
+    // (MainMenu.xib); Windows has no application menu, so it sits beside
+    // About in Help. Name verbatim from Mac.
+    .{ .id = .whats_new, .name = "What’s New in Ghoztty…", .action = .new_window, .kind = .whats_new },
     // Mac's palette title (TerminalCommandPalette.swift): opens the Agent
     // Integrations management window, not a blind install (T871).
     .{ .id = .claude_integration, .name = "Set Up Agent Integrations…", .action = .new_window, .kind = .claude },
@@ -313,6 +320,7 @@ test "only the local kinds carry a placeholder action" {
         .remote,
         .activity,
         .about,
+        .whats_new,
         .claude,
         .help,
         .viewer_open_file,

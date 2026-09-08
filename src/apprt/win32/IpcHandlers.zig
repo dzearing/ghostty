@@ -18,6 +18,7 @@ const Surface = @import("Surface.zig");
 const ipc_capture = @import("ipc_capture.zig");
 const ipc_hover = @import("ipc_hover.zig");
 const ipc_agent_integration = @import("ipc_agent_integration.zig");
+const ipc_whats_new = @import("ipc_whats_new.zig");
 const ipc_handoff = @import("../../os/ipc_handoff.zig");
 const CoreSurface = @import("../../Surface.zig");
 const PaneView = @import("PaneView.zig");
@@ -115,6 +116,12 @@ pub fn dispatch(ctx: Context, request_json: []const u8) Allocator.Error!?[]u8 {
         // ipc_agent_integration.zig; release builds fall through to
         // unknown-action.
         return try ipc_agent_integration.handle(ctx.alloc, request.arguments);
+    } else if (ipc_whats_new.enabled and std.mem.eql(u8, request.action, "whats-new")) {
+        // T624: the DEBUG-ONLY seam for the What's New window. Which bundled
+        // versions count as "new" is a decision no screenshot can check, so
+        // the harness reads the model out of the same store the window
+        // paints. Release builds fall through to unknown-action.
+        return try ipc_whats_new.handle(ctx.app, ctx.alloc, request.arguments);
     }
 
     return try errorResponse(ctx.alloc, "unknown action: {s}", .{request.action});

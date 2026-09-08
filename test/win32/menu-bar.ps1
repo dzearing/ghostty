@@ -92,6 +92,7 @@ function Assert([bool]$cond, [string]$label) {
 # Non-ASCII menu text is built from code points: this file stays ASCII so no
 # editor/shell in the chain can mojibake it (the standing PS5.1 trap).
 $EL = [char]0x2026   # HORIZONTAL ELLIPSIS, as used by the "..." menu rows
+$RQ = [char]0x2019   # RIGHT SINGLE QUOTATION MARK, Mac's apostrophe in "What's New"
 
 Add-Type -AssemblyName System.Drawing
 
@@ -590,6 +591,7 @@ $expectedTree = @(
     "&Help/Set Up Agent &Integrations$EL"
     '&Help/---'
     "&Help/&About Ghoztty"
+    "&Help/&What${RQ}s New in Ghoztty$EL"
     '---'
     "&Settings"
     "&Reload Configuration"

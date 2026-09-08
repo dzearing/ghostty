@@ -8,6 +8,7 @@ const HelpStrings = @import("HelpStrings.zig");
 const MetallibStep = @import("MetallibStep.zig");
 const UnicodeTables = @import("UnicodeTables.zig");
 const GhosttyFrameData = @import("GhosttyFrameData.zig");
+const GhosttyReleaseNotes = @import("GhosttyReleaseNotes.zig");
 const DistResource = @import("GhosttyDist.zig").Resource;
 
 config: *const Config,
@@ -17,6 +18,7 @@ help_strings: HelpStrings,
 metallib: ?*MetallibStep,
 unicode_tables: UnicodeTables,
 framedata: GhosttyFrameData,
+release_notes: GhosttyReleaseNotes,
 uucode_tables: std.Build.LazyPath,
 
 /// Used to keep track of a list of file sources.
@@ -36,6 +38,7 @@ pub fn init(b: *std.Build, cfg: *const Config) !SharedDeps {
         .help_strings = try .init(b, cfg),
         .unicode_tables = try .init(b, uucode_tables),
         .framedata = try .init(b),
+        .release_notes = try .init(b),
         .uucode_tables = uucode_tables,
 
         // Setup by retarget
@@ -673,6 +676,7 @@ pub fn add(
     self.help_strings.addImport(step);
     self.unicode_tables.addImport(step);
     self.framedata.addImport(step);
+    self.release_notes.addImport(step);
 
     return static_libs;
 }

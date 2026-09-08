@@ -9,6 +9,76 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-07: T624 - **an update on Windows now tells you what it changed.**
+  macOS has shipped a "What's New in Ghoztty" window since the release-notes
+  files were introduced; Windows shipped neither the notes nor the window, so
+  the only way to find out what an update did was to go and read the GitHub
+  release page. There is now a window with the same two tabs, reached from
+  **Help > What's New in Ghoztty...** - Mac lists it directly under About in
+  the application menu, and Windows has no application menu, so About's
+  neighbour in Help is the same neighbour.
+
+  **Getting the notes into the build was the part with a real choice in it.**
+  macOS copies `release-notes/{client,agent}/*.json` into
+  `Contents/Resources/ghostty/release-notes/` and reads the directory at
+  runtime. A Windows exe has no Resources directory and the portable ZIP is a
+  flat folder, so the equivalent of "inside the app bundle" is "inside the
+  exe" - the call `GhosttyAssets.zig` already made for the skill and hook
+  assets. What is new here is that the list is **generated rather than
+  written**: `src/build/GhosttyReleaseNotes.zig` enumerates both directories
+  at configure time and emits a `release_notes_data` module that
+  `@embedFile`s each file, wired in through `SharedDeps.add` so every lane
+  and the exe carry it. A hand-kept `@embedFile` list would be a thing to
+  forget on exactly the day it matters, since the release process adds a
+  `<version>.json` on the way to every tag; this way a notes file that exists
+  is a notes file that ships.
+
+  **The split is Mac's, semantics for semantics.** `release_notes.zig` is the
+  pure parse-and-partition (`ReleaseNotesStore.partitioned`): above the
+  version you were last running is new, at or below it is "already
+  installed", and anything above the version you are RUNNING is dropped
+  outright rather than demoted - a bundle can carry notes for a release the
+  app is not, and announcing a release the user does not have is worse than
+  silence. `whats_new_seen.zig` is the anchor (`WhatsNewTracking`):
+  snapshotted once, early in `App.init`, because the moment the store is
+  advanced the old value is gone and any later read would tell a
+  just-upgraded user they already had everything. `UserDefaults` becomes one
+  small file, `%LOCALAPPDATA%\ghoztty\whats-new-seen[-debug]` - suffixed on
+  a debug build, so a dev instance never advances the installed app's anchor.
+
+  **One divergence from Mac, and it is in the comparison.** Versions are
+  ordered on the MAJOR.MINOR.PATCH triple alone, ignoring pre-release and
+  build metadata. Full semver precedence ranks `1.36.0-dev+abc` BELOW
+  `1.36.0`, which would silently drop that release's own notes on every dev
+  build - the one build where somebody is most likely to open the window.
+
+  **The window** (`WhatsNewWindow.zig`) is a plain top-level
+  `WS_OVERLAPPEDWINDOW`, not an owned modal, because Mac's is a window you can
+  leave open behind the terminal and an owned window can never go behind its
+  owner. `TabView` has no win32 counterpart, so the two tabs are the Win11
+  pivot the rest of this app reads like - a leading-aligned label run with an
+  accent underline - rather than the 3D notebook tabs of `SysTabControl32`.
+  Geometry is the pure `whats_new_layout.zig`, asserted at 1.0/1.25/1.5/2.0;
+  inline markdown is the banner's own `banner_markdown.parseSegs`, so a note
+  renders exactly the way a banner renders the same string.
+
+  **Testing needed one seam and one override.** The debug-only `whats-new`
+  IPC action (`ipc_whats_new.zig`, the `capture-pane`/`agent-integration`
+  pattern) opens the window, drives its tabs, and reports the model out of the
+  same store the window paints - which bundled versions count as new is a
+  decision no screenshot can check. The override is
+  `GHOZTTY_WHATS_NEW_VERSION`, debug builds only, and it is not a
+  convenience: the notes are keyed by the version line a RELEASE carries,
+  while a dev build's version comes from the branch's git description
+  (`1.4.0-...` today) and sits below every bundled file - so on a dev build
+  the cap correctly drops all of them, which leaves the window empty for
+  developers and the cap itself unprovable from outside. With it,
+  `test/win32/whats-new.ps1` drives both the anchor and the running version:
+  ALL PASS at 46 assertions across bundling, the anchor, a first run, the
+  window and its tabs, typed refusals, and a section that runs BELOW the
+  newest bundled note purely to watch the cap fire. `-NegativeControl` scores
+  red. Guard row `whats-new` added.
+
 - 2026-09-07: T621 - **taking over a machine's windows, or resuming a session this
   viewer has never had open, no longer makes every pane re-send its whole recent
   history before it is usable.** Those two paths ("Restore All" from an agent-held
