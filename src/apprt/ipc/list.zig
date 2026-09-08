@@ -163,6 +163,12 @@ pub const List = struct {
         /// come back on its own), false for a terminal verdict that needs the
         /// user.
         self_healable: ?bool = null,
+        /// Only when the disconnection has a reason worth naming (T628):
+        /// `"incompatible"` when the far agent answered and disagrees about the
+        /// protocol version, which is a machine that is UP and a link that no
+        /// retry can restore. Absent for an ordinary drop, so a script reading
+        /// for the unusual case does not have to filter the usual one.
+        reason: ?[]const u8 = null,
     };
 
     pub const Window = struct {
@@ -270,6 +276,10 @@ pub const List = struct {
         if (c.self_healable) |h| {
             try jws.objectField("self_healable");
             try jws.write(h);
+        }
+        if (c.reason) |r| {
+            try jws.objectField("reason");
+            try jws.write(r);
         }
         try jws.endObject();
     }
@@ -872,6 +882,10 @@ test "List: connection reports the ladder's three states (T609)" {
             .conn = .{ .state = "disconnected", .self_healable = false },
             .want = "\"connection\":{\"state\":\"disconnected\",\"self_healable\":false}",
         },
+        .{
+            .conn = .{ .state = "disconnected", .self_healable = false, .reason = "incompatible" },
+            .want = "\"connection\":{\"state\":\"disconnected\",\"self_healable\":false,\"reason\":\"incompatible\"}",
+        },
     };
 
     for (cases) |c| {
@@ -891,6 +905,8 @@ test "List: connection reports the ladder's three states (T609)" {
             try testing.expect(std.mem.indexOf(u8, json, "attempt") == null);
         if (c.conn.self_healable == null)
             try testing.expect(std.mem.indexOf(u8, json, "self_healable") == null);
+        if (c.conn.reason == null)
+            try testing.expect(std.mem.indexOf(u8, json, "reason") == null);
     }
 }
 

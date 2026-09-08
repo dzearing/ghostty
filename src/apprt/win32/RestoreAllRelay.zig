@@ -50,6 +50,7 @@ const Window = @import("Window.zig");
 const layout_blobs = @import("layout_blobs.zig");
 const session_layout = @import("session_layout.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
+const dial_failure = @import("dial_failure.zig");
 const w32 = @import("win32.zig");
 
 const log = std.log.scoped(.win32);
@@ -355,8 +356,13 @@ fn dialRelay(
         alloc.destroy(dialed);
         // A rejected bearer is not an unreachable machine, and telling the user
         // to check the network when the fix is signing in wastes their time
-        // (the split T319 drew for the roster).
-        return if (err == error.WebSocketUnauthorized) error.Unauthorized else error.DialFailed;
+        // (the split T319 drew for the roster). A protocol skew is the third
+        // sentence, drawn for the same reason (T628).
+        return switch (dial_failure.classify(err)) {
+            .unauthorized => error.Unauthorized,
+            .incompatible => error.IncompatibleVersion,
+            .unreachable_machine => error.DialFailed,
+        };
     };
     return .{ .relay = dialed };
 }

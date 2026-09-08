@@ -55,6 +55,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const machine_pool = @import("machine_pool.zig");
+const dial_failure = @import("dial_failure.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
 const remote_connection = @import("../../remote/connection.zig");
@@ -78,11 +79,11 @@ pub const WM_APP_MACHINE_POOL_DIALED: u32 = w32.WM_APP + 28;
 /// (the roster), with the CPU meter to come; far above what a session reaches.
 pub const max_leases: usize = 32;
 
-/// Why a machine is not usable. `offline` and `unauthorized` are different
-/// SENTENCES to the user — "couldn't reach it" sends them to the network when
-/// the answer is to sign in again — so the distinction is carried rather than
-/// flattened into "failed".
-pub const Failure = enum { none, offline, unauthorized };
+/// Why a machine is not usable. `offline`, `unauthorized` and `incompatible`
+/// are different SENTENCES to the user — "couldn't reach it" sends them to the
+/// network when the answer is to sign in again, or to update one side (T628) —
+/// so the distinction is carried rather than flattened into "failed".
+pub const Failure = enum { none, offline, unauthorized, incompatible };
 
 /// The transport a pooled connection rides. Same two shapes as
 /// `Window.RemoteDialed`, declared here rather than imported so the pool does
@@ -481,6 +482,18 @@ fn startDial(self: *MachineConnectionPool, hwnd: w32.HWND, slot: usize, generati
     log.info("machine pool: dialing {s}", .{k});
 }
 
+/// A dial error as the ROSTER has to say it. The classification itself is
+/// `dial_failure`'s, shared with every other dial in the app so the machine
+/// chooser and the window pill cannot end up disagreeing about the same
+/// machine.
+fn failureFor(err: anyerror) Failure {
+    return switch (dial_failure.classify(err)) {
+        .unreachable_machine => .offline,
+        .unauthorized => .unauthorized,
+        .incompatible => .incompatible,
+    };
+}
+
 fn dialWorker(req: *DialRequest) void {
     defer req.destroy();
     const alloc = req.alloc;
@@ -496,7 +509,7 @@ fn dialWorker(req: *DialRequest) void {
                     failure = .none;
                 } else |err| {
                     log.warn("machine pool: relay dial failed device={s} err={}", .{ r.device, err });
-                    if (err == error.WebSocketUnauthorized) failure = .unauthorized;
+                    failure = failureFor(err);
                     alloc.destroy(d);
                 }
             } else |_| {}
@@ -509,6 +522,7 @@ fn dialWorker(req: *DialRequest) void {
                     failure = .none;
                 } else |err| {
                     log.warn("machine pool: tcp dial failed host={s} err={}", .{ t.host, err });
+                    failure = failureFor(err);
                     alloc.destroy(d);
                 }
             } else |_| {}

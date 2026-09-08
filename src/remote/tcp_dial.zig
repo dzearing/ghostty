@@ -83,6 +83,36 @@ pub const DialReport = struct {
     peer_proto_version: ?u16 = null,
 };
 
+/// What a FAILED HELLO handshake means, from the error the wait returned and
+/// the peer proto version the control reader managed to parse.
+///
+/// A peer we UNDERSTOOD and disagreed with is a different box state from one
+/// that never spoke, and the caller's response to it is different too (T125):
+/// a skew is permanent until somebody updates a side, so retrying it is wasted
+/// time and "could not reach that machine" sends the user to the network for an
+/// answer that is not there (T628).
+///
+/// `error.Incompatible` alone cannot tell them apart: the control reader also
+/// raises it for EOF before the HELLO, a malformed frame, and a HELLO payload
+/// that would not parse. A parsed peer proto version is the discriminator — it
+/// is written ONLY after `Hello.parse` succeeded, and the sole error left after
+/// that point is `negotiate` disagreeing.
+///
+/// It is a free function rather than three lines inline because BOTH dialers
+/// need the same answer and only one of them had it: `relay_dial` collapsed
+/// every handshake failure into `error.HandshakeFailed`, so a remote machine on
+/// an incompatible protocol was indistinguishable from one that is off (T628).
+pub fn classifyHandshakeError(err: anyerror, peer_proto: ?u16) anyerror {
+    return switch (err) {
+        error.HandshakeTimeout => error.HandshakeTimeout,
+        error.Incompatible => if (peer_proto != null)
+            error.ProtocolIncompatible
+        else
+            error.HandshakeFailed,
+        else => error.HandshakeFailed,
+    };
+}
+
 /// Default deadline for the HELLO handshake (WP-D1). A peer that TCP-accepts
 /// but never answers (frozen/SIGSTOPped agent: the kernel backlog completes the
 /// connect; the process says nothing) must fail the dial instead of parking it
@@ -296,24 +326,7 @@ fn dialConnected(
         // reader that wrote them has certainly finished.
         const peer_proto = conn.peerProtoVersion();
         if (report) |r| r.peer_proto_version = peer_proto;
-        return switch (err) {
-            error.HandshakeTimeout => error.HandshakeTimeout,
-            // A peer we UNDERSTOOD and disagreed with is a different box state
-            // from one that never spoke, and the caller's response to it is
-            // different too (T125).
-            //
-            // `error.Incompatible` alone cannot tell them apart: the control
-            // reader also raises it for EOF before the HELLO, a malformed frame,
-            // and a HELLO payload that would not parse. A parsed peer proto
-            // version is the discriminator — it is written ONLY after
-            // `Hello.parse` succeeded, and the sole error left after that point
-            // is `negotiate` disagreeing.
-            error.Incompatible => if (peer_proto != null)
-                error.ProtocolIncompatible
-            else
-                error.HandshakeFailed,
-            else => error.HandshakeFailed,
-        };
+        return classifyHandshakeError(err, peer_proto);
     };
 
     return .{
@@ -469,6 +482,39 @@ test "dial: stands up a Connection over a real loopback socket, OPEN + DATA roun
     agent_thread.join();
     listener.deinit();
     try testing.expect(agent.err == null);
+}
+
+test "classifyHandshakeError: only a peer we parsed and disagreed with is a skew" {
+    // The rule both dialers now share (T628). A timeout stays a timeout; a
+    // disagreement WITH a parsed peer version is the permanent one; the same
+    // disagreement WITHOUT one (EOF before the HELLO, garbage, an unparseable
+    // payload) is an ordinary handshake failure and must stay retryable.
+    try testing.expectEqual(
+        @as(anyerror, error.HandshakeTimeout),
+        classifyHandshakeError(error.HandshakeTimeout, null),
+    );
+    try testing.expectEqual(
+        @as(anyerror, error.ProtocolIncompatible),
+        classifyHandshakeError(error.Incompatible, 7),
+    );
+    try testing.expectEqual(
+        @as(anyerror, error.HandshakeFailed),
+        classifyHandshakeError(error.Incompatible, null),
+    );
+    try testing.expectEqual(
+        @as(anyerror, error.HandshakeFailed),
+        classifyHandshakeError(error.EndOfStream, null),
+    );
+    // A peer version parsed on a NON-disagreement error changes nothing: the
+    // discriminator is the pair, not either half.
+    try testing.expectEqual(
+        @as(anyerror, error.HandshakeFailed),
+        classifyHandshakeError(error.EndOfStream, 7),
+    );
+    try testing.expectEqual(
+        @as(anyerror, error.HandshakeTimeout),
+        classifyHandshakeError(error.HandshakeTimeout, 7),
+    );
 }
 
 test "dial: a peer on a different protocol version fails as ProtocolIncompatible" {

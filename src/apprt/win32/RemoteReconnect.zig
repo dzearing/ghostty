@@ -64,6 +64,7 @@ const Window = @import("Window.zig");
 const ActivityMonitor = @import("ActivityMonitor.zig");
 const IpcHandlers = @import("IpcHandlers.zig");
 const policy = @import("remote_reconnect.zig");
+const dial_failure = @import("dial_failure.zig");
 const session_layout = @import("session_layout.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
@@ -249,7 +250,7 @@ fn drive(app: *App, window: *Window, now: i64) void {
                     .{windowName(window)},
                 );
             }
-            goTerminal(window);
+            goTerminal(window, policy.terminal_state);
         },
     }
 
@@ -285,14 +286,14 @@ fn beginLadder(app: *App, window: *Window, now: i64, manual: bool) void {
                 "remote reconnect: '{s}' dropped with no session to re-attach; nothing to come back to",
                 .{windowName(window)},
             );
-            goTerminal(window);
+            goTerminal(window, policy.terminal_state);
         },
         .terminal_poisoned => {
             log.warn(
                 "remote reconnect: '{s}' condemned after {d} swaps that died inside {d}ms",
                 .{ windowName(window), policy.poison_limit, policy.poison_window_ms },
             );
-            goTerminal(window);
+            goTerminal(window, policy.terminal_state);
         },
         .start => |s| {
             _ = rc.gen.bump();
@@ -332,7 +333,7 @@ fn setLadder(window: *Window, next: policy.WindowState) void {
     window.invalidateChrome();
 }
 
-fn goTerminal(window: *Window) void {
+fn goTerminal(window: *Window, state: policy.WindowState) void {
     const rc = &window.reconnect;
     _ = rc.gen.bump();
     rc.attempt = 0;
@@ -340,7 +341,7 @@ fn goTerminal(window: *Window) void {
     // The ladder this click (if any) started is over. The next one gets its own
     // answer to "did the user ask for this", from its own beginning.
     rc.manual = false;
-    setLadder(window, policy.terminal_state);
+    setLadder(window, state);
 }
 
 /// The user asked for this window to reconnect NOW (T367's pill button). Starts
@@ -449,7 +450,7 @@ fn startAttempt(app: *App, window: *Window) void {
             "remote reconnect: '{s}' has no recorded machine; cannot re-dial",
             .{windowName(window)},
         );
-        goTerminal(window);
+        goTerminal(window, policy.terminal_state);
         return;
     };
 
@@ -477,7 +478,7 @@ fn startAttempt(app: *App, window: *Window) void {
                     "remote reconnect: '{s}' needs a relay credential (signed out)",
                     .{windowName(window)},
                 );
-                goTerminal(window);
+                goTerminal(window, policy.terminal_state);
                 return;
             };
             const base = alloc.dupe(u8, r.base) catch return failAttempt(app, window);
@@ -586,6 +587,11 @@ fn worker(req: *Request) void {
                     dial = .ok;
                 } else |err| {
                     log.warn("remote reconnect: tcp dial {s}:{d} failed err={}", .{ t.host, t.port, err });
+                    // A far agent that ANSWERED and disagreed about the
+                    // protocol is not an unreachable machine (T628): five more
+                    // attempts cannot make the two builds speak, so the ladder
+                    // stops and the pill says what is actually wrong.
+                    if (dial_failure.classify(err) == .incompatible) dial = .incompatible;
                     alloc.destroy(d);
                 }
             } else |_| {}
@@ -600,8 +606,15 @@ fn worker(req: *Request) void {
                     log.warn("remote reconnect: relay dial device={s} failed err={}", .{ r.device, err });
                     // A rejected bearer is not an unreachable machine: retrying
                     // cannot sign anyone in, so the ladder must stop instead of
-                    // spending five attempts on a 401.
-                    if (err == error.WebSocketUnauthorized) dial = .unauthorized;
+                    // spending five attempts on a 401. A protocol skew is the
+                    // same shape of answer for the same reason (T628), and
+                    // since T628 the relay dialer reports it rather than
+                    // collapsing it into a handshake failure.
+                    switch (dial_failure.classify(err)) {
+                        .unauthorized => dial = .unauthorized,
+                        .incompatible => dial = .incompatible,
+                        .unreachable_machine => {},
+                    }
                     alloc.destroy(d);
                 }
             } else |_| {}
@@ -703,7 +716,10 @@ pub fn onDialed(app: *App, res: *Result) void {
                 "remote reconnect: '{s}' is terminal after attempt {d} ({s})",
                 .{ windowName(window), rc.attempt, @tagName(decided.outcome) },
             );
-            goTerminal(window);
+            // The terminal STATE is not one state: a skew has to reach the pill
+            // as itself, or the window that told the user to check the network
+            // is the one this task exists to stop shipping (T628).
+            goTerminal(window, policy.terminalStateFor(decided.outcome));
         },
     }
     arm(app);

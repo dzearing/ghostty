@@ -89,6 +89,23 @@ pub fn retriesExhausted(attempt: u32) bool {
 // Window state
 // =============================================================================
 
+/// WHY a window's link is down, for the states that are not merely "not right
+/// now" (T628).
+///
+/// Two members and not three: the ladder never lands a window on a rejected
+/// bearer (a relay window with no token never starts one), so `signed_out` has
+/// no window state to name. What it does have to separate is the failure whose
+/// remedy is TIME from the one whose remedy is an UPDATE — because the pill
+/// says one sentence for the first and must say a different one for the second.
+pub const DownReason = enum {
+    /// The machine did not answer. It may answer later; the ladder's exhausted
+    /// tier and its slow background re-dial both assume this.
+    transient,
+    /// The far agent answered and disagrees about the protocol version. No
+    /// number of attempts changes that; somebody has to update a side.
+    incompatible,
+};
+
 /// This window's connection status — the ladder's output, and what the T367
 /// status pill paints. Distinct from the transport's `LinkState.State`: the
 /// transport describes one socket, this describes the window across the
@@ -106,7 +123,13 @@ pub const WindowState = union(enum) {
     /// and a terminal verdict (red, user action required). It is a field rather
     /// than two cases because the pill treats them identically and only the
     /// recovery paths care.
-    disconnected: struct { self_healable: bool },
+    ///
+    /// `reason` is the OTHER question, and the pill does care about it (T628):
+    /// a link that is down because the two ends disagree about the protocol is
+    /// not a machine you can reach by trying again, and saying so is the whole
+    /// point. It defaults to `.transient`, so every construction site that
+    /// predates the field keeps meaning exactly what it meant.
+    disconnected: struct { self_healable: bool, reason: DownReason = .transient },
 
     pub fn isConnected(self: WindowState) bool {
         return self == .connected;
@@ -126,6 +149,13 @@ pub const WindowState = union(enum) {
             .disconnected => |d| .{
                 .state = "disconnected",
                 .self_healable = d.self_healable,
+                // Reported only when it is the interesting answer: a
+                // `"reason":"transient"` on every ordinary drop would be noise
+                // in the one place a script reads to find the unusual one.
+                .reason = switch (d.reason) {
+                    .transient => null,
+                    .incompatible => "incompatible",
+                },
             },
         };
     }
@@ -276,6 +306,11 @@ pub const ProbeOutcome = enum {
     unreachable_agent,
     /// Relay machine with no bearer token. Terminal until sign-in.
     signed_out,
+    /// The far agent answered and disagrees about the protocol version (T628).
+    /// Terminal until one side is updated — and unlike every other terminal
+    /// verdict, the machine itself is perfectly healthy, so the window must say
+    /// that rather than blame the network.
+    incompatible_agent,
 };
 
 /// What to do with a probe outcome.
@@ -300,6 +335,10 @@ pub fn onProbeOutcome(outcome: ProbeOutcome, fresh_session_on_gone: bool) Outcom
             .terminal,
         .unreachable_agent => .retry,
         .signed_out => .terminal,
+        // A skew is the one failure that is BOTH a dial failure and permanent.
+        // Retrying it burns the ladder's whole budget (~30s of amber pill)
+        // to arrive at the answer the first attempt already had.
+        .incompatible_agent => .terminal,
     };
 }
 
@@ -328,6 +367,23 @@ pub const exhausted_state: WindowState = .{ .disconnected = .{ .self_healable = 
 
 /// The window state every terminal verdict lands in.
 pub const terminal_state: WindowState = .{ .disconnected = .{ .self_healable = false } };
+
+/// The terminal state a PROTOCOL SKEW lands in (T628). Terminal for the same
+/// reason as any other: retrying cannot change it. Distinct from
+/// `terminal_state` because the pill and the tooltip owe the user the actual
+/// reason — "couldn't reach that machine" about a machine that answered is the
+/// wrong answer, and it is the one that sends them to check the network.
+pub const incompatible_state: WindowState = .{
+    .disconnected = .{ .self_healable = false, .reason = .incompatible },
+};
+
+/// The state a terminal `outcome` lands the window in.
+pub fn terminalStateFor(outcome: ProbeOutcome) WindowState {
+    return switch (outcome) {
+        .incompatible_agent => incompatible_state,
+        else => terminal_state,
+    };
+}
 
 // =============================================================================
 // Cancellation
@@ -359,7 +415,10 @@ pub const Generation = struct {
 /// asked. `unauthorized` is kept apart from `failed` because a rejected bearer
 /// is not an unreachable machine — the fix is signing in, and telling the user
 /// to check the network wastes their time (the split T319 drew for the roster).
-pub const DialResult = enum { ok, failed, unauthorized };
+/// `incompatible` is kept apart for the same shape of reason (T628): the far
+/// agent ANSWERED, so the machine is neither unreachable nor mis-credentialed,
+/// and the only thing that changes the answer is updating a side.
+pub const DialResult = enum { ok, failed, unauthorized, incompatible };
 
 /// Collapse one attempt's raw result onto the ladder's vocabulary.
 ///
@@ -378,6 +437,7 @@ pub const DialResult = enum { ok, failed, unauthorized };
 pub fn outcomeFromAttempt(dial: DialResult, session_present: ?bool) ProbeOutcome {
     return switch (dial) {
         .unauthorized => .signed_out,
+        .incompatible => .incompatible_agent,
         .failed => .unreachable_agent,
         .ok => if (session_present orelse true) .session_alive else .session_gone,
     };
@@ -1020,6 +1080,72 @@ test "needsTick: only a window with something to wait for keeps the poller alive
     try testing.expect(needsTick(exhausted_state));
     // Terminal is waiting on the user, not on us.
     try testing.expect(!needsTick(terminal_state));
+}
+
+test "a protocol skew is terminal, named, and never retried (T628)" {
+    // The dial answered — the machine is up, the agent is running, the network
+    // is fine — and the two ends disagree. Every other dial FAILURE is worth
+    // another attempt; this one is worth none, and the difference has to
+    // survive all the way to the state the window lands in.
+    try testing.expectEqual(
+        ProbeOutcome.incompatible_agent,
+        outcomeFromAttempt(.incompatible, null),
+    );
+    // The liveness answer cannot rescue it: there is no connection to probe.
+    try testing.expectEqual(
+        ProbeOutcome.incompatible_agent,
+        outcomeFromAttempt(.incompatible, true),
+    );
+    try testing.expectEqual(
+        ProbeOutcome.incompatible_agent,
+        outcomeFromAttempt(.incompatible, false),
+    );
+
+    // Terminal in BOTH ladders. A manual click is the one thing that turns a
+    // `session_gone` into a fresh shell, and it must not turn a skew into
+    // anything: the user asking again does not update the far machine.
+    try testing.expectEqual(OutcomeAction.terminal, onProbeOutcome(.incompatible_agent, false));
+    try testing.expectEqual(OutcomeAction.terminal, onProbeOutcome(.incompatible_agent, true));
+    for ([_]bool{ true, false }) |manual| {
+        const d = decideAttempt(.{
+            .dial = .incompatible,
+            .session_present = null,
+            .manual = manual,
+        });
+        try testing.expectEqual(ProbeOutcome.incompatible_agent, d.outcome);
+        try testing.expectEqual(OutcomeAction.terminal, d.action);
+    }
+
+    // ...and the state it lands in NAMES it, which is the half that reaches the
+    // pill. It is terminal (nothing self-heals a version mismatch) but it is
+    // not the same state as an evicted session.
+    const st = terminalStateFor(.incompatible_agent);
+    try testing.expectEqual(incompatible_state, st);
+    try testing.expect(!st.disconnected.self_healable);
+    try testing.expectEqual(DownReason.incompatible, st.disconnected.reason);
+    try testing.expect(!needsTick(st));
+
+    // Every other terminal verdict is unchanged: ordinary, unnamed, transient.
+    for ([_]ProbeOutcome{ .session_gone, .signed_out, .unreachable_agent }) |o| {
+        try testing.expectEqual(terminal_state, terminalStateFor(o));
+        try testing.expectEqual(DownReason.transient, terminalStateFor(o).disconnected.reason);
+    }
+    // And the tier a spent ladder lands in still reads as transient — the link
+    // may yet come back, which is exactly what `reason` is there to deny.
+    try testing.expectEqual(DownReason.transient, exhausted_state.disconnected.reason);
+}
+
+test "listConnection: a skew is reported as a named reason (T628)" {
+    const inc = WindowState.listConnection(incompatible_state);
+    try testing.expectEqualStrings("disconnected", inc.state);
+    try testing.expectEqual(@as(?bool, false), inc.self_healable);
+    try testing.expectEqualStrings("incompatible", inc.reason.?);
+
+    // An ordinary drop carries no reason at all, in either tier: a field that
+    // is present on every window says nothing about the one that matters.
+    try testing.expect(WindowState.listConnection(terminal_state).reason == null);
+    try testing.expect(WindowState.listConnection(exhausted_state).reason == null);
+    try testing.expect(WindowState.listConnection(.connected).reason == null);
 }
 
 test "listConnection: every ladder state has a +list --json shape (T609)" {

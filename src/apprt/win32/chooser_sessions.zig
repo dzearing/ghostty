@@ -18,6 +18,7 @@ const chooser_cpu = @import("chooser_cpu.zig");
 const chooser_layout = @import("chooser_layout.zig");
 const chooser_rows = @import("chooser_rows.zig");
 const chrome_theme = @import("chrome_theme.zig");
+const dial_failure = @import("dial_failure.zig");
 const color_math = @import("color_math.zig");
 const icon_button = @import("icon_button.zig");
 const type_ramp = @import("type_ramp.zig");
@@ -262,7 +263,12 @@ pub fn activityBadge(activity: []const u8) ?Badge {
 /// enrolled device, so "your relay session expired" is the one failure the user
 /// can actually act on, and it must not be spelled as "couldn't reach this
 /// machine's agent" (T319).
-pub const State = enum { loading, failed, unauthorized, loaded };
+///
+/// `incompatible` is a THIRD, for the same reason again (T628): a machine
+/// running a Ghoztty that no longer speaks to ours is awake, running its agent
+/// and perfectly reachable, and "couldn't reach this machine's agent" sends the
+/// user to check four things that are all fine.
+pub const State = enum { loading, failed, unauthorized, incompatible, loaded };
 
 pub const loading_text = "Loading sessions...";
 pub const failed_text = "Couldn't reach this machine's agent";
@@ -271,6 +277,9 @@ pub const empty_text = "No active sessions";
 /// (`:755`, `:1663`, `:1673`). One condition, one sentence — a second wording
 /// for the same state is how a surface stops reading as one surface.
 pub const unauthorized_text = "Session expired — sign in again above.";
+/// The SAME sentence every other surface uses for a protocol skew, sourced from
+/// the one module that owns it (T628) rather than retyped here.
+pub const incompatible_text = dial_failure.incompatible_hint;
 
 /// The placeholder line for a state, or null when the region has real rows to
 /// draw instead.
@@ -279,6 +288,7 @@ pub fn stateText(state: State) ?[]const u8 {
         .loading => loading_text,
         .failed => failed_text,
         .unauthorized => unauthorized_text,
+        .incompatible => incompatible_text,
         .loaded => null,
     };
 }
@@ -1100,7 +1110,7 @@ test "targetEql compares remote machines by device id, not by tag" {
 test "moving to another machine always resets and refetches" {
     // ... whatever the old machine's state was: a loaded roster is the WORST
     // thing to keep, because it looks like an answer about the new machine.
-    for ([_]State{ .loading, .failed, .unauthorized, .loaded }) |s| {
+    for ([_]State{ .loading, .failed, .unauthorized, .incompatible, .loaded }) |s| {
         try testing.expectEqual(
             Transition.reset_and_fetch,
             transitionFor(.local, .{ .remote = "dev-a" }, s, false),
@@ -1134,7 +1144,7 @@ test "re-selecting the same machine refreshes in place, never back to loading" {
         transitionFor(.local, .local, .loading, true),
     );
     // A failed machine the user came back to: try again.
-    for ([_]State{ .loading, .failed, .unauthorized }) |s| {
+    for ([_]State{ .loading, .failed, .unauthorized, .incompatible }) |s| {
         try testing.expectEqual(
             Transition.reset_and_fetch,
             transitionFor(.local, .local, s, false),
@@ -1157,6 +1167,10 @@ test "every non-loaded state has a placeholder line and loaded has none" {
     // The expired-credential line is the one the rest of the chooser already
     // uses; a second wording for the same state is the defect.
     try testing.expectEqualStrings(unauthorized_text, stateText(.unauthorized).?);
+    // A version skew has its own line, and specifically NOT the one that blames
+    // the agent — that sentence about a machine that answered is the T628 bug.
+    try testing.expectEqualStrings(incompatible_text, stateText(.incompatible).?);
+    try testing.expect(!std.mem.eql(u8, failed_text, stateText(.incompatible).?));
     try testing.expectEqual(@as(?[]const u8, null), stateText(.loaded));
 }
 

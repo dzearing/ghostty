@@ -562,6 +562,11 @@ test {
     // user's keybind when they have stated one (T575). Same no-OS-imports deal.
     _ = @import("apprt/win32/menu_activation.zig");
 
+    // Pure win32 classification of a failed remote dial — unreachable vs a
+    // rejected bearer vs a protocol skew — and the one place each of those
+    // three sentences is written (T628). Pure std, no OS imports.
+    _ = @import("apprt/win32/dial_failure.zig");
+
     // Pure win32 remote connection pill — the caption-band affordance's
     // wording, geometry and contrast floors (T367). Its only non-std imports
     // are sibling pure modules and the reconnect policy, so it builds and tests

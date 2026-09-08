@@ -60,6 +60,7 @@ const system_colors = @import("system_colors.zig");
 const chooser_layout = @import("chooser_layout.zig");
 const chooser_menu = @import("chooser_menu.zig");
 const chooser_sessions = @import("chooser_sessions.zig");
+const dial_failure = @import("dial_failure.zig");
 const text_search = @import("text_search.zig");
 const utf16_text = @import("utf16_text.zig");
 const SessionRoster = @import("SessionRoster.zig");
@@ -3254,6 +3255,7 @@ fn resumeRow(self: *MachineChooser, row: SessionRoster.VisibleRow) void {
                 log.warn("machine chooser: resume relay session failed err={}", .{err});
                 self.setHint(switch (err) {
                     error.DialFailed => "Couldn't reach that machine - is its agent running?",
+                    error.IncompatibleVersion => dial_failure.incompatible_hint,
                     else => "Couldn't resume that session.",
                 });
                 return;
@@ -3413,6 +3415,7 @@ fn restoreAllFailed(self: *MachineChooser, err: App.RestoreAllError) void {
         error.PullFailed => "Couldn't read this machine's saved layouts from the agent.",
         error.DialFailed => "Couldn't reach that machine - is its agent running?",
         error.Unauthorized => "Session expired - sign in again above.",
+        error.IncompatibleVersion => dial_failure.incompatible_hint,
     });
 }
 
@@ -3791,6 +3794,7 @@ fn openSelection(self: *MachineChooser) void {
                 log.warn("machine chooser: open relay window failed device={s} err={}", .{ dev.id, err });
                 self.setHint(switch (err) {
                     error.DialFailed => "Couldn't reach that machine — is its agent running?",
+                    error.IncompatibleVersion => dial_failure.incompatible_hint,
                     else => "Couldn't open that machine.",
                 });
                 return;

@@ -9,6 +9,79 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-07: T628 - **a remote machine on the wrong version now says so
+  instead of reading as unreachable.** T125 taught the LOCAL agent dial the
+  difference between "nobody answered" and "somebody answered and disagreed
+  about the protocol". Every other dial in the app still collapsed the second
+  into the first, so a remote box running a Ghoztty that no longer speaks to
+  ours was indistinguishable from one that is switched off: the chooser said
+  "couldn't reach that machine - is its agent running?", `+new-remote-window`
+  said "failed to reach 10.0.0.4:9000", the connection pill went red and
+  offered `Reconnect`, and the reconnect ladder spent its whole 30-second
+  budget retrying a disagreement no attempt can settle. Every one of those
+  sends the user to check a machine that is awake, an agent that is running
+  and a network that is fine.
+
+  **The dialer half was one shared function.** `tcp_dial` already had the
+  discrimination and `relay_dial` did not - it collapsed every handshake
+  failure into `error.HandshakeFailed`, so the relay path could not have
+  reported a skew even if everything above it had been ready. The three-line
+  rule (a parsed peer proto version is what separates a disagreement from an
+  EOF, a garbage frame or an unparseable HELLO) is now
+  `tcp_dial.classifyHandshakeError`, called by both dialers, which also means
+  the Mac gets the relay half for free since both files are shared core.
+
+  **Above the dialer it is one new word in four vocabularies.** The split
+  T319 drew for `unauthorized` - a rejected bearer is not an unreachable
+  machine, and telling someone to check the network when the fix is signing
+  in wastes their time - is exactly the shape this needed, three more times.
+  `MachineConnectionPool.Failure`, `chooser_sessions.State`,
+  `remote_reconnect.DialResult` and `App.RemoteOpenError` each gained an
+  `incompatible` member beside their `unauthorized` one, and
+  `src/apprt/win32/dial_failure.zig` is the one place a dial error is turned
+  into which of the three it is, and the one place each sentence is written.
+  Eight call sites were already three different wordings for the same fact,
+  which is how "couldn't reach that machine" survived on the resume path
+  after the open path had learned better.
+
+  **The ladder stops rather than counting.** `DialResult.incompatible` maps
+  to a new `ProbeOutcome.incompatible_agent`, which is `.terminal` in both
+  the automatic and the manual ladder - a click does not update the far
+  machine either. A CLICK still re-dials, because updating the far machine is
+  precisely what a person does between reading the label and pressing it;
+  what stops is the app doing it five times on its own.
+
+  **The pill grew a fourth state, and it is a sentence rather than a hue.**
+  `winbox - Version mismatch`, in the same red as `winbox - Reconnect`,
+  because the link really is broken. The task warned that the pill's three
+  states are load-bearing for WCAG 1.4.1 (they differ in whether there is
+  text and in what it says, not only in colour) and a fourth must not break
+  that: it does not, because the four now differ in text - nothing, a count,
+  an offer, a diagnosis - and share three colours between them. The tooltip
+  carries what the nine-character label cannot: which side to update, and
+  that reconnecting is still the way back afterwards. The state reaches it
+  through a new `WindowState.disconnected.reason`, defaulted to `.transient`
+  so every construction site that predates the field means what it always
+  meant, and `+list --json` publishes `"reason":"incompatible"` - only when
+  it is the interesting answer, since a field present on every ordinary drop
+  is noise in the one place a script looks for the unusual one.
+
+  **Nothing on a remote machine is restarted from here.** The destructive
+  half of T125 - stop the agent, it is behind us - stays local-only by
+  construction: `dialPipeTimeoutReport` and its `DialReport` are the LOCAL
+  pipe dial's alone, and the remote paths added here have no restart to
+  reach. A remote agent is not ours to kill.
+
+  Validated: `test\win32\ipc-remote.ps1` section 4b stands up a real second
+  `ghoztty-agent` on `GHOZTTY_AGENT_PROTO_VERSION=0` (the debug-only seam
+  T125 added, since a skew cannot be produced from one tree) and asserts the
+  CLI names an incompatible version, names the endpoint, does NOT say "failed
+  to reach", and opens no window. Unit coverage for the classifier, the
+  three sentences, the ladder's terminal verdict, the `+list` shape and the
+  pill's fourth label is in the `none` lane. Filed T1446 for the Mac seat
+  under the platform-symmetry rule - the dialer half is already shared, the
+  Swift chooser/pill/ladder half is not.
+
 - 2026-09-07: T624 - **an update on Windows now tells you what it changed.**
   macOS has shipped a "What's New in Ghoztty" window since the release-notes
   files were introduced; Windows shipped neither the notes nor the window, so

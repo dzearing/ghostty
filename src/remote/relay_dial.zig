@@ -71,7 +71,10 @@ pub const Dialed = struct {
     }
 };
 
-/// The HELLO handshake failed (version/encoding mismatch or a dropped stream).
+/// The HELLO handshake failed (a dropped stream, a garbage payload, or a peer
+/// that answered something that isn't a HELLO). An INCOMPATIBLE peer is
+/// `error.ProtocolIncompatible` instead — the same split `tcp_dial` draws, and
+/// since T628 drawn here too.
 pub const HandshakeFailed = error{HandshakeFailed};
 
 /// Open a native `wss://` WebSocket to the relay for `device_id`, wrap it as the
@@ -189,10 +192,16 @@ pub fn dialUpgradeTimeout(
         // Handshake failed: tear down (shutdown joins everything; pump joined too).
         conn.shutdown();
         mux.joinPump();
-        return switch (err) {
-            error.HandshakeTimeout => error.HandshakeTimeout,
-            else => error.HandshakeFailed,
-        };
+        // Read the peer's HELLO facts only AFTER the join, so the control
+        // reader that wrote them has certainly finished — the same ordering
+        // `tcp_dial.dialConnected` keeps, for the same reason.
+        //
+        // Until T628 every failure here collapsed to `error.HandshakeFailed`,
+        // so a remote machine running an incompatible Ghoztty was
+        // indistinguishable from one that is off: the chooser said "couldn't
+        // reach that machine", the pill went red, and the ladder retried
+        // forever against something no amount of retrying can fix.
+        return tcp_dial.classifyHandshakeError(err, conn.peerProtoVersion());
     };
 
     return .{

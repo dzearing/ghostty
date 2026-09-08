@@ -16,13 +16,19 @@
 //! app's own "…" button (T234/T205), so the pill joins that cluster and shares
 //! its vertical center — one baseline, not a second one invented here.
 //!
-//! ## Three states, and what each one says
+//! ## Four states, and what each one says
 //!
 //! | State | Mark | Label | Fill | Click |
 //! |---|---|---|---|---|
 //! | `connected` | green dot | the machine's name | a tint of the band | Activity Monitor |
 //! | `reconnecting` | amber dot | `winbox — Reconnecting… n/5` | a tint of the band | Activity Monitor |
 //! | `disconnected` | refresh glyph | `winbox — Reconnect` | solid red | reconnect |
+//! | `incompatible` | refresh glyph | `winbox — Version mismatch` | solid red | reconnect |
+//!
+//! The fourth is T628's, and it is a SENTENCE and not a hue: a link that is
+//! down because the two ends disagree about the protocol used to present as the
+//! third, so a machine that was awake, running its agent and perfectly
+//! reachable told the user to go and check the network.
 //!
 //! The connected pill NAMES the machine (T610), which is the half of Mac's
 //! `MachinePillView` T367 left out: Mac's control is really two, a
@@ -76,18 +82,29 @@ pub const Rect = icon_button.Rect;
 // What the pill says
 // =============================================================================
 
-/// The pill's three presentations, derived from the ladder's window state.
-/// Deliberately three and not four: `disconnected.self_healable` splits the
-/// RECOVERY paths, not the presentation — a window whose fast ladder is
-/// exhausted and one that is terminally gone look identical to a user, and
-/// `manualReconnect` starts from either.
-pub const Mode = enum { connected, reconnecting, disconnected };
+/// The pill's presentations, derived from the ladder's window state.
+///
+/// `disconnected.self_healable` does NOT split them: it splits the RECOVERY
+/// paths, and a window whose fast ladder is exhausted looks identical to a user
+/// to one that is terminally gone — `manualReconnect` starts from either.
+///
+/// `disconnected.reason` DOES split them (T628). A link that is down because
+/// the far agent disagrees about the protocol is a machine that is awake, an
+/// agent that is running and a network that is fine, and a pill saying
+/// `Reconnect` about it is an offer that cannot be honoured. It is the same red
+/// — the link IS broken — carrying a different sentence, which is also what
+/// keeps WCAG 1.4.1 satisfied: the four states differ in TEXT (none, a count,
+/// an offer, a diagnosis), so hue is never the only carrier.
+pub const Mode = enum { connected, reconnecting, disconnected, incompatible };
 
 pub fn modeFor(state: policy.WindowState) Mode {
     return switch (state) {
         .connected => .connected,
         .reconnecting => .reconnecting,
-        .disconnected => .disconnected,
+        .disconnected => |d| switch (d.reason) {
+            .transient => .disconnected,
+            .incompatible => .incompatible,
+        },
     };
 }
 
@@ -97,7 +114,9 @@ pub fn tone(mode: Mode) chrome_theme.Tone {
     return switch (mode) {
         .connected => .good,
         .reconnecting => .warn,
-        .disconnected => .danger,
+        // One red for a broken link, whatever broke it. The reason is carried
+        // by the words, not by a fourth hue nobody could learn.
+        .disconnected, .incompatible => .danger,
     };
 }
 
@@ -107,7 +126,7 @@ pub fn tone(mode: Mode) chrome_theme.Tone {
 /// decides the red fill, the refresh glyph and the imperative label, all of
 /// which would be lying about a link that is up.
 pub fn isAction(mode: Mode) bool {
-    return mode == .disconnected;
+    return mode == .disconnected or mode == .incompatible;
 }
 
 /// What a click on the pill DOES in each state.
@@ -126,6 +145,15 @@ pub fn clickAction(mode: Mode) Click {
     return if (isAction(mode)) .reconnect else .activity;
 }
 
+/// Is this mode one the AUTOMATIC ladder will keep working on? The skew is not:
+/// it is the one broken state where retrying is known to be futile, so the
+/// window sits still and waits for a person. The pill still re-dials on a
+/// CLICK, because updating the far machine is exactly what a person does
+/// between reading this label and pressing it.
+pub fn retriesOnItsOwn(mode: Mode) bool {
+    return mode != .incompatible;
+}
+
 /// The mark drawn at the pill's leading edge: a status dot, or the refresh
 /// glyph on the button.
 pub const Mark = enum { dot, refresh };
@@ -133,7 +161,11 @@ pub const Mark = enum { dot, refresh };
 pub fn mark(mode: Mode) Mark {
     return switch (mode) {
         .connected, .reconnecting => .dot,
-        .disconnected => .refresh,
+        // The skew keeps the refresh glyph because the click keeps its meaning:
+        // once a side is updated, this pill is how you come back. A second
+        // glyph would be a new symbol to learn for a control that still does
+        // the same thing.
+        .disconnected, .incompatible => .refresh,
     };
 }
 
@@ -192,11 +224,21 @@ pub fn parts(buf: []u8, state: policy.WindowState, machine: []const u8) Parts {
             "{s}Reconnecting\u{2026} {d}/{d}",
             .{ lead, r.attempt, policy.max_attempts },
         ) catch "Reconnecting\u{2026}",
-        .disconnected => std.fmt.bufPrint(
-            rest,
-            "{s}Reconnect",
-            .{lead},
-        ) catch "Reconnect",
+        .disconnected => |d| switch (d.reason) {
+            .transient => std.fmt.bufPrint(
+                rest,
+                "{s}Reconnect",
+                .{lead},
+            ) catch "Reconnect",
+            // Not an offer, a diagnosis (T628). "Reconnect" here would be a
+            // button promising something no click can deliver, and the user
+            // would press it five times before going to look at the network.
+            .incompatible => std.fmt.bufPrint(
+                rest,
+                "{s}Version mismatch",
+                .{lead},
+            ) catch "Version mismatch",
+        },
     };
     return .{ .name = name, .status = status };
 }
@@ -240,11 +282,21 @@ pub fn tooltip(buf: []u8, state: policy.WindowState, machine: []const u8) []cons
             "Connection to {s} lost \u{2014} reconnecting (attempt {d} of {d})",
             .{ who, r.attempt, policy.max_attempts },
         ) catch "Reconnecting",
-        .disconnected => std.fmt.bufPrint(
-            buf,
-            "Connection to {s} lost \u{2014} click to reconnect",
-            .{who},
-        ) catch "Click to reconnect",
+        .disconnected => |d| switch (d.reason) {
+            .transient => std.fmt.bufPrint(
+                buf,
+                "Connection to {s} lost \u{2014} click to reconnect",
+                .{who},
+            ) catch "Click to reconnect",
+            // The label has room for two words; this is where the user finds
+            // out what to DO about it, and which side to update is the one
+            // thing the label cannot fit.
+            .incompatible => std.fmt.bufPrint(
+                buf,
+                "{s} runs a different version of Ghoztty \u{2014} update one side, then click to reconnect",
+                .{who},
+            ) catch "Update one side to reconnect",
+        },
     };
 }
 
@@ -501,7 +553,7 @@ pub const Ink = struct {
 /// for the same reason the caption slab does — a saturated fill that lightens
 /// walks toward the ceiling white needs, and away from the color it is.
 pub fn ink(bar: Rgb, pal: chrome_theme.Palette, mode: Mode, state: icon_button.State) Ink {
-    if (mode == .disconnected) {
+    if (isAction(mode)) {
         const d = if (icon_button.paintsFill(state)) icon_button.fillDelta(state, false) else 0;
         const fill: Rgb = .{
             .r = icon_button.shadeChannel(pal.danger.r, d),
@@ -538,18 +590,78 @@ pub fn ink(bar: Rgb, pal: chrome_theme.Palette, mode: Mode, state: icon_button.S
 
 const scales = [_]f32{ 1.0, 1.25, 1.5, 2.0 };
 
-test "modeFor: the ladder's three states map onto the three presentations" {
+test "modeFor: the ladder's states map onto the presentations" {
     try testing.expectEqual(Mode.connected, modeFor(.connected));
     try testing.expectEqual(Mode.reconnecting, modeFor(.{ .reconnecting = .{ .attempt = 1 } }));
     // Both disconnected tiers present identically — the split is about recovery.
     try testing.expectEqual(Mode.disconnected, modeFor(policy.exhausted_state));
     try testing.expectEqual(Mode.disconnected, modeFor(policy.terminal_state));
+    // ...except the one whose REASON the user has to know (T628).
+    try testing.expectEqual(Mode.incompatible, modeFor(policy.incompatible_state));
 }
 
-test "isAction: only the broken pill wears the red action treatment" {
+test "a version skew reads as its own state, in words (T628)" {
+    // The red is shared with `disconnected` — the link really is broken — so
+    // everything that separates the two has to be text.
+    try testing.expectEqual(tone(.disconnected), tone(.incompatible));
+    try testing.expect(isAction(.incompatible));
+    try testing.expectEqual(Mark.refresh, mark(.incompatible));
+    // Clicking still re-dials: updating the far machine is what a person does
+    // between reading this and pressing it. What must NOT happen is the ladder
+    // doing it on its own, five times, for nothing.
+    try testing.expectEqual(Click.reconnect, clickAction(.incompatible));
+    try testing.expect(!retriesOnItsOwn(.incompatible));
+    for ([_]Mode{ .connected, .reconnecting, .disconnected }) |m|
+        try testing.expect(retriesOnItsOwn(m));
+
+    var buf: [label_cap]u8 = undefined;
+    const skew = parts(&buf, policy.incompatible_state, "winbox");
+    try testing.expectEqualStrings("winbox", skew.name);
+    try testing.expectEqualStrings(" \u{2014} Version mismatch", skew.status);
+
+    // Distinct from the state it used to be indistinguishable from. This is the
+    // whole defect: the two said the same thing about very different machines.
+    var buf2: [label_cap]u8 = undefined;
+    const down = parts(&buf2, policy.terminal_state, "winbox");
+    try testing.expect(!std.mem.eql(u8, down.status, skew.status));
+
+    // A window with no machine to name still gets a bare, unpunctuated status.
+    var buf3: [label_cap]u8 = undefined;
+    const nameless = parts(&buf3, policy.incompatible_state, "");
+    try testing.expectEqualStrings("", nameless.name);
+    try testing.expectEqualStrings("Version mismatch", nameless.status);
+
+    // The tooltip carries the part the label has no room for: which side, and
+    // that reconnecting is still the way back afterwards.
+    var tip: [tooltip_cap + name_cap]u8 = undefined;
+    const t = tooltip(&tip, policy.incompatible_state, "winbox");
+    try testing.expect(std.mem.indexOf(u8, t, "winbox") != null);
+    try testing.expect(std.mem.indexOf(u8, t, "different version") != null);
+    try testing.expect(std.mem.indexOf(u8, t, "update one side") != null);
+    // ...and it never says the connection was "lost", which is the word that
+    // sends people to the network.
+    try testing.expect(std.mem.indexOf(u8, t, "lost") == null);
+}
+
+test "the skew label fits the same buffers every other state is sized for" {
+    // `status_cap` is what callers size a half-buffer with; a status that
+    // overflowed it would fall back to the un-separated `catch` arm and paint
+    // `winboxVersion mismatch`.
+    var buf: [label_cap]u8 = undefined;
+    const long = "build-agent-westus2.corp.example.internal.name.that.runs.on";
+    const p2 = parts(&buf, policy.incompatible_state, long);
+    try testing.expect(p2.status.len <= status_cap);
+    try testing.expect(p2.name.len + p2.status.len <= label_cap);
+    // The separator survived the squeeze — the status is a suffix of the name,
+    // not glued to it.
+    try testing.expect(std.mem.startsWith(u8, p2.status, sep));
+}
+
+test "isAction: only the broken pills wear the red action treatment" {
     try testing.expect(!isAction(.connected));
     try testing.expect(!isAction(.reconnecting));
     try testing.expect(isAction(.disconnected));
+    try testing.expect(isAction(.incompatible));
 }
 
 test "clickAction: no state is inert, and only the broken one re-dials" {
@@ -763,7 +875,7 @@ test "layout: mark, name and status keep the padding, and nothing hangs out" {
         const m = Metrics.init(s);
         const name_w: i32 = px(40.0, s);
         const status_w: i32 = px(60.0, s);
-        for ([_]Mode{ .connected, .reconnecting, .disconnected }) |mode| {
+        for ([_]Mode{ .connected, .reconnecting, .disconnected, .incompatible }) |mode| {
             const sw: i32 = if (mode == .connected) 0 else status_w;
             const w = width(m, mode, name_w, sw);
             const pill: Rect = .{ .left = 100, .top = 6, .right = 100 + w, .bottom = 6 + m.h };
@@ -903,7 +1015,7 @@ test "ink: every state clears its contrast floor on a sweep of bands" {
     for (bands) |bar| {
         for (accents) |accent| {
             const pal = chrome_theme.resolve(bar, accent);
-            for ([_]Mode{ .connected, .reconnecting, .disconnected }) |mode| {
+            for ([_]Mode{ .connected, .reconnecting, .disconnected, .incompatible }) |mode| {
                 for (states) |st| {
                     const c = ink(pal.bar, pal, mode, st);
                     // §2.3: chrome marks 3:1, label text 4.5:1 — against the
@@ -916,7 +1028,7 @@ test "ink: every state clears its contrast floor on a sweep of bands" {
                     // to black the moment a lit fill crosses the crossover,
                     // which is the caption close button's defect wearing the
                     // pill's shape.
-                    if (mode == .disconnected) {
+                    if (isAction(mode)) {
                         try testing.expectEqual(pal.on_danger, c.text);
                         try testing.expectEqual(pal.on_danger, c.mark);
                     }
@@ -948,7 +1060,7 @@ test "ink: hover is a change of FILL, in every state, on either theme" {
         .{ .r = 0xF3, .g = 0xF3, .b = 0xF3 },
     }) |bar| {
         const pal = chrome_theme.resolve(bar, .{ .r = 0x00, .g = 0x78, .b = 0xD4 });
-        for ([_]Mode{ .connected, .reconnecting, .disconnected }) |mode| {
+        for ([_]Mode{ .connected, .reconnecting, .disconnected, .incompatible }) |mode| {
             const rest = ink(pal.bar, pal, mode, .normal);
             const hover = ink(pal.bar, pal, mode, .hover);
             const pressed = ink(pal.bar, pal, mode, .pressed);

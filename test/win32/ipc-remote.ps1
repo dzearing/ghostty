@@ -7,8 +7,9 @@
 #
 # Covers: dial + open window (happy path), terminal round-trip through the
 # agent (send-keys -> read), --command forwarded into the agent OPEN,
-# dial-failure error (no listener), tokenless relay-args refusal (T21b;
-# the full relay path is covered by ipc-relay.ps1), +close teardown
+# dial-failure error (no listener), PROTOCOL-SKEW error against a real agent
+# advertising a different proto version (T628), tokenless relay-args refusal
+# (T21b; the full relay path is covered by ipc-relay.ps1), +close teardown
 # without wedging the app.
 param(
     [string]$Exe = 'D:\git\ghoztty\zig-out\bin\ghoztty.exe',
@@ -110,6 +111,44 @@ $r = Ghoz @('+new-remote-window', '--host=127.0.0.1', "--port=$deadPort", '--nam
 Assert "exit nonzero" ($r.ExitCode -ne 0)
 $err = $r.Output
 Assert "error names the endpoint" ($err -match "failed to reach 127.0.0.1:$deadPort")
+
+"== 4b: a PROTOCOL SKEW says so, instead of reading as unreachable (T628)"
+# The machine is awake, its agent is running and the network is fine - the two
+# builds simply no longer speak. Until T628 that came out as "failed to reach",
+# which sends the user to check four things that are all healthy.
+# GHOZTTY_AGENT_PROTO_VERSION is the debug-only seam on the AGENT (T125); a skew
+# cannot otherwise be produced from one tree, since both ends compile the same
+# protocol.proto_version.
+$skewPort = $Port + 2
+$savedProto = $env:GHOZTTY_AGENT_PROTO_VERSION
+$savedInstance = $env:GHOZTTY_AGENT_INSTANCE
+# A DISTINCT lineage suffix, not just a distinct lock path: the agent's
+# single-instance guard is a named mutex (T167's GHOZTTY_AGENT_INSTANCE forks
+# its identity), so a second agent sharing this sandbox's suffix exits 183
+# ("another instance is already running") before it ever listens - which reads
+# downstream as an unreachable port and would quietly turn this section into a
+# re-test of section 4.
+$env:GHOZTTY_AGENT_INSTANCE = "ipcrem-skew-$PID"
+$env:GHOZTTY_AGENT_PROTO_VERSION = '0'
+$skewAgent = Start-Process -FilePath $AgentExe `
+    -ArgumentList "--listen", "127.0.0.1:$skewPort", "--headless" `
+    -PassThru -WindowStyle Hidden
+$env:GHOZTTY_AGENT_PROTO_VERSION = $savedProto
+$env:GHOZTTY_AGENT_INSTANCE = $savedInstance
+Start-Sleep -Seconds 2
+Assert "skewed agent is running" (-not $skewAgent.HasExited)
+
+$r = Ghoz @('+new-remote-window', '--host=127.0.0.1', "--port=$skewPort", '--name=remskew')
+Assert "skewed dial exits nonzero" ($r.ExitCode -ne 0)
+$err = $r.Output
+# The claim under test: the message names the VERSION, and does not claim the
+# machine could not be reached.
+Assert "error names an incompatible version" ($err -match 'incompatible Ghoztty version')
+Assert "error names the endpoint" ($err -match "127\.0\.0\.1:$skewPort")
+Assert "error does NOT blame reachability" (-not ($err -match 'failed to reach'))
+Assert "no window was opened for the skewed machine" (-not ((Get-List) -match '\[target: remskew\]'))
+
+if (-not $skewAgent.HasExited) { Stop-Process -Id $skewAgent.Id -Force -ErrorAction SilentlyContinue }
 
 "== 5: tokenless relay args are refused with sign-in guidance (T21b)"
 $savedTok = $env:GHOSTTY_RELAY_TOKEN

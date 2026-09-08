@@ -4717,7 +4717,7 @@ pub fn performViewerBindingAction(
             if (self.remote_machine != null) {
                 _ = self.app.openRemoteWindowFrom(self, .{}) catch |err| {
                     log.warn("viewer chord: new window on remote parent failed err={}", .{err});
-                    self.app.showRemoteOpenFailed(self);
+                    self.app.showRemoteOpenFailed(self, err);
                 };
             } else _ = self.app.createWindow(.{}) catch |err| {
                 log.err("viewer chord: new window failed err={}", .{err});

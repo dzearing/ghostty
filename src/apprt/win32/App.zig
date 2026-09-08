@@ -43,6 +43,7 @@ const ViewerFeedbackBar = @import("ViewerFeedbackBar.zig");
 const ViewerFindBar = @import("ViewerFindBar.zig");
 const webview2 = @import("webview2.zig");
 const Window = @import("Window.zig");
+const dial_failure = @import("dial_failure.zig");
 const relay_dial = @import("../../remote/relay_dial.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
 const LocalAgent = @import("LocalAgent.zig");
@@ -5627,7 +5628,11 @@ pub const RemoteOpenOptions = struct {
     session_id: ?[]const u8 = null,
 };
 
-pub const RemoteOpenError = error{ DialFailed, CreateFailed } || Allocator.Error;
+/// `IncompatibleVersion` is kept apart from `DialFailed` for the reason T319
+/// kept `Unauthorized` apart from it in the restore path (T628): the machine
+/// answered, so every sentence about reaching it is a wrong answer, and the
+/// only fix is updating a side.
+pub const RemoteOpenError = error{ DialFailed, IncompatibleVersion, CreateFailed } || Allocator.Error;
 
 /// The ONE remote-window open tail (T22c decision 6): build the `.remote`
 /// surface overrides from a completed dial, create the window, hand it
@@ -5718,7 +5723,7 @@ pub fn openRelayWindow(
             .{ relay_base, device, err },
         );
         alloc.destroy(dialed);
-        return error.DialFailed;
+        return remoteOpenErrorFor(err);
     };
     var opts_with_machine = opts;
     opts_with_machine.machine = .{ .relay = .{ .base = relay_base, .device = device, .token = token } };
@@ -5810,6 +5815,10 @@ pub const RestoreAllError = error{
     /// because the fix is the account row, not the network — the same split
     /// T319 drew for the roster.
     Unauthorized,
+    /// The far agent answered and disagrees about the protocol version (T628).
+    /// Distinct for the third time and for the third reason: the fix is an
+    /// update, and the machine this is said about is demonstrably up.
+    IncompatibleVersion,
 };
 
 /// GUI thread (T618): rebuild the windows a `RestoreAllLocal` worker pulled —
@@ -6084,7 +6093,7 @@ pub fn resumeRelaySession(
             .{ relay_base, device, err },
         );
         alloc.destroy(dialed);
-        return error.DialFailed;
+        return remoteOpenErrorFor(err);
     };
     log.info("resume session: attaching remote session id={s} device={s}", .{ session_id, device });
     // The PINNED half rides `openDialedWindow`'s own `title` option (it applies
@@ -6168,7 +6177,7 @@ pub fn openRemoteWindowFrom(
                     .{ t.host, t.port, err },
                 );
                 alloc.destroy(dialed);
-                return error.DialFailed;
+                return remoteOpenErrorFor(err);
             };
             return self.openDialedWindow(.{ .tcp = dialed }, opts);
         },
@@ -6182,10 +6191,27 @@ pub fn openRemoteWindowFrom(
     }
 }
 
+/// Which `RemoteOpenError` a dial error is. One classification for every remote
+/// open path, so the chooser, the CLI and the inheriting re-dial cannot end up
+/// telling the user three different things about one machine (T628).
+fn remoteOpenErrorFor(err: anyerror) RemoteOpenError {
+    return switch (dial_failure.classify(err)) {
+        .incompatible => error.IncompatibleVersion,
+        .unreachable_machine, .unauthorized => error.DialFailed,
+    };
+}
+
 /// Show the T68 "couldn't reach the machine" dialog (T80 dark ConfirmDialog,
-/// OK-only) over `owner` after a failed inheriting re-dial.
-pub fn showRemoteOpenFailed(self: *App, owner: *Window) void {
-    const label: [:0]const u16 = switch (owner.remote_machine orelse return) {
+/// OK-only) over `owner` after a failed inheriting re-dial. `err` is what the
+/// re-dial came back with: a version skew gets its own sentence, because every
+/// word of the other one is wrong about a machine that answered (T628).
+pub fn showRemoteOpenFailed(self: *App, owner: *Window, err: RemoteOpenError) void {
+    const machine = owner.remote_machine orelse return;
+    const label: [:0]const u16 = if (err == error.IncompatibleVersion)
+        std.unicode.utf8ToUtf16LeStringLiteral(
+            "That machine runs a different version of Ghoztty.\nUpdate one side, then try again.",
+        )
+    else switch (machine) {
         .tcp => std.unicode.utf8ToUtf16LeStringLiteral(
             "Couldn't open a new window on the remote machine.\nIs its agent still running?",
         ),
@@ -6558,7 +6584,7 @@ pub fn performAction(
                 if (pw.remote_machine != null) {
                     _ = self.openRemoteWindowFrom(pw, .{}) catch |err| {
                         log.warn("new window on remote parent failed err={}", .{err});
-                        self.showRemoteOpenFailed(pw);
+                        self.showRemoteOpenFailed(pw, err);
                     };
                     return true;
                 }

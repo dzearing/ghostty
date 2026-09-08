@@ -12,6 +12,7 @@ const agent_recovery = @import("agent_recovery.zig");
 const ProcessTree = @import("ProcessTree.zig");
 const provenance = @import("provenance.zig");
 const tcp_dial = @import("../../remote/tcp_dial.zig");
+const dial_failure = @import("dial_failure.zig");
 const remote_connection = @import("../../remote/connection.zig");
 const relay_account = @import("../../remote/relay_account.zig");
 const Surface = @import("Surface.zig");
@@ -282,6 +283,14 @@ fn handleNewWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
                     error.DialFailed => return try errorResponse(
                         ctx.alloc,
                         "failed to reach the focused window's remote machine: the agent is not running or not reachable",
+                        .{},
+                    ),
+                    // The machine answered and disagreed (T628). Saying it
+                    // could not be reached would send a script — and whoever
+                    // reads its log — after a network that is fine.
+                    error.IncompatibleVersion => return try errorResponse(
+                        ctx.alloc,
+                        "incompatible Ghoztty version on the focused window's remote machine: update one side",
                         .{},
                     ),
                     error.CreateFailed => return try errorResponse(ctx.alloc, "failed to create window", .{}),
@@ -593,6 +602,11 @@ fn handleNewRemoteWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
                 "failed to reach {s} via relay {s}: the agent is not running or not reachable",
                 .{ device.?, relay.? },
             ),
+            error.IncompatibleVersion => return try errorResponse(
+                ctx.alloc,
+                "incompatible Ghoztty version on {s} (via relay {s}): update one side",
+                .{ device.?, relay.? },
+            ),
             error.CreateFailed => return try errorResponse(ctx.alloc, "failed to create window", .{}),
             error.OutOfMemory => return error.OutOfMemory,
         };
@@ -606,6 +620,11 @@ fn handleNewRemoteWindow(ctx: Context, request: Request) Allocator.Error!?[]u8 {
                 .{ host, args.port, err },
             );
             alloc.destroy(dialed);
+            if (dial_failure.classify(err) == .incompatible) return try errorResponse(
+                ctx.alloc,
+                "incompatible Ghoztty version on {s}:{d}: update one side",
+                .{ host, args.port },
+            );
             return try errorResponse(
                 ctx.alloc,
                 "failed to reach {s}:{d}: the agent is not running or not reachable",

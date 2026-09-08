@@ -575,6 +575,7 @@ pub fn onPoolChange(
     if (self.owned != null) return false;
     const next: chooser_sessions.State = switch (failure) {
         .unauthorized => .unauthorized,
+        .incompatible => .incompatible,
         .none, .offline => .failed,
     };
     if (self.state == next) return false;
