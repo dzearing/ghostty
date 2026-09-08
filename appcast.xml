@@ -440,5 +440,45 @@
 </description>
             <enclosure url="https://github.com/dzearing/ghoztty/releases/download/v1.34.0/Ghoztty-1.34.0-arm64.dmg" type="application/octet-stream" sparkle:edSignature="LZhJJKGdt3B3h212bYy3ccDo1pEbx839DMPCEvgveOUcyupwMZHga3RCjAAOglgtGmTK17FZDAlCa58fvz/IAg==" length="25806432" />
         </item>
+        <item>
+            <title>Version 1.35.0</title>
+            <sparkle:version>1.35.0</sparkle:version>
+            <sparkle:shortVersionString>1.35.0</sparkle:shortVersionString>
+            <pubDate>Tue, 08 Sep 2026 16:12:43 +0000</pubDate>
+            <description>{
+  "version": "1.35.0",
+  "sections": [
+    {
+      "title": "Viewer panes",
+      "items": [
+        { "title": "Cmd-F finds text in any viewer", "text": "A viewer pane had no way to search what it was showing. Cmd-F now opens a find bar in every mode — markdown, code, a local HTML page, a website, and a git diff — with the same behavior everywhere. Typing highlights every match with a live `3/17` count; Enter, Shift-Enter, Cmd-G and Cmd-Shift-G step through them and wrap. Escape closes the bar and clears the highlights but keeps your query, so Cmd-G picks it back up. It is honest about its limits too: a page with a frame says so, and a diff pane names the file it is searching." },
+        { "title": "Images get a real image viewer", "text": "Opening an image in a viewer pane used to render its bytes as syntax-highlighted source. It now gets a proper image pane with trackpad pinch anchored where your fingers are, two-finger pan with elastic edges and momentum, and double-click to toggle between best-fit and 100%. 100% means one image pixel per device pixel, so a screenshot shows exactly what was captured, and best-fit never upscales, so a small icon stays crisp at its real size." },
+        { "title": "The navigation bar stays put", "text": "Markdown and code panes were the last ones still hiding their nav bar until you reached for it — and that was the one mode where the content reflowed under your pointer and the only way out of the pane had to be hunted for with the mouse. The address field, Back, Forward and Home are now pinned open in every viewer mode." }
+      ]
+    },
+    {
+      "title": "Hero mode",
+      "items": [
+        { "title": "Scrolling a web page is smooth again", "text": "Scrolling a page in a hero-mode viewer was visibly janky: each carousel thumbnail cost about 30ms of web-process render time and fired every 150ms, so roughly a fifth of the frame budget went to a picture the size of a postage stamp. Thumbnails now pause while you are interacting with a pane — scrolling, typing, dragging a divider — and refresh once things settle. Measured over a 6-second continuous scroll, dropped frames went from 10.8% to zero, matching a build that takes no thumbnails at all. Thumbnails are also captured at the size they are actually displayed, and a wedged page can no longer freeze its thumbnail for the life of the pane." },
+        { "title": "The divider is grabbable across its whole band", "text": "The hero divider showed a resize cursor over a 6pt band but could only be grabbed on the 1pt line drawn in the middle, so the pointer promised a target that wasn't there. It now has the same real grab zone as the regular split divider, reaching about 4pt into each pane." }
+      ]
+    },
+    {
+      "title": "Remote machines",
+      "items": [
+        { "title": "Disconnect from a remote window without ending the session", "text": "Closing a remote window always terminated the remote process, so there was no way to walk away from a session and come back to it. The close confirmation for a remote window now offers a third button — Disconnect — which leaves the remote process running and the session resumable from the machine chooser (Cmd-Shift-N). Remote windows are also confirmed even when idle now: ending a process on another machine isn't the recoverable thing an idle local shell is. Local windows, viewer panes, and `ghoztty +close` are unchanged." }
+      ]
+    },
+    {
+      "title": "Account and security",
+      "items": [
+        { "title": "Signing out actually removes this machine from your account", "text": "Signing out of the Ghoztty app on a relay-enrolled machine ended your session but left the machine enrolled — from any other client on the account it stayed listed, stayed online, and a session already bridged to it kept streaming. Sign-out is now a hard revocation of the machine the app is running on: the device row is deleted, every live connection is severed, and the local credential is destroyed. If the relay can't be reached you stay signed in rather than being told you're secure when you aren't; you can sign out anyway, and the revocation is retried at every launch and whenever the network comes back until the relay confirms it. Signing back in with the same account re-enrolls the machine under the name it had." }
+      ]
+    }
+  ]
+}
+</description>
+            <enclosure url="https://github.com/dzearing/ghoztty/releases/download/v1.35.0/Ghoztty-1.35.0-arm64.dmg" type="application/octet-stream" sparkle:edSignature="Owzm+2LVe+F6Excj0Gt6nwf/W5N3cTj+QIJZbjGKCejtexLLfOqznY1MZ8Lx0Km9nk5JprX1W8c3PYLWETR3CA==" length="25917697" />
+        </item>
     </channel>
 </rss>
