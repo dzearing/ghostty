@@ -585,6 +585,35 @@ pub fn adoptIfUp(self: *LocalAgent) ?*connection.Connection {
     return self.shared.?.conn;
 }
 
+/// Keep answering IPC while a dial waits on the HELLO handshake (T630).
+///
+/// T188 bracketed `dialExisting` with pumps and left the middle alone, because
+/// the wait is inside `tcp_dial` and nothing here could reach it. Against a
+/// WEDGED agent — one suspended across a relaunch, still holding the pipe and
+/// the single-instance guard — that middle is the entire `probe_handshake_ns`
+/// budget: the app accepted the caller's connection and then answered nothing
+/// for 1.2 s, measured by `test\win32\ipc-startup-latency.ps1` as a first
+/// answer at ~1330 ms against ~250 ms for a healthy restore.
+///
+/// `tcp_dial.WaitTick` is the shared, platform-agnostic slot for it; this is
+/// the win32 filling. Two reasons it is safe where a general nested pump would
+/// not be: the hook drains ONLY `WM_APP_IPC` (see `gui_pump`), and a request
+/// served from inside it cannot start a second resolve — `sharedConnection`
+/// and `adoptIfUp` both hold `self.resolving` across the dial for exactly this
+/// reason.
+///
+/// Null off the GUI thread and in any build with no hook installed, so the
+/// worker-safe `dialProbe` path and the unit tests take the plain single-wait
+/// dial rather than slicing it to call a no-op.
+fn pumpWhileDialing() ?tcp_dial.WaitTick {
+    if (!gui_pump.active()) return null;
+    return .{ .func = pumpTick };
+}
+
+fn pumpTick(_: ?*anyopaque) void {
+    gui_pump.pump();
+}
+
 /// Dial the agent that is ALREADY running — never spawning one, and touching
 /// none of a manager's shared state. Returns a PROBE connection the caller owns
 /// and must `deinit`; null when no healthy agent answered.
@@ -894,8 +923,9 @@ fn writeAutostart(self: *LocalAgent, arena: Allocator) !void {
 fn findOrSpawn(self: *LocalAgent) ?tcp_dial.Dialed {
     // 1. Find: dial the agent recorded in port.json, if any. The dial itself is
     //    bounded by `probe_handshake_ns`, and a WEDGED agent spends all of it —
-    //    so pump either side of it (T188) and keep the unserviced stretch to one
-    //    handshake timeout instead of the whole find-or-spawn budget.
+    //    so pump either side of it (T188) AND through it (T630,
+    //    `pumpWhileDialing`), which is what keeps the unserviced stretch to a
+    //    slice rather than a whole handshake timeout.
     gui_pump.pump();
     if (self.dialExisting()) |d| return d;
     gui_pump.pump();
@@ -960,6 +990,7 @@ fn dialExisting(self: *LocalAgent) ?tcp_dial.Dialed {
         .raw,
         probe_handshake_ns,
         &report,
+        pumpWhileDialing(),
     ) catch |err| {
         if (err == error.ProtocolIncompatible) {
             // The agent ANSWERED and we could not agree with it. That is a live

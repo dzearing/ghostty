@@ -293,7 +293,14 @@ Stop-AppOnly
 $c = Measure-Startup 'csusp'
 Say "   suspended agent: first answer $($c.Answer)ms, first window $($c.Window)ms"
 Assert 'C2 the app answers +list despite the wedged agent' ($c.Answer -ge 0)
-Assert 'C3 that answer is prompt (< 3s)' ($c.Answer -ge 0 -and $c.Answer -lt 3000)
+# T630 tightened this from 3000ms. Before the handshake wait was sliced, the
+# app spent the WHOLE probe_handshake_ns (1200ms) inside one blocking dial and
+# this arm measured ~1330ms - which passed a 3s ceiling, so the arm could not
+# see the defect it exists for. With the slicing it measures ~72ms, alongside
+# ~162ms cold and ~180ms healthy-restore. 800ms sits an order of magnitude
+# above the measurement and well below the 1200ms budget, so a regression to
+# the single blocking wait fails here rather than passing quietly.
+Assert 'C3 that answer is prompt (< 800ms)' ($c.Answer -ge 0 -and $c.Answer -lt 800)
 # The pre-condition that stops C3 from passing vacuously: startup really WAS
 # slow this time. Without the suspend it settles in well under a second.
 Assert 'C4 setup held: startup really was slowed by the wedged agent (>= 2.5s)' ($c.Window -ge 2500)

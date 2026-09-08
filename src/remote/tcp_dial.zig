@@ -83,6 +83,33 @@ pub const DialReport = struct {
     peer_proto_version: ?u16 = null,
 };
 
+/// A callback the dial runs periodically while it is BLOCKED on the HELLO
+/// handshake, so a single-threaded caller does not go deaf for the whole
+/// handshake budget.
+///
+/// Why it lives here rather than at the call site: the wait is inside
+/// `dialConnected`, and nothing outside can reach into it. A dial against a
+/// wedged peer spends its entire timeout in that one call — 1200 ms for the
+/// win32 startup dial of the local agent (T630) — and a caller that services
+/// its own work from the GUI thread (Windows), a run loop (macOS), or a poll
+/// set answers nothing for the duration.
+///
+/// It is deliberately shapeless: an opaque context and a function, with no
+/// notion of what the caller does with the slice. That is what keeps a
+/// platform-specific pump out of this shared file — `src/apprt/*` supplies the
+/// behavior, this only supplies the moment.
+pub const WaitTick = struct {
+    /// Handed back to `func` verbatim. Null is fine.
+    ctx: ?*anyopaque = null,
+    /// Run roughly every `interval_ns` until the handshake settles. Must not
+    /// block for long: the handshake deadline keeps running while it does.
+    func: *const fn (ctx: ?*anyopaque) void,
+    /// How finely to slice the wait. 20 ms is well under any human-perceptible
+    /// latency and costs at most 60 extra `ResetEvent` waits over a 1200 ms
+    /// budget, which is noise beside a dial.
+    interval_ns: u64 = 20 * std.time.ns_per_ms,
+};
+
 /// What a FAILED HELLO handshake means, from the error the wait returned and
 /// the peer proto version the control reader managed to parse.
 ///
@@ -160,7 +187,7 @@ pub fn dialTimeout(
     sock.* = socket_stream.SocketStream.init(stream.handle);
     // `dialConnected` takes ownership of `sock` (closes + destroys it on any
     // failure), so no errdefer here.
-    return dialConnected(alloc, .{ .sock = sock }, sock.connectionStream(), encoding, handshake_timeout_ns, null);
+    return dialConnected(alloc, .{ .sock = sock }, sock.connectionStream(), encoding, handshake_timeout_ns, null, null);
 }
 
 /// Default deadline shared by `dialUnix`; the same rationale as
@@ -211,7 +238,7 @@ pub fn dialUnixTimeout(
     sock.* = socket_stream.SocketStream.init(fd);
     // `dialConnected` takes ownership of `sock` (closes + destroys it on any
     // failure) — cancel the raw-fd errdefer above by returning through it.
-    return dialConnected(alloc, .{ .sock = sock }, sock.connectionStream(), encoding, handshake_timeout_ns, null);
+    return dialConnected(alloc, .{ .sock = sock }, sock.connectionStream(), encoding, handshake_timeout_ns, null, null);
 }
 
 /// Connect to a Windows named pipe at `name` (a full `\\.\pipe\...` path) —
@@ -236,7 +263,7 @@ pub fn dialPipeTimeout(
     encoding: protocol.TransferEncoding,
     handshake_timeout_ns: u64,
 ) !Dialed {
-    return dialPipeTimeoutReport(alloc, name, encoding, handshake_timeout_ns, null);
+    return dialPipeTimeoutReport(alloc, name, encoding, handshake_timeout_ns, null, null);
 }
 
 /// `dialPipeTimeout` that also fills in a `DialReport` about the peer. Only the
@@ -249,6 +276,9 @@ pub fn dialPipeTimeoutReport(
     encoding: protocol.TransferEncoding,
     handshake_timeout_ns: u64,
     report: ?*DialReport,
+    // Run while the handshake blocks — see `WaitTick`. The win32 startup dial
+    // passes one so the app keeps answering IPC through it (T630).
+    tick: ?WaitTick,
 ) !Dialed {
     // Comptime gate: keeps the Windows pipe code out of POSIX analysis (the
     // same pattern as the agent's --listen-unix gate, mirrored).
@@ -264,7 +294,44 @@ pub fn dialPipeTimeoutReport(
     pipe.* = pipe_stream.PipeStream.init(handle);
     // `dialConnected` takes ownership of `pipe` (closes + destroys it on any
     // failure).
-    return dialConnected(alloc, .{ .pipe = pipe }, pipe.connectionStream(), encoding, handshake_timeout_ns, report);
+    return dialConnected(alloc, .{ .pipe = pipe }, pipe.connectionStream(), encoding, handshake_timeout_ns, report, tick);
+}
+
+/// `Connection.waitHandshakeTimeout`, sliced so a caller-supplied `tick` runs
+/// while we wait. With no tick this IS `waitHandshakeTimeout` — one call, one
+/// wait — so the ordinary dial pays nothing for the option.
+///
+/// Slicing is safe precisely because a timed-out wait tears NOTHING down (see
+/// `waitHandshakeTimeout`'s contract: the caller owns the teardown). So a
+/// slice that expires is just a place to stand, and the loop keeps the same
+/// total budget: the deadline is computed once, up front, and the ticks are
+/// spent out of it rather than added to it. A peer that answers mid-slice is
+/// picked up at the end of that slice, which is why the slice is small.
+fn waitHandshakeTicking(
+    conn: *connection.Connection,
+    timeout_ns: u64,
+    tick: ?WaitTick,
+) !protocol.Negotiated {
+    const t = tick orelse return conn.waitHandshakeTimeout(timeout_ns);
+    const slice = @max(t.interval_ns, 1);
+
+    var remaining = timeout_ns;
+    while (true) {
+        const this_slice = @min(remaining, slice);
+        if (conn.waitHandshakeTimeout(this_slice)) |negotiated| {
+            return negotiated;
+        } else |err| {
+            // Only a slice EXPIRING is a reason to go round again. A real
+            // negotiation failure (version/encoding skew, a dropped control
+            // stream) is the final answer and is handed straight back — retrying
+            // it would re-read the same settled result until the budget ran out
+            // and then mislabel it a timeout.
+            if (err != error.HandshakeTimeout) return err;
+        }
+        remaining -= this_slice;
+        if (remaining == 0) return error.HandshakeTimeout;
+        t.func(t.ctx);
+    }
 }
 
 /// Shared post-connect core for every transport (TCP, AF_UNIX, named pipe):
@@ -281,6 +348,7 @@ fn dialConnected(
     encoding: protocol.TransferEncoding,
     handshake_timeout_ns: u64,
     report: ?*DialReport,
+    tick: ?WaitTick,
 ) !Dialed {
     errdefer {
         stream.close(); // closes the fd/handle
@@ -318,7 +386,7 @@ fn dialConnected(
     //    agent / half-open middlebox): tear down exactly like a failed
     //    handshake (`shutdown` closes the lanes, unblocking + joining the
     //    reader still parked on the HELLO) and surface `HandshakeTimeout`.
-    const negotiated = conn.waitHandshakeTimeout(handshake_timeout_ns) catch |err| {
+    const negotiated = waitHandshakeTicking(conn, handshake_timeout_ns, tick) catch |err| {
         // Handshake failed: tear down (shutdown joins everything; pump joined too).
         conn.shutdown();
         mux.joinPump();
@@ -587,6 +655,131 @@ test "dial: a peer that accepts and says nothing is NOT reported as incompatible
     t.join();
     if (silent.conn) |c| c.stream.close();
     listener.deinit();
+}
+
+/// `dialTimeout` with a `WaitTick`, reaching straight into the private
+/// `dialConnected`. It is the only way to exercise `waitHandshakeTicking` end
+/// to end: no shipping TCP entry point takes a tick, because the caller that
+/// needs one dials a named pipe (`dialPipeTimeoutReport`), which cannot be
+/// stood up on a POSIX test lane.
+fn dialWithTick(
+    alloc: Allocator,
+    host: []const u8,
+    port: u16,
+    timeout_ns: u64,
+    tick: ?WaitTick,
+) !Dialed {
+    const stream = try std.net.tcpConnectToHost(alloc, host, port);
+    const sock = alloc.create(socket_stream.SocketStream) catch |e| {
+        stream.close();
+        return e;
+    };
+    sock.* = socket_stream.SocketStream.init(stream.handle);
+    return dialConnected(alloc, .{ .sock = sock }, sock.connectionStream(), .raw, timeout_ns, null, tick);
+}
+
+var tick_test_calls: usize = 0;
+
+fn countingTick(ctx: ?*anyopaque) void {
+    tick_test_calls += 1;
+    if (ctx) |p| {
+        const counter: *usize = @ptrCast(@alignCast(p));
+        counter.* += 1;
+    }
+}
+
+test "waitHandshakeTicking: a silent peer still times out, but the caller is not deaf while it does" {
+    // T630. The defect this closes: the dial spent its WHOLE handshake budget
+    // in one blocking wait, so a win32 startup dial against a wedged agent
+    // answered no IPC for 1.2 s. The tick is the slot that lets the caller do
+    // its own work meanwhile — and the two things that must both hold are that
+    // it actually runs (many times, not once) and that it does not change the
+    // outcome or blow the budget.
+    const alloc = testing.allocator;
+
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(.{ .reuse_address = true });
+    const bound = listener.listen_address;
+
+    const Silent = struct {
+        listener: *std.net.Server,
+        conn: ?std.net.Server.Connection = null,
+        fn run(self: *@This()) void {
+            self.conn = self.listener.accept() catch null;
+        }
+    };
+    var silent = Silent{ .listener = &listener };
+    const t = try std.Thread.spawn(.{}, Silent.run, .{&silent});
+
+    var calls: usize = 0;
+    tick_test_calls = 0;
+    const budget_ns: u64 = 300 * std.time.ns_per_ms;
+
+    var timer = try std.time.Timer.start();
+    try testing.expectError(error.HandshakeTimeout, dialWithTick(
+        alloc,
+        "127.0.0.1",
+        bound.getPort(),
+        budget_ns,
+        .{ .ctx = &calls, .func = countingTick, .interval_ns = 20 * std.time.ns_per_ms },
+    ));
+    const elapsed = timer.read();
+
+    // Ran repeatedly, not once: a 300 ms budget in 20 ms slices is ~14 ticks.
+    // Five is a floor loose enough to survive a loaded box and still fail the
+    // shape this replaces (one blocking wait = zero ticks).
+    try testing.expect(calls >= 5);
+    try testing.expectEqual(calls, tick_test_calls);
+    // And the ticks came OUT of the budget rather than being added to it: the
+    // deadline is computed once. Generous ceiling — this asserts "still bounded
+    // by roughly the budget", not a scheduling guarantee.
+    try testing.expect(elapsed < 3 * budget_ns);
+
+    t.join();
+    if (silent.conn) |c| c.stream.close();
+    listener.deinit();
+}
+
+test "waitHandshakeTicking: a handshake that SUCCEEDS is not delayed to a slice boundary it missed" {
+    // The negative control for the test above. With a tick installed, a peer
+    // that answers must still be picked up and the dial must succeed — a loop
+    // that mistook a settled handshake for an expired slice would keep waiting
+    // until the budget ran out and then report a timeout for a peer that spoke.
+    const alloc = testing.allocator;
+    const enc: protocol.TransferEncoding = .raw;
+
+    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    var listener = try addr.listen(.{ .reuse_address = true });
+    const bound = listener.listen_address;
+
+    const Accepter = struct {
+        listener: *std.net.Server,
+        agent: *MiniAgent,
+        fn run(self: *@This()) void {
+            const c = self.listener.accept() catch return;
+            self.agent.fd = c.stream.handle;
+            self.agent.run();
+        }
+    };
+    var agent = MiniAgent{ .fd = undefined, .alloc = alloc, .encoding = enc };
+    var accepter = Accepter{ .listener = &listener, .agent = &agent };
+    const agent_thread = try std.Thread.spawn(.{}, Accepter.run, .{&accepter});
+
+    var calls: usize = 0;
+    tick_test_calls = 0;
+    var dialed = try dialWithTick(
+        alloc,
+        "127.0.0.1",
+        bound.getPort(),
+        2 * std.time.ns_per_s,
+        .{ .ctx = &calls, .func = countingTick, .interval_ns = 20 * std.time.ns_per_ms },
+    );
+    try testing.expectEqual(enc, dialed.negotiated.transfer_encoding);
+
+    dialed.deinit();
+    agent_thread.join();
+    listener.deinit();
+    try testing.expect(agent.err == null);
 }
 
 test "dialUnix: stands up a Connection over a real AF_UNIX socket, OPEN + DATA round-trip" {

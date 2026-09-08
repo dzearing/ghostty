@@ -24860,3 +24860,46 @@ the arm (K14–K15). Also `agent-handoff.ps1` (29), `msg-timer-ids.ps1` (15),
 `ipc-version.ps1`, `orphan-notify.ps1` (13) and the eleven static audits an edit
 here re-opens. Follow-up filed: T1445, a durable place to look the state up once
 the balloon has gone.
+
+## 2026-09-08 — the app keeps answering while it waits on a wedged agent (T630)
+
+T188 stopped Ghoztty going deaf for ten seconds at startup by pumping IPC from
+the points where startup blocks. One of those points was left: the dial of an
+already-running local agent is a single blocking wait on the HELLO handshake,
+and against an agent that is wedged — suspended across a relaunch, still holding
+the pipe — it spends the entire 1200 ms budget. The brackets sat either side of
+it and nothing could reach inside, so `ipc-startup-latency.ps1` measured the
+first answer at ~1330 ms while a healthy restore answered in ~250 ms. A script
+driving the terminal through a relaunch saw a second of silence with no way to
+tell it from a hang.
+
+The fix is to slice the wait rather than shorten it. `tcp_dial.WaitTick` is a
+shapeless `{ctx, func, interval_ns}` the dial runs while it waits, and
+`waitHandshakeTicking` spends the SAME budget in 20 ms slices instead of one —
+safe because a timed-out handshake wait tears nothing down (it is a `ResetEvent`
+timed wait; the caller owns the teardown), so a slice that expires is just a
+place to stand. The deadline is computed once and the ticks come out of it, so
+the total is unchanged and a real negotiation failure is still handed straight
+back rather than retried into a mislabelled timeout. With no tick installed the
+call IS `waitHandshakeTimeout`, so every other dial pays nothing. win32 fills
+the slot with `LocalAgent.pumpWhileDialing`, which is null off the GUI thread —
+the worker-safe `dialProbe` path is untouched — and drains only `WM_APP_IPC`,
+with `self.resolving` already held across the dial so a request served from
+inside the pump cannot start a second resolve. Nothing win32-shaped enters
+`src/remote/`.
+
+Measured: the suspended-agent first answer went from ~1330 ms to **56–72 ms**,
+beside 164 ms cold and 174 ms healthy-restore, and arm C3's ceiling came down
+from 3000 ms to 800 ms — an order of magnitude above the measurement and well
+under the 1200 ms budget, so a regression to the single blocking wait now fails
+the arm instead of passing it. Before this the arm could not have seen the
+defect it exists for.
+
+Green: `floor-lane.ps1 -Lane all` (lib / none / win32 / agent), P1–P3, and
+`ipc-startup-latency.ps1` ALL PASS (17). Two new none-lane unit tests cover the
+slicing — a silent peer still times out but the tick ran ≥5 times, and a peer
+that speaks still negotiates with a tick installed — and both were proved able
+to fail by inverting the tick-count assertion before landing. Also the thirteen
+harnesses the edit came due for (agent-autostart, agent-upgrade,
+registration-sites, restore-late-agent and the nine static audits), all green
+and re-stamped.
