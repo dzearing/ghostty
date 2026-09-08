@@ -1,15 +1,15 @@
 {
     "guard":  "session-vanished",
     "script":  "test/win32/session-vanished.ps1",
-    "generated":  "2026-09-07T16:50:17-07:00",
-    "commit":  "897e3d7dc",
+    "generated":  "2026-09-08T08:32:53-07:00",
+    "commit":  "57cf59f7a",
     "uncommitted":  [
                         "src/remote/agent/session.zig"
                     ],
     "files":  {
                   "src/remote/agent/descendants.zig":  "bbd319ec821cb683fbaddfd9b76f4bc20c32d44b6efb5369aa25e6341142319b",
                   "src/remote/agent/proc.zig":  "d6b5a2bd5bc2bd7da3e53505986b787b46c62accca7855847cad133cb819e48c",
-                  "src/remote/agent/session.zig":  "cd736c5b02943e8354fe30ca7c2a8cef165c8cb69f2ada65081f0333121fab67",
+                  "src/remote/agent/session.zig":  "f5bde9e073975c5ab5378f07a80df4de67387d74e35f7f9d1b373a2e7c14b7ef",
                   "test/win32/session-vanished.ps1":  "048fe12b684bc37dc9500ae1838ccd7e15f9ca1a296a7b820bdcf0b7a864c587"
               }
 }

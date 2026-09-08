@@ -566,6 +566,69 @@ Two things deliberately do NOT survive the translation:
   on one spot, which is worse for the multi-window case the feature exists for.
   Recording the source screen's geometry as an additive field is **T623**.
 
+#### 5.4.3 A session id does not imply a continuous byte stream (T653)
+
+**The rule, normatively: a session ID is stable across an agent restart; its
+output BYTE STREAM is not. A client must never trust a resume point it has not
+checked against the peer's current stream head.**
+
+This is a property of the protocol, not an accident to be fixed later. It is
+written here because T532 cost two investigation contexts rediscovering it from
+a frozen pane.
+
+Why the stream restarts. `SessionStore.preloadRingSnapshot`
+(`src/remote/agent/session.zig`) is what brings a session back after the agent
+process dies: it loads the session's on-disk ring snapshot, **re-bases it at
+offset 0**, appends the restart divider, and anchors `out_offset` at the ring
+tail, so a RELAUNCH's first live byte lands immediately after the divider. The
+id, meanwhile, is deliberately reused — it is what `sessions.json` records and
+what the viewer's manifest names, and reusing it is the whole reboot floor.
+
+So after an agent restart, id `X` names a stream that begins at 0 (well, at a
+few KB of surviving scrollback) while every manifest and every previously
+attached viewer still holds offsets from the stream that died — `43394044`
+against a minutes-old agent, in the incident that produced T532.
+
+The base-0 renumbering is not the thing to change:
+
+- **Carrying the tally would make the numbering honest while the DATA stays
+  dishonest.** Only a ring's worth of bytes survives a restart, so a session
+  resumed at offset 43 MB could serve no replay and fill no gap below its own
+  head; it would trade a detectable mismatch for an undetectable one.
+- **A non-zero base manufactures a phantom gap.** A freshly restored viewer
+  applies DATA from 0 with no resync watermark, and would read any higher base
+  as scrollback it had lost.
+- **Retiring the id instead** (minting a new one on every relaunch, old id
+  recorded as predecessor) was considered and rejected: it would put a breaking
+  change through the app↔agent compatibility boundary and through every
+  consumer that assumes ids are stable — manifests, layout blobs, the chooser's
+  roster, `+sessions` — to remove a mismatch that a two-line clamp already
+  handles correctly on the side that actually cares.
+
+What the rule obliges each side to do:
+
+- **The agent** reports its current head on every attach, as
+  `ATTACHED.snapshot_at_offset`. That field is the contract; it is not
+  advisory.
+- **The client** clamps its recorded resume point to that head before arming
+  any resync watermark — `Connection.resumeOffset(last_byte_offset,
+  agent_head)`, with `termio.Remote` rebasing its own `attach_offset` onto the
+  clamped value so the NEXT manifest write is not written into the phantom
+  future either. A head of `0` never clamps: it is ambiguous between "produced
+  nothing" and "peer too old to report one".
+- **A holder-backed session negotiates rather than assumes.** `holder_offset`
+  in `sessions.json` records where the snapshot ENDS in the *holder's* stream
+  and is sent as the re-adopting agent's ATTACH ack — the same principle one
+  layer down: continuity is something the two ends agree on explicitly, never
+  something an identifier implies.
+
+Locked in by `test "agent restart renumbers a session's byte stream to base 0:
+the id survives, the tally does not"` (agent lane) — a session whose ring
+evicted, restored under the same id, must come back with a head strictly BEHIND
+where the dead stream stood — and by the `resumeOffset` / `attachChannel` unit
+tests in the `none` lane, which fail on the user-visible freeze rather than on a
+mismatched number.
+
 ### 5.5 Portability / moving windows
 
 - The Mac enrolls as a relay device (already supported; this Mac has a device

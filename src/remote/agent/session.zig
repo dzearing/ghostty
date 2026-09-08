@@ -4188,6 +4188,98 @@ test "SessionStore ring snapshot: dirty alive ring persists; reload preloads scr
 }
 
 // -----------------------------------------------------------------------------
+// T653 — a session id does not imply a continuous byte stream
+// -----------------------------------------------------------------------------
+
+test "agent restart renumbers a session's byte stream to base 0: the id survives, the tally does not" {
+    // The rule this locks in (docs/design/session-persistence.md §5.4.2): a
+    // session ID is stable across an agent restart, its OUTPUT BYTE STREAM is
+    // not. `preloadRingSnapshot` re-bases the surviving scrollback at 0 and
+    // anchors `out_offset` at the ring tail, so the number a relaunched session
+    // reports is a fresh count over the bytes that actually survived — never a
+    // continuation of the dead stream's tally.
+    //
+    // The neighbouring reboot-preload test cannot see this, because its session
+    // produced exactly one ring's worth of output: "carried the tally" and
+    // "counted the survivors" give the same number there. Here the ring EVICTS,
+    // so the two rules disagree by construction and only the real one passes.
+    const alloc = testing.allocator;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(dir_path);
+    const meta = try std.fs.path.join(alloc, &.{ dir_path, "sessions.json" });
+    defer alloc.free(meta);
+    const rings = try std.fs.path.join(alloc, &.{ dir_path, "rings" });
+    defer alloc.free(rings);
+
+    // Run #1's ring is small enough to EVICT (so the stream outruns what
+    // survives); run #2 gives the reloaded ring room for the snapshot plus the
+    // divider, so what the assertions below measure is the renumbering rather
+    // than a second eviction.
+    const ring_bytes: usize = 512;
+    const reload_ring_bytes: usize = 4096;
+    var id_buf: [32]u8 = undefined;
+    var run1_offset: u64 = 0;
+    var retained: usize = 0;
+
+    // --- Agent run #1: far more output than the ring retains.
+    {
+        var prng = std.Random.DefaultPrng.init(0x7373);
+        var clock: MutClock = .{ .ms = 500 };
+        var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 100000);
+        store.meta_path = meta;
+        store.rings_dir = rings;
+        defer store.deinit();
+
+        var fake: FakeChild = .{ .alloc = alloc };
+        defer fake.deinit();
+        const s = try store.table.create(fake.child(), 4242, 24, 80, ring_bytes, 500);
+        s.pinned = true;
+        s.setArgv("sleep 600");
+        for (0..200) |i| {
+            var line: [16]u8 = undefined;
+            const text = try std.fmt.bufPrint(&line, "tick-{d:0>3}\r\n", .{i});
+            _ = s.recordOutput(text, 600);
+        }
+        @memcpy(&id_buf, s.id_str[0..]);
+        run1_offset = s.out_offset.value;
+        retained = s.ring.len;
+
+        // The premise: the stream is much longer than what survives on disk.
+        try testing.expect(run1_offset > retained);
+
+        store.snapshotRings();
+        store.persistMeta();
+    }
+
+    // --- Agent run #2 (fresh store, same id): the tally restarts.
+    {
+        var prng = std.Random.DefaultPrng.init(0x8484);
+        var clock: MutClock = .{ .ms = 9000 };
+        var store = SessionStore.init(alloc, prng.random(), &clock, MutClock.nowFn, 100000);
+        store.meta_path = meta;
+        store.rings_dir = rings;
+        defer store.deinit();
+
+        try testing.expectEqual(@as(usize, 1), store.loadPersisted(reload_ring_bytes));
+
+        // The ID is the same one the viewer's manifest recorded.
+        const s = store.table.getByIdStr(id_buf[0..]).?;
+
+        // The STREAM is not. Base 0, and the head counts only the survivors +
+        // the divider — strictly behind where the dead stream stood, which is
+        // the mismatch every client must expect (and clamp against: see
+        // `Connection.resumeOffset`, T532).
+        try testing.expectEqual(@as(u64, 0), s.ring.base_offset);
+        try testing.expectEqual(s.ring.tailOffset(), s.out_offset.value);
+        try testing.expect(s.out_offset.value < run1_offset);
+        try testing.expectEqual(@as(u64, retained + reboot_divider.len), s.out_offset.value);
+    }
+}
+
+// -----------------------------------------------------------------------------
 // T906 — holder adoption + ring reconciliation
 // -----------------------------------------------------------------------------
 

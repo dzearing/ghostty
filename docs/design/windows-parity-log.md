@@ -25222,3 +25222,52 @@ anyway, the quiet case, the standalone verb, the status on a match,
 tracker. Full harness ALL PASS; the `parity-tasks` guard re-stamped. Follow-up
 T1454 asks the same question of the whole open backlog rather than only of new
 filings.
+
+## 2026-09-08 - T653: a session id names a session, not a byte stream - written down and locked in
+
+T532 fixed a frozen pane by clamping a client's resume point to the agent's
+stream head. T653 was the upstream question it left open: should the mismatch
+that made the clamp necessary exist at all - either the agent's `out_offset`
+survives a relaunch, or a session that starts a new stream should not keep the
+old id.
+
+Answered from the code rather than from the protocol prose, because the code had
+already decided. `SessionStore.preloadRingSnapshot` (`src/remote/agent/session.zig`)
+is what brings a session back after the agent process dies: it loads the on-disk
+ring snapshot, **re-bases the ring at offset 0**, appends the restart divider and
+anchors `out_offset` at the ring tail. Nothing carries the old tally - a
+`session_meta.Record` persists no output offset at all. So a relaunched session
+keeps its id and starts a fresh count over the few KB that survived, and the base
+of 0 is deliberate: a freshly restored viewer applies DATA from 0 with no resync
+watermark, so any higher base manufactures a phantom gap.
+
+Both alternatives are rejected in the task file with their reasons. Carrying the
+tally would make the NUMBER honest while the DATA stayed dishonest - only a
+ring's worth of bytes survives, so a session resumed at 43 MB could serve no
+replay below its own head, trading a detectable mismatch for an undetectable one.
+Retiring the id would push a breaking change through the app-agent compatibility
+boundary and through every consumer that assumes stable ids (manifests, layout
+blobs, the chooser roster, `+sessions`) to remove a mismatch a two-line clamp
+already handles on the side that cares.
+
+So the answer was option 3 - and the half that was actually missing was the
+writing-down. `docs/design/session-persistence.md` section 5.4.3 now states it
+normatively ("a session ID is stable across an agent restart; its output byte
+stream is not") along with what it obliges each side to do: the agent reports its
+head as `ATTACHED.snapshot_at_offset`, the client clamps to it through
+`Connection.resumeOffset` and rebases `termio.Remote.attach_offset`, and a head
+of 0 never clamps. `holder_offset` is cited as the same principle one layer down
+- continuity is negotiated by an explicit ack, never implied by an identifier.
+
+The rule now has a test with teeth. The neighbouring reboot-preload test could
+not see this property at all: its session produced exactly one ring's worth of
+output, where "carried the tally" and "counted the survivors" give the same
+number. The new agent-lane test restores a session whose ring **evicted**, so the
+two rules disagree by construction, and requires the head to come back strictly
+behind where the dead stream stood. Verified rather than assumed: preloading at a
+non-zero base turns it red (`expected 0, found 100000`) with the rest of the lane
+green.
+
+No decision file: all three options are indistinguishable from inside the app -
+under each, a restored pane is live - so it fails the experience test and was a
+mechanism call to make and record.
