@@ -816,6 +816,15 @@ ship, in `GhosttyAssets.zig`'s none-lane tests and
   `std.fs`'s `MoveFileExW` **without** `MOVEFILE_COPY_ALLOWED`, so a staging
   area that somehow ended up on another volume fails loudly rather than
   degrading into the non-atomic copy this design exists to avoid.
+  **The staging folder is also the DRAFT's folder.** The composer mints its
+  stem when it opens and keeps it until the report is filed, and the footer
+  shows `<worktree>/temp/feedback/.staging/<stem>` as a link that opens that
+  folder (Finder on macOS, File Explorer on Windows), materializing it first so
+  it is never empty or stale. Anything dropped in there — a log, a crash dump, a
+  recording — is published with the report, because the send is that same folder
+  refreshed in place and renamed. Drafts composed and never sent sweep
+  themselves: staging the next draft removes any staging folder untouched for
+  24h, never the one being composed.
   The queue lives under **`temp/`** because that name is already gitignored
   here (`.gitignore`) and conventionally elsewhere; a top-level `.feedback/`
   was not, so every filed report showed up as untracked in `git status`.

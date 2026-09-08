@@ -66,6 +66,15 @@ pub const images_dir_name = "images";
 /// with `/` because it is shown to a human and read by the shared watcher.
 pub const queue_relative_path = temp_dir_name ++ "/" ++ queue_dir_name ++ "/" ++ new_dir_name;
 
+/// Worktree-relative path of the staging area a draft is assembled in, for the
+/// composer's footer link (T645). Same `/` spelling and same reason.
+pub const staging_relative_path = temp_dir_name ++ "/" ++ queue_dir_name ++ "/" ++ staging_dir_name;
+
+/// How long a staging folder may sit untouched before a later draft sweeps it.
+/// A day is long enough that a draft somebody walked away from over lunch is
+/// still there, and short enough that abandoned drafts do not accumulate.
+pub const stale_staging_secs: i64 = 24 * 60 * 60;
+
 pub const WriteError = error{
     /// Nothing to file: the composer trimmed away to nothing.
     Empty,
@@ -533,55 +542,49 @@ pub const Written = struct {
     }
 };
 
-/// Build the report folder under `.staging/` and publish it into `new/` with a
-/// single rename. See the header for why the two directories are siblings.
+/// Absolute path of the folder a draft with this stem is assembled in. Caller
+/// frees. The stem is stable for the draft's whole life, so the footer link,
+/// the files the user drops into the folder, and the eventual atomic publish
+/// all name one folder (T645, Mac's `stagingDirectory`).
+pub fn stagingDir(alloc: Allocator, worktree_path: []const u8, stem: []const u8) ![]u8 {
+    return std.fs.path.join(alloc, &.{
+        worktree_path, temp_dir_name, queue_dir_name, staging_dir_name, stem,
+    });
+}
+
+/// Create or refresh a draft's staging folder IN PLACE: (over)write
+/// `report.json` and the draft's own `images/`, leaving every other file in the
+/// folder untouched. That last clause is the whole point — a log, a crash dump
+/// or a recording the user dropped into the folder through the footer link has
+/// to still be there when the folder is published.
 ///
-/// `epoch_secs` and `suffix` are injected rather than read here so a test can
-/// assert an exact folder name; `ViewerPane` passes the wall clock and a
-/// random 24-bit suffix.
-pub fn write(
+/// Unlike `write` this tolerates an empty draft: a work-in-progress folder
+/// legitimately has nothing typed in it yet. Returns the staging directory,
+/// which the caller frees.
+pub fn stage(
     alloc: Allocator,
     ctx: Context,
     body: []const u8,
     quotes: []const Quote,
     images: []const Image,
+    stem: []const u8,
     epoch_secs: u64,
-    suffix: u24,
-) !Written {
-    // A report whose whole content is a picture is a real report, so an empty
-    // BODY is only empty when there are no images either.
-    if (images.len == 0 and std.mem.trim(u8, body, " \t\r\n").len == 0) {
-        return WriteError.Empty;
-    }
-
-    var stem_buf: [stem_len]u8 = undefined;
-    const stem = makeStem(&stem_buf, epoch_secs, suffix);
+) ![]u8 {
     std.debug.assert(stemIsFilenameSafe(stem));
+
+    const staging = try stagingDir(alloc, ctx.worktree_path, stem);
+    errdefer alloc.free(staging);
+    try std.fs.cwd().makePath(staging);
+
+    // Drafts composed but never sent would otherwise leave their folders here
+    // forever, and nothing else ever looks at this directory. Sweeping on each
+    // write is what makes the staging area self-limiting without a timer.
+    _ = pruneStaleStaging(alloc, ctx.worktree_path, stem, epoch_secs, stale_staging_secs);
 
     var created_buf: [20]u8 = undefined;
     const created = formatCreated(&created_buf, epoch_secs);
-
     const json = try serialize(alloc, stem, created, body, ctx, quotes, images);
     defer alloc.free(json);
-
-    const feedback_dir = try std.fs.path.join(alloc, &.{
-        ctx.worktree_path, temp_dir_name, queue_dir_name,
-    });
-    defer alloc.free(feedback_dir);
-    const staging = try std.fs.path.join(alloc, &.{ feedback_dir, staging_dir_name, stem });
-    defer alloc.free(staging);
-    const queue = try std.fs.path.join(alloc, &.{ feedback_dir, new_dir_name });
-    defer alloc.free(queue);
-    const final = try std.fs.path.join(alloc, &.{ queue, stem });
-    errdefer alloc.free(final);
-
-    // The queue directory has to exist BEFORE the rename, or the publish fails
-    // with the report already assembled.
-    try std.fs.cwd().makePath(queue);
-    try std.fs.cwd().makePath(staging);
-    // A staging folder left behind by a failed write would be swept up by the
-    // next one only by luck, so this write owns its own cleanup.
-    errdefer std.fs.cwd().deleteTree(staging) catch {};
 
     {
         const report_path = try std.fs.path.join(alloc, &.{ staging, report_file_name });
@@ -591,7 +594,7 @@ pub fn write(
         try file.writeAll(json);
     }
 
-    // Inside the staging folder, so the single rename below publishes the
+    // Inside the staging folder, so the single rename in `write` publishes the
     // report and every one of its images at once. A watcher can never see a
     // report whose pictures have not arrived yet.
     if (images.len != 0) {
@@ -612,6 +615,112 @@ pub fn write(
         }
     }
 
+    return staging;
+}
+
+/// Remove staging folders left by drafts that were never sent. Only folders
+/// whose last modification is older than `older_than_secs` go, and never
+/// `keep_stem` — so the draft being composed right now, in this pane or
+/// another, is safe, and so is one another pane started minutes ago. Returns
+/// how many were removed.
+///
+/// `now_secs` and `older_than_secs` are injected so a test can age a folder
+/// without waiting a day. A directory that cannot be opened, statted or deleted
+/// is skipped rather than failing the write that called this: a sweep is
+/// housekeeping, and housekeeping must never cost the user their report.
+pub fn pruneStaleStaging(
+    alloc: Allocator,
+    worktree_path: []const u8,
+    keep_stem: []const u8,
+    now_secs: u64,
+    older_than_secs: i64,
+) usize {
+    const root = std.fs.path.join(alloc, &.{
+        worktree_path, temp_dir_name, queue_dir_name, staging_dir_name,
+    }) catch return 0;
+    defer alloc.free(root);
+
+    var dir = std.fs.cwd().openDir(root, .{ .iterate = true }) catch return 0;
+    defer dir.close();
+
+    var removed: usize = 0;
+    var it = dir.iterate();
+    while (it.next() catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (std.mem.eql(u8, entry.name, keep_stem)) continue;
+
+        var sub = dir.openDir(entry.name, .{}) catch continue;
+        const st = sub.stat() catch {
+            sub.close();
+            continue;
+        };
+        sub.close();
+
+        // `mtime` is nanoseconds since the epoch and can legitimately sit in
+        // the FUTURE (a clock that stepped back, a file copied off another
+        // box), which on a subtraction of unsigned seconds would wrap into
+        // "unimaginably old" and delete a live draft.
+        const mtime_secs: i128 = @divFloor(st.mtime, std.time.ns_per_s);
+        const age: i128 = @as(i128, now_secs) - mtime_secs;
+        if (age <= older_than_secs) continue;
+
+        dir.deleteTree(entry.name) catch continue;
+        removed += 1;
+    }
+    return removed;
+}
+
+/// Build the report folder under `.staging/` and publish it into `new/` with a
+/// single rename. See the header for why the two directories are siblings.
+///
+/// `epoch_secs` and `suffix` are injected rather than read here so a test can
+/// assert an exact folder name; `ViewerPane` passes the wall clock and a
+/// random 24-bit suffix.
+///
+/// `draft_stem` is the composer's own draft folder (T645). When it is given,
+/// THAT folder is refreshed and published, so anything the user dropped into it
+/// while composing rides along into the report; when it is null a fresh stem is
+/// minted from `epoch_secs`/`suffix`, which is what a caller with no composer
+/// behind it — a test, a future scripted filer — wants.
+pub fn write(
+    alloc: Allocator,
+    ctx: Context,
+    body: []const u8,
+    quotes: []const Quote,
+    images: []const Image,
+    epoch_secs: u64,
+    suffix: u24,
+    draft_stem: ?[]const u8,
+) !Written {
+    // A report whose whole content is a picture is a real report, so an empty
+    // BODY is only empty when there are no images either.
+    if (images.len == 0 and std.mem.trim(u8, body, " \t\r\n").len == 0) {
+        return WriteError.Empty;
+    }
+
+    var stem_buf: [stem_len]u8 = undefined;
+    const minted = makeStem(&stem_buf, epoch_secs, suffix);
+    const stem = if (draft_stem) |s| s else minted;
+    std.debug.assert(stemIsFilenameSafe(stem));
+
+    const queue = try std.fs.path.join(alloc, &.{
+        ctx.worktree_path, temp_dir_name, queue_dir_name, new_dir_name,
+    });
+    defer alloc.free(queue);
+    const final = try std.fs.path.join(alloc, &.{ queue, stem });
+    errdefer alloc.free(final);
+
+    // The queue directory has to exist BEFORE the rename, or the publish fails
+    // with the report already assembled.
+    try std.fs.cwd().makePath(queue);
+
+    const staging = try stage(alloc, ctx, body, quotes, images, stem, epoch_secs);
+    defer alloc.free(staging);
+
+    // Deliberately NOT cleaned up on a failed rename: the folder may hold files
+    // the user dragged in, and a publish that failed is one the next press
+    // retries into the same stem. An orphan is swept by `pruneStaleStaging` a
+    // day later, which is the cost of never deleting somebody's attachment.
     try std.fs.cwd().rename(staging, final);
 
     return .{ .folder = final, .stem = try alloc.dupe(u8, stem) };
@@ -991,6 +1100,7 @@ test "write: one complete folder appears, and nothing is left staged" {
         &.{},
         sample_epoch,
         0xa3f9c2,
+        null,
     );
     defer written.deinit(alloc);
     try testing.expectEqualStrings("20260809T004912Z-a3f9c2", written.stem);
@@ -1022,9 +1132,9 @@ test "write: a second report in the same second gets its own folder" {
     const root = try tmp.dir.realpathAlloc(alloc, ".");
     defer alloc.free(root);
 
-    const a = try write(alloc, sampleContext(root), "first", &.{}, &.{}, sample_epoch, 0x000001);
+    const a = try write(alloc, sampleContext(root), "first", &.{}, &.{}, sample_epoch, 0x000001, null);
     defer a.deinit(alloc);
-    const b = try write(alloc, sampleContext(root), "second", &.{}, &.{}, sample_epoch, 0x000002);
+    const b = try write(alloc, sampleContext(root), "second", &.{}, &.{}, sample_epoch, 0x000002, null);
     defer b.deinit(alloc);
     try testing.expect(!std.mem.eql(u8, a.stem, b.stem));
 
@@ -1045,7 +1155,7 @@ test "write: an empty composer files nothing at all" {
 
     try testing.expectError(
         WriteError.Empty,
-        write(alloc, sampleContext(root), "   \n\t ", &.{}, &.{}, sample_epoch, 0x000001),
+        write(alloc, sampleContext(root), "   \n\t ", &.{}, &.{}, sample_epoch, 0x000001, null),
     );
     // Not even the queue directory: a refused send must leave no trace for a
     // watcher to poll.
@@ -1071,6 +1181,7 @@ test "write: the images land in the folder, published by the same one rename" {
         &images,
         sample_epoch,
         0xa3f9c2,
+        null,
     );
     defer written.deinit(alloc);
 
@@ -1092,6 +1203,207 @@ test "write: the images land in the folder, published by the same one rename" {
     );
 }
 
+test "stage: the draft's folder appears, holding a report nothing has published" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    // A draft with nothing typed into it yet is a real state — the folder has
+    // to exist before there is anything to say, or the footer link would open
+    // nothing on a fresh composer.
+    const staging = try stage(alloc, sampleContext(root), "", &.{}, &.{}, "20260809T004912Z-a3f9c2", sample_epoch);
+    defer alloc.free(staging);
+
+    const body = try tmp.dir.readFileAlloc(
+        alloc,
+        "temp/feedback/.staging/20260809T004912Z-a3f9c2/report.json",
+        64 * 1024,
+    );
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("20260809T004912Z-a3f9c2", parsed.value.object.get("id").?.string);
+
+    // ...and the queue is untouched: staging a draft is not filing a report,
+    // which is the whole distinction a watcher polling `new/` depends on.
+    try testing.expectError(error.FileNotFound, tmp.dir.access("temp/feedback/new", .{}));
+}
+
+test "stage: a file the user dropped in survives every refresh, and rides along to the queue" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const stem = "20260809T004912Z-a3f9c2";
+    const first = try stage(alloc, sampleContext(root), "half a thought", &.{}, &.{}, stem, sample_epoch);
+    alloc.free(first);
+
+    // What the footer link is FOR: the user opens the folder and drops a log
+    // into it.
+    try tmp.dir.writeFile(.{
+        .sub_path = "temp/feedback/.staging/20260809T004912Z-a3f9c2/crash.log",
+        .data = "the log they dragged in",
+    });
+
+    // They keep typing, so the draft is staged again over the same folder.
+    const second = try stage(alloc, sampleContext(root), "the whole thought", &.{}, &.{}, stem, sample_epoch + 30);
+    alloc.free(second);
+    try tmp.dir.access("temp/feedback/.staging/20260809T004912Z-a3f9c2/crash.log", .{});
+
+    // And then they send. The publish is still ONE rename, and it takes the
+    // dropped file with it — the property this whole draft folder exists for.
+    const written = try write(
+        alloc,
+        sampleContext(root),
+        "the whole thought",
+        &.{},
+        &.{},
+        sample_epoch + 60,
+        0x000009,
+        stem,
+    );
+    defer written.deinit(alloc);
+    try testing.expectEqualStrings(stem, written.stem);
+
+    const dropped = try tmp.dir.readFileAlloc(
+        alloc,
+        "temp/feedback/new/20260809T004912Z-a3f9c2/crash.log",
+        4096,
+    );
+    defer alloc.free(dropped);
+    try testing.expectEqualStrings("the log they dragged in", dropped);
+
+    // The published report is the LAST staged one, not the first: the folder
+    // is refreshed in place, so a stale `report.json` cannot be what ships.
+    const body = try tmp.dir.readFileAlloc(
+        alloc,
+        "temp/feedback/new/20260809T004912Z-a3f9c2/report.json",
+        64 * 1024,
+    );
+    defer alloc.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("the whole thought", parsed.value.object.get("body").?.string);
+
+    // ...and the draft folder is gone, because it BECAME the published folder.
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access("temp/feedback/.staging/20260809T004912Z-a3f9c2", .{}),
+    );
+}
+
+test "pruneStaleStaging: an abandoned draft is swept; the live one never is" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    // Three folders, all created NOW: one being composed into, one somebody
+    // else started a minute ago, one abandoned yesterday. The clock is what
+    // separates them, which is why it is injected.
+    for ([_][]const u8{ "mine", "another-pane", "abandoned" }) |name| {
+        const dir = try std.fs.path.join(alloc, &.{ root, "temp", "feedback", ".staging", name });
+        defer alloc.free(dir);
+        try std.fs.cwd().makePath(dir);
+    }
+    const now: u64 = @intCast(@max(std.time.timestamp(), 0));
+
+    // Nothing is a day old yet, so a sweep right now removes nothing at all —
+    // the case that matters most, because getting it wrong deletes a report
+    // somebody is in the middle of writing.
+    try testing.expectEqual(
+        @as(usize, 0),
+        pruneStaleStaging(alloc, root, "mine", now, stale_staging_secs),
+    );
+    try tmp.dir.access("temp/feedback/.staging/another-pane", .{});
+
+    // A day later they are all stale by the clock — and `mine` is still not
+    // swept, because the draft being composed is exempt however old it is.
+    try testing.expectEqual(
+        @as(usize, 2),
+        pruneStaleStaging(alloc, root, "mine", now + 25 * 60 * 60, stale_staging_secs),
+    );
+    try tmp.dir.access("temp/feedback/.staging/mine", .{});
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access("temp/feedback/.staging/abandoned", .{}),
+    );
+
+    // A staging area that is not there at all is not an error: the first draft
+    // on a fresh worktree sweeps before anything has ever been staged.
+    var empty = testing.tmpDir(.{});
+    defer empty.cleanup();
+    const empty_root = try empty.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(empty_root);
+    try testing.expectEqual(
+        @as(usize, 0),
+        pruneStaleStaging(alloc, empty_root, "mine", now, stale_staging_secs),
+    );
+}
+
+test "stage: staging a draft sweeps the drafts nobody came back to" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    const old = try std.fs.path.join(alloc, &.{ root, "temp", "feedback", ".staging", "left-behind" });
+    defer alloc.free(old);
+    try std.fs.cwd().makePath(old);
+
+    // The sweep rides on the draft's own write, so it needs no timer and no
+    // startup pass — and the clock it judges by is the one the caller staged
+    // with, here a day after the folder above was made.
+    const now: u64 = @intCast(@max(std.time.timestamp(), 0));
+    const staging = try stage(
+        alloc,
+        sampleContext(root),
+        "a new draft",
+        &.{},
+        &.{},
+        "20260809T004912Z-a3f9c2",
+        now + 25 * 60 * 60,
+    );
+    defer alloc.free(staging);
+
+    try testing.expectError(
+        error.FileNotFound,
+        tmp.dir.access("temp/feedback/.staging/left-behind", .{}),
+    );
+    try tmp.dir.access("temp/feedback/.staging/20260809T004912Z-a3f9c2/report.json", .{});
+}
+
+test "write: a draft stem publishes under the draft's own name, not a fresh one" {
+    const alloc = testing.allocator;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realpathAlloc(alloc, ".");
+    defer alloc.free(root);
+
+    // The stem the composer minted when it opened — deliberately NOT what
+    // `epoch_secs`/`suffix` would produce, so a publish that quietly minted its
+    // own name would show up here rather than in a user's missing attachment.
+    const written = try write(
+        alloc,
+        sampleContext(root),
+        "filed from a draft",
+        &.{},
+        &.{},
+        sample_epoch,
+        0xa3f9c2,
+        "20260808T120000Z-000abc",
+    );
+    defer written.deinit(alloc);
+    try testing.expectEqualStrings("20260808T120000Z-000abc", written.stem);
+    try tmp.dir.access("temp/feedback/new/20260808T120000Z-000abc/report.json", .{});
+}
+
 test "write: a report that is only a picture is not an empty report" {
     const alloc = testing.allocator;
     var tmp = testing.tmpDir(.{});
@@ -1110,6 +1422,7 @@ test "write: a report that is only a picture is not an empty report" {
         &images,
         sample_epoch,
         0x000001,
+        null,
     );
     defer written.deinit(alloc);
     try tmp.dir.access("temp/feedback/new/20260809T004912Z-000001/images/image-1.png", .{});

@@ -69,6 +69,9 @@ const Job = struct {
     images: []report.Image,
     epoch_secs: u64,
     suffix: u24,
+    /// The composer's own draft folder, empty when the caller has none and the
+    /// worker should mint a fresh stem.
+    draft_stem: []const u8 = "",
 
     /// Filled by the worker.
     ok: bool = false,
@@ -107,6 +110,10 @@ pub const Request = struct {
     images: []const report.Image = &.{},
     epoch_secs: u64,
     suffix: u24,
+    /// The stem of the folder the composer has been drafting into (T645), so
+    /// the publish carries any file the user dropped in there. Null for a
+    /// caller with no draft behind it.
+    draft_stem: ?[]const u8 = null,
 };
 
 /// What `complete` hands back. `text` is the line the composer's footer shows,
@@ -207,6 +214,7 @@ pub fn begin(self: *Sender, req: Request) bool {
 fn fill(job: *Job, req: Request) !void {
     const aa = job.arena.allocator();
     job.body = try aa.dupe(u8, req.body);
+    if (req.draft_stem) |stem| job.draft_stem = try aa.dupe(u8, stem);
     job.ctx = .{
         .location = try aa.dupe(u8, req.location),
         .kind = try aa.dupe(u8, req.kind),
@@ -275,6 +283,7 @@ fn work(self: *Sender, job: *Job) void {
         job.images,
         job.epoch_secs,
         job.suffix,
+        if (job.draft_stem.len != 0) job.draft_stem else null,
     )) |written| {
         job.ok = true;
         job.stem = written.stem;

@@ -40,6 +40,7 @@
 #     C and D geometric assertions rather than log-scraping.
 #   * the pane states each open/close in its own stderr:
 #         viewer feedback pane=<id> open=<bool> bar_h=<px> worktree=<path>
+#             staging=<worktree-relative draft folder, or <none>>
 #     and each send as
 #         viewer feedback pane=<id> action=send bytes=<n> quotes=<n> ...
 #         viewer feedback pane=<id> filed=<bool> stem=<name> status=<text>
@@ -184,6 +185,21 @@ function Get-ContentTop($paneHwnd) {
         if ($null -eq $best -or $c.Top -lt $best) { $best = [int]$c.Top }
     }
     return $best
+}
+
+# The draft staging folder the pane last reported (T645) -- worktree-relative,
+# e.g. `temp/feedback/.staging/20260908T051200Z-a3f9c2`. The stem inside it is
+# random, so this line is the only way a test can name the folder the footer
+# link points at.
+function Get-FeedbackStaging($errlog, $paneId) {
+    if (-not (Test-Path $errlog) -or -not $paneId) { return $null }
+    $hit = $null
+    foreach ($line in (Get-Content $errlog -ErrorAction SilentlyContinue)) {
+        if ($line -match "viewer feedback pane=$([regex]::Escape($paneId)) open=\w+ bar_h=\d+ worktree=\S+ staging=(\S+)") {
+            if ($Matches[1] -ne '<none>') { $hit = $Matches[1] }
+        }
+    }
+    return $hit
 }
 
 # The pane's LAST reported composer state, from the GUI's stderr.
@@ -565,6 +581,32 @@ try {
     # unrolls a one-element array on return, and `.Count` on the bare object is
     # $null -- which reads as "0 folders" and passes a test that should fail.
     Assert (@(Get-QueueFolders $queueDir).Count -eq 0) 'the queue starts empty'
+
+    # --- G1. the draft's own folder (T645) -----------------------------------
+    # The composer minted a stem when it opened, and the footer link names that
+    # folder. Opening created NOTHING: a composer opened and closed without a
+    # word must leave no folder behind.
+    $draftRel = Get-FeedbackStaging $errlog $paneId
+    Assert ($null -ne $draftRel) "the pane names the draft's staging folder ('$draftRel')"
+    $draftStem = $null
+    if ($draftRel) {
+        Assert ($draftRel -like 'temp/feedback/.staging/*') `
+            "...under the staging area, forward-slashed for display ('$draftRel')"
+        $draftStem = $draftRel.Split('/')[-1]
+    }
+    $draftDir = if ($draftStem) { Join-Path $stagingDir $draftStem } else { $null }
+    Assert ($draftDir -and -not (Test-Path $draftDir)) `
+        'opening the composer created no folder -- the draft materializes on reveal or on send'
+
+    # What the footer link is FOR: the user opens that folder and drops a file
+    # in. The click itself launches File Explorer, which is not a thing to do on
+    # a background test desktop, so the DROP is done here directly -- the
+    # property under test is that the send publishes whatever is in the folder.
+    if ($draftDir) {
+        New-Item -ItemType Directory -Path $draftDir -Force | Out-Null
+        Set-Content -Path (Join-Path $draftDir 'dropped.log') -Encoding utf8 -Value 'the log they dragged in'
+    }
+
     [void](Send-TestViewerChord -Window $view.Top -Target $rich -Key Enter -Modifiers Ctrl)
     $len = $null
     for ($t = 0; $t -lt 20; $t++) {
@@ -592,6 +634,13 @@ try {
     Assert (-not $sawPartial) 'no folder was ever visible in the queue without its report.json'
     Assert (-not (Test-Path (Join-Path $stagingDir $folders[0].Name))) `
         'the staging folder is gone -- it WAS the published one, renamed'
+    # The published folder is the DRAFT's folder under the DRAFT's name (T645),
+    # which is what makes the file dropped into it a part of the report rather
+    # than something stranded in a staging directory nobody drains.
+    Assert ($draftStem -and $folders[0].Name -eq $draftStem) `
+        "the report was filed under the draft's own stem ('$($folders[0].Name)' vs '$draftStem')"
+    Assert (Test-Path (Join-Path $queueDir (Join-Path $folders[0].Name 'dropped.log'))) `
+        '...and the file dropped into the draft folder rode along into the queue'
 
     $reportPath = Join-Path $queueDir (Join-Path $folders[0].Name 'report.json')
     $report = $null

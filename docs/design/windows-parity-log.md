@@ -25118,3 +25118,35 @@ taking it on trust. Four new unit tests cover the wordings and
 `killOutcomeFor`'s generosity toward an unfamiliar message. The nine static
 audits the script edit came due for are green and re-stamped. T1449 carries the
 same wording to the Mac seat, which has the identical defect.
+
+## 2026-09-08 - T645: the feedback composer's draft folder, its footer link, and its own housekeeping
+
+The composer now mints its report folder's name when it OPENS and keeps it until
+the report is filed, so the footer can show `<worktree>/temp/feedback/.staging/<stem>`
+as a link that opens that folder in File Explorer. That is the point of the
+feature: the user drops a log, a crash dump or a recording in there and it is
+published with the report, because the send is that same folder refreshed in
+place and renamed into the queue rather than a fresh folder built from the text
+alone. Mac has had this since the composer shipped (`stage` / `feedbackDraftStem`
+/ `revealFeedbackStagingFolder`); win32 minted its stem inside `write`, so there
+was nothing to link to until the report was already gone.
+
+`viewer_feedback_report` gains `stage()` (write `report.json` and the draft's own
+`images/` in place, leaving every other file alone), `stagingDir()`, and
+`pruneStaleStaging()` - drafts composed and never sent sweep themselves on the
+next draft's write, 24h, never the live one, on an injected clock. `write()`
+takes an optional draft stem and publishes THAT folder. `ViewerPane` grew the
+stem, `feedbackStagingRelative`, `revealFeedbackStagingFolder`, and a
+`feedbackSnapshot` helper the send and the reveal share so the folder the user
+opens holds the same report the send would file. The footer link is drawn in the
+banner card's link idiom - dotted underline at rest, solid under the pointer,
+hand cursor.
+
+Validation: all four floor lanes PASS; `test\win32\viewer-feedback.ps1` ALL PASS
+(96), with new section G1 asserting that opening the composer creates nothing,
+that the publish uses the draft's own stem, and that a file dropped into the
+draft folder is in the queue afterwards; `test\win32\feedback-user-report.ps1`
+ALL PASS (10) for the docs edit. Five new unit tests in the `none` lane cover
+stage/prune/publish-with-stem, and a negative control confirmed they can go red.
+The Explorer launch itself is manual - a `ShellExecute` is not something to fire
+from a background test desktop.

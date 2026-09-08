@@ -90,6 +90,7 @@ const chrome_reposition = @import("chrome_reposition.zig");
 const color_math = @import("color_math.zig");
 const chrome_theme = @import("chrome_theme.zig");
 const banner_card = @import("banner_card.zig");
+const banner_layout = @import("banner_layout.zig");
 const type_ramp = @import("type_ramp.zig");
 const icon_button = @import("icon_button.zig");
 const icon_paint = @import("icon_button_paint.zig");
@@ -106,6 +107,7 @@ const RegionSelector = @import("RegionSelector.zig");
 const system_colors = @import("system_colors.zig");
 const viewer_accel = @import("viewer_accel.zig");
 const ViewerPane = @import("ViewerPane.zig");
+const viewer_worktree = @import("viewer_worktree.zig");
 const input = @import("../../input.zig");
 
 const log = std.log.scoped(.viewer_feedback);
@@ -172,6 +174,15 @@ hover: ?layout_mod.Button = null,
 pressed: ?layout_mod.Button = null,
 tracking: bool = false,
 focused: bool = false,
+
+/// Where the footer's staging-folder link was last painted, and whether the
+/// pointer is on it (T645). Recorded by the paint rather than derived by the
+/// layout, because the link's width is the width of a string the layout knows
+/// nothing about — the draft's stem — and a hit box that disagreed with the
+/// underline would be a link you cannot click where it looks clickable.
+link_rect: layout_mod.Rect = .{},
+link_hover: bool = false,
+link_pressed: bool = false,
 
 /// Which of the composer's three stops holds keyboard focus (T640). `.text`
 /// means the text surface has it — the RichEdit or the web composer — and is
@@ -2397,6 +2408,10 @@ fn paintButtons(self: *ViewerFeedbackBar, hdc: w32.HDC, l: layout_mod.Layout) vo
 /// wrong repo is the main failure mode, so the destination is on screen the
 /// whole time the composer is open (Mac's footer, same reasoning).
 fn paintFooter(self: *ViewerFeedbackBar, hdc: w32.HDC, l: layout_mod.Layout) void {
+    // Cleared up front so every path below either paints the link and records
+    // where, or leaves no hit box behind. A footer that went away at a narrow
+    // width must not keep answering clicks where it used to be.
+    self.link_rect = .{};
     if (l.footer.isEmpty()) return;
     const saved = w32.SaveDC(hdc);
     defer _ = w32.RestoreDC(hdc, saved);
@@ -2429,9 +2444,54 @@ fn paintFooter(self: *ViewerFeedbackBar, hdc: w32.HDC, l: layout_mod.Layout) voi
         );
         _ = w32.SetTextColor(hdc, self.text_ref);
         drawUtf8(hdc, l.footer.left, l.footer.top, status);
+        // A "Filed …" line has taken the footer, so there is nothing to click
+        // where the link was a moment ago — which the reset at the top of this
+        // function has already seen to.
         return;
     }
 
+    // The draft's own folder, as a link — the destination the report is about
+    // to take, and a folder the user can open and drop files into so they ride
+    // along with the report (T645, Mac's `stagingLink`).
+    var path_buf: [ViewerPane.staging_path_max]u8 = undefined;
+    var line_buf: [ViewerPane.staging_path_max + 260]u8 = undefined;
+    const line: ?[]const u8 = if (self.pane.feedbackStagingRelative(&path_buf)) |rel| line: {
+        const root = self.pane.feedbackWorktree() orelse break :line null;
+        break :line std.fmt.bufPrint(&line_buf, "{s}/{s}", .{
+            viewer_worktree.worktreeName(root), rel,
+        }) catch null;
+    } else null;
+
+    if (line) |text| {
+        const saved2 = w32.SaveDC(hdc);
+        defer _ = w32.RestoreDC(hdc, saved2);
+        const clip_right = @max(l.footer.right - hint_w - 8, l.footer.left);
+        _ = w32.IntersectClipRect(hdc, l.footer.left, l.footer.top, clip_right, l.footer.bottom);
+        // Hovering brightens it to body text the way every other link in this
+        // chrome does; the underline is what says "link" when it is not hovered.
+        if (self.link_hover) _ = w32.SetTextColor(hdc, self.text_ref);
+        drawUtf8(hdc, l.footer.left, l.footer.top, text);
+
+        const w = @min(textWidth(hdc, text), clip_right - l.footer.left);
+        self.paintLinkUnderline(
+            hdc,
+            l.footer.left,
+            l.footer.top,
+            w,
+            textHeight(hdc, text),
+            self.link_hover,
+        );
+        self.link_rect = .{
+            .left = l.footer.left,
+            .top = l.footer.top,
+            .right = l.footer.left + w,
+            .bottom = l.footer.bottom,
+        };
+        return;
+    }
+
+    // No draft and no worktree name to build one from: fall back to naming the
+    // working tree, which is the thing a misfiled report gets wrong.
     if (self.pane.feedbackWorktree()) |root| {
         const saved2 = w32.SaveDC(hdc);
         defer _ = w32.RestoreDC(hdc, saved2);
@@ -2446,11 +2506,70 @@ fn paintFooter(self: *ViewerFeedbackBar, hdc: w32.HDC, l: layout_mod.Layout) voi
     }
 }
 
+/// The rule under a link, in the shape this chrome's other links use (the
+/// banner card's): dotted at rest, solid under the pointer, on the same DPI
+/// geometry so the two never disagree about where a link's underline sits.
+/// Drawn rather than carried on a second underlined font, because the dotted
+/// rest state is not something a font can express.
+fn paintLinkUnderline(
+    self: *ViewerFeedbackBar,
+    hdc: w32.HDC,
+    x: i32,
+    text_y: i32,
+    w: i32,
+    text_h: i32,
+    solid: bool,
+) void {
+    if (w <= 0) return;
+    const u = banner_layout.linkUnderline(text_y, text_h, self.scale);
+    const color = if (solid) self.text_ref else self.secondary_ref;
+    const brush = w32.CreateSolidBrush(color) orelse return;
+    defer _ = w32.DeleteObject(brush);
+
+    if (solid) {
+        var r: w32.RECT = .{ .left = x, .top = u.y, .right = x + w, .bottom = u.y + u.thickness };
+        _ = w32.FillRect(hdc, &r, brush);
+        return;
+    }
+    // Dot phase keyed to the client x, the same absolute phase the banner uses
+    // — here there is only one run, but keeping the rule identical is what
+    // stops the two link treatments drifting apart.
+    const end = x + w;
+    var dx: i32 = x - @mod(x, u.period);
+    while (dx < end) : (dx += u.period) {
+        const left = @max(x, dx);
+        const right = @min(end, dx + u.dot);
+        if (right <= left) continue;
+        var r: w32.RECT = .{ .left = left, .top = u.y, .right = right, .bottom = u.y + u.thickness };
+        _ = w32.FillRect(hdc, &r, brush);
+    }
+}
+
+/// Whether a client point is on the footer's staging link.
+fn hitLink(self: *const ViewerFeedbackBar, x: i32, y: i32) bool {
+    const r = self.link_rect;
+    if (r.right <= r.left) return false;
+    return x >= r.left and x < r.right and y >= r.top and y < r.bottom;
+}
+
 fn drawUtf8(hdc: w32.HDC, x: i32, y: i32, text: []const u8) void {
     var buf: [512]u16 = undefined;
     const n = std.unicode.utf8ToUtf16Le(&buf, text) catch return;
     if (n == 0) return;
     _ = w32.TextOutW(hdc, x, y, &buf, @intCast(n));
+}
+
+/// The drawn height of a run, which is where a link's underline goes. Measured
+/// rather than assumed: the caption font's line box changes with the DPI, and
+/// an underline placed at a constant offset would cut through the descenders at
+/// one scale and float away from the text at another.
+fn textHeight(hdc: w32.HDC, text: []const u8) i32 {
+    var buf: [512]u16 = undefined;
+    const n = std.unicode.utf8ToUtf16Le(&buf, text) catch return 0;
+    if (n == 0) return 0;
+    var size: w32.SIZE = .{ .cx = 0, .cy = 0 };
+    _ = w32.GetTextExtentPoint32W(hdc, &buf, @intCast(n), &size);
+    return size.cy;
 }
 
 fn textWidth(hdc: w32.HDC, text: []const u8) i32 {
@@ -2473,8 +2592,10 @@ fn updateHover(self: *ViewerFeedbackBar, x: i32, y: i32) void {
         (if (self.buttonEnabled(b)) b else null)
     else
         null;
-    if (hot_enabled == self.hover) return;
+    const on_link = self.hitLink(x, y);
+    if (hot_enabled == self.hover and on_link == self.link_hover) return;
     self.hover = hot_enabled;
+    self.link_hover = on_link;
     _ = w32.InvalidateRect(self.hwnd, null, 1);
 }
 
@@ -2805,6 +2926,20 @@ fn wndProc(
             return 0;
         },
 
+        // The link is the one thing in this band that is not a button, so it
+        // needs its own cursor answer; everything else keeps the arrow.
+        w32.WM_SETCURSOR => {
+            var pt: w32.POINT = undefined;
+            if (w32.GetCursorPos_(&pt) != 0) {
+                _ = w32.ScreenToClient(hwnd, &pt);
+                if (self.hitLink(pt.x, pt.y)) {
+                    _ = w32.SetCursor(w32.LoadCursorW(null, w32.IDC_HAND));
+                    return 1;
+                }
+            }
+            return w32.DefWindowProcW(hwnd, msg, wparam, lparam);
+        },
+
         w32.WM_MOUSEMOVE => {
             const x: i32 = @intCast(@as(i16, @bitCast(@as(u16, @intCast(lparam & 0xFFFF)))));
             const y: i32 = @intCast(@as(i16, @bitCast(@as(u16, @intCast((lparam >> 16) & 0xFFFF)))));
@@ -2823,9 +2958,10 @@ fn wndProc(
 
         w32.WM_MOUSELEAVE => {
             self.tracking = false;
-            if (self.hover != null or self.pressed != null) {
+            if (self.hover != null or self.pressed != null or self.link_hover) {
                 self.hover = null;
                 self.pressed = null;
+                self.link_hover = false;
                 _ = w32.InvalidateRect(hwnd, null, 1);
             }
             return 0;
@@ -2838,6 +2974,11 @@ fn wndProc(
             // composer to type in it is not a thing a user should have to aim
             // for.
             _ = w32.SetFocus(hwnd);
+            if (self.hitLink(x, y)) {
+                self.link_pressed = true;
+                _ = w32.SetCapture(hwnd);
+                return 0;
+            }
             const l = self.currentLayout();
             if (l.hitButton(self.scale, x, y)) |b| {
                 if (self.buttonEnabled(b)) {
@@ -2863,8 +3004,17 @@ fn wndProc(
             _ = w32.ReleaseCapture();
             const was = self.pressed;
             const was_thumb = self.pressed_thumb;
+            const was_link = self.link_pressed;
             self.pressed = null;
             self.pressed_thumb = null;
+            self.link_pressed = false;
+            if (was_link) {
+                _ = w32.InvalidateRect(hwnd, null, 1);
+                // A click that slid off the link is a cancelled click, the same
+                // rule the buttons and the tiles follow.
+                if (self.hitLink(x, y)) self.pane.revealFeedbackStagingFolder(self.alloc);
+                return 0;
+            }
             _ = w32.InvalidateRect(hwnd, null, 1);
             const l = self.currentLayout();
             if (was) |b| {

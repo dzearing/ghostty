@@ -568,6 +568,14 @@ feedback: ?*ViewerFeedbackBar = null,
 /// reason: restoring an open composer would cover the content it is about.
 feedback_open: bool = false,
 
+/// The draft's staging-folder name, minted when the composer opens and cleared
+/// when a report is filed (T645, Mac's `feedbackDraftStem`). Stable for the
+/// draft's whole life, which is what lets the footer link, the files the user
+/// drops into that folder, and the eventual atomic publish all name ONE folder.
+/// Zero-length when no draft is in progress.
+feedback_stem_buf: [feedback_report.stem_len]u8 = undefined,
+feedback_stem_len: usize = 0,
+
 /// The composer's text. On the PANE, not on the bar, because Mac is explicit
 /// that contents survive toggling the toolbar closed and open — and on win32
 /// the natural mistake is to own the buffer in the child window, where it
@@ -1174,6 +1182,18 @@ pub fn setFeedbackOpen(self: *ViewerPane, open: bool) void {
             return;
         };
         self.feedback_open = true;
+        // Minted here so the footer link has a concrete folder to name from the
+        // moment the composer appears. The folder itself is created lazily — on
+        // reveal or on send — so a composer opened and closed without a word
+        // leaves nothing behind.
+        if (self.feedback_stem_len == 0) {
+            const stem = feedback_report.makeStem(
+                &self.feedback_stem_buf,
+                @intCast(@max(std.time.timestamp(), 0)),
+                std.crypto.random.int(u24),
+            );
+            self.feedback_stem_len = stem.len;
+        }
         // A "Filed …" line from the last report is not true of this one, and a
         // confirmation still on screen while a fresh report is being typed is
         // the footer lying about where the text will go. (Only a pane with a
@@ -1203,11 +1223,16 @@ pub fn setFeedbackOpen(self: *ViewerPane, open: bool) void {
     // The acceptance script's oracle, and the same shape T633's line has:
     // native owner-painted chrome inside a background test desktop cannot be
     // screenshotted, so the pane states what it did in its own stderr.
-    log.info("viewer feedback pane={s} open={} bar_h={d} worktree={s}", .{
+    // `staging` is the draft folder the footer link names (T645) — the one
+    // thing on that line a test cannot otherwise learn, since the stem is
+    // random and the folder does not exist until the link is clicked.
+    var staging_buf: [staging_path_max]u8 = undefined;
+    log.info("viewer feedback pane={s} open={} bar_h={d} worktree={s} staging={s}", .{
         self.paneId(),
         self.feedback_open,
         self.feedbackBarHeight(),
         root orelse "<none>",
+        self.feedbackStagingRelative(&staging_buf) orelse "<none>",
     });
 }
 
@@ -1219,6 +1244,193 @@ fn feedbackBarHeight(self: *ViewerPane) i32 {
     var r: w32.RECT = undefined;
     if (w32.GetClientRect(h, &r) == 0) return 0;
     return bar.barHeight(@max(r.right - r.left, 0), self.scale);
+}
+
+/// The draft's staging-folder name, or null when no draft is in progress.
+pub fn feedbackDraftStem(self: *const ViewerPane) ?[]const u8 {
+    if (self.feedback_stem_len == 0) return null;
+    return self.feedback_stem_buf[0..self.feedback_stem_len];
+}
+
+/// Bytes `feedbackStagingRelative` can need: the staging area's path, a
+/// separator, and a stem.
+pub const staging_path_max = feedback_report.staging_relative_path.len + 1 + feedback_report.stem_len;
+
+/// Worktree-relative path of the draft's staging folder, for the composer's
+/// footer (`temp/feedback/.staging/<stem>`). Null when there is no draft or no
+/// worktree to file into — the two states in which the footer has nothing to
+/// link to. Written into `buf`, which must hold `staging_path_max` bytes.
+pub fn feedbackStagingRelative(self: *ViewerPane, buf: []u8) ?[]const u8 {
+    const stem = self.feedbackDraftStem() orelse return null;
+    if (self.feedbackWorktree() == null) return null;
+    return std.fmt.bufPrint(buf, "{s}/{s}", .{
+        feedback_report.staging_relative_path, stem,
+    }) catch null;
+}
+
+/// Open the draft's staging folder in File Explorer, materializing it first —
+/// the draft's images plus a work-in-progress `report.json` — so opening it
+/// never shows an empty or stale draft (T645, Mac's
+/// `revealFeedbackStagingFolder`).
+///
+/// The point is not just seeing where the report lands: the user can drop extra
+/// files into that folder — a log, a crash dump, a recording — and the send
+/// publishes the folder whole, so those files become part of the report.
+///
+/// The staged `report.json` deliberately carries no branch/commit: resolving
+/// those costs two `git` spawns, and this runs on the UI thread while somebody
+/// is waiting for a window to open. The PUBLISHED report gets them, from the
+/// send worker that is allowed to block.
+pub fn revealFeedbackStagingFolder(self: *ViewerPane, alloc: Allocator) void {
+    const root = self.feedbackWorktree() orelse return;
+    const stem = self.feedbackDraftStem() orelse return;
+
+    var snap = self.feedbackSnapshot(alloc) orelse {
+        self.setFeedbackStatus(alloc, "Could not open this draft's folder");
+        return;
+    };
+    defer snap.deinit();
+
+    var viewport_buf: [32]u8 = undefined;
+    const staging = feedback_report.stage(
+        alloc,
+        .{
+            .location = self.location orelse "",
+            .kind = if (self.mode == .web) "web" else "file",
+            .file_path = self.file_path,
+            .page_title = self.title,
+            .selection = self.page_selection,
+            .pane_id = if (pane_id_mod.isValid(self.paneId())) self.paneId() else null,
+            .viewport = self.viewportText(&viewport_buf),
+            .worktree_path = root,
+            .worktree_name = viewer_worktree.worktreeName(root),
+            .app_version = build_config.version_string,
+        },
+        snap.body,
+        snap.quotes,
+        snap.images,
+        stem,
+        @intCast(@max(std.time.timestamp(), 0)),
+    ) catch |err| {
+        log.warn("viewer feedback staging failed err={}", .{err});
+        self.setFeedbackStatus(alloc, "Could not open this draft's folder");
+        return;
+    };
+    defer alloc.free(staging);
+
+    openFolder(alloc, staging);
+
+    // The acceptance oracle, and the shape the rest of this chrome logs in:
+    // owner-painted chrome on a background test desktop cannot be
+    // screenshotted, so the pane says what it did in its own stderr.
+    log.info("viewer feedback pane={s} action=reveal stem={s} folder={s}", .{
+        self.paneId(), stem, staging,
+    });
+}
+
+/// Show a folder in File Explorer. Best-effort by design: a shell that refuses
+/// is a nuisance, and the folder is on screen in the footer either way.
+fn openFolder(alloc: Allocator, path: []const u8) void {
+    if (builtin.os.tag != .windows) return;
+    const wide = std.unicode.utf8ToUtf16LeAllocZ(alloc, path) catch return;
+    defer alloc.free(wide);
+    const verb = std.unicode.utf8ToUtf16LeStringLiteral("open");
+    _ = w32.ShellExecuteW(null, verb, wide.ptr, null, null, w32.SW_SHOW);
+}
+
+/// What the composer holds right now, rendered the way a report wants it: the
+/// markdown body with quotes and image links resolved, plus the live quote and
+/// image entries. Shared by the send and by the draft's staging write, so the
+/// folder the user opens holds the same report the send would file.
+///
+/// Every slice is either in the snapshot's own arena or borrowed from the
+/// pane's stores, so it is valid until `deinit` and no longer — both callers
+/// consume it synchronously (the sender copies into its job's arena).
+const FeedbackSnapshot = struct {
+    arena: std.heap.ArenaAllocator,
+    body: []const u8,
+    quotes: []feedback_report.Quote,
+    images: []feedback_report.Image,
+
+    fn deinit(self: *FeedbackSnapshot) void {
+        self.arena.deinit();
+    }
+};
+
+fn feedbackSnapshot(self: *ViewerPane, alloc: Allocator) ?FeedbackSnapshot {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    const parts = self.feedbackSnapshotParts(alloc, &arena) catch {
+        // `errdefer` would not fire here: the failure paths below are `error`
+        // returns, but this function's own answer is an OPTIONAL, and a `return
+        // null` runs no errdefer at all. Freeing explicitly is the difference
+        // between a failed send and a leaked arena per failed send.
+        arena.deinit();
+        return null;
+    };
+    return .{
+        .arena = arena,
+        .body = parts.body,
+        .quotes = parts.quotes,
+        .images = parts.images,
+    };
+}
+
+fn feedbackSnapshotParts(
+    self: *ViewerPane,
+    alloc: Allocator,
+    arena: *std.heap.ArenaAllocator,
+) !struct {
+    body: []const u8,
+    quotes: []feedback_report.Quote,
+    images: []feedback_report.Image,
+} {
+    const aa = arena.allocator();
+
+    // The quotes still in the text, and the metadata each one carries. Derived,
+    // never tallied: a block the user deleted is simply not in `spans`.
+    const spans = self.feedbackQuoteSpans(alloc) orelse &.{};
+    defer if (spans.len != 0) alloc.free(spans);
+
+    // The images still chipped into the text, and the entries they name.
+    // Derived exactly like the quotes, from the same buffer.
+    const image_spans = self.feedback_images.live(alloc, self.feedback_text.items) catch &.{};
+    defer if (image_spans.len != 0) alloc.free(image_spans);
+
+    const images = try aa.alloc(feedback_report.Image, image_spans.len);
+    const numbers = try aa.alloc(u32, image_spans.len);
+    for (image_spans, 0..) |sp, i| {
+        const e = self.feedback_images.entries.items[sp.index];
+        images[i] = .{
+            .number = e.number,
+            .png = e.png,
+            .pixel_width = e.pixel_width,
+            .pixel_height = e.pixel_height,
+        };
+        numbers[i] = e.number;
+    }
+
+    const quoted = try feedback_report.renderBody(aa, self.feedback_text.items, spans);
+    // Chips become markdown image references LAST, over the rendered body:
+    // `renderBody` has already moved every offset by adding `> ` and trimming,
+    // and the links are re-found by text rather than placed by offset.
+    const body = try feedback_images_mod.renderLinks(aa, quoted, numbers);
+
+    const quotes = try aa.alloc(feedback_report.Quote, spans.len);
+    for (spans, 0..) |sp, i| {
+        const e = self.feedback_quotes.entries.items[sp.index];
+        quotes[i] = .{
+            .number = e.id,
+            .text = e.text,
+            .heading_id = e.heading_id,
+            .heading_text = e.heading_text,
+            .block_selector = e.block_selector,
+            .block_text = e.block_text,
+            .offset_in_block = e.offset_in_block,
+            .document_offset = e.document_offset,
+        };
+    }
+
+    return .{ .body = body, .quotes = quotes, .images = images };
 }
 
 /// File the composed report into the detected worktree's queue (T636).
@@ -1237,71 +1449,17 @@ pub fn sendFeedback(self: *ViewerPane, alloc: Allocator) void {
     // A second press while the first send is out must not file twice.
     if (sender.busy()) return;
 
-    // The quotes still in the text, and the metadata each one carries. Derived,
-    // never tallied: a block the user deleted is simply not in `spans`.
-    const spans = self.feedbackQuoteSpans(alloc) orelse &.{};
-    defer if (spans.len != 0) alloc.free(spans);
+    var snap = self.feedbackSnapshot(alloc) orelse {
+        self.setFeedbackStatus(alloc, "Could not file this report (out of memory)");
+        return;
+    };
+    defer snap.deinit();
+    const body = snap.body;
+    const quotes = snap.quotes;
+    const images = snap.images;
 
-    // The images still chipped into the text, and the entries they name.
-    // Derived exactly like the quotes, from the same buffer.
-    const image_spans = self.feedback_images.live(alloc, self.feedback_text.items) catch &.{};
-    defer if (image_spans.len != 0) alloc.free(image_spans);
-
-    var images = alloc.alloc(feedback_report.Image, image_spans.len) catch {
-        self.setFeedbackStatus(alloc, "Could not file this report (out of memory)");
-        return;
-    };
-    defer alloc.free(images);
-    var numbers = alloc.alloc(u32, image_spans.len) catch {
-        self.setFeedbackStatus(alloc, "Could not file this report (out of memory)");
-        return;
-    };
-    defer alloc.free(numbers);
-    for (image_spans, 0..) |s, i| {
-        const e = self.feedback_images.entries.items[s.index];
-        images[i] = .{
-            .number = e.number,
-            .png = e.png,
-            .pixel_width = e.pixel_width,
-            .pixel_height = e.pixel_height,
-        };
-        numbers[i] = e.number;
-    }
-
-    const quoted = feedback_report.renderBody(alloc, self.feedback_text.items, spans) catch {
-        self.setFeedbackStatus(alloc, "Could not file this report (out of memory)");
-        return;
-    };
-    defer alloc.free(quoted);
-    // Chips become markdown image references LAST, over the rendered body:
-    // `renderBody` has already moved every offset by adding `> ` and trimming,
-    // and the links are re-found by text rather than placed by offset.
-    const body = feedback_images_mod.renderLinks(alloc, quoted, numbers) catch {
-        self.setFeedbackStatus(alloc, "Could not file this report (out of memory)");
-        return;
-    };
-    defer alloc.free(body);
     // A report that is nothing but a picture is still a report.
     if (images.len == 0 and std.mem.trim(u8, body, " \t\r\n").len == 0) return;
-
-    var quotes = alloc.alloc(feedback_report.Quote, spans.len) catch {
-        self.setFeedbackStatus(alloc, "Could not file this report (out of memory)");
-        return;
-    };
-    defer alloc.free(quotes);
-    for (spans, 0..) |s, i| {
-        const e = self.feedback_quotes.entries.items[s.index];
-        quotes[i] = .{
-            .number = e.id,
-            .text = e.text,
-            .heading_id = e.heading_id,
-            .heading_text = e.heading_text,
-            .block_selector = e.block_selector,
-            .block_text = e.block_text,
-            .offset_in_block = e.offset_in_block,
-            .document_offset = e.document_offset,
-        };
-    }
 
     var viewport_buf: [32]u8 = undefined;
     const viewport = self.viewportText(&viewport_buf);
@@ -1327,6 +1485,9 @@ pub fn sendFeedback(self: *ViewerPane, alloc: Allocator) void {
         // Only has to break a tie inside one second; the timestamp separates
         // everything else.
         .suffix = std.crypto.random.int(u24),
+        // The draft's own folder, so anything the user dropped into it through
+        // the footer link is published with the report (T645).
+        .draft_stem = self.feedbackDraftStem(),
     });
     if (!started) {
         self.setFeedbackStatus(alloc, "Could not file this report");
@@ -1376,6 +1537,9 @@ fn completeFeedbackSend(self: *ViewerPane) void {
         // ...and so do the images, for the same reason plus a plainer one:
         // they are megabytes, and the report that needed them has them now.
         self.feedback_images.deinit(p.alloc);
+        // The draft folder was RENAMED into the queue by the publish, so the
+        // stem now names a filed report. The next composer opens a new draft.
+        self.feedback_stem_len = 0;
         if (self.feedback) |bar| {
             // The carousel's cache is keyed by chip NUMBER, and the store just
             // reset its counter — so without this the next paste's `#1` would
