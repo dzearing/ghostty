@@ -457,6 +457,14 @@ ring/snapshot/gap-fill replay, HELLO handshake):
     ended 95 live sessions on this path before the rule was written down. The
     confirmation exists for the skew the handshake actually flags, where the app
     cannot reach the sessions to save them and there is no other way back.
+  - **When the APP is the older side, say so** (T626). The agent must not be
+    restarted there — that would replace a newer binary with an older one and
+    end its sessions to do it — but "no action" is not permission to say
+    nothing. The user sees windows quietly stop keeping their sessions, so the
+    app raises a non-blocking notice naming the one act that cures it (update
+    Ghoztty), once per run, and clicking it looks for an update. Loud
+    degradation is the contract; which direction the skew points only decides
+    whether the app asks a question or delivers news.
 
   The mandatory-update process is the safety net that makes breaking changes
   survivable; the HELLO handshake is what lets us detect when we need it. Build

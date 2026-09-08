@@ -677,7 +677,12 @@ $GuardTable = @(
             # dialog (arm J), and its absence is arm N - so an edit to the
             # accessory, or to the dialog band it sits in, is due here.
             'src\apprt\win32\WhatsNewNotesView.zig',
-            'src\apprt\win32\ConfirmDialog.zig'
+            'src\apprt\win32\ConfirmDialog.zig',
+            # T626: the OTHER direction's answer - the tray notice arm K raises
+            # when the app is the older side. Its uid and click routing live in
+            # tray_notify.zig, and a change there is what would silently turn
+            # the notice into one nobody can click.
+            'src\apprt\win32\tray_notify.zig'
         )
     },
     # Cross-lineage layout blobs (T337/T623): the only harness that proves the

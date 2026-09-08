@@ -68,6 +68,9 @@ pub const update_recheck: usize = 14;
 /// collided with `quick_terminal_anim` above.
 pub const notif_update: usize = 15;
 
+/// Icon cleanup for the "this app is older than its agent" balloon (T626).
+pub const notif_app_outdated: usize = 16;
+
 // Fail the build if two ids above are equal. Every `pub const … : usize` in
 // this file is a timer id and is compared against every other one, so a new
 // entry is covered by adding it — there is no second list to keep in step.

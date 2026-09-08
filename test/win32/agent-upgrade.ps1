@@ -36,7 +36,10 @@
 #      panes back in place.
 #   K: T125 negative control - a skew where the AGENT is the newer side is never
 #      acted on. The app is the out-of-date one; downgrading it would eat
-#      sessions a newer app could still have attached to.
+#      sessions a newer app could still have attached to. Plus T626: doing
+#      nothing is not the same as saying nothing - the user gets a tray notice
+#      naming the one act that cures it (update Ghoztty), once per run, and a
+#      click on it goes looking for an update without touching the agent.
 #   L: T907/T1056 - handoff-capable, but a session the agent owns DIRECTLY is
 #      still live => the update drains and nobody is asked to hurry it along.
 #   M: T907 - handoff-capable and every live session holder-backed => the app
@@ -911,6 +914,65 @@ Assert "K4 NO confirmation was shown (nothing for the user to consent to)" `
 Assert "K5 the newer agent was NOT touched (same pid)" ((Agent-Pid $tmp) -eq $agentK)
 Assert "K6 the app is still running (degraded, not broken)" `
     (@(Get-Process -Id $appPidK -ErrorAction SilentlyContinue).Count -eq 1)
+
+# --- T626: doing nothing must not mean SAYING nothing ------------------------
+# K1-K6 above are the whole of the old contract, and they were satisfied by an
+# app that told the user precisely nothing: windows quietly stopped keeping
+# their sessions and the reason lived in a log file. The notice is the tray
+# balloon the update path already uses - a report, not a question, because
+# there is nothing here for the user to consent to and nothing they can repair
+# from inside a dialog.
+#
+# What can and cannot be measured here: this desktop has no shell, so no
+# notification area exists to draw a balloon in and `shown=` is expected to be
+# False. So the arm asserts the two things that are true wherever it runs - the
+# app decided to tell the user and said what the shell answered, and a click on
+# THAT balloon's icon routes to an update check - and leaves "a balloon is drawn
+# on screen" to the interactive pass, exactly as
+# test\win32\notification-click-focus.ps1 documents for the desktop balloon.
+Assert "K7 T626: the app said out loud that it told the user to update" `
+    (Wait-LogMatch $logK 'app is older than its agent: told the user to update' 30)
+$logTextK = Read-AppLog $logK
+Assert "K8 T626: ... and recorded the shell's answer rather than assuming one" `
+    ($logTextK -match 'told the user to update \(shown=(True|False|true|false)')
+Assert "K9 T626: ... naming the version pair in the LOG, where it belongs" `
+    ($logTextK -match 'agent protocol 9999, this app \d+')
+
+# Once per run, not once per check. The skew is re-evaluated every time a
+# window looks for the agent, and a notice that re-fired on each one would nag
+# about something the user may not be able to fix this minute. Driven by
+# posting the app's own re-check message (WM_APP+12, the one a closing
+# persistent window posts), so the second evaluation is the real one.
+$msgWndK = Find-TestMessageWindow -ProcessId $appPidK
+Assert "K10 T626: found the app's message-only window to re-check through" `
+    ($msgWndK -ne [IntPtr]::Zero)
+if ($msgWndK -ne [IntPtr]::Zero) {
+    $skewBefore = ([regex]::Matches($logTextK, 'running agent speaks a NEWER protocol')).Count
+    [void](Send-TestRawMessage -Window $msgWndK -Message ([uint32]0x800C))
+    Start-Sleep -Seconds 3
+    $logTextK2 = Read-AppLog $logK
+    $skewAfter = ([regex]::Matches($logTextK2, 'running agent speaks a NEWER protocol')).Count
+    # The control: without this, "still one notice" would also be the reading
+    # of a re-check that never happened.
+    Assert "K11 T626: CONTROL - the skew really was evaluated a second time" `
+        ($skewAfter -gt $skewBefore)
+    Assert "K12 T626: the user is told once per run, not once per check" `
+        ((([regex]::Matches($logTextK2, 'told the user to update')).Count) -eq 1)
+
+    # The balloon's click contract: uid 5 (tray_notify.app_outdated_uid) under
+    # NOTIFYICON_VERSION - wparam is the uid, lparam's low word the event.
+    [void](Send-TestRawMessage -Window $msgWndK -Message ([uint32]0x8003) `
+        -WParam ([IntPtr]5) -LParam ([IntPtr]0x0405))
+    Assert "K13 T626: clicking the notice goes looking for an update" `
+        (Wait-LogMatch $logK 'app-older notice clicked: looking for an update' 20)
+    # And the standing rule of this whole direction, re-asserted AFTER the
+    # click: the cure is a newer app, so nothing on this path may ever go near
+    # the agent holding the user's sessions.
+    Assert "K14 T626: the newer agent is STILL untouched after the notice and its click" `
+        ((Agent-Pid $tmp) -eq $agentK)
+    Assert "K15 T626: and no dialog was raised to deliver news" `
+        ((Find-Dialog $appPidK) -eq [IntPtr]::Zero)
+}
 $env:GHOZTTY_AGENT_PROTO_VERSION = $null
 Stop-TestProcs
 

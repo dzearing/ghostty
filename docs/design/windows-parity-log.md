@@ -24757,3 +24757,33 @@ accessory); `whats-new.ps1` (46), `remote-disconnect.ps1` (49),
 Six new `ConfirmDialog.layoutFor` tests cover the band at 1.0/1.25/1.5/2.0 and
 prove a caller that asks for no notes lays out byte-identically to before.
 
+## 2026-09-07 — a Ghoztty that is older than its own background process now says so (T626)
+
+Roll Ghoztty back and the process holding your terminal sessions stays on the
+newer version, so the two can no longer talk. Ghoztty was right not to kill it
+— that would destroy live sessions to install something older — but it said
+nothing at all: windows quietly stopped keeping their sessions and the reason
+lived in a log file. T125 fixed exactly that invisibility for the other
+direction and left this one silent.
+
+The decision is unchanged (`agent_upgrade.evaluateSkew` still answers `.none`
+for an agent that is the newer side, and a new unit sweep proves it does so at
+any distance, deferred or not). What changed is that `.none` now REPORTS: a
+tray balloon on its own icon, once per app run, saying that sessions are not
+being kept and to update Ghoztty. Not a dialog — there is nothing to consent to
+and nothing the user could repair from inside one — and a click goes looking for
+an update rather than anywhere near the agent. The version pair the user cannot
+act on stays in the log line, which also records what the shell answered, so a
+notice the notification area refused is distinguishable from one nobody looked
+at.
+
+Green: `floor-lane.ps1 -Lane all` (lib / none / win32 / agent) and P1–P3, plus
+the harnesses the change came due for — `agent-upgrade.ps1` ALL PASS (138) with
+nine new assertions on arm K: the notice is raised (K7–K9), it is said once per
+run rather than once per check with the app's own re-check message posted as the
+control (K10–K12), a synthetic click on the balloon's icon routes to an update
+check (K13), and the newer agent's pid is unchanged with no dialog anywhere in
+the arm (K14–K15). Also `agent-handoff.ps1` (29), `msg-timer-ids.ps1` (15),
+`ipc-version.ps1`, `orphan-notify.ps1` (13) and the eleven static audits an edit
+here re-opens. Follow-up filed: T1445, a durable place to look the state up once
+the balloon has gone.

@@ -39,6 +39,12 @@ pub const orphan_uid: u32 = 3;
 /// for, the update-available balloon next door: that one offers to FETCH a
 /// release, this one offers to restart into a build already on the disk.
 pub const stale_build_uid: u32 = 4;
+/// The "this copy of Ghoztty is older than the background process holding your
+/// sessions" balloon, T626. Its own icon for the same reason as the one above:
+/// it offers a different act (update the app) from the update-available balloon
+/// (fetch a release we already found) and the stale-build one (restart into a
+/// build already on disk).
+pub const app_outdated_uid: u32 = 5;
 
 /// What the app should do about a callback message. `null` from `classify`
 /// means "nothing" — the overwhelmingly common case, since the shell also
@@ -56,6 +62,11 @@ pub const Action = enum {
     /// A stale-build balloon (T1205) was dismissed by a click: restart into
     /// the newer build already sitting on disk.
     restart_into_new_build,
+    /// An app-is-older balloon (T626) was dismissed by a click: go look for an
+    /// update, the way the About window's button does. Nothing on this path
+    /// ever touches the running agent — the app is the out-of-date side, so
+    /// updating THE APP is the whole cure.
+    check_for_app_update,
 };
 
 /// Decode one `WM_APP_TRAY` (`uCallbackMessage`) delivery under
@@ -75,6 +86,7 @@ pub fn classify(wparam: usize, lparam: isize) ?Action {
         update_uid => .open_release_page,
         orphan_uid => .review_orphan_sessions,
         stale_build_uid => .restart_into_new_build,
+        app_outdated_uid => .check_for_app_update,
         else => null,
     };
 }
@@ -98,6 +110,21 @@ test "classify: a balloon click routes by icon id" {
         Action.restart_into_new_build,
         classify(stale_build_uid, click).?,
     );
+    try testing.expectEqual(
+        Action.check_for_app_update,
+        classify(app_outdated_uid, click).?,
+    );
+}
+
+test "the notification icon ids are all distinct" {
+    // Two balloons sharing a uid would mean one's auto-cleanup removes the
+    // other's icon, and a click on either would route to whichever `classify`
+    // matched first. Same failure shape the timer-id registry guards against.
+    const testing = std.testing;
+    const ids = [_]u32{ desktop_uid, update_uid, orphan_uid, stale_build_uid, app_outdated_uid };
+    for (ids, 0..) |a, i| {
+        for (ids[i + 1 ..]) |b| try testing.expect(a != b);
+    }
 }
 
 test "classify: an unknown icon id does nothing" {

@@ -567,6 +567,14 @@ agent_refresh_depth: usize = 0,
 /// launch asks again, because by then the sessions in question are new ones.
 agent_upgrade_declined: bool = false,
 
+/// True once this run has told the user that THIS APP is the out-of-date side
+/// of a protocol skew (T626). Once per run, not once per check: the skew is
+/// re-evaluated every time a window looks for the agent, and a notice that
+/// re-fired on each one would be a nag about a thing the user may not be able
+/// to fix this minute. The next launch says it again, because by then either
+/// they updated or the situation is still true.
+agent_skew_notice_shown: bool = false,
+
 /// How many agent restarts this run has already spent trying to adopt the
 /// bundled build (T147). Bounded by `max_agent_upgrade_attempts`: if a restart
 /// does not cure staleness — an agent from another install holding the
@@ -4557,8 +4565,14 @@ fn handleAgentProtocolSkew(self: *App, skew: LocalAgent.Skew, reason: []const u8
     switch (decision.action) {
         // `.none` here means the app is the out-of-date side, or we could not
         // tell. Either way nothing gets killed. New windows fall back to
-        // non-persistent shells, which is degraded but not destructive.
-        .none => return,
+        // non-persistent shells, which is degraded but not destructive — but
+        // since T626 it is no longer SILENT when we know which side is old.
+        .none => {
+            if (decision.reason == .skew_app_older) {
+                self.notifyAppOlderThanAgent(skew.peer_proto_version);
+            }
+            return;
+        },
         // A skew has no idle arm — see `evaluateSkew`, which is exhaustively
         // tested for it. Handled rather than `unreachable` anyway: this is a
         // destructive path, and in a release build `unreachable` would turn a
@@ -7886,7 +7900,10 @@ const NOTIF_UPDATE_TIMER_ID: usize = msg_timer.notif_update;
 const NOTIF_ORPHAN_UID: u32 = tray_notify.orphan_uid;
 const NOTIF_ORPHAN_TIMER_ID: usize = msg_timer.notif_orphan;
 const NOTIF_STALE_UID: u32 = tray_notify.stale_build_uid;
+/// The "this app is older than its agent" balloon (T626).
+const NOTIF_APP_OLDER_UID: u32 = tray_notify.app_outdated_uid;
 const NOTIF_STALE_TIMER_ID: usize = msg_timer.notif_stale;
+const NOTIF_APP_OLDER_TIMER_ID: usize = msg_timer.notif_app_outdated;
 
 /// Register a notification-area icon's behavior version, which is what turns
 /// the `NIN_*` balloon notifications on. Without it the icon keeps the
@@ -8414,7 +8431,7 @@ fn checkStaleBuild(self: *App) void {
         "newer build installed on disk (running build started {s}, exe written {s})",
         .{ prov.started, prov.exe_modified },
     );
-    self.showTrayBalloon(
+    _ = self.showTrayBalloon(
         NOTIF_STALE_UID,
         NOTIF_STALE_TIMER_ID,
         "Ghoztty Was Updated",
@@ -8463,7 +8480,7 @@ pub fn restartIntoInstalledBuild(self: *App) void {
         "restart into new build",
     ) catch |err| {
         log.err("restart into new build: spawn of {s} FAILED: {}", .{ exe, err });
-        self.showTrayBalloon(
+        _ = self.showTrayBalloon(
             NOTIF_STALE_UID,
             NOTIF_STALE_TIMER_ID,
             "Ghoztty",
@@ -8486,7 +8503,7 @@ pub fn restartIntoInstalledBuild(self: *App) void {
 /// Show a balloon on the update tray icon. A click is delivered as
 /// WM_APP_TRAY (NOTIF_UPDATE_UID) → opens the release page.
 fn showUpdateBalloon(self: *App, title_utf8: []const u8, body_utf8: []const u8) void {
-    self.showTrayBalloon(NOTIF_UPDATE_UID, NOTIF_UPDATE_TIMER_ID, title_utf8, body_utf8);
+    _ = self.showTrayBalloon(NOTIF_UPDATE_UID, NOTIF_UPDATE_TIMER_ID, title_utf8, body_utf8);
 }
 
 /// Show a balloon on `uid`'s tray icon, cleaned up by `timer_id`. A click is
@@ -8499,8 +8516,8 @@ fn showTrayBalloon(
     timer_id: usize,
     title_utf8: []const u8,
     body_utf8: []const u8,
-) void {
-    const hwnd = self.msg_hwnd orelse return;
+) bool {
+    const hwnd = self.msg_hwnd orelse return false;
 
     var nid: w32.NOTIFYICONDATAW = std.mem.zeroes(w32.NOTIFYICONDATAW);
     nid.cbSize = @sizeOf(w32.NOTIFYICONDATAW);
@@ -8516,14 +8533,14 @@ fn showTrayBalloon(
     nid.uVersion_or_uTimeout = 10000;
 
     var title_utf16: [64]u16 = undefined; // NOTIFYICONDATAW.szInfoTitle
-    if (title_utf8.len >= title_utf16.len) return;
-    const tlen = std.unicode.utf8ToUtf16Le(&title_utf16, title_utf8) catch return;
+    if (title_utf8.len >= title_utf16.len) return false;
+    const tlen = std.unicode.utf8ToUtf16Le(&title_utf16, title_utf8) catch return false;
     @memcpy(nid.szInfoTitle[0..tlen], title_utf16[0..tlen]);
     nid.szInfoTitle[tlen] = 0;
 
     var body_utf16: [256]u16 = undefined; // NOTIFYICONDATAW.szInfo
-    if (body_utf8.len >= body_utf16.len) return;
-    const wlen = std.unicode.utf8ToUtf16Le(&body_utf16, body_utf8) catch return;
+    if (body_utf8.len >= body_utf16.len) return false;
+    const wlen = std.unicode.utf8ToUtf16Le(&body_utf16, body_utf8) catch return false;
     @memcpy(nid.szInfo[0..wlen], body_utf16[0..wlen]);
     nid.szInfo[wlen] = 0;
 
@@ -8538,8 +8555,47 @@ fn showTrayBalloon(
     const added = w32.Shell_NotifyIconW(w32.NIM_ADD, &nid) != 0;
     setNotifyIconVersion(hwnd, uid, added);
     nid.uFlags |= w32.NIF_INFO;
-    _ = w32.Shell_NotifyIconW(w32.NIM_MODIFY, &nid);
+    // The shell's own answer, returned rather than dropped (T626): a caller
+    // that promises the user was TOLD something needs to know whether the
+    // notification area accepted it, and every existing caller keeps its old
+    // behavior by ignoring it.
+    const shown = w32.Shell_NotifyIconW(w32.NIM_MODIFY, &nid) != 0;
     _ = w32.SetTimer(hwnd, timer_id, 10000, null);
+    return shown;
+}
+
+/// Say — once per run — that this app is the OLDER side of a protocol skew
+/// (T626).
+///
+/// `handleAgentProtocolSkew` is right to do nothing here: restarting the agent
+/// would replace a newer binary with an older one and end the sessions it is
+/// holding to do it. But doing nothing used to mean SAYING nothing, and what
+/// the user then experiences is windows that silently stop keeping their
+/// sessions with the reason in a log file. This is the report, on the same tray
+/// surface an available update already uses, with the same click-to-act
+/// contract — a click looks for an update, because updating this app is the
+/// only cure.
+///
+/// Deliberately not a dialog: there is nothing to consent to and nothing the
+/// user can fix from inside one, so a modal would block work to deliver news.
+fn notifyAppOlderThanAgent(self: *App, peer: ?u16) void {
+    if (self.agent_skew_notice_shown) return;
+    self.agent_skew_notice_shown = true;
+
+    const shown = self.showTrayBalloon(
+        NOTIF_APP_OLDER_UID,
+        NOTIF_APP_OLDER_TIMER_ID,
+        agent_upgrade.app_older_notice_title,
+        agent_upgrade.app_older_notice_body,
+    );
+    // The version pair lives here rather than in the balloon: it is what a
+    // maintainer needs and what the user cannot act on. `shown=false` is the
+    // honest record of a notice the shell refused, which is otherwise
+    // indistinguishable from one nobody happened to look at.
+    log.warn(
+        "app is older than its agent: told the user to update (shown={}, agent protocol {?d}, this app {d})",
+        .{ shown, peer, protocol.proto_version },
+    );
 }
 
 /// Response-size cap for the releases-list fetch. Release notes can be
@@ -9022,7 +9078,7 @@ fn onOrphanRoster(self: *App, res: *OrphanRosterResult) void {
 
     var body_buf: [256]u8 = undefined;
     const body = orphan_notify.formatBody(&body_buf, s.cwd, s.argv, now_ms - since, d.eligible - 1);
-    self.showTrayBalloon(
+    _ = self.showTrayBalloon(
         NOTIF_ORPHAN_UID,
         NOTIF_ORPHAN_TIMER_ID,
         "A terminal session is still running",
@@ -9909,6 +9965,15 @@ fn msgWndProc(
                     MachineChooser.open(w);
                 }
             },
+            .check_for_app_update => {
+                // T626: the app is the out-of-date side of a protocol skew, so
+                // the cure is a newer Ghoztty and nothing else. A MANUAL check,
+                // the same one the menu item runs: the user asked, so it must
+                // report back even when the automatic path would have stayed
+                // quiet. Nothing here goes near the agent.
+                log.info("app-older notice clicked: looking for an update", .{});
+                app.startUpdateCheck(.manual);
+            },
             .restart_into_new_build => {
                 // T1205: the newer build is already on disk — nothing to
                 // fetch, nothing to install. Restarting IS the whole action,
@@ -10051,12 +10116,14 @@ fn msgWndProc(
     // an unrelated timeout.
     if (msg == w32.WM_TIMER and
         (wparam == NOTIF_DESKTOP_TIMER_ID or wparam == NOTIF_UPDATE_TIMER_ID or
-            wparam == NOTIF_ORPHAN_TIMER_ID or wparam == NOTIF_STALE_TIMER_ID))
+            wparam == NOTIF_ORPHAN_TIMER_ID or wparam == NOTIF_STALE_TIMER_ID or
+            wparam == NOTIF_APP_OLDER_TIMER_ID))
     {
         const uid: u32 = switch (wparam) {
             NOTIF_DESKTOP_TIMER_ID => NOTIF_DESKTOP_UID,
             NOTIF_UPDATE_TIMER_ID => NOTIF_UPDATE_UID,
             NOTIF_STALE_TIMER_ID => NOTIF_STALE_UID,
+            NOTIF_APP_OLDER_TIMER_ID => NOTIF_APP_OLDER_UID,
             else => NOTIF_ORPHAN_UID,
         };
         _ = w32.KillTimer(hwnd, wparam);

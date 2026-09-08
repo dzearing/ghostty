@@ -371,6 +371,25 @@ pub fn formatSkewConfirmText(buf: []u8, peer: ?u16, local: u16) ![]const u8 {
         std.fmt.bufPrint(buf, lead ++ tail, .{});
 }
 
+/// The other direction's notice (T626), as a title/body pair sized for a tray
+/// balloon.
+///
+/// `evaluateSkew` answers `.none` when the agent is the NEWER side, and it is
+/// right to: restarting would downgrade a newer binary and end the sessions it
+/// holds. But `.none` used to mean the user was told nothing at all — new
+/// windows simply stopped keeping their sessions, with the reason only in a log
+/// file. That is the same invisible degradation T125 fixed for the other
+/// direction.
+///
+/// The text names the ACT, not the protocol. There is nothing to consent to
+/// here and nothing this app can repair from inside a dialog: the cure is a
+/// newer Ghoztty, so the notice says so and a click goes looking for one. The
+/// version pair belongs in the log line beside it, not in front of the user.
+pub const app_older_notice_title = "Ghoztty Is Out of Date";
+pub const app_older_notice_body =
+    "The background process holding your terminal sessions is newer than " ++
+    "this copy, so sessions are not being kept.\nClick to update Ghoztty.";
+
 /// Title for the skew confirmation. Deliberately the SAME title as the staleness
 /// one: it is one dialog with one outcome (the background process restarts),
 /// reached two ways, and giving each trigger its own title would make the app
@@ -726,6 +745,36 @@ test "evaluateSkew: the agent is only restarted when IT is the older side" {
     // not understand it, and the restart is the same cure.
     try testing.expectEqual(Action.confirm_first, evaluateSkew(local, local).action);
     try testing.expectEqual(Reason.skew_agent_older, evaluateSkew(local, local).reason);
+}
+
+test "an app-older skew never acts, at any distance, deferred or not" {
+    // The invariant the whole T626 notice rests on: this path is a REPORT.
+    // A future policy edit that made it destructive would have to delete this
+    // test to ship, which is the point of writing it as a sweep rather than a
+    // single case.
+    const local: u16 = 3;
+    for ([_]u16{ 4, 5, 9, 99, 9999, 65535 }) |peer| {
+        const d = evaluateSkew(peer, local);
+        try testing.expectEqual(Action.none, d.action);
+        try testing.expectEqual(Reason.skew_app_older, d.reason);
+        // Deferral only ever suppresses a confirmation; it cannot promote a
+        // `.none` into an act.
+        try testing.expectEqual(Action.none, applyDeferral(d, true).action);
+        try testing.expectEqual(Reason.skew_app_older, applyDeferral(d, true).reason);
+    }
+}
+
+test "the app-older notice fits a tray balloon and names the act" {
+    // NOTIFYICONDATAW caps the title at 64 UTF-16 units and the body at 256,
+    // nul included, and `App.showTrayBalloon` DROPS anything longer rather than
+    // truncating mid-rune — so text that overruns is a notice nobody ever sees.
+    try testing.expect(app_older_notice_title.len < 64);
+    try testing.expect(app_older_notice_body.len < 256);
+    // The step the user can actually take, in the words they would use.
+    try testing.expect(std.mem.indexOf(u8, app_older_notice_body, "update Ghoztty") != null);
+    // And NOT the mechanism: a protocol number tells the user nothing they can
+    // act on, which is the whole complaint this task was filed about.
+    try testing.expect(std.mem.indexOf(u8, app_older_notice_body, "protocol") == null);
 }
 
 test "evaluateSkew never returns refresh_now" {
