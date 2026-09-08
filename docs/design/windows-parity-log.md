@@ -25186,3 +25186,39 @@ resolution of the same directory without a spawn, and that an aged-out memo asks
 again. That harness also gains a `guard-due` row, since nothing tied a
 provenance edit to the only script that runs the strategy against a real
 listener. The Mac half is filed as T1452 (`seat: mac`).
+
+## 2026-09-08 - T651: filing a task that already exists says so
+
+`parity-tasks.ps1 new` allocated an id and wrote a file with no lookup of any
+kind, so the same defect could be filed over and over by turns that had each
+just watched something go red and had no cheap way to ask "is this known?". The
+card was filed for a three-way duplicate (T615/T643/T649, the T400
+stale-debounce flake); pointing the finished check at the real tracker found a
+worse one, the persistence-flag audit filed EIGHT times with three cards still
+open, now T1453.
+
+`new` scores the title it is about to file against every title in the tracker
+BEFORE it allocates anything, and prints a `SIMILAR:` block naming each
+candidate, its status and the tokens that matched. It warns and never blocks: a
+false positive that refused to file would lose a mid-turn report, which is
+strictly worse than a duplicate. `similar -Title "..."` asks the same question
+without writing a file, which is also what makes the heuristic testable.
+
+The match is a cosine over binary term vectors weighted by inverse document
+frequency across the tracker's own titles. Raw overlap cannot work here -
+`viewer`, `pane`, `windows` and `test` are in a large share of the backlog, so
+every filing would match everything - and idf is what makes those weigh nearly
+nothing while `stale-debounce`, `t400` and `conpty` carry the score. Ties break
+toward the oldest id, so a split's children cannot push the original off the
+list.
+
+Validation: the threshold (0.42) was calibrated against the real 1450-title
+corpus, where true near-duplicates score 0.43-0.97 and merely related cards
+0.26-0.40; five invented titles were silent and a 14-card random sample fired
+twice, both genuinely. Section S of `test\win32\parity-tasks-seat.ps1` is the
+hermetic version - ten checks covering the warning, the file being written
+anyway, the quiet case, the standalone verb, the status on a match,
+`-NoSimilarCheck`, both sides of `-MinScore`, and a closing probe of the real
+tracker. Full harness ALL PASS; the `parity-tasks` guard re-stamped. Follow-up
+T1454 asks the same question of the whole open backlog rather than only of new
+filings.

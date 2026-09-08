@@ -41,6 +41,16 @@
   a later commit having NAMED the task by id, then oldest first. Both are
   prompts to verify, never verdicts.
 
+  AND IS IT ALREADY FILED? (T651). `new` used to allocate an id and write a
+  file with no lookup of any kind, so the same defect could be filed three
+  times - the T400 stale-debounce flake went in as T615, then T643, then T649
+  on consecutive days, each by a turn that had just watched the lane go red and
+  had no cheap way to ask "is this known?". `new` now NAMES existing tasks
+  whose titles look like the one being filed, before it writes anything, and
+  `similar` asks that question on its own. It warns and never blocks: a false
+  positive that refused to file would lose a mid-turn report, which is worse
+  than a duplicate.
+
 .EXAMPLE
   scripts\parity-tasks.ps1 list -Status todo
   scripts\parity-tasks.ps1 stale-scan -Top 40
@@ -55,11 +65,12 @@
   scripts\parity-tasks.ps1 set-order T500 -Order 2.5   # inject without renumbering
   scripts\parity-tasks.ps1 set-tags T503 -Tags infra,docs
   scripts\parity-tasks.ps1 set-tags T503 -Tags polish -Add
+  scripts\parity-tasks.ps1 similar -Title "the viewer pane flakes on a cold cache"
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateSet('list', 'next', 'show', 'new', 'set-status', 'set-priority', 'set-order', 'set-tags', 'note', 'ack-stranded', 'stale-scan', 'validate')]
+    [ValidateSet('list', 'next', 'show', 'new', 'set-status', 'set-priority', 'set-order', 'set-tags', 'note', 'ack-stranded', 'stale-scan', 'similar', 'validate')]
     [string]$Command,
 
     [Parameter(Position = 1)]
@@ -175,6 +186,16 @@ param(
     # reason that is not this turn's (a flaky runner, a red commit somebody
     # else pushed, no network); it PRINTS that it was used.
     [switch]$NoCiCheck,
+
+    # `new` warns when an existing task's title looks like the one being filed
+    # (T651), and `similar` asks that question on its own. The threshold is a
+    # cosine over idf-weighted title tokens; it is exposed so the acceptance
+    # script can probe either side of the line, not because a turn should tune
+    # it. `-NoSimilarCheck` is for a caller that knows it is filing a
+    # deliberate near-twin (a split's children, a mac/win pair) and does not
+    # want the noise - it never blocks either way.
+    [Nullable[double]]$MinScore,
+    [switch]$NoSimilarCheck,
 
     # `stale-scan` prints the N most-suspect todos (T404). The whole queue is
     # 400+ files, and a sweep that dumps all of them is a re-derivation rather
@@ -675,6 +696,152 @@ function Get-StaleSignal {
     }
 }
 
+# --------------------------------------------------- duplicate detection ---
+#
+# T651. `new` allocated an id and wrote a file with no lookup of any kind, so
+# the same defect could be - and was - filed three times: the T400 stale-debounce
+# flake went in as T615, then T643, then T649 on consecutive days, by three
+# turns that had each just watched the lane go red and had no cheap way to ask
+# "is this known?". Every duplicate inflates the backlog and buys somebody a
+# fresh investigation of a problem that was already understood.
+#
+# The match is title-against-title, weighted by inverse document frequency over
+# the tracker's own titles. Raw token overlap is useless here: `viewer`,
+# `windows`, `pane` and `test` are in a large fraction of the backlog, so every
+# filing would "match" everything. IDF makes those tokens weigh almost nothing
+# and lets the distinctive ones - `stale-debounce`, `t400`, `conpty` - carry the
+# score, which is exactly the shape of two reports of one defect.
+
+# Words that carry no signal about WHICH defect a title describes. Deliberately
+# short: idf already flattens the domain's own common words (`windows`, `test`),
+# and a long hand-list is a second, staler copy of that.
+$SimilarStopWords = @(
+    'a', 'an', 'and', 'are', 'as', 'at', 'be', 'been', 'but', 'by', 'can', 'do',
+    'does', 'for', 'from', 'had', 'has', 'have', 'in', 'into', 'is', 'it', 'its',
+    'not', 'of', 'on', 'or', 'so', 'than', 'that', 'the', 'their', 'them',
+    'then', 'there', 'they', 'this', 'to', 'was', 'were', 'when', 'which',
+    'while', 'with', 'would'
+)
+
+# Title -> the set of distinctive tokens it contributes. Lowercased, split on
+# anything that is not a letter or digit, stopwords dropped, and a trailing `s`
+# stripped from longer tokens so `panes` and `pane` are one token. Bare numbers
+# go: `3` says nothing, while `t400` and `win32` are exactly the identifiers
+# that make two reports of one defect look alike, so alphanumerics stay.
+function Get-TitleTokens {
+    param([string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+    $seen = @{}
+    foreach ($raw in ($Text.ToLowerInvariant() -split '[^a-z0-9]+')) {
+        if (-not $raw) { continue }
+        if ($raw.Length -lt 2) { continue }
+        if ($raw -match '^\d+$') { continue }
+        if ($SimilarStopWords -contains $raw) { continue }
+        $tok = $raw
+        if ($tok.Length -gt 3 -and $tok.EndsWith('s') -and -not $tok.EndsWith('ss')) {
+            $tok = $tok.Substring(0, $tok.Length - 1)
+        }
+        $seen[$tok] = $true
+    }
+    return @($seen.Keys)
+}
+
+# Cosine similarity between a candidate title and every existing task, over
+# binary term vectors weighted by idf across the tracker's titles. Returns the
+# top matches above $MinScore, best first.
+#
+# Warns, never blocks (goal 2 of T651): `new` is called by agents mid-turn and a
+# false positive that refused to file would LOSE work, which is strictly worse
+# than a duplicate. The caller prints and carries on.
+function Get-SimilarTasks {
+    param(
+        [string]$Title,
+        [object[]]$Tasks,
+        [double]$MinScore = 0.42,
+        [int]$Limit = 3,
+        # Ids to leave out - the just-created file, when `new` scores after it
+        # has already allocated.
+        [string[]]$ExcludeIds = @()
+    )
+
+    $queryTokens = @(Get-TitleTokens $Title)
+    if ($queryTokens.Count -eq 0) { return @() }
+
+    # Document frequency over every title in the tracker, the query included:
+    # the corpus is what makes a token common, and a fixed list could not know
+    # that `viewer` became a common word here in August.
+    $df = @{}
+    $docs = @()
+    foreach ($t in $Tasks) {
+        if ($ExcludeIds -contains $t.Id) { continue }
+        $toks = @(Get-TitleTokens $t.Title)
+        if ($toks.Count -eq 0) { continue }
+        $docs += [pscustomobject]@{ Task = $t; Tokens = $toks }
+        foreach ($tok in $toks) { $df[$tok] = 1 + [int]$df[$tok] }
+    }
+    if ($docs.Count -eq 0) { return @() }
+    $n = $docs.Count
+
+    # ln((N+1)/(df+1)): a token in every title weighs ~0, one seen nowhere else
+    # weighs the most, and nothing divides by zero for a word that is new here.
+    $idf = {
+        param($tok)
+        [math]::Log(($n + 1) / (1.0 + [int]$df[$tok]))
+    }
+
+    $qNorm = 0.0
+    foreach ($tok in $queryTokens) { $w = & $idf $tok; $qNorm += $w * $w }
+    if ($qNorm -le 0) { return @() }
+    $qNorm = [math]::Sqrt($qNorm)
+
+    $scored = @()
+    foreach ($d in $docs) {
+        $dot = 0.0
+        $dNorm = 0.0
+        foreach ($tok in $d.Tokens) {
+            $w = & $idf $tok
+            $dNorm += $w * $w
+            if ($queryTokens -contains $tok) { $dot += $w * $w }
+        }
+        if ($dot -le 0 -or $dNorm -le 0) { continue }
+        $score = $dot / ($qNorm * [math]::Sqrt($dNorm))
+        if ($score -lt $MinScore) { continue }
+        # Most distinctive first, then alphabetical - the second key matters
+        # because in a small corpus every token has the SAME idf, and an
+        # arbitrary order there makes the reported evidence unreproducible.
+        $shared = @($d.Tokens | Where-Object { $queryTokens -contains $_ } |
+            Sort-Object -Property @{ Expression = { - (& $idf $_) } }, @{ Expression = { $_ } })
+        $scored += [pscustomobject]@{
+            Task   = $d.Task
+            Score  = $score
+            Shared = @($shared | Select-Object -First 4)
+        }
+    }
+
+    # Best first, then oldest id - so a split's children and a mac/win pair,
+    # which legitimately look alike, cannot push the ORIGINAL off the list.
+    return @($scored |
+        Sort-Object -Property @{ Expression = { - $_.Score } },
+        @{ Expression = { [int]([regex]::Match($_.Task.Id, '\d+').Value) } } |
+        Select-Object -First $Limit)
+}
+
+# The warning `new` prints, and the whole body of the `similar` verb. Names each
+# candidate WITH its status, so a match on an already-closed duplicate reads as
+# already known and already handled rather than as work to do again.
+function Write-SimilarWarning {
+    param([object[]]$Matches, [string]$Title)
+    if (@($Matches).Count -eq 0) { return }
+    Write-Host ("SIMILAR: {0} existing task(s) look like `"{1}`":" -f @($Matches).Count, $Title)
+    foreach ($m in $Matches) {
+        $status = if ($m.Task.Status) { $m.Task.Status } else { 'todo' }
+        if ($status.Length -gt 32) { $status = $status.Substring(0, 29) + '...' }
+        Write-Host ("  {0}  {1}  [{2}]" -f $m.Task.Id, $m.Task.Title, $status)
+        Write-Host ("      match {0:N2} on: {1}" -f $m.Score, ($m.Shared -join ', '))
+    }
+    Write-Host "  If one of these is the same defect, close the duplicate rather than working it twice."
+}
+
 # --------------------------------------------------------------- commands ---
 
 switch ($Command) {
@@ -1167,11 +1334,23 @@ switch ($Command) {
             $tagsJson = '[' + (($tagList | ForEach-Object { ConvertTo-Json $_ -Compress }) -join ', ') + ']'
         }
 
+        # Read the tracker ONCE: the max id and the duplicate check are both
+        # questions about the same list.
+        $existing = @(Get-AllTasks)
+
+        # T651: say so BEFORE the file is written when an existing task looks
+        # like this one. A warning, never a refusal - see Get-SimilarTasks.
+        if (-not $NoSimilarCheck) {
+            $simArgs = @{ Title = $Title; Tasks = $existing }
+            if ($null -ne $MinScore) { $simArgs['MinScore'] = [double]$MinScore }
+            Write-SimilarWarning -Matches (Get-SimilarTasks @simArgs) -Title $Title
+        }
+
         # Allocate the next free id by CREATING the file atomically. A racing
         # agent that picked the same number loses the CreateNew and we retry,
         # so two sessions can never mint the same id.
         $max = 0
-        foreach ($t in Get-AllTasks) {
+        foreach ($t in $existing) {
             $n = [int]([regex]::Match($t.Id, '\d+').Value)
             if ($n -gt $max) { $max = $n }
         }
@@ -1233,6 +1412,26 @@ switch ($Command) {
 
         if (-not $created) { throw 'Could not allocate a task id.' }
         Write-Host ("created {0}: docs/design/windows-parity-tasks/{0}.md" -f $created)
+    }
+
+    # T651. The duplicate question asked on its own, so a turn can check
+    # before it writes a title - and so the heuristic is testable without
+    # creating a file every time.
+    'similar' {
+        $wanted = if ($Title) { $Title } elseif ($Summary) { $Summary } else { '' }
+        if (-not $wanted) { throw 'similar requires -Title.' }
+        $simArgs = @{ Title = $wanted; Tasks = @(Get-AllTasks) }
+        if ($null -ne $MinScore) { $simArgs['MinScore'] = [double]$MinScore }
+        # Default to the same short list `new` prints; -Top widens it when a
+        # human is actually surveying rather than filing.
+        if ($PSBoundParameters.ContainsKey('Top') -and $Top -gt 0) { $simArgs['Limit'] = $Top }
+        $simMatches = @(Get-SimilarTasks @simArgs)
+        if ($simMatches.Count -eq 0) {
+            Write-Host ("NO SIMILAR: nothing in the tracker looks like `"{0}`"." -f $wanted)
+        }
+        else {
+            Write-SimilarWarning -Matches $simMatches -Title $wanted
+        }
     }
 
     'note' {

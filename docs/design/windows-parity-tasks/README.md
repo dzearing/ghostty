@@ -166,8 +166,34 @@ scripts\parity-tasks.ps1 show T144
 scripts\parity-tasks.ps1 set-status T144 -Status done -Commit abc1234
 scripts\parity-tasks.ps1 new -Title "Short title" -Phase K -Deps T73,T94
 scripts\parity-tasks.ps1 stale-scan -Top 40   # which todos may already be fixed
+scripts\parity-tasks.ps1 similar -Title "..." # is this defect already filed?
 scripts\parity-tasks.ps1 validate             # ids, titles, statuses, dangling deps
 ```
+
+**Is this defect already filed?** (T651). `new` used to write a file with no
+lookup of any kind, so the SAME defect could be — and was — filed three times:
+the T400 stale-debounce flake went in as T615, then T643, then T649 on
+consecutive days, by three turns that had each just watched the lane go red.
+`new` now names existing tasks whose titles look like the one being filed,
+before the file is written, and `similar` asks that question without filing
+anything:
+
+```
+SIMILAR: 2 existing task(s) look like "the stale-debounce fetch count flakes":
+  T615  The T400 stale-debounce viewer test compares two ...  [skipped(duplicate of T596)]
+      match 0.72 on: fetch, t400, debounce, count
+```
+
+The match is a cosine over title tokens weighted by inverse document frequency
+across the tracker's own titles. Raw overlap would be useless here — `viewer`,
+`pane`, `windows` and `test` are in a large share of the backlog — so idf makes
+those weigh almost nothing and lets `stale-debounce`, `t400` and `conpty` carry
+the score, which is the shape of two reports of one defect. It **warns and never
+blocks**: `new` is called by agents mid-turn, and a false positive that refused
+to file would lose work, which is strictly worse than a duplicate.
+`-NoSimilarCheck` silences it for a deliberate near-twin (a split's children, a
+mac/win pair); `-MinScore` moves the line, and exists so the acceptance script
+can probe both sides of it (section S of `test\win32\parity-tasks-seat.ps1`).
 
 **A todo is a claim about the code, made on the day it was filed, and nothing
 re-checks it** (T404). T98 was handed out fourteen days after T41 had already

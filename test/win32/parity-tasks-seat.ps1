@@ -78,6 +78,13 @@
 #      out-of-vocabulary tag and an empty set without touching the file, and
 #      the section closes by asserting the REAL tracker has no open task
 #      without a category.
+#   S. Duplicate detection (T651). The same defect was filed three times in two
+#      days because `new` looked nothing up. Filing a near-duplicate title now
+#      NAMES the existing task and files anyway (a refusal would lose work); a
+#      title sharing only the backlog's common words stays silent, which is the
+#      whole reason the match is idf-weighted rather than raw overlap; `similar`
+#      asks the question without writing a file; and the closing check runs the
+#      real 1400-title tracker.
 #
 # Hermetic: sections A-H run against a fixture task dir under $env:TEMP via
 # `-TaskDir`; docs\design\windows-parity-tasks\ is only ever READ (section I).
@@ -121,12 +128,15 @@ function New-FixtureTask {
         [string]$OrderLine = '',
         # Extra frontmatter lines, emitted verbatim after the fixed ones. Used
         # for fields only some tasks carry, e.g. `unblock:` on a parked task.
-        [string[]]$ExtraLines = @()
+        [string[]]$ExtraLines = @(),
+        # Real prose, for the sections whose subject IS the title (S). The
+        # default keeps every other section's fixtures deliberately bland.
+        [string]$Title = ''
     )
     $lines = @(
         '---'
         "id: $Id"
-        ("title: " + (ConvertTo-Json "fixture $Id" -Compress))
+        ("title: " + (ConvertTo-Json ($(if ($Title) { $Title } else { "fixture $Id" })) -Compress))
         # `order:` and `priority:` are emitted only when asked, so the default
         # fixture is deliberately unordered and untriaged - the state most of
         # the tracker was in before the ranking pass, and the one the fallbacks
@@ -898,6 +908,75 @@ Assert "R7 every OPEN task in the real tracker carries a category ($($untagged.C
 if ($untagged.Count) { "      untagged: " + (($untagged | Select-Object -First 12) -join ', ') }
 
 Reset-Fixture
+
+# --- S. filing a duplicate says so (T651) ------------------------------------
+'S. new warns when an existing task already describes this defect (T651)'
+Reset-Fixture
+
+# The real incident, reduced: the T400 stale-debounce flake filed three times
+# in two days, plus a backlog of unrelated titles that shares only the common
+# words every task here uses (viewer, pane, windows, test, lane).
+New-FixtureTask -Id 'T1' -Title "The T400 stale-debounce viewer test compares two cache-dependent fetch counts and flakes"
+New-FixtureTask -Id 'T2' -Title "The tab strip loses its close button when the window is narrow"
+New-FixtureTask -Id 'T3' -Title "Session restore reopens remote panes in the wrong order"
+New-FixtureTask -Id 'T4' -Title "The machine chooser has no keyboard focus ring"
+New-FixtureTask -Id 'T5' -Title "Viewer pane markdown headings do not wrap in a narrow pane"
+New-FixtureTask -Id 'T6' -Title "test\win32\ipc-p2.ps1 leaks an agent process on the way out"
+
+# S1/S2: the duplicate is named, and the file is STILL created - the check
+# warns, it never blocks (goal 2). A refusal would lose a mid-turn filing,
+# which is strictly worse than a duplicate.
+$r = Task-Run @('new', '-Title', "T400's stale-debounce fetch count is intermittent in the win32 lane")
+Assert 'S1 a near-duplicate title names the existing task' ($r.Out -match 'SIMILAR:' -and $r.Out -match '(?m)^\s+T1\s')
+Assert 'S2 and the task is filed anyway, with a fresh id' ($r.Out -match 'created T7' -and (Test-Path (Join-Path $fixture 'T7.md')))
+
+# S3: the shared tokens are the DISTINCTIVE ones, which is the whole reason
+# this is idf-weighted rather than raw overlap.
+Assert 'S3 the warning names what matched' ($r.Out -match 'match 0\.\d+ on: .*debounce')
+
+# S4: a title sharing only common words with the backlog is silent. Raw token
+# overlap would fire here - `viewer`, `pane`, `test` and `window` are in half
+# the tracker - and a check that fires constantly is a check nobody reads.
+$r = Task-Run @('new', '-Title', 'The window menu has no accelerator for the settings item')
+Assert 'S4 an unrelated title warns about nothing' ($r.Out -notmatch 'SIMILAR:')
+Assert 'S4b and is filed normally' ($r.Out -match 'created T8')
+
+# S5: the question can be asked WITHOUT filing, which is what a turn wants
+# before it writes a title - and what makes the heuristic testable.
+$r = Task-Run @('similar', '-Title', 'the stale-debounce fetch count flakes')
+Assert 'S5 similar reports without creating a file' (
+    $r.Out -match 'SIMILAR:' -and $r.Out -match '(?m)^\s+T1\s' -and -not (Test-Path (Join-Path $fixture 'T9.md')))
+
+# A title nothing in the fixture shares a distinctive word with - note it must
+# also differ from what S1/S4 just FILED, since those are in the corpus now.
+$r = Task-Run @('similar', '-Title', 'The find bar highlights the wrong occurrence after scrolling')
+Assert 'S6 similar says so plainly when nothing matches' ($r.Out -match 'NO SIMILAR')
+
+# S7: the status travels with the id. "T1 [skipped(duplicate of ...)]" reads as
+# "already known and already handled"; the bare id reads as work to redo.
+New-FixtureTask -Id 'T20' -Status 'skipped(duplicate of T1)' -Title "the t400 stale-debounce test calibrates on a cold cache and flakes"
+$r = Task-Run @('similar', '-Title', 'the t400 stale-debounce test calibrates on a cold cache and flakes')
+Assert 'S7 a match carries its status' ($r.Out -match 'T20.*\[skipped\(duplicate of T1\)\]')
+
+# S8: an explicit near-twin can opt out of the noise (a split's children, a
+# mac/win pair) - and opting out never changes whether the file is written.
+$r = Task-Run @('new', '-Title', "T400's stale-debounce fetch count is intermittent in the win32 lane", '-NoSimilarCheck')
+Assert 'S8 -NoSimilarCheck suppresses the warning, files anyway' (
+    $r.Out -notmatch 'SIMILAR:' -and $r.Out -match 'created T')
+
+# S9: the threshold is a knob the harness can probe on both sides, so the
+# heuristic cannot silently rot into "always quiet" or "always loud".
+$r = Task-Run @('similar', '-Title', 'the window menu has no accelerator', '-MinScore', '0.01', '-Top', '3')
+Assert 'S9 a low threshold does find weak matches' ($r.Out -match 'SIMILAR:')
+
+Reset-Fixture
+
+# S10: against the REAL tracker, a title copied from an existing task finds
+# that task. This is the end-to-end shape - 1400+ real titles, real idf - and
+# it is what a turn about to file a duplicate would actually see.
+$sample = 'parity-tasks.ps1 new should warn when a similar task already exists'
+$r = Task-Run @('similar', '-Title', $sample) -Dir $realDir
+Assert 'S10 the real tracker finds its own T651' ($r.Out -match '(?m)^\s+T651\s')
 
 # --- teardown ---------------------------------------------------------------
 if (Test-Path $fixture) { Remove-Item -Recurse -Force $fixture }

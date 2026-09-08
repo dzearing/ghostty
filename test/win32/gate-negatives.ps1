@@ -209,6 +209,14 @@ $Registry = @(
     # Informational by design. SPLIT DEP is a legitimate queue state (a task
     # waiting on a split parent), STRANDED WORK ACKNOWLEDGED is the ack path
     # succeeding, and the rest belong to other verbs entirely.
+    # T651's duplicate check. Both are informational BY DESIGN and neither can
+    # ever be a gate: `new` prints SIMILAR and then files the task anyway,
+    # because a false positive that refused to file would lose a mid-turn
+    # report - which is strictly worse than the duplicate it would prevent.
+    # Section S of test\win32\parity-tasks-seat.ps1 is where that promise is
+    # actually held to (S2: the warning fires AND the file is created).
+    [pscustomobject]@{ Label = 'SIMILAR'; Kind = 'status' }
+    [pscustomobject]@{ Label = 'NO SIMILAR'; Kind = 'status' }
     [pscustomobject]@{ Label = 'SPLIT DEP'; Kind = 'status' }
     [pscustomobject]@{ Label = 'REDIRECT DEP'; Kind = 'status' }
     [pscustomobject]@{ Label = 'STRANDED WORK ACKNOWLEDGED'; Kind = 'status' }

@@ -502,6 +502,16 @@ Concretely, in order, with no stops in between:
    `scripts\parity-tasks.ps1 new -Title "…"`. Loose threads are how work gets
    lost. Never hand-pick an id; `new` allocates atomically so a second agent
    filing at the same moment cannot collide with you.
+
+   **Read the `SIMILAR:` block when it prints** (T651). `new` names existing
+   tasks whose titles look like the one you are filing, before it writes the
+   file, because the same defect used to be filed three times - the T400
+   stale-debounce flake as T615, then T643, then T649, by three turns that had
+   each just watched the lane go red. It warns and never blocks, so the filing
+   still happens; if one of the named tasks is the same defect, close YOUR
+   duplicate in the same breath rather than leaving the backlog counting one
+   problem twice. `parity-tasks.ps1 similar -Title "..."` asks the question
+   without filing anything.
 5b. **File any judgement call as a decision.** You never stop to ask (THE
    CONTEXT RULE), and that stays true — but a call the user might want to
    overturn gets a receipt, so it reaches them without blocking you:
