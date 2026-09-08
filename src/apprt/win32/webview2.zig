@@ -161,6 +161,57 @@ test "a missing runtime is not a transient failure, a refused start is" {
     }
 }
 
+/// How many times a live-runtime test asks for an environment before it takes
+/// the answer it got. Three is the shape T592 settled on: two extra tries
+/// across a ~4s window, which is longer than a browser tree takes to finish
+/// tearing down and far shorter than a runtime upgrade.
+pub const floor_max_attempts: u8 = 3;
+
+/// Whether a live-runtime test should ask the runtime for an environment
+/// again, having already been refused `attempts` times.
+///
+/// This is the whole policy behind T665: a test that stands up a REAL
+/// WebView2 cannot tell "the viewer is broken" from "the OS component was
+/// mid-upgrade" unless it asks twice, and a red lane that says the second
+/// thing is a floor run spent saying nothing. `false` here does not mean
+/// "fail" — the caller's answer to a refusal it has stopped retrying is to
+/// skip with the reason named — it means "this is the box's answer".
+///
+/// It lives here, as a function of values, because the loop it came out of
+/// only executes on a box with a runtime installed and only branches when
+/// that runtime misbehaves: the decision was untestable exactly where it
+/// mattered most.
+pub fn shouldRetryEnvironment(why: Failure, attempts: u8, max_attempts: u8) bool {
+    return why.isTransient() and attempts < max_attempts;
+}
+
+test "the floor retries a runtime that refused it, and never one that is absent" {
+    // A refusal is worth asking about again, up to the cap...
+    try testing.expect(shouldRetryEnvironment(.create_callback_failed, 1, 3));
+    try testing.expect(shouldRetryEnvironment(.create_callback_failed, 2, 3));
+    // ...and the cap is a stop, not a suggestion, so the loop terminates.
+    try testing.expect(!shouldRetryEnvironment(.create_callback_failed, 3, 3));
+    try testing.expect(!shouldRetryEnvironment(.create_callback_failed, 4, 3));
+
+    // A box with no runtime answers on the first reply: retrying it would
+    // only spend the deadline waiting for an installer to run itself.
+    try testing.expect(!shouldRetryEnvironment(.runtime_not_found, 0, 3));
+    try testing.expect(!shouldRetryEnvironment(.runtime_not_found, 1, 3));
+    try testing.expect(!shouldRetryEnvironment(.client_dll_unloadable, 1, 3));
+    try testing.expect(!shouldRetryEnvironment(.entry_point_missing, 1, 3));
+
+    // The shipped cap allows retries at all — a cap of zero or one would make
+    // the policy above a no-op and this test would still pass without this.
+    try testing.expect(floor_max_attempts >= 2);
+    try testing.expect(shouldRetryEnvironment(.create_callback_failed, 1, floor_max_attempts));
+
+    // And every failure answers, so a new variant cannot arrive without one.
+    inline for (@typeInfo(Failure).@"enum".fields) |f| {
+        const v: Failure = @enumFromInt(f.value);
+        _ = shouldRetryEnvironment(v, 0, floor_max_attempts);
+    }
+}
+
 // -------------------------------------------------------------------- COM
 
 /// The COM floor lives in `com.zig` (T376): the IIDs, the HRESULT helpers,

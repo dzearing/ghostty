@@ -25352,3 +25352,31 @@ T775.
 Filed: T1455 (a static audit for the `@()`-around-a-comma-returning-helper
 shape, which is mechanical and greppable) and T1456 (the twenty-odd scripts
 still hand-rolling their own manifest readers).
+
+## 2026-09-08 - T665: the viewer host-floor check stops calling a Windows upgrade a failure
+
+T665 was filed on 2026-08-09 against the live-runtime test that stands up a real
+WebView2 and drives a real controller: it had gone red with `environment
+creation failed hr=0x80004005` while two runtime versions were resident on the
+box, i.e. while Windows was replacing the component underneath it, and passed on
+an immediate re-run. A check that cannot tell "the viewer is broken" from "the
+OS component was mid-upgrade" spends a whole floor run to say nothing.
+
+Re-verified before building anything, per the CHECK FIRST rule: the defect was
+already fixed. **T592** (03a22076f, 2026-09-06) came at the same failure from the
+overlapping-lanes end and landed exactly what this card asked for - the refusal
+maps to `create_callback_failed`, `isTransient()` says true, the floor asks again
+up to three times, and a runtime that still will not start ends in a named SKIP
+rather than a red lane. So no new fix was owed; the validation was.
+
+And the validation was the interesting half. The retry-or-give-up decision lived
+inline in a test that only executes on a box with a runtime installed, and only
+branches when that runtime misbehaves - the one judgement worth covering was the
+one nothing could reach, which is how it sat uncovered for a month with the
+symptom already fixed. It is now `webview2.shouldRetryEnvironment`, a function of
+values: a refusal is retried while under the cap, the cap is a stop so the loop
+terminates, a permanent answer (no runtime, an unloadable DLL) is taken on the
+first reply rather than spending the deadline waiting for an installer to run
+itself, and the `inline for` over the enum means a new failure variant cannot
+arrive without deciding. The host floor loop is its one caller, so the shipped
+behaviour and the tested behaviour cannot drift apart.

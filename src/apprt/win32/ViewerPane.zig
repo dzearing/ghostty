@@ -6412,7 +6412,11 @@ test "host floor: a real controller on a real window, on this box" {
     // The skip branch further down still exists and still means what it meant:
     // after this loop, `.failed` is a considered verdict rather than a race.
     {
-        const max_attempts: u8 = 3;
+        // The policy — retry a refusal, take a permanent answer on the first
+        // reply, stop at the cap — is `webview2.shouldRetryEnvironment`, which
+        // is a function of values so it has tests that do not need a live
+        // runtime to run (T665). This loop is its one caller.
+        const max_attempts = webview2.floor_max_attempts;
         var attempt: u8 = 0;
         while (true) {
             host.ensure();
@@ -6434,7 +6438,7 @@ test "host floor: a real controller on a real window, on this box" {
 
             const why = host.failure.?;
             attempt += 1;
-            if (!why.isTransient() or attempt >= max_attempts) break;
+            if (!webview2.shouldRetryEnvironment(why, attempt, max_attempts)) break;
             log.warn(
                 "host floor: environment refused ({s}); attempt {d} of {d}, " ++
                     "waiting for the runtime to settle",
