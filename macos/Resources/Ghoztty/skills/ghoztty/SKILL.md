@@ -546,8 +546,10 @@ ghoztty +send-keys --target=<name> [flags] <text|key>...
 |------------|-------------|
 | `--target=<name>` | Named pane or window to send input to. Required. |
 | `--enter` | Press Enter after the text, submitting it. Same as a trailing `\n` or a trailing `Enter` argument. On its own, with no text, it just presses Enter. |
-| `--when-idle` | Poll the target's recent output every 500ms until it no longer shows `esc to interrupt` (Claude Code's busy marker) before sending. Sends anyway once the timeout elapses, or if the pane can't be read. |
+| `--when-idle` | Poll the target's recent output every 500ms until it looks idle before sending: the tail unchanged across ~1s (a working TUI animates a spinner or a timer; an idle prompt is static, so this catches any program without naming its chrome) AND none of the caller's `--busy-marker` texts present. Sends anyway once the timeout elapses, or if the pane can't be read. |
 | `--idle-timeout=<seconds>` | How long `--when-idle` waits before sending regardless. Default 30. |
+| `--busy-marker=<text>` | Extra busy signal for `--when-idle`: while `<text>` is in the pane's last lines, the pane counts as busy even if its tail is static. Repeatable; any match counts. |
+| `--keys-file=<path>` | Send the file's bytes **verbatim** — no key notation, no `\n` escape processing, and no trailing-newline peel. It keeps its position among the positional arguments, so `--keys-file=p.txt Enter` sends the file and then presses Enter. |
 | `--` | Stop flag parsing. Everything after it is a positional, so this is how you send literal text starting with `--`. Key notation still applies. |
 | Positional args | Text strings and key names, written to the PTY in order. |
 
@@ -562,14 +564,25 @@ ghoztty +send-keys --target=term "ls -la" Enter
 ghoztty +send-keys --target=agent --when-idle --enter "next task"
 ghoztty +send-keys --target=term C-c
 ghoztty +send-keys --target=term -- "--not-a-flag" Enter
+ghoztty +send-keys --target=agent --keys-file=prompt.txt Enter
 ```
+
+**Text you did not author by hand goes through `--keys-file=`.** A generated
+prompt, a path, anything carrying quotes or backslashes: put it in a file and
+send the file. A positional argument is re-tokenized by whatever shell builds
+the command line — PowerShell 5.1 does not escape an embedded `"` at all — so
+such text arrives with its quotes stripped, its words concatenated, or broken
+outright. Length is not the hazard; punctuation is.
 
 **A trailing newline is a keypress; an interior one is content.** The trailing
 run of `\n`/`\r` is peeled off the text and sent as that many Enter presses, so
 `"a\nb\n"` pastes two lines and then submits. The peel happens after escape
 processing, so `\n` written as the two-character escape and a real newline byte
 behave the same. The accepted cost: text ending in a literal newline can't be
-pasted without submitting.
+pasted without submitting — which is why `--keys-file=` is exempt from the
+peel: a file the caller generated ends in a newline because files do, not
+because it meant to submit. Pass a separate `Enter` (or `--enter`) to submit
+one.
 
 **Any unknown `--flag` is a hard error** (exit 1) naming the submit spellings —
 `--press-enter` used to be typed into the pane at exit 0, silently. Single-dash
@@ -1036,3 +1049,4 @@ Closing a nonexistent target is a no-op, so teardown scripts are safe even if so
 - **Don't `+read`, `+send-keys`, `+set-state`, or `+set-banner` a viewer pane** — all four exit 1. The pane is for the user to look at; if you need a diff as text, run `git diff` yourself.
 - **Don't `+close` a pane you only meant to hide** — it ends that pane's persistent session and the process does not come back.
 - **Don't send `+send-keys` text with no way to submit it** — a bare `"message"` sits in a TUI composer unsent. End it with `\n` (`"message\n"`), or pass `--enter`, or a separate `Enter` argument. Pick one: they stack, and two of them submit twice.
+- **Don't pass generated text as a positional argument** — a prompt you assembled, a path, anything with quotes or backslashes. Write it to a file and send `--keys-file=<path> Enter`; a positional goes through the calling shell's tokenizer and arrives mangled.

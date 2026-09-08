@@ -9,6 +9,34 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-08: T660 - **the instruction sheet Windows hands an AI agent
+  described a terminal we do not ship.** The `ghoztty` skill document is what
+  an agent READS to learn how to drive panes, and T866 made the Windows build
+  bundle it. What nobody settled then was whose text it carries:
+  `test/win32/hook-json.ps1` section A pinned the Windows live copy
+  byte-identical to the pristine `origin/main` mirror, so it shipped main's
+  doc against this branch's binary.
+
+  Three things it therefore got wrong. It named no `--keys-file=`, which on
+  this platform is not a nicety - a positional argument goes through the
+  calling shell's tokenizer, and PowerShell 5.1 does not escape an embedded
+  quote at all, so a generated prompt arrives with its quotes stripped and its
+  words concatenated. It named no `--busy-marker=`. And it described
+  `--when-idle` as polling until the pane stops showing `esc to interrupt`,
+  the baked-in Claude Code marker that D11/T517 replaced with motion
+  detection, so an agent reading it would expect the wait to work for exactly
+  one tool. It did not even carry the `readonly` list field this branch added
+  in T574 - the field whose whole job is to explain a `+send-keys` that
+  reported success and did nothing.
+
+  So the doc is now a deliberate fork, under the same rule the
+  `process-feedback` doc has had since T1321: the `upstream/` mirror stays
+  pristine for the T1325 drift compare, and the live Windows copy is asserted
+  byte-identical to the Mac bundle resource, because two platforms handing an
+  agent different instructions is the divergence CLAUDE.md calls the defect.
+  Section A asserts the four things the fork must carry and the one thing it
+  must not, so a future re-vendor cannot quietly restore main's text.
+
 - 2026-09-08: T642 - **the composer's IME support was a claim about RichEdit,
   not a measurement — and the measurement found a hole.** T635 swapped the
   feedback composer onto a RichEdit precisely so that caret, selection, undo,

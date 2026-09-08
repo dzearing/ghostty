@@ -1,11 +1,10 @@
 {
     "guard":  "test-reach",
     "script":  "test/win32/test-reach-audit.ps1",
-    "generated":  "2026-09-08T07:11:25-07:00",
-    "commit":  "bb8b242df",
+    "generated":  "2026-09-08T10:29:47-07:00",
+    "commit":  "ecd1d06f8",
     "uncommitted":  [
-                        "src/apprt/win32/ViewerPane.zig",
-                        "src/apprt/win32/ViewerWorktreeProbe.zig"
+                        "src/apprt/win32/GhosttyAssets.zig"
                     ],
     "files":  {
                   "src/apprt/win32.zig":  "542d83515aebcff9593d8a9f349d5801a35336c6836f673934bc455b347ee460",
@@ -70,7 +69,7 @@
                   "src/apprt/win32/drag_perf.zig":  "84bb2a4bcfce60fea15b52eb0672a3de258d5a52ac2df2594eab79a71ef48c72",
                   "src/apprt/win32/frame_size.zig":  "f1dc53407ba90d5d50c37bf1f2a5ce9aec1d4cc0db2d00b8ca7472fac29f1086",
                   "src/apprt/win32/gdiplus_decode.zig":  "e35ad6c8d9c8369de68ff38af6dfa794852177141126d9936612e714d7b13fd6",
-                  "src/apprt/win32/GhosttyAssets.zig":  "f9aa8e7e582991edfd955e9b6599d2858995baed7242f6abdc9cb06917c207d5",
+                  "src/apprt/win32/GhosttyAssets.zig":  "12570d8bb96b01067c724c01c178db7a18e827c409d8d1861ddda2aeccc8a0bc",
                   "src/apprt/win32/git_run.zig":  "9f1fd0286c144889782e28f729257564dbc529cc42bb998df676a37e752eeaec",
                   "src/apprt/win32/gui_pump.zig":  "ac66102200ebf3a08b1992846ff7189d4ff80226cfdb6dc750db74501be02782",
                   "src/apprt/win32/hero_math.zig":  "5aa97b9827f5aca6cf1217c0242480dc359b27fbee9e1d5374f9d30a7538d67f",

@@ -1,12 +1,10 @@
 {
     "guard":  "command-resolve",
     "script":  "test/win32/command-resolve-audit.ps1",
-    "generated":  "2026-09-08T09:50:35-07:00",
-    "commit":  "ccf59cfed",
+    "generated":  "2026-09-08T10:20:33-07:00",
+    "commit":  "ecd1d06f8",
     "uncommitted":  [
-                        "test/win32/lib/SessionManifest.ps1",
-                        "test/win32/session-reattach-zombie.ps1",
-                        "test/win32/session-relaunch-notify.ps1"
+                        "test/win32/hook-json.ps1"
                     ],
     "files":  {
                   "test/win32/activity-monitor.ps1":  "a3f98a551352e27d1ad9c1745e222757dc4b802efc5638fbe6ea4d3f621b6307",
@@ -126,7 +124,7 @@
                   "test/win32/holder-durable.ps1":  "397ae7c3e73d125d3e57c13775b9a5e10a703d7bdaa2108a2de9eda21b32309c",
                   "test/win32/holder-soak.ps1":  "a8c7eaa00a75aeb97f8436055214b4afc913f9af0f6f9c552f672cd42f4f30f6",
                   "test/win32/holder-volume.ps1":  "f339df53cd125b2ef347804b53e361754c52cdcb7e9c073055bfbd79e77b9c31",
-                  "test/win32/hook-json.ps1":  "5d78a69ce4e363ae016c335a638677c8c13299664fe0bf1d8d4fff49d7d6eab6",
+                  "test/win32/hook-json.ps1":  "66ca65a50dc855db877327f18496e40d60b509c276c854e401889b0f8d5b917b",
                   "test/win32/host-settings.ps1":  "4bc5045b4017d45d664d2f715b14e538022cb9ff87e40cedbdeecd4a1216ccb5",
                   "test/win32/hover-capture.ps1":  "0a8055d036ef8aa5ef83d91851c418f52dfdc09ea29d63f5eae9af87a9ee92a1",
                   "test/win32/install-launch.ps1":  "df8a8917d448d735d327ae87bcfde00f09a665dcbe0737ae56c4c0487d8225ca",

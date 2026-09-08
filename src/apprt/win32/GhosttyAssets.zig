@@ -9,16 +9,23 @@
 //! Layout of `assets/ghoztty/` (chosen here, recorded for convergence):
 //!   - `upstream/`   pristine byte-for-byte mirror of tip-of-main's
 //!                   `macos/Resources/Ghoztty/` — NEVER edited by hand. The
-//!                   acceptance harness (`test/win32/vendored-assets.ps1`)
-//!                   compares every file against `origin/main`, so drift from
-//!                   the Mac copies is loud.
+//!                   acceptance harness (section A of
+//!                   `test/win32/hook-json.ps1`) compares every file against
+//!                   `origin/main`, so drift from the Mac copies is loud.
 //!   - `hooks/`, `skills/`  the copies the app ships, byte-identical to this
 //!                   branch's `macos/Resources/Ghoztty/` and therefore AHEAD of
 //!                   `upstream/` wherever this branch has edited them —
 //!                   today that is `process-feedback/SKILL.md`, which T1321
 //!                   taught to record a release request and to file deferred
 //!                   work with `-UserReport`, so a fix a person asked for is
-//!                   not left to the ordinary release cadence. Both hook
+//!                   not left to the ordinary release cadence, and
+//!                   `ghoztty/SKILL.md`, which T660 forked so the document an
+//!                   agent READS describes the CLI this branch actually has:
+//!                   `--keys-file=` (the only safe way to send generated text
+//!                   through a PowerShell command line), `--busy-marker=`, the
+//!                   motion-based `--when-idle` that replaced main's baked-in
+//!                   `esc to interrupt` marker, and the `readonly` list field.
+//!                   Both hook
 //!                   scripts are deliberate forks — `ghoztty-banner.sh` replaces its `jq`
 //!                   plumbing with `ghoztty +json` (native, dependency-free),
 //!                   and `ghoztty-activity-state.sh` adds OSTYPE-guarded

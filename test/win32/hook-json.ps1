@@ -111,14 +111,34 @@ if (-not $mainOk) {
     }
 }
 
-# The live copies: one unforked (byte-identical to the mirror), three forks.
-foreach ($rel in @('skills/ghoztty/SKILL.md')) {
-    $live = Join-Path $assetRoot ($rel -replace '/', '\')
-    $mirror = Join-Path $assetRoot ("upstream\" + ($rel -replace '/', '\'))
-    $a = (& git -C $repo hash-object $live 2>$null | Out-String).Trim()
-    $b = (& git -C $repo hash-object $mirror 2>$null | Out-String).Trim()
-    Assert ($a -and ($a -eq $b)) "live copy of $rel is byte-identical to the mirror"
+# The live copies: four forks, no unforked one left.
+#
+# The ghoztty skill fork (T660). This document is what an agent READS to learn
+# how to drive the terminal, and until now the Windows copy was pinned
+# byte-identical to the mirror - so it shipped main's text describing a CLI this
+# branch does not have. It named no `--keys-file=` (the only safe way to send
+# generated text: a positional argument goes through the calling shell's
+# tokenizer and PowerShell 5.1 does not escape an embedded quote at all), no
+# `--busy-marker=`, and described `--when-idle` as watching for Claude Code's
+# `esc to interrupt` marker, which D11/T517 replaced with motion detection. It
+# did not even carry our own `readonly` list field (T574). An agent that follows
+# a doc contradicting the binary hands the user a mangled prompt and calls it
+# sent. So the divergence is deliberate and must SURVIVE a re-vendor, and the
+# same rule as the process-feedback fork applies: the mirror stays pristine for
+# section A's drift compare, and the live copy tracks the Mac bundle resource so
+# the two platforms never hand an agent different instructions.
+$fork4 = Join-Path $assetRoot 'skills\ghoztty\SKILL.md'
+$fork4Text = [System.IO.File]::ReadAllText($fork4)
+foreach ($needle in @('--keys-file=', '--busy-marker=', 'unchanged across ~1s', '**`readonly`**')) {
+    Assert ($fork4Text.IndexOf($needle, [StringComparison]::Ordinal) -ge 0) `
+        "ghoztty skill fork carries '$needle'"
 }
+Assert ($fork4Text.IndexOf('esc to interrupt', [StringComparison]::Ordinal) -lt 0) `
+    "ghoztty skill fork does not describe --when-idle as watching for a baked-in busy marker"
+$fork4Mac = (& git -C $repo hash-object (Join-Path $repo 'macos\Resources\Ghoztty\skills\ghoztty\SKILL.md') 2>$null | Out-String).Trim()
+$fork4Win = (& git -C $repo hash-object $fork4 2>$null | Out-String).Trim()
+Assert ($fork4Win -and ($fork4Win -eq $fork4Mac)) `
+    'ghoztty skill fork is byte-identical to the mac bundle resource'
 
 # The process-feedback fork (T1321). A report drained from the viewer feedback
 # queue IS a user report, and until this text existed the skill ended at "commit
