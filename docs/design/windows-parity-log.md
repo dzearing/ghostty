@@ -25632,3 +25632,50 @@ pinning only the shell's initial thread (1.87x/2.22x, worse than doing nothing),
 CPU-set preference alone, and the EcoQoS opt-out, which is kept because it is
 the documented companion to this and is worth a few percent, not because it was
 the answer.
+
+## 2026-09-08 - T667: the session-persistence floor was fixed the day it was filed, and nobody ran it since
+
+T667 was filed on 2026-08-09: `test\win32\session-persistence.ps1` - the
+crash-and-restart E2E that builds five panes across two windows, kills the app
+three times, floods it and checks everything comes back - aborted before doing
+anything when started from a Ghoztty pane. It predated `lib\Isolation.ps1`, so
+it never claimed a private pipe suffix, the CLI resolved the pane's baked
+`$GHOZTTY_IPC_SOCKET`, and its own hermeticity pre-flight was answered by the
+user's installed release. The guard was right; the endpoint was wrong.
+
+Re-verified before building anything, per the CHECK FIRST rule, and it was
+already fixed - by **328da04b0**, pushed the same day the card was written,
+under T89i's banner and never naming T667. The suffix is claimed at line 367,
+*above* the pre-flight rather than beside the `LOCALAPPDATA` switch below it,
+which is the whole trick: the guard's own `+list` is itself a CLI call.
+`Assert-GhozttyIsolatedBuild` runs first (the shared T350 gate since T1033) and
+`Assert-GhozttyIsolated` settles whose panes these are once the first window is
+up. The card's last bullet - "worth checking the same gap in any other script" -
+was answered as a class by T680's `isolation-meta.ps1` scan, which is the right
+shape: a hand-audit goes stale the day someone adds a script.
+
+So the deliverable was the run the card was owed, and this time it was reachable
+rather than needing a seam built for it. From this loop's own pane, no
+environment variable set by hand: exit 0, ALL PASS, 77 PASS / 0 FAIL, including
+all twelve arms of section E and the `[isolation] the answering instance is
+ours` assertion. The release-exe refusal is not re-asserted here on purpose -
+it is the shared gate's, demonstrated by `build-mode-guard.ps1` sections C and
+D, and a second local copy of a shared negative control is exactly what T1033
+deleted.
+
+One thing the green run turned up, filed as **T1467**: its teardown reported
+`CRASHED - 0xFFFFFFFF unnamed NTSTATUS` for a process the harness had just
+force-killed. `0xFFFFFFFF` is what `Stop-Process -Force` leaves and is not an
+NTSTATUS at all - no facility, no severity encoding - so the postmortem's
+otherwise-correct "high bit set means crash" rule has exactly one false
+positive, and Windows filing no WER record for it is the corroboration. A green
+run that ends with the word CRASHED in it is how a real crash line stops being
+read.
+
+T1466 was claimed first and parked rather than worked: it is the last third of
+the pane-lag report and it needs **D94**, the user's call on whether a restored
+pane's own commands give up half the CPU to keep its output fast. Its Details
+offered a third, uncosted option - pin the conhost without pinning the shell -
+and reading the code retired it: `pty_host.zig` pins ITSELF, conhost is its
+child, and affinity is inherited, so that option is already what ships. There is
+no middle path left, which makes the card blocked rather than merely waiting.
