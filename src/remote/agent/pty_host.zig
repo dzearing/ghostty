@@ -41,6 +41,7 @@ const protocol = @import("../protocol.zig");
 const proto = @import("pty_host_proto.zig");
 const pty_child = @import("pty_child.zig");
 const pipe_stream = @import("../pipe_stream.zig");
+const internal_os = @import("../../os/main.zig");
 const relay_perf = @import("relay_perf.zig");
 const server = @import("server.zig");
 const session = @import("session.zig");
@@ -152,6 +153,21 @@ const win = struct {
     };
 
     fn run(alloc: Allocator, opts: Options) !void {
+        // Before anything else, and before the ConPTY exists: this process is
+        // windowless and long-lived, which is exactly the shape Windows 11 puts
+        // in efficiency mode on its own - E-cores, reduced clock. That cost the
+        // shipped pane path 2.2x against the same read loop running inside the
+        // foreground app (T1465), and conhost, spawned underneath us, inherits
+        // whatever we are.
+        internal_os.power.disableThrottling();
+        internal_os.power.preferPerformanceCores();
+        // ...and, on a hybrid CPU, keep this process and the conhost it is about
+        // to create off the efficiency cores. That is the whole of the T1465
+        // deficit: the cmd->conhost round trip behind every ~73-byte chunk of
+        // shell output costs ~122 us on an E-core against ~55 us on a P-core,
+        // which is exactly the 2x an agent-held pane showed. The SHELL is put
+        // back on the full machine below - it is the user's work, not plumbing.
+
         if (!proto.validSessionId(opts.session_id)) {
             log.err("invalid --session-id '{s}' (pipe-name-safe charset required)", .{opts.session_id});
             return error.InvalidSessionId;
@@ -187,6 +203,12 @@ const win = struct {
             .command = opts.command,
             .shell = opts.shell,
         });
+        // Hand the shell the whole machine back, with a preference (T1465). The
+        // process mask is what its children inherit, so a build started in a
+        // persisted pane keeps all 32 logical CPUs; the CPU-set default is a
+        // hint the scheduler honours while the fast cores are free.
+        if (comptime is_windows) internal_os.power.allowAllCores(pc.pid);
+
         const child = pc.child();
         // One conversion for both Windows arms (T355): a `posix.pid_t` here is
         // the process HANDLE, and the pid the owner is told must be the shell's

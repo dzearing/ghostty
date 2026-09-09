@@ -175,6 +175,13 @@ pub fn main() !void {
     // registered later (`startConsoleCtrlWatcher`).
     if (builtin.os.tag == .windows) _ = SetConsoleCtrlHandler(null, std.os.windows.FALSE);
 
+    // The agent is windowless and long-lived, which is the shape Windows 11
+    // puts in efficiency mode of its own accord - E-cores at a reduced clock.
+    // It relays every byte of every session's output, so being clamped there is
+    // felt as a slow pane (T1465). Ask, once, before any session exists; a pty
+    // holder asks again for itself, because it is spawned rather than forked.
+    @import("../../os/main.zig").power.disableThrottling();
+
     // The transfer encoding is fixed at construction (the client pins it in HELLO).
     // Default to raw; `GHOZTTY_AGENT_ENCODING` overrides it (deterministic tests).
     const encoding = encodingFromEnv(alloc);

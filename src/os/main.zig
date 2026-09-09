@@ -32,6 +32,7 @@ pub const log_stamp = @import("log_stamp.zig");
 pub const log_rotate = @import("log_rotate.zig");
 pub const mach = @import("mach.zig");
 pub const path = @import("path.zig");
+pub const power = @import("power.zig");
 pub const path_env = @import("path_env.zig");
 pub const process_cwd = @import("process_cwd.zig");
 pub const self_exe = @import("self_exe.zig");

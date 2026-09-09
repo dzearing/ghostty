@@ -25585,3 +25585,50 @@ arm at all.
 
 T1465 carries the deficit from here, and it starts where a task should: with a
 measured cause and a list of what has already been paid for and disproved.
+
+## 2026-09-08 - the ConPTY was never slow either; Windows had put it on the small cores (T1465)
+
+Three tasks in a row have narrowed the same defect by removing a suspect, and
+this is the one that names it. T1464 left a number that looked like a hard cap:
+the holder's ConPTY read loop delivering ~8,400 chunks a second where the app's
+identical loop does ~19,000. T1465's first act was to bracket the `ReadFile`
+itself, and the answer arrived immediately - `child_read io_ms_per_s=946-973`
+against `child_sink 23-49`. The reader spends 96% of every second BLOCKED,
+waiting for bytes that have not arrived, and under 5% doing its own work. The
+sink, the mutex, the broadcast: not the cost. Then the obvious remedy was tried
+and disproved in the same breath - `termio/Exec.zig`'s local reader peeks and
+tops up before parsing, so the holder's 73-byte chunks looked like a missing
+coalesce. With that exact drain added, `frames_per_wake` stayed at **1** for
+every second of a 7.7 MB burst: the pipe is empty every single time the reader
+comes back to it. There was never anything to coalesce.
+
+So the source was slow, and the source is conhost, and the question became why
+the same conhost is slower under a holder than under the app. A processor-number
+histogram cleared the reader thread (cores 0-15, 99.9% of samples). Priority
+class moved nothing. What moved it was affinity: pinning the holder - and so the
+conhost it creates and the shell underneath it - to the performance cores took
+the ratio from 1.99x/2.02x to **1.05x and 1.14x**, level with conhost. This is a
+hybrid CPU, and Windows had quietly decided that a windowless background process
+and its children belong on the efficiency cores. Every line the shell prints is
+a round trip to conhost, and that round trip costs ~122 us there against ~55 us
+on a performance core. The pane was not paying for a relay, a parser or a pipe.
+It was paying for the small cores, twice per line.
+
+What shipped is the half of that with no downside. `src/os/power.zig` derives
+the performance set from `GetSystemCpuSetInformation`'s `EfficiencyClass` - a
+machine with one class has no faster half, so it answers null and nothing is
+pinned - and the holder claims it before creating the ConPTY. The SHELL is then
+handed the whole machine back, because affinity is inherited and a build started
+in a persisted pane must not be confined to sixteen of this box's thirty-two
+CPUs. Five runs before: 1.84-2.02x. Three runs after: 1.51x, 1.56x, 1.58x, and
+`pane-ingest-ab`'s bound comes down 2.50 -> 1.75, which is now above every
+measurement of the fixed path and below every measurement of the broken one.
+
+The last third is a trade rather than a bug, so it went to the user as D94
+(carried by T1466): pinning the shell subtree too would close the gap outright,
+and would cost anything you RUN in that pane half the machine. Three things were
+measured and rejected on the way and are written down so they are not retried -
+pinning only the shell's initial thread (1.87x/2.22x, worse than doing nothing),
+CPU-set preference alone, and the EcoQoS opt-out, which is kept because it is
+the documented companion to this and is worth a few percent, not because it was
+the answer.

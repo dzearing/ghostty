@@ -50,7 +50,89 @@ pub const exp = struct {
         lpAttributeList: LPPROC_THREAD_ATTRIBUTE_LIST,
     };
 
+    // --- EcoQoS opt-out (T1465) ------------------------------------------------
+    //
+    // Windows 11 decides, on its own, that a background process should run in
+    // "efficiency mode": its threads are parked on E-cores at a reduced clock.
+    // On a 13900K that is worth roughly 2.2x, which is exactly the deficit an
+    // agent-held pane showed against the same code running inside the
+    // foreground app. `SetProcessInformation(ProcessPowerThrottling)` with the
+    // EXECUTION_SPEED bit in `ControlMask` and clear in `StateMask` is the
+    // documented way to say "never throttle this one"; child processes inherit
+    // it, which is how the ConPTY's own conhost gets covered.
+
+    pub const PROCESS_INFORMATION_CLASS = enum(c_int) {
+        ProcessMemoryPriority = 0,
+        ProcessMemoryExhaustionInfo = 1,
+        ProcessAppMemoryInfo = 2,
+        ProcessInPrivateInfo = 3,
+        ProcessPowerThrottling = 4,
+        ProcessReservedValue1 = 5,
+        ProcessTelemetryCoverageInfo = 6,
+        ProcessProtectionLevelInfo = 7,
+        ProcessLeapSecondInfo = 8,
+        ProcessMachineTypeInfo = 9,
+    };
+
+    pub const PROCESS_POWER_THROTTLING_CURRENT_VERSION: windows.ULONG = 1;
+    pub const PROCESS_POWER_THROTTLING_EXECUTION_SPEED: windows.ULONG = 0x1;
+
+    pub const PROCESS_POWER_THROTTLING_STATE = extern struct {
+        Version: windows.ULONG,
+        ControlMask: windows.ULONG,
+        StateMask: windows.ULONG,
+    };
+
+    /// One processor, as `GetSystemCpuSetInformation` reports it (winnt.h
+    /// `SYSTEM_CPU_SET_INFORMATION`). `EfficiencyClass` is the field that makes
+    /// a hybrid CPU's performance cores nameable without hardcoding a mask:
+    /// higher is faster, and every processor sharing one value means the
+    /// machine has no faster half. The union in the C header has exactly one
+    /// arm today, so it is flattened here.
+    pub const SYSTEM_CPU_SET_INFORMATION = extern struct {
+        Size: windows.DWORD,
+        Type: windows.DWORD,
+        Id: windows.DWORD,
+        Group: windows.WORD,
+        LogicalProcessorIndex: u8,
+        CoreIndex: u8,
+        LastLevelCacheIndex: u8,
+        NumaNodeIndex: u8,
+        EfficiencyClass: u8,
+        AllFlags: u8,
+        _pad: [2]u8,
+        SchedulingClass: windows.DWORD,
+        AllocationTag: u64,
+    };
+
     pub const kernel32 = struct {
+        pub extern "kernel32" fn GetSystemCpuSetInformation(
+            Information: ?*SYSTEM_CPU_SET_INFORMATION,
+            BufferLength: windows.ULONG,
+            ReturnedLength: *windows.ULONG,
+            Process: windows.HANDLE,
+            Flags: windows.ULONG,
+        ) callconv(.winapi) windows.BOOL;
+        pub extern "kernel32" fn SetProcessDefaultCpuSets(
+            Process: windows.HANDLE,
+            CpuSetIds: ?[*]const windows.ULONG,
+            CpuSetIdCount: windows.ULONG,
+        ) callconv(.winapi) windows.BOOL;
+        pub extern "kernel32" fn SetProcessAffinityMask(
+            hProcess: windows.HANDLE,
+            dwProcessAffinityMask: usize,
+        ) callconv(.winapi) windows.BOOL;
+        pub extern "kernel32" fn GetProcessAffinityMask(
+            hProcess: windows.HANDLE,
+            lpProcessAffinityMask: *usize,
+            lpSystemAffinityMask: *usize,
+        ) callconv(.winapi) windows.BOOL;
+        pub extern "kernel32" fn SetProcessInformation(
+            hProcess: windows.HANDLE,
+            ProcessInformationClass: PROCESS_INFORMATION_CLASS,
+            ProcessInformation: windows.LPVOID,
+            ProcessInformationSize: windows.DWORD,
+        ) callconv(.winapi) windows.BOOL;
         pub extern "kernel32" fn CreatePipe(
             hReadPipe: *windows.HANDLE,
             hWritePipe: *windows.HANDLE,

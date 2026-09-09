@@ -53,6 +53,7 @@ const proc_spawn = @import("proc_spawn.zig");
 const proc = @import("proc.zig");
 const foreground = @import("foreground.zig");
 const pty_holder_child = @import("pty_holder_child.zig");
+const relay_perf = @import("relay_perf.zig");
 
 /// On Windows the OS-specific arms reach `ReadFile`/`WriteFile`/`TerminateProcess`
 /// straight from `std.os.windows` — the same kernel32 surface the smoke uses.
@@ -295,7 +296,17 @@ pub const PtyChild = struct {
         // zero channel. (attach() always fires before any output is meaningful.)
         self.attached.wait();
         var buf: [read_buf_size]u8 = undefined;
+        // T1465: the SOURCE leg, split in two. `holder_read` (pty_host's sink
+        // meter) counts what leaves this loop, and its `io_ms_per_s` is 0
+        // because a sink cannot see the read that produced it - so a loop that
+        // is BLOCKED waiting for the shell and a loop whose own per-chunk work
+        // is expensive look identical from there. These two brackets tell them
+        // apart: `child_read` is time inside `ReadFile`, `child_sink` is time
+        // inside the sink, and they sum to the second.
+        var read_meter: relay_perf.Meter = .init("child_read");
+        var sink_meter: relay_perf.Meter = .init("child_sink");
         while (true) {
+            const read_t = read_meter.start();
             const n = if (is_windows) blk: {
                 // Windows: ConPTY output side. `ReadFile(out_pipe)` blocks until
                 // bytes arrive and returns 0 (with BROKEN_PIPE) once the ConPTY
@@ -304,6 +315,19 @@ pub const PtyChild = struct {
                 var read: windows.DWORD = 0;
                 if (windows.kernel32.ReadFile(self.pty.out_pipe, &buf, buf.len, &read, null) == 0)
                     break :blk 0;
+                if (read == 0) break :blk 0;
+
+                // NO TOP-UP DRAIN HERE, and that is a measurement rather than an
+                // omission (T1465). `termio/Exec.zig`'s local reader peeks and
+                // refills before parsing, so the obvious guess was that the
+                // holder's ~73-byte chunks were a missing coalesce. They are not:
+                // with the same peek loop added here, `frames_per_wake` on
+                // `perf child_read` stayed at exactly 1 for every second of a
+                // 7.7 MB burst - the pipe is EMPTY every single time this loop
+                // comes back to it, because the reader is faster than conhost by
+                // a wide margin. A peek per read is a syscall on the hot path
+                // buying nothing. Re-add it only with a number showing otherwise.
+                read_meter.frame(read);
                 break :blk @as(usize, read);
             } else posix.read(self.pty.master, &buf) catch |err| switch (err) {
                 // On Linux a pty master read after the slave hangs up yields EIO;
@@ -312,13 +336,21 @@ pub const PtyChild = struct {
                 error.WouldBlock => continue,
                 else => 0,
             };
+            read_meter.stop(read_t);
             if (n == 0) break; // EOF: child gone
+            read_meter.wake();
             self.mutex.lock();
             const sink = self.sink;
             const sink_ctx = self.sink_ctx;
             const channel = self.channel;
             self.mutex.unlock();
+            const sink_t = sink_meter.start();
             if (sink) |f| f(sink_ctx.?, channel, buf[0..n]);
+            sink_meter.stop(sink_t);
+            sink_meter.wake();
+            sink_meter.frame(n);
+            read_meter.report();
+            sink_meter.report();
         }
         // After EOF the child has (almost certainly) exited; surface it so the next
         // tryWait reaps and the EXIT/tombstone path fires. A final zero-length sink

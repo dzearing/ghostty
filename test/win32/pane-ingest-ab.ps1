@@ -113,16 +113,22 @@ $env:GHOZTTY_RELAY_PERF_DIR = $tmp
 # --- bounds -----------------------------------------------------------------
 # How much slower the agent-held pane may be than the local one.
 #
-# READ THIS BEFORE TIGHTENING IT. 2.50 is not the goal - it is a CEILING over a
+# READ THIS BEFORE TIGHTENING IT. 1.75 is not the goal - it is a CEILING over a
 # deficit that is still open. Measured on this box, optimized build: 2.25x
-# before T1464's relay work and 1.97-2.15x after it, against a target of 1.0x.
-# So the arm below asks "has the relay got WORSE?", which is the question a
-# regression test can answer today, and the goal state (agent-held ingest at
-# least conhost's) belongs to the task that carries the remaining deficit. When
-# that lands, this number comes down to ~1.40 - wide enough for a loaded box,
-# narrow enough that half the original regression fails it - and the assertion
-# text below stops hedging.
-$relayRatioBound = 2.50
+# before T1464's relay work, 1.97-2.15x after it, and 1.84-2.02x over five runs
+# immediately before T1465. T1465 found the cause - the holder's process tree
+# was being placed on the CPU's efficiency cores, where the shell->conhost round
+# trip behind every ~73-byte chunk of output costs ~122 us against ~55 us on a
+# performance core - and took the plumbing off them: three runs at 1.51x, 1.56x,
+# 1.58x. Hence 1.75: above every measurement of the fixed path, below every
+# measurement of the broken one, so this arm now fails if the fix stops working
+# rather than only if something new breaks.
+#
+# The REST of the gap needs the user's own shell subtree pinned there too, which
+# costs a build started in a persisted pane half the machine - a trade recorded
+# as a decision rather than taken quietly. If that lands, this comes down to
+# ~1.20 and the target becomes conhost parity.
+$relayRatioBound = 1.75
 # A run that produced no output at all would otherwise "pass" every ratio, so
 # each pane must also clear a floor. Deliberately generous: the slowest thing
 # measured on this box was the Debug agent path at ~50 KB/s.
