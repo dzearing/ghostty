@@ -66,6 +66,7 @@ const metrics = @import("metrics.zig");
 const proc = @import("proc.zig");
 const descendants = @import("descendants.zig");
 const proc_control = @import("proc_control.zig");
+const relay_perf = @import("relay_perf.zig");
 
 /// Scratch read buffer per reader thread's blocking `Stream.read`.
 const read_buf_size = 64 * 1024;
@@ -223,6 +224,73 @@ const OutFrame = struct {
     channel: u128,
     payload: []u8,
 };
+
+/// Upper bound on a coalesced DATA payload (T1464). Big enough that a pane
+/// under a full-speed `cat` collapses thousands of ConPTY-sized frames into a
+/// handful, small enough that one frame is still a sane unit of work for the
+/// client's parser and never approaches `protocol.max_frame_len`.
+const max_coalesced_payload: usize = 256 * 1024;
+
+/// One frame's worth of payload taken off the head of a write batch, plus how
+/// many queued entries it consumed.
+const CoalescedRun = struct {
+    payload: []const u8,
+    count: usize,
+};
+
+/// Merge the run of DATA frames at the head of `run` that are **contiguous on
+/// one channel** into a single payload (T1464).
+///
+/// The relay carries child output one ConPTY read at a time: T1463 measured
+/// ~60 bytes per frame at 10,000-22,600 frames a second, and every one of them
+/// costs a frame header, a pipe write and a wake-up at the far end. Merging is
+/// what makes that cost proportional to BYTES rather than to reads.
+///
+/// It is deliberately a backlog-only effect. This only ever sees frames that
+/// were already sitting in the queue when the writer woke, so a lone keystroke
+/// echo — `run.len == 1` — returns untouched and is written immediately. There
+/// is no timer here and nothing waits for a frame that has not arrived.
+///
+/// Merging is refused unless every property that makes two DATA frames one
+/// frame holds: same lane, same channel, plain `.data` (a `.data_repaint`
+/// anchors rather than advances the stream, so it can never fold into its
+/// neighbours), and a `byte_offset` that continues exactly where the previous
+/// frame ended. Anything else ends the run, which is then written as-is.
+///
+/// On OOM the head frame is returned alone — a merge that cannot allocate is a
+/// missed optimization, never a dropped byte.
+fn coalesceRun(alloc: Allocator, merged: *std.ArrayList(u8), run: []const OutFrame) CoalescedRun {
+    const head = run[0];
+    const single: CoalescedRun = .{ .payload = head.payload, .count = 1 };
+    if (run.len < 2) return single;
+    if (head.stream != .data or head.ftype != .data) return single;
+    if (head.payload.len < protocol.DataPayload.header) return single;
+
+    var end = std.mem.readInt(u64, head.payload[0..8], .big) +
+        (head.payload.len - protocol.DataPayload.header);
+    var total = head.payload.len;
+    var n: usize = 1;
+    while (n < run.len) : (n += 1) {
+        const f = run[n];
+        if (f.stream != .data or f.ftype != .data) break;
+        if (f.channel != head.channel) break;
+        if (f.payload.len < protocol.DataPayload.header) break;
+        if (std.mem.readInt(u64, f.payload[0..8], .big) != end) break;
+        const add = f.payload.len - protocol.DataPayload.header;
+        if (total + add > max_coalesced_payload) break;
+        total += add;
+        end += add;
+    }
+    if (n == 1) return single;
+
+    merged.clearRetainingCapacity();
+    merged.ensureTotalCapacity(alloc, total) catch return single;
+    merged.appendSliceAssumeCapacity(head.payload);
+    for (run[1..n]) |f| {
+        merged.appendSliceAssumeCapacity(f.payload[protocol.DataPayload.header..]);
+    }
+    return .{ .payload = merged.items, .count = n };
+}
 
 // -----------------------------------------------------------------------------
 // Server
@@ -806,8 +874,15 @@ pub const Server = struct {
         defer wire.deinit(self.alloc);
         var batch: std.ArrayList(OutFrame) = .empty;
         defer batch.deinit(self.alloc);
+        var merged: std.ArrayList(u8) = .empty;
+        defer merged.deinit(self.alloc);
+        // The app-facing leg of the relay (T1464): what this connection puts on
+        // the wire, how much of it a single frame carries, and how much of the
+        // second goes into the pipe writes themselves.
+        var meter: relay_perf.Meter = .init("relay_out");
 
         while (true) {
+            meter.report();
             self.write_mutex.lock();
             while (self.write_queue.items.len == 0 and !self.closed) {
                 self.write_cond.wait(&self.write_mutex);
@@ -819,29 +894,56 @@ pub const Server = struct {
             const done = self.closed and batch.items.len == 0;
             self.write_mutex.unlock();
 
-            for (batch.items) |f| {
+            meter.wake();
+
+            // Emit the batch, coalescing runs of contiguous DATA on one channel
+            // into one frame and writing consecutive same-lane frames with ONE
+            // `writeAll` (T1464). Both are pure backlog effects: a batch of one
+            // — an idle pane's keystroke echo — takes exactly the path it took
+            // before, so nothing here trades latency for throughput. It is only
+            // when the queue is ALREADY deep, i.e. when the writer is behind,
+            // that frames merge, and then merging is what lets it catch up.
+            var lane: ?StreamId = null;
+            wire.clearRetainingCapacity();
+            var i: usize = 0;
+            while (i < batch.items.len) {
+                const f = batch.items[i];
+                if (lane != null and lane.? != f.stream) {
+                    self.flushWire(lane.?, wire.items, &meter);
+                    wire.clearRetainingCapacity();
+                }
+                lane = f.stream;
+
+                const run = coalesceRun(self.alloc, &merged, batch.items[i..]);
                 const frame: protocol.Frame = .{
                     .type = f.ftype,
                     .channel = f.channel,
                     .seq = self.frame_seq.next(), // single writer ⇒ seq == wire order
-                    .payload = f.payload,
+                    .payload = run.payload,
                 };
-                wire.clearRetainingCapacity();
-                protocol.writeFrame(self.alloc, self.encoding, frame, &wire) catch {
-                    self.alloc.free(f.payload);
-                    continue;
-                };
-                const stream = switch (f.stream) {
-                    .control => self.control,
-                    .data => self.data,
-                };
-                stream.writeAll(wire.items) catch {};
-                self.alloc.free(f.payload);
+                protocol.writeFrame(self.alloc, self.encoding, frame, &wire) catch {};
+                meter.frame(run.payload.len);
+                for (batch.items[i..][0..run.count]) |m| self.alloc.free(m.payload);
+                i += run.count;
+            }
+            if (lane) |l| {
+                if (wire.items.len > 0) self.flushWire(l, wire.items, &meter);
             }
             batch.clearRetainingCapacity();
 
             if (done) break;
         }
+    }
+
+    /// Write one lane's accumulated wire bytes, timed for `perf relay_out`.
+    fn flushWire(self: *Server, lane: StreamId, bytes: []const u8, meter: *relay_perf.Meter) void {
+        const stream = switch (lane) {
+            .control => self.control,
+            .data => self.data,
+        };
+        const io = meter.start();
+        stream.writeAll(bytes) catch {};
+        meter.stop(io);
     }
 
     // --- Reader threads -------------------------------------------------------
@@ -2561,6 +2663,158 @@ pub const Server = struct {
 // =============================================================================
 
 const testing = std.testing;
+
+// --- coalesceRun (T1464) -----------------------------------------------------
+//
+// The merge rules the writer relies on, pinned without a live connection: the
+// writer thread's own batching is a timing effect, so these are the only place
+// the CONTRACT is deterministic.
+
+/// Build an owned DATA `OutFrame` (payload = `byte_offset` + `bytes`) for the
+/// coalescing tests. Freed by `freeFrames`.
+fn dataFrame(alloc: Allocator, channel: u128, offset: u64, bytes: []const u8) !OutFrame {
+    const payload = try alloc.alloc(u8, protocol.DataPayload.encodedLen(bytes.len));
+    const dp: protocol.DataPayload = .{ .byte_offset = offset, .bytes = bytes };
+    _ = dp.encodeInto(payload);
+    return .{ .stream = .data, .ftype = .data, .channel = channel, .payload = payload };
+}
+
+fn freeFrames(alloc: Allocator, frames: []const OutFrame) void {
+    for (frames) |f| alloc.free(f.payload);
+}
+
+test "coalesceRun: contiguous DATA on one channel merges into a single payload" {
+    const alloc = testing.allocator;
+    var merged: std.ArrayList(u8) = .empty;
+    defer merged.deinit(alloc);
+
+    var frames = [_]OutFrame{
+        try dataFrame(alloc, 7, 0, "hello "),
+        try dataFrame(alloc, 7, 6, "world"),
+        try dataFrame(alloc, 7, 11, "!"),
+    };
+    defer freeFrames(alloc, &frames);
+
+    const run = coalesceRun(alloc, &merged, &frames);
+    try testing.expectEqual(@as(usize, 3), run.count);
+    const dp = try protocol.DataPayload.decode(run.payload);
+    try testing.expectEqual(@as(u64, 0), dp.byte_offset);
+    try testing.expectEqualSlices(u8, "hello world!", dp.bytes);
+}
+
+test "coalesceRun: a lone frame is returned untouched (no latency for a keystroke)" {
+    const alloc = testing.allocator;
+    var merged: std.ArrayList(u8) = .empty;
+    defer merged.deinit(alloc);
+
+    var frames = [_]OutFrame{try dataFrame(alloc, 7, 0, "x")};
+    defer freeFrames(alloc, &frames);
+
+    const run = coalesceRun(alloc, &merged, &frames);
+    try testing.expectEqual(@as(usize, 1), run.count);
+    try testing.expectEqual(@as(usize, 0), merged.items.len);
+    try testing.expectEqualSlices(u8, frames[0].payload, run.payload);
+}
+
+test "coalesceRun: a gap in byte_offset ends the run" {
+    const alloc = testing.allocator;
+    var merged: std.ArrayList(u8) = .empty;
+    defer merged.deinit(alloc);
+
+    var frames = [_]OutFrame{
+        try dataFrame(alloc, 7, 0, "ab"),
+        try dataFrame(alloc, 7, 2, "cd"),
+        // Offset 99 does not continue the stream: merging here would claim
+        // bytes 4..6 carried content they never carried.
+        try dataFrame(alloc, 7, 99, "ef"),
+    };
+    defer freeFrames(alloc, &frames);
+
+    const run = coalesceRun(alloc, &merged, &frames);
+    try testing.expectEqual(@as(usize, 2), run.count);
+    const dp = try protocol.DataPayload.decode(run.payload);
+    try testing.expectEqualSlices(u8, "abcd", dp.bytes);
+}
+
+test "coalesceRun: another channel ends the run" {
+    const alloc = testing.allocator;
+    var merged: std.ArrayList(u8) = .empty;
+    defer merged.deinit(alloc);
+
+    var frames = [_]OutFrame{
+        try dataFrame(alloc, 7, 0, "ab"),
+        try dataFrame(alloc, 8, 2, "cd"),
+    };
+    defer freeFrames(alloc, &frames);
+
+    const run = coalesceRun(alloc, &merged, &frames);
+    try testing.expectEqual(@as(usize, 1), run.count);
+    const dp = try protocol.DataPayload.decode(run.payload);
+    try testing.expectEqualSlices(u8, "ab", dp.bytes);
+}
+
+test "coalesceRun: DATA_REPAINT never merges (it anchors, it does not advance)" {
+    const alloc = testing.allocator;
+    var merged: std.ArrayList(u8) = .empty;
+    defer merged.deinit(alloc);
+
+    var frames = [_]OutFrame{
+        try dataFrame(alloc, 7, 0, "ab"),
+        try dataFrame(alloc, 7, 2, "repaint"),
+        try dataFrame(alloc, 7, 2, "cd"),
+    };
+    frames[1].ftype = .data_repaint;
+    defer freeFrames(alloc, &frames);
+
+    // The repaint stops the run ahead of it...
+    const first = coalesceRun(alloc, &merged, &frames);
+    try testing.expectEqual(@as(usize, 1), first.count);
+    // ...and is itself never a merge head.
+    const second = coalesceRun(alloc, &merged, frames[1..]);
+    try testing.expectEqual(@as(usize, 1), second.count);
+}
+
+test "coalesceRun: a control-lane frame is never merged" {
+    const alloc = testing.allocator;
+    var merged: std.ArrayList(u8) = .empty;
+    defer merged.deinit(alloc);
+
+    var frames = [_]OutFrame{
+        try dataFrame(alloc, 7, 0, "ab"),
+        try dataFrame(alloc, 7, 2, "cd"),
+    };
+    frames[0].stream = .control;
+    defer freeFrames(alloc, &frames);
+
+    const run = coalesceRun(alloc, &merged, &frames);
+    try testing.expectEqual(@as(usize, 1), run.count);
+}
+
+test "coalesceRun: the merged payload is capped" {
+    const alloc = testing.allocator;
+    var merged: std.ArrayList(u8) = .empty;
+    defer merged.deinit(alloc);
+
+    const chunk_len = 64 * 1024;
+    const chunk = try alloc.alloc(u8, chunk_len);
+    defer alloc.free(chunk);
+    @memset(chunk, 'z');
+
+    var frames: [8]OutFrame = undefined;
+    var i: usize = 0;
+    while (i < frames.len) : (i += 1) {
+        frames[i] = try dataFrame(alloc, 7, @intCast(i * chunk_len), chunk);
+    }
+    defer freeFrames(alloc, &frames);
+
+    const run = coalesceRun(alloc, &merged, &frames);
+    // Three 64 KB chunks fit under the 256 KB cap (with the 8-byte payload
+    // header the fourth would pass it); the run stops rather than growing an
+    // unbounded frame.
+    try testing.expectEqual(@as(usize, 3), run.count);
+    const dp = try protocol.DataPayload.decode(run.payload);
+    try testing.expectEqual(@as(usize, 3 * chunk_len), dp.bytes.len);
+}
 const all_encodings = [_]protocol.TransferEncoding{ .raw, .cobs, .base64 };
 
 /// Wall-clock waiter for cross-thread effects (T346) — see test_util.zig.
@@ -4085,6 +4339,84 @@ test "PROC_KILL a bogus pid → ok=false (graceful)" {
     try testing.expect(parsed.value.@"error" != null);
 }
 
+/// Consume live DATA frames until `want` bytes of `channel`'s stream have
+/// arrived, asserting the offsets stay contiguous from `from`. Returns the
+/// concatenation (caller frees).
+///
+/// Tests used to read ONE frame per `onChildOutput` call, which stopped being
+/// true at T1464: the writer coalesces a backlog, so two chunks fed
+/// back-to-back arrive as two frames or as one, depending on whether the writer
+/// thread happened to drain in between. That is the writer's timing, not the
+/// protocol's promise - what the wire guarantees is that every byte arrives
+/// exactly once, in order, at a contiguous offset. This checks that, and
+/// `coalesceRun`'s own unit tests pin the merge rules deterministically.
+fn drainLiveData(
+    client: *MockClient,
+    alloc: Allocator,
+    channel: u128,
+    from: u64,
+    want: usize,
+) !std.ArrayList(u8) {
+    var acc: std.ArrayList(u8) = .empty;
+    errdefer acc.deinit(alloc);
+    var next = from;
+    while (acc.items.len < want) {
+        const f = (try client.nextData()) orelse return error.NoData;
+        try testing.expectEqual(channel, f.channel);
+        const dp = try protocol.DataPayload.decode(f.payload);
+        try testing.expectEqual(next, dp.byte_offset);
+        try acc.appendSlice(alloc, dp.bytes);
+        next += dp.bytes.len;
+    }
+    return acc;
+}
+
+/// What a post-ATTACH drain saw: the offset the first frame was anchored at,
+/// and every byte from there until the stream passed `past`.
+const AttachData = struct {
+    at: u64,
+    bytes: std.ArrayList(u8),
+
+    fn deinit(self: *AttachData, alloc: Allocator) void {
+        self.bytes.deinit(alloc);
+    }
+};
+
+/// Drain DATA frames after an ATTACH until the stream has gone past `past`
+/// (the `snapshot_at_offset` the ATTACHED named), asserting contiguity.
+///
+/// The agent enqueues the gap-fill/ring replay and the repaint back to back, so
+/// since T1464 the writer can hand them over as two frames or as one merged
+/// frame - identical bytes at identical offsets either way, which is exactly
+/// why merging them is safe. A test that reads TWO frames is asserting on the
+/// writer's timing; this reads until the CONTENT is in hand, and the caller
+/// splits it at `past` to check each half.
+fn drainAttachData(
+    client: *MockClient,
+    alloc: Allocator,
+    channel: u128,
+    past: u64,
+) !AttachData {
+    var acc: std.ArrayList(u8) = .empty;
+    errdefer acc.deinit(alloc);
+    var at: ?u64 = null;
+    var end: u64 = 0;
+    while (at == null or end <= past) {
+        const f = (try client.nextData()) orelse return error.NoData;
+        try testing.expectEqual(channel, f.channel);
+        const dp = try protocol.DataPayload.decode(f.payload);
+        if (at == null) {
+            at = dp.byte_offset;
+            end = dp.byte_offset;
+        } else {
+            try testing.expectEqual(end, dp.byte_offset);
+        }
+        try acc.appendSlice(alloc, dp.bytes);
+        end += dp.bytes.len;
+    }
+    return .{ .at = at.?, .bytes = acc };
+}
+
 test "OPEN→OPENED then child output streams as DATA with advancing byte_offsets" {
     const alloc = testing.allocator;
     for (all_encodings) |enc| {
@@ -4103,20 +4435,15 @@ test "OPEN→OPENED then child output streams as DATA with advancing byte_offset
 
         const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
 
-        // Feed two output chunks; they must arrive as DATA at offsets 0 then 5.
+        // Feed two output chunks; every byte must arrive once, in order, from
+        // offset 0. (Whether that is one DATA frame or two is up to the
+        // writer's backlog since T1464 - see `drainLiveData`.)
         h.server.onChildOutput(o.channel, "hello");
         h.server.onChildOutput(o.channel, " world");
 
-        const d1 = try h.client.nextData();
-        const dp1 = try protocol.DataPayload.decode(d1.?.payload);
-        try testing.expectEqual(o.channel, d1.?.channel);
-        try testing.expectEqual(@as(u64, 0), dp1.byte_offset);
-        try testing.expectEqualSlices(u8, "hello", dp1.bytes);
-
-        const d2 = try h.client.nextData();
-        const dp2 = try protocol.DataPayload.decode(d2.?.payload);
-        try testing.expectEqual(@as(u64, 5), dp2.byte_offset);
-        try testing.expectEqualSlices(u8, " world", dp2.bytes);
+        var got = try drainLiveData(&h.client, alloc, o.channel, 0, "hello world".len);
+        defer got.deinit(alloc);
+        try testing.expectEqualSlices(u8, "hello world", got.items);
     }
 }
 
@@ -4221,8 +4548,10 @@ test "ATTACH with grid_snapshot negotiated replays a visible-screen repaint (FIX
     // would be evicted from the ring.
     h.server.onChildOutput(o.channel, "\x1b[?1049h");
     h.server.onChildOutput(o.channel, "SNAPSHOT-ME");
-    _ = try h.client.nextData(); // drain live DATA (chunk 1)
-    _ = try h.client.nextData(); // drain live DATA (chunk 2)
+    // Drain the live stream by BYTES: the writer may hand these over as
+    // one frame or two (T1464 coalescing).
+    var pre = try drainLiveData(&h.client, alloc, o.channel, 0, 8 + "SNAPSHOT-ME".len);
+    pre.deinit(alloc);
 
     // A FRESH attach (last_byte_offset = 0), exactly like the GUI after an app
     // relaunch/upgrade.
@@ -4285,8 +4614,8 @@ test "T739: the ATTACH repaint is framed as DATA_REPAINT, and only for a peer th
         // DATA-lane frame is the repaint itself.
         h.server.onChildOutput(o.channel, "\x1b[?1049h");
         h.server.onChildOutput(o.channel, "SNAPSHOT-ME");
-        _ = try h.client.nextData();
-        _ = try h.client.nextData();
+        var pre = try drainLiveData(&h.client, alloc, o.channel, 0, 8 + "SNAPSHOT-ME".len);
+        pre.deinit(alloc);
 
         var id_buf: [32]u8 = o.id;
         try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
@@ -4342,12 +4671,17 @@ test "T621: a snapshot-less ATTACH gets scrollback in the repaint and no ring re
     // above the visible screen, on the PRIMARY screen (the alt-screen case
     // already skipped the replay before T621, so it would prove nothing here).
     const o = try doOpen(&h, .{ .rows = 5, .cols = 40 });
+    var produced: usize = 0;
     var i: usize = 1;
     while (i <= 20) : (i += 1) {
         var buf: [32]u8 = undefined;
-        h.server.onChildOutput(o.channel, std.fmt.bufPrint(&buf, "line-{d}\r\n", .{i}) catch unreachable);
-        _ = try h.client.nextData(); // drain the live DATA
+        const line = std.fmt.bufPrint(&buf, "line-{d}\r\n", .{i}) catch unreachable;
+        h.server.onChildOutput(o.channel, line);
+        produced += line.len;
     }
+    // Drain the live stream by BYTES, not by frames (T1464 coalescing).
+    var live = try drainLiveData(&h.client, alloc, o.channel, 0, produced);
+    live.deinit(alloc);
 
     var id_buf: [32]u8 = o.id;
     try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
@@ -4398,15 +4732,19 @@ test "T621: a DELTA re-attach keeps its gap-fill and gets no duplicate scrollbac
 
     const o = try doOpen(&h, .{ .rows = 5, .cols = 40 });
     var seen: u64 = 0;
+    var produced: usize = 0;
     var i: usize = 1;
     while (i <= 20) : (i += 1) {
         var buf: [32]u8 = undefined;
         const line = std.fmt.bufPrint(&buf, "line-{d}\r\n", .{i}) catch unreachable;
         h.server.onChildOutput(o.channel, line);
-        _ = try h.client.nextData();
+        produced += line.len;
         // Pretend the client disconnected after line-15: that is its resume point.
         if (i <= 15) seen += line.len;
     }
+    // Drain the live stream by BYTES, not by frames (T1464 coalescing).
+    var live = try drainLiveData(&h.client, alloc, o.channel, 0, produced);
+    live.deinit(alloc);
 
     var id_buf: [32]u8 = o.id;
     try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
@@ -4419,19 +4757,18 @@ test "T621: a DELTA re-attach keeps its gap-fill and gets no duplicate scrollbac
     var ap = try protocol.parseJson(protocol.Attached, alloc, af.payload);
     defer ap.deinit();
 
-    // First the gap-fill, anchored at the resume point and carrying lines 16-20.
-    const gap = (try h.client.nextData()) orelse return error.NoGapFill;
-    const gp = try protocol.DataPayload.decode(gap.payload);
-    try testing.expectEqual(seen, gp.byte_offset);
-    try testing.expect(std.mem.indexOf(u8, gp.bytes, "line-16") != null);
-
-    // Then the repaint of the visible screen ONLY — line-1 scrolled off long
+    // First the gap-fill, anchored at the resume point and carrying lines 16-20;
+    // then the repaint of the visible screen ONLY — line-1 scrolled off long
     // before this client's resume point and must not come back.
-    const snap = (try h.client.nextData()) orelse return error.NoSnapshot;
-    const sp2 = try protocol.DataPayload.decode(snap.payload);
-    try testing.expectEqual(ap.value.snapshot_at_offset, sp2.byte_offset);
-    try testing.expect(std.mem.indexOf(u8, sp2.bytes, "line-1\r\n") == null);
-    try testing.expect(std.mem.indexOf(u8, sp2.bytes, "line-20") != null);
+    var post = try drainAttachData(&h.client, alloc, o.channel, ap.value.snapshot_at_offset);
+    defer post.deinit(alloc);
+    try testing.expectEqual(seen, post.at);
+    const split = ap.value.snapshot_at_offset - post.at;
+    const gap_bytes = post.bytes.items[0..split];
+    const snap_bytes = post.bytes.items[split..];
+    try testing.expect(std.mem.indexOf(u8, gap_bytes, "line-16") != null);
+    try testing.expect(std.mem.indexOf(u8, snap_bytes, "line-1\r\n") == null);
+    try testing.expect(std.mem.indexOf(u8, snap_bytes, "line-20") != null);
 }
 
 test "T621: without grid_scrollback an older peer gets today's payload byte-for-byte" {
@@ -4455,12 +4792,17 @@ test "T621: without grid_scrollback an older peer gets today's payload byte-for-
     try testing.expect(!neg.grid_scrollback);
 
     const o = try doOpen(&h, .{ .rows = 5, .cols = 40 });
+    var produced: usize = 0;
     var i: usize = 1;
     while (i <= 20) : (i += 1) {
         var buf: [32]u8 = undefined;
-        h.server.onChildOutput(o.channel, std.fmt.bufPrint(&buf, "line-{d}\r\n", .{i}) catch unreachable);
-        _ = try h.client.nextData();
+        const line = std.fmt.bufPrint(&buf, "line-{d}\r\n", .{i}) catch unreachable;
+        h.server.onChildOutput(o.channel, line);
+        produced += line.len;
     }
+    // Drain the live stream by BYTES, not by frames (T1464 coalescing).
+    var live = try drainLiveData(&h.client, alloc, o.channel, 0, produced);
+    live.deinit(alloc);
 
     var id_buf: [32]u8 = o.id;
     try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{
@@ -4473,16 +4815,16 @@ test "T621: without grid_scrollback an older peer gets today's payload byte-for-
     var ap = try protocol.parseJson(protocol.Attached, alloc, af.payload);
     defer ap.deinit();
 
-    // The raw ring replay is still sent, from the ring base...
-    const replay = (try h.client.nextData()) orelse return error.NoReplay;
-    const rp = try protocol.DataPayload.decode(replay.payload);
-    try testing.expect(std.mem.indexOf(u8, rp.bytes, "line-1\r\n") != null);
-    // ...and the repaint that follows it is the visible screen only.
-    const snap = (try h.client.nextData()) orelse return error.NoSnapshot;
-    const sp2 = try protocol.DataPayload.decode(snap.payload);
-    try testing.expectEqual(ap.value.snapshot_at_offset, sp2.byte_offset);
-    try testing.expect(std.mem.indexOf(u8, sp2.bytes, "line-1\r\n") == null);
-    try testing.expect(std.mem.indexOf(u8, sp2.bytes, "line-20") != null);
+    // The raw ring replay is still sent, from the ring base, and the repaint
+    // that follows it is the visible screen only.
+    var post = try drainAttachData(&h.client, alloc, o.channel, ap.value.snapshot_at_offset);
+    defer post.deinit(alloc);
+    const split = ap.value.snapshot_at_offset - post.at;
+    const replay_bytes = post.bytes.items[0..split];
+    const snap_bytes = post.bytes.items[split..];
+    try testing.expect(std.mem.indexOf(u8, replay_bytes, "line-1\r\n") != null);
+    try testing.expect(std.mem.indexOf(u8, snap_bytes, "line-1\r\n") == null);
+    try testing.expect(std.mem.indexOf(u8, snap_bytes, "line-20") != null);
 }
 
 test "ATTACH without grid_snapshot falls back to raw ring replay (skew safety, FIX 2)" {
@@ -4505,8 +4847,8 @@ test "ATTACH without grid_snapshot falls back to raw ring replay (skew safety, F
     const o = try doOpen(&h, .{ .rows = 24, .cols = 80 });
     h.server.onChildOutput(o.channel, "\x1b[?1049h");
     h.server.onChildOutput(o.channel, "PLAINBYTES");
-    _ = try h.client.nextData();
-    _ = try h.client.nextData();
+    var pre = try drainLiveData(&h.client, alloc, o.channel, 0, 8 + "PLAINBYTES".len);
+    pre.deinit(alloc);
 
     var id_buf: [32]u8 = o.id;
     try h.client.sendControlJson(.attach, protocol.control_channel, protocol.Attach{

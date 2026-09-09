@@ -625,6 +625,27 @@ $GuardTable = @(
     # false on the release build, and nothing on the box could tell the two
     # apart. Neither test lane can see any of it: the number only exists with a
     # real ConPTY, a real child and a real parse loop under it.
+    # The RELAY's cost, which is a different question from the one above (T1464).
+    # `pane-ingest-lag` asks whether a pane's screen catches up; this asks
+    # whether it is SLOWER for having its ConPTY held by the agent, by running
+    # one workload down both paths and comparing. That contrast is what found a
+    # 2.1x deficit in the shipped configuration - invisible to every other test
+    # here, because each of them measures one path and none of them measures the
+    # difference. Covers the whole trip: the holder's writer, the agent's ingest
+    # and framing, and the app's end of the pipe.
+    [pscustomobject]@{
+        Name   = 'relay-throughput'
+        Script = 'test\win32\pane-ingest-ab.ps1'
+        Stamp  = 'test\win32\relay-throughput.stamp.json'
+        Covers = @(
+            'test\win32\pane-ingest-ab.ps1',
+            'src\remote\agent\pty_host.zig',
+            'src\remote\agent\pty_holder_child.zig',
+            'src\remote\agent\server.zig',
+            'src\remote\agent\relay_perf.zig',
+            'src\remote\pipe_stream.zig'
+        )
+    },
     [pscustomobject]@{
         Name   = 'pane-ingest-lag'
         Script = 'test\win32\pane-ingest-lag.ps1'

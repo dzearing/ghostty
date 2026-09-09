@@ -41,6 +41,7 @@ const protocol = @import("../protocol.zig");
 const proto = @import("pty_host_proto.zig");
 const pty_child = @import("pty_child.zig");
 const pipe_stream = @import("../pipe_stream.zig");
+const relay_perf = @import("relay_perf.zig");
 const server = @import("server.zig");
 const session = @import("session.zig");
 
@@ -122,7 +123,26 @@ const win = struct {
 
         /// The EXIT frame reached an owner's pipe; the holder may finish.
         exit_delivered: bool = false,
+
+        /// The SOURCE end of the relay (T1464): how fast the shell's own output
+        /// actually arrives out of this holder's ConPTY. Touched only by the
+        /// pty reader thread (`sinkFn`), which is the one thread that ever
+        /// delivers a chunk - the same one-owner contract every other `Meter`
+        /// has. It is the number every leg downstream is bounded by, and
+        /// without it a slow relay and a slow ConPTY read look identical.
+        read_meter: relay_perf.Meter = .init("holder_read"),
     };
+
+    // MEASURED AND REJECTED (T1464): a one-millisecond coalescing wait here,
+    // taken when the ring held less than 4 KiB, so a burst left with ~1,000 real
+    // frames a second instead of ~8,300 tiny ones. It worked exactly as
+    // designed - `bytes_per_frame` went 73 -> 146 and `frames_per_s` 8,294 ->
+    // 4,378 - and moved the throughput not at all (626 KB/s against 594). The
+    // ceiling is the holder's ConPTY READ rate (`perf holder_read`, ~8,700 reads
+    // a second against the local path's ~19,000 of the same 73 bytes); every leg
+    // downstream merely follows it. So the message count was never the cost, and
+    // a millisecond of added echo latency buys nothing. Do not re-add batching
+    // here without a number showing the source can go faster.
 
     /// Per-connection writer handle: `closed` tells a cond-parked writer the
     /// connection is gone (the stream alone cannot wake it).
@@ -213,6 +233,9 @@ const win = struct {
         _ = channel;
         const state: *State = @ptrCast(@alignCast(ctx));
         if (bytes.len == 0) return; // EOF nudge; the exit poller reaps
+        state.read_meter.report();
+        state.read_meter.wake();
+        state.read_meter.frame(bytes.len);
         state.mutex.lock();
         defer state.mutex.unlock();
         state.replay.append(bytes);
@@ -357,8 +380,17 @@ const win = struct {
     /// shell has exited and everything produced has been sent, deliver EXIT.
     fn writerLoop(state: *State, conn: *Conn, start_from: u64) void {
         var sent = start_from;
-        var chunk: [32 * 1024]u8 = undefined;
+        // One buffer for the whole frame — header, offset, payload — so an
+        // OUTPUT frame is ONE pipe write rather than three (T1464). Each write
+        // on this path is an overlapped `WriteFile` plus its completion wait, so
+        // three of them per frame is three kernel round trips for what the peer
+        // reassembles into one message anyway.
+        const prefix_len = proto.header_len + 8;
+        var frame_buf: [prefix_len + 32 * 1024]u8 = undefined;
+        const chunk = frame_buf[prefix_len..];
+        var meter: relay_perf.Meter = .init("holder_out");
         while (true) {
+            meter.report();
             var send_n: usize = 0;
             var send_exit = false;
             var exit_code: i64 = 0;
@@ -400,9 +432,13 @@ const win = struct {
                 var ohdr: [8]u8 = undefined;
                 proto.frameHeader(.output, @intCast(8 + send_n), &hdr);
                 proto.Output.encodeHeader(.{ .offset = sent, .bytes = &.{} }, &ohdr);
-                conn.stream.writeAll(&hdr) catch return;
-                conn.stream.writeAll(&ohdr) catch return;
-                conn.stream.writeAll(chunk[0..send_n]) catch return;
+                @memcpy(frame_buf[0..proto.header_len], &hdr);
+                @memcpy(frame_buf[proto.header_len..prefix_len], &ohdr);
+                meter.wake();
+                meter.frame(send_n);
+                const io = meter.start();
+                conn.stream.writeAll(frame_buf[0 .. prefix_len + send_n]) catch return;
+                meter.stop(io);
                 sent += send_n;
                 continue;
             }

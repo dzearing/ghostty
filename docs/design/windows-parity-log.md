@@ -25527,3 +25527,61 @@ turns of good instrumentation, a correct hypothesis-killing, and a clean
 lock-versus-work split all pointed confidently at the wrong component, because
 nobody asked what `-Doptimize=Debug` was doing to the absolute numbers. The
 ratio survived that; nothing else did.
+
+## 2026-09-08 - the relay was never the cost either; the ConPTY under it is (T1464)
+
+T1463 handed this turn a suspect and a number: the shipped, agent-held pane runs
+a 7.7 MB burst in 12.5 s against a local-ConPTY pane's 5.6 s, carrying the stream
+about sixty bytes at a time. T1464's own Details said to measure the trip before
+changing it, and that instruction is the reason this turn is worth reading.
+
+The relay had no instrument at all, and could not have had one where anybody
+would see it: the app's stderr is redirected by whoever launches it, nothing
+redirects the agent's, and nothing but the agent launches a pty holder. So
+`relay_perf.zig` is a meter plus a file sink - `GHOZTTY_RELAY_PERF_DIR`, which
+both child processes inherit - and four call sites bracket the whole path:
+`holder_read` at the ConPTY, `holder_out` at the holder's writer, `holder_in` at
+the agent's reader, `relay_out` at the agent's writer, with the app's existing
+`agent_feed` as the fourth corner.
+
+Then the batching the task predicted would help. The holder now frames an OUTPUT
+in one pipe write instead of three; the agent's writer merges contiguous DATA
+frames that are already queued and writes the batch with one syscall; ACKs go out
+per 64 KiB rather than per read, which under a burst was sixteen thousand pipe
+writes a second. That is 2.25x down to 2.12x - about six percent - and then the
+instrument said why it could never have been more:
+
+```
+perf holder_read  frames_per_s=8408  kb_per_s=600  bytes_per_frame=73  io_ms_per_s=0
+perf holder_out   frames_per_s=8399  kb_per_s=600  bytes_per_frame=73  io_ms_per_s=55
+perf holder_in    frames_per_s=8399  kb_per_s=600  bytes_per_frame=73  io_ms_per_s=890
+perf relay_out    frames_per_s=8306  kb_per_s=664  bytes_per_frame=81  io_ms_per_s=54
+```
+
+Every leg carries the same ~8,400 messages a second; every leg's own pipe
+syscalls cost under seven microseconds; the one big number is a reader *waiting*
+for bytes that have not arrived. The ceiling is the source. `holder_read` is the
+holder's own ConPTY and it delivers ~8,400 reads a second of 73 bytes where the
+app's local ConPTY, same code and same read size, does ~19,000. Everything
+downstream was only ever keeping up with it, which is why merging messages could
+not help - and to be sure of that rather than to argue it, a one-millisecond
+coalescing wait went in, halved the frame count exactly as designed (73 -> 146
+bytes per frame), moved throughput by nothing, and came back out. The finding is
+a comment in `pty_host.zig` now, where the next person will look for it.
+
+The other half of the turn is `test\win32\pane-ingest-ab.ps1`, and the property
+that matters about it is that it REPRODUCES the defect: 2.25x against the
+pre-change build, through the same script that reports 2.12x against this one.
+Three things it had to learn on the way, all of which are the same lesson - a
+harness that measures the wrong thing looks exactly like a product that is fine.
+A cold sandbox has no agent, so the agent-held section measured the local path
+and cheerfully reported 1.01x over a 2.25x defect. A `+new-window` that lands
+while the app's own startup resolve is in flight gets a plain local shell. And
+`+list`'s `session_id` - the oracle for "is this pane really on the relay?" - is
+null until the OPEN completes, so a pane read the instant its window appears says
+"local" about every pane there is. Every one of those was found by an arm that
+failed while the timings looked plausible, which is the argument for having the
+arm at all.
+
+T1465 carries the deficit from here, and it starts where a task should: with a
+measured cause and a list of what has already been paid for and disproved.

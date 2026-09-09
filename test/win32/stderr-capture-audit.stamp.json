@@ -1,10 +1,10 @@
 {
     "guard":  "stderr-capture",
     "script":  "test/win32/stderr-capture-audit.ps1",
-    "generated":  "2026-09-08T10:20:00-07:00",
-    "commit":  "ecd1d06f8",
+    "generated":  "2026-09-08T17:24:33-07:00",
+    "commit":  "7feb8684a",
     "uncommitted":  [
-                        "test/win32/hook-json.ps1"
+                        "test/win32/pane-ingest-ab.ps1"
                     ],
     "files":  {
                   "docs/claude/testing.md":  "bd71205587d0c90a2ff6103b4bee2ecdb05ef8461f82d1b6ae9f222be0998f92",
@@ -226,6 +226,7 @@
                   "test/win32/pane-capture.ps1":  "bafa49ecb514b76f8cafb16cb2a6172c04188e0081f28c759d939f1c378b8a4c",
                   "test/win32/pane-hwnd-reap.ps1":  "93f787edbf5abb1a9841dfd3b52f05a076871ab29cb4dccde3c51489828d9dba",
                   "test/win32/pane-id.ps1":  "0c722d4f0cb52d3567b2d070362fa2cf825aafc952a81b1bcf01768203181161",
+                  "test/win32/pane-ingest-ab.ps1":  "d893636afba9725d1fa6df6ef0abebd72e53cc305da9a73eb941e1bac213b616",
                   "test/win32/pane-ingest-lag.ps1":  "a5c9ffcbdeae28c26b54d98d09586137bcba9be70691c2b2634c781b3fdf9768",
                   "test/win32/parity-decisions.ps1":  "05039eff3fcb43d262e34894717a2fc200e98d6e165e29a9eb17618ba54bd397",
                   "test/win32/parity-sweep.ps1":  "2251497104f8df5a8b1146441bd2b5e3ebb38a495c7d7fe16a9f64a05c801044",

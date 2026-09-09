@@ -3025,6 +3025,7 @@ test {
     _ = @import("pty_host_proto.zig");
     _ = @import("pty_host_spec.zig");
     _ = @import("pty_holder_child.zig");
+    _ = @import("relay_perf.zig");
     _ = @import("holder_adopt.zig");
     _ = @import("handoff.zig");
     _ = @import("relay_creds.zig");

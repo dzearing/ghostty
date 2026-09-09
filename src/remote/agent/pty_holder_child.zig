@@ -46,6 +46,7 @@ const proto = @import("pty_host_proto.zig");
 const spec_mod = @import("pty_host_spec.zig");
 const pty_host = @import("pty_host.zig");
 const pipe_stream = @import("../pipe_stream.zig");
+const relay_perf = @import("relay_perf.zig");
 const server = @import("server.zig");
 const session = @import("session.zig");
 const internal_os = @import("../../os/main.zig");
@@ -173,6 +174,35 @@ pub fn replayBytesFor(value: ?[]const u8) usize {
 /// nothing, which is the whole first-30-seconds case the fix is about.
 ///
 /// Pure, so the arithmetic is a unit test rather than a claim.
+/// How many un-acked bytes are worth an ACK on their own (T1464). 64 KiB
+/// against a 1 MiB holder ring: sixteen ACKs per ring rather than one per
+/// ConPTY read, and the ring still has fifteen sixteenths of its headroom when
+/// each one is sent.
+pub const ack_batch_bytes: u64 = 64 * 1024;
+
+/// How long a smaller amount may sit un-acked before it is sent anyway. A
+/// trickle - a prompt, a keystroke echo - never reaches the byte threshold, and
+/// bytes the holder is still retaining because nobody acked them are bytes a
+/// crash cannot hand back. A fifth of a second is far below any ring's lifetime
+/// and far above the burst this exists to thin out.
+pub const ack_idle_ms: i64 = 200;
+
+/// Should an ACK go out now? `pending` is what is un-acked, `since_ms` how long
+/// since the last one was sent.
+///
+/// The relay used to send one ACK per read batch, which under a burst is one
+/// ACK per ConPTY read: 16,000 pipe writes a second from the agent's reader
+/// thread, each one waking the holder's frame reader to take the very mutex the
+/// holder's ConPTY reader needs for every chunk it delivers (T1464). The ACK
+/// only carries a high-water mark, so batching it costs nothing but retained
+/// bytes, bounded by `ack_batch_bytes`.
+///
+/// Pure, so the policy is a unit test rather than a claim.
+pub fn ackDue(pending: u64, since_ms: i64) bool {
+    if (pending == 0) return false;
+    return pending >= ack_batch_bytes or since_ms >= ack_idle_ms;
+}
+
 pub fn ackTarget(durable_gate: bool, received: u64, durable: u64) u64 {
     if (!durable_gate) return received;
     return @min(received, durable);
@@ -293,6 +323,8 @@ const win = struct {
         /// re-ATTACH, and what we ACK back to release the holder's ring.
         received: u64 = 0,
         acked: u64 = 0,
+        /// When the last ACK went out, for `ackDue`. Zero until the first one.
+        last_ack_ms: i64 = 0,
 
         /// Highest offset the OWNER has told us is durable — written to the
         /// session's ring snapshot on disk (T911). Only meaningful once
@@ -358,7 +390,10 @@ const win = struct {
             self.durable_gate = true;
             if (offset > self.durable) self.durable = offset;
             self.mutex.unlock();
-            self.ackDelivered();
+            // Forced: this is the durability gate advancing after a ring
+            // snapshot, which is exactly the moment the holder can let go of
+            // bytes, and it may be minutes before another batch arrives.
+            self.ackDelivered(true);
         }
 
         // --- frame writing ----------------------------------------------------
@@ -410,8 +445,13 @@ const win = struct {
         fn readerLoop(self: *HolderChild) void {
             self.attached.wait();
             var buf: [64 * 1024]u8 = undefined;
+            // The agent's ingest leg of the relay (T1464): how many OUTPUT
+            // frames the holder hands us, how many of them a single pipe read
+            // carries, and how much of the second is spent in that read.
+            var meter: relay_perf.Meter = .init("holder_in");
 
             while (true) {
+                meter.report();
                 // Drain anything already reassembled (the HELLO read may have
                 // carried the first OUTPUT frames with it) before blocking.
                 var fatal = false;
@@ -421,16 +461,22 @@ const win = struct {
                         break;
                     };
                     const frame = maybe orelse break;
+                    if (frame.type == .output and frame.payload.len >= 8) {
+                        meter.frame(frame.payload.len - 8);
+                    }
                     if (self.handleFrame(frame)) break; // EXIT: stop reading
                 }
                 if (fatal) break;
-                self.ackDelivered();
+                self.ackDelivered(false);
                 self.mutex.lock();
                 const done = self.exited;
                 self.mutex.unlock();
                 if (done) break;
 
+                const io = meter.start();
                 const n = self.stream.read(&buf) catch 0;
+                meter.stop(io);
+                meter.wake();
                 if (n == 0) {
                     // The link died. Alive holder ⇒ transient, reconnect and
                     // gap-fill; dead holder ⇒ the session really is over.
@@ -439,8 +485,11 @@ const win = struct {
                 self.accum.push(buf[0..n]) catch break;
             }
 
-            // Whatever ended the loop, nudge the server to reap-check (the same
-            // zero-length nudge `PtyChild`'s reader ends on).
+            // Whatever ended the loop, flush the outstanding ACK (T1464's
+            // batching must not strand retained bytes on the way out) and nudge
+            // the server to reap-check (the same zero-length nudge `PtyChild`'s
+            // reader ends on).
+            self.ackDelivered(true);
             self.deliver(&.{});
         }
 
@@ -480,27 +529,38 @@ const win = struct {
             return false;
         }
 
-        /// Release the holder's retained bytes up to what is safe to lose.
-        /// One ACK per read batch, not per frame: the ring only needs to know
-        /// the high-water mark.
+        /// Release the holder's retained bytes up to what is safe to lose,
+        /// when `ackDue` says an ACK has earned its cost. The ring only needs
+        /// the high-water mark, so an ACK is never per frame and — since T1464
+        /// — no longer per read batch either, which under a burst was the same
+        /// thing.
         ///
         /// What "safe to lose" means depends on the gate (T911): with a store
         /// that snapshots rings it is `min(received, durable)` — never ahead of
         /// what we actually took, never ahead of what is on disk — and without
         /// one it is what we delivered, as it was before durability existed.
-        fn ackDelivered(self: *HolderChild) void {
+        ///
+        /// `force` sends whatever is outstanding regardless of the batching
+        /// rule: the reader takes that path on its way out, so a link that ends
+        /// mid-burst does not leave the holder retaining bytes we have.
+        fn ackDelivered(self: *HolderChild, force: bool) void {
+            const now = std.time.milliTimestamp();
             self.mutex.lock();
             const want = ackTarget(self.durable_gate, self.received, self.durable);
             const have = self.acked;
+            const last = self.last_ack_ms;
             self.mutex.unlock();
             // `<=`, not `!=`: under the gate `want` trails `received`, so a
             // re-ATTACH that resumed at a higher offset than the last snapshot
             // must not send the holder an ACK that walks backwards.
             if (want <= have) return;
+            const since = if (last == 0) ack_idle_ms else now - last;
+            if (!force and !ackDue(want - have, since)) return;
             var buf: [8]u8 = undefined;
             self.sendFrame(.ack, proto.Ack.encode(.{ .offset = want }, &buf)) catch return;
             self.mutex.lock();
             if (want > self.acked) self.acked = want;
+            self.last_ack_ms = now;
             self.mutex.unlock();
         }
 
@@ -1193,6 +1253,30 @@ test "replayBytesFor: a typo keeps the default rather than shrinking the window 
     // pair has to stay in the ratio the design assumes: a snapshot due at half
     // capacity refills the ring before it can wrap (T969).
     try testing.expect(session.default_snapshot_volume_bytes * 2 == dflt);
+}
+
+test "ackDue: a burst acks by the batch, not by the read (T1464)" {
+    // Nothing outstanding is never worth a frame, however long it has been.
+    try testing.expect(!ackDue(0, 0));
+    try testing.expect(!ackDue(0, 10_000));
+
+    // The shape this exists to stop: one ConPTY read's worth, arriving 16,000
+    // times a second, each one a pipe write that wakes the holder's frame
+    // reader onto the mutex its ConPTY reader needs.
+    try testing.expect(!ackDue(73, 0));
+    try testing.expect(!ackDue(ack_batch_bytes - 1, 0));
+
+    // A full batch goes immediately, whatever the clock says.
+    try testing.expect(ackDue(ack_batch_bytes, 0));
+    try testing.expect(ackDue(ack_batch_bytes * 4, 0));
+}
+
+test "ackDue: a trickle is not held forever (T1464)" {
+    // A prompt or a keystroke echo never reaches the byte threshold, and bytes
+    // nobody acked are bytes a crash cannot hand back - so time releases them.
+    try testing.expect(!ackDue(12, ack_idle_ms - 1));
+    try testing.expect(ackDue(12, ack_idle_ms));
+    try testing.expect(ackDue(1, ack_idle_ms * 10));
 }
 
 test "ackTarget: an ACK means DELIVERED until the store arms durability (T911)" {
