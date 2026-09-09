@@ -25715,3 +25715,55 @@ photograph is the strip's own report, which now carries `view=`, `max=`, `cue=`
 and `focus=` beside the geometry it already stated, and it re-states itself on a
 RESIZE too: a band that got narrower is the other way a strip starts
 overflowing, and until now nothing said so.
+
+## 2026-09-09 - T669: a see-through picture in the composer's strip is see-through again
+
+Paste a logo, or a screenshot cropped to rounded corners, into a feedback report
+and its thumbnail used to show every transparent pixel as solid black. In light
+theme that is a black slab sitting in a pale strip, which reads as a broken
+thumbnail rather than a transparent one. It now shows the tile's own fill
+through, the way every other app does, in both themes.
+
+The tile decode asked GDI+ for an HBITMAP with `0xFF000000` as its background,
+and that argument is precisely "the colour to composite the alpha channel
+against". It was the right answer for the call site the function was written
+for - the hero thumbnail (T397) captures a web page, which has no transparency -
+and the wrong one for a picture the user pasted, sitting on the composer's pill
+fill.
+
+The fix composites at PAINT time rather than at decode time. `decodeBytes` now
+scales through GDI+ straight into a premultiplied 32-bit DIB section of ours and
+keeps the alpha; `blitThumb` paints it with `AlphaBlend` over the fill the tile
+frame has already laid down. The alternative - threading the tile's colour down
+into the decode - is a line shorter and bakes a theme colour into a bitmap the
+strip CACHES, so a light/dark switch would have to invalidate and re-decode
+every tile. The cache is now theme-independent for the same reason the tile's
+fill is derived and not stored. The hero path is untouched and still flattens
+onto black, and the module documents the two decodes as two kinds of picture
+rather than one call with a colour threaded through it.
+
+Found on the way, and worth more than the fix: **`gdiplus_decode.zig`'s unit
+tests ran in no lane at all.** The module was imported and compiled, but it was
+missing from the `test { _ = @import(...) }` list in `src\apprt\win32.zig`,
+which is what actually pulls a win32 module's tests into the run - the exact
+T1177 shape `test\win32\test-reach-audit.ps1` was built to catch. The first
+version of the regression test went green against a build that never executed
+it, and only a `-Dtest-filter` naming the test itself showed the lane had
+skipped it. It is registered now, and the audit passes over the registration.
+
+Evidence: two win32-lane tests over the real decode (transparent stays alpha 0
+with zeroed premultiplied colour; an opaque picture is byte-identical through
+the new path), both proved to go RED with `decodeBytes` pointed back at the old
+call. On the box, `test\win32\viewer-feedback-alpha.ps1` - 47 assertions, ALL
+PASS - pastes a half-transparent PNG and reads the tile's pixels out of a
+synchronous `WM_PRINTCLIENT` capture of the composer band, comparing the
+transparent half against the tile fill sampled from the SAME capture rather than
+against a colour the script re-derives: light `255,255,255` on `255,255,255`,
+dark `30,35,46` on `30,35,46`. It runs both themes because that is the claim the
+design makes. Floor all green; `viewer-feedback.ps1` (96) and
+`viewer-feedback-carousel.ps1` (60) unchanged.
+
+One unrelated red found while proving the hero path still renders:
+`test\win32\hero-viewer-tile.ps1` fails on the TERMINAL tile's border stroke,
+twice in a row, and has no row in `guard-due` to have ever said so. Filed as
+T1469; the viewer tile in the same run is healthy (128 distinct colours).

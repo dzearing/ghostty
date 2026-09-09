@@ -2522,15 +2522,27 @@ fn paintTileFrame(
 }
 
 /// Blit one decoded picture into the middle of its tile. Already scaled to fit
-/// (see `thumbFor`), so this is a straight `BitBlt` — the aspect ratio was
-/// settled at decode time and cannot be got wrong twice.
+/// (see `thumbFor`), so there is no stretch here — the aspect ratio was settled
+/// at decode time and cannot be got wrong twice.
+///
+/// `AlphaBlend` rather than `BitBlt` because the decode keeps the picture's
+/// alpha channel (T669): a PNG with a transparent region — a logo, a screenshot
+/// cropped to rounded corners — must show the TILE'S OWN FILL through it, which
+/// `paintTileFrame` has already laid down underneath. A `BitBlt` would paint
+/// whatever the transparent pixels happen to hold, and the decode used to make
+/// that opaque black, which is how a see-through picture came out as a black
+/// slab in a pale strip.
+///
+/// The blend is the whole-source kind: `SourceConstantAlpha` 255 so the picture
+/// is not additionally faded, and `AC_SRC_ALPHA` because the source really does
+/// carry per-pixel alpha, premultiplied, which is what this call reads.
 fn blitThumb(hdc: w32.HDC, tile: layout_mod.Rect, t: Thumb, dib: w32.HANDLE) void {
     if (t.w <= 0 or t.h <= 0) return;
     const src = w32.CreateCompatibleDC(hdc) orelse return;
     defer _ = w32.DeleteDC(src);
     const old = w32.SelectObject(src, dib);
     defer _ = w32.SelectObject(src, old);
-    _ = w32.BitBlt(
+    _ = w32.AlphaBlend(
         hdc,
         tile.left + @divTrunc(tile.width() - t.w, 2),
         tile.top + @divTrunc(tile.height() - t.h, 2),
@@ -2539,7 +2551,12 @@ fn blitThumb(hdc: w32.HDC, tile: layout_mod.Rect, t: Thumb, dib: w32.HANDLE) voi
         src,
         0,
         0,
-        w32.SRCCOPY,
+        t.w,
+        t.h,
+        w32.BLENDFUNCTION{
+            .SourceConstantAlpha = 255,
+            .AlphaFormat = w32.AC_SRC_ALPHA,
+        },
     );
 }
 

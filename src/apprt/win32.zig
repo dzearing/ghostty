@@ -42,6 +42,14 @@ test {
     // nobody has checked.
     _ = @import("win32/PaneView.zig");
     _ = @import("win32/ViewerPane.zig");
+    // The GDI+ image decoder behind the hero thumbnail and the feedback
+    // carousel (T397/T646). Listed here for the reason the whole list exists:
+    // it was already imported and compiled, and its tests still ran nowhere —
+    // the T669 alpha regression was written, went green against a build that
+    // never executed it, and only a `-Dtest-filter` naming the test itself
+    // showed the lane had skipped it. Its assertions need real GDI+, so the
+    // win32 lane is the only one that can host them.
+    _ = @import("win32/gdiplus_decode.zig");
     // The COM callback object every WebView2 handler is an instance of
     // (T376). Listed in its own right, not just as webview2.zig's import:
     // its refcount and interface matching are the part a fifth handler would

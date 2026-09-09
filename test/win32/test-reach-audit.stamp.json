@@ -1,14 +1,15 @@
 {
     "guard":  "test-reach",
     "script":  "test/win32/test-reach-audit.ps1",
-    "generated":  "2026-09-08T21:27:05-07:00",
-    "commit":  "139fe5d41",
+    "generated":  "2026-09-08T22:29:45-07:00",
+    "commit":  "f7b2b01b6",
     "uncommitted":  [
-                        "src/apprt/win32/viewer_feedback_layout.zig",
+                        "src/apprt/win32.zig",
+                        "src/apprt/win32/gdiplus_decode.zig",
                         "src/apprt/win32/ViewerFeedbackBar.zig"
                     ],
     "files":  {
-                  "src/apprt/win32.zig":  "542d83515aebcff9593d8a9f349d5801a35336c6836f673934bc455b347ee460",
+                  "src/apprt/win32.zig":  "37c4f7349426b449ac7ece79cab52211c264458ba698e08ef66bf9123565c4b2",
                   "src/apprt/win32/activity_actions.zig":  "de2cd7a41d7c801b64e4046dd67d04caeaeef94d7ff3959f3566cb94f3630714",
                   "src/apprt/win32/activity_borrow.zig":  "8be5e4ba3e61feeaf28f2d7027fbadb5607c7e5541562795e984c9dc4a2e43a7",
                   "src/apprt/win32/activity_cards.zig":  "d232ad886704e03fce1c0433529b8526a51286c4d54bb7da35a76a92f2a277c0",
@@ -69,7 +70,7 @@
                   "src/apprt/win32/DimOverlay.zig":  "d9567dea0098c8fe70742f6988d0f27b6dd7f0e1bc034d76976dd4b99d610829",
                   "src/apprt/win32/drag_perf.zig":  "84bb2a4bcfce60fea15b52eb0672a3de258d5a52ac2df2594eab79a71ef48c72",
                   "src/apprt/win32/frame_size.zig":  "f1dc53407ba90d5d50c37bf1f2a5ce9aec1d4cc0db2d00b8ca7472fac29f1086",
-                  "src/apprt/win32/gdiplus_decode.zig":  "e35ad6c8d9c8369de68ff38af6dfa794852177141126d9936612e714d7b13fd6",
+                  "src/apprt/win32/gdiplus_decode.zig":  "451370269c6bcd2d2d1bef9e03d36182810a22638b6b96a687ed5859712d89e2",
                   "src/apprt/win32/GhosttyAssets.zig":  "12570d8bb96b01067c724c01c178db7a18e827c409d8d1861ddda2aeccc8a0bc",
                   "src/apprt/win32/git_run.zig":  "9f1fd0286c144889782e28f729257564dbc529cc42bb998df676a37e752eeaec",
                   "src/apprt/win32/gui_pump.zig":  "ac66102200ebf3a08b1992846ff7189d4ff80226cfdb6dc750db74501be02782",
@@ -211,7 +212,7 @@
                   "src/apprt/win32/viewer_watcher.zig":  "bfd305699acc6d74deb8bdb2e353366b5b2b3482d7eaabba7ddb7adbd2833dc0",
                   "src/apprt/win32/viewer_worktree.zig":  "216b7a5e71476cf126698487b2999fea3b861b04220dd7a184ed646e0172deae",
                   "src/apprt/win32/ViewerDiffProbe.zig":  "50af27c63edb96ccb1155a5f97c83cf88a131600cb5385eec016542c3d813135",
-                  "src/apprt/win32/ViewerFeedbackBar.zig":  "2afdbe7c8d160106ef841495c77e2b266c3f3be6f1a723760a35ff928cd89fa0",
+                  "src/apprt/win32/ViewerFeedbackBar.zig":  "b1a90a3175001921f0909ee0b3a67ffd92e56cd6b5ed9ffa78294471e1ed5d77",
                   "src/apprt/win32/ViewerFeedbackSend.zig":  "6bf1e1c396e5ecdcbe65b6caaeb4b1cfbd22a2736ea7f010e8636ca3d69222f7",
                   "src/apprt/win32/ViewerFeedbackWeb.zig":  "bd420cf35aa02909c9632b2589b36b69ba0ac141a87add034ae7c0080af4f1f3",
                   "src/apprt/win32/ViewerFindBar.zig":  "265556167eea1ac38bab8d1b05101bc8c3621a7cb100b7147b95b826b28dc03c",

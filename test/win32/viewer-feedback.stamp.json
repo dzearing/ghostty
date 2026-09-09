@@ -1,15 +1,15 @@
 {
     "guard":  "viewer-feedback",
     "script":  "test/win32/viewer-feedback.ps1",
-    "generated":  "2026-09-08T21:28:36-07:00",
-    "commit":  "139fe5d41",
+    "generated":  "2026-09-08T22:31:44-07:00",
+    "commit":  "f7b2b01b6",
     "uncommitted":  [
                         "src/apprt/win32/ViewerFeedbackBar.zig"
                     ],
     "files":  {
                   "src/apprt/win32/richedit_tom.zig":  "1cdc66022c7e724d0dd5a3bbd76e83285a9ebcb1b5f4968ac1b4b6e5bacf2523",
                   "src/apprt/win32/viewer_feedback_doc.zig":  "e934bd536bb22be7484e66de00060f32832243928b733350a07828083d22573b",
-                  "src/apprt/win32/ViewerFeedbackBar.zig":  "2afdbe7c8d160106ef841495c77e2b266c3f3be6f1a723760a35ff928cd89fa0",
+                  "src/apprt/win32/ViewerFeedbackBar.zig":  "b1a90a3175001921f0909ee0b3a67ffd92e56cd6b5ed9ffa78294471e1ed5d77",
                   "test/win32/viewer-feedback.ps1":  "d140744a28a0f13e0d6d7bcd3e58ba9f9cd4e5bc66137d104b8b0bfcb2c8dd65"
               }
 }
