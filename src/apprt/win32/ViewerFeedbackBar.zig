@@ -221,12 +221,22 @@ lines: u32 = 1,
 images: u32 = 0,
 /// How far the thumbnail strip is scrolled, in physical pixels.
 carousel_scroll: i32 = 0,
+/// The viewport width the strip was last REPORTED at, so a resize that changes
+/// whether the ribbon overflows re-states it once rather than on every bounds
+/// sync (T668).
+carousel_view: i32 = 0,
 /// The tile whose chip the caret is sitting in, drawn with a selection ring —
 /// the visible half of "clicking a chip scrolls to its thumbnail".
 carousel_selected: ?usize = null,
 /// The tile the mouse went down on, so a click acts on mouse-UP over the same
 /// one, the way the two circular actions already do.
 pressed_thumb: ?usize = null,
+/// The tile the KEYBOARD is on while `key_focus` is `.carousel` (T668), drawn
+/// with the same accent focus ring the two actions get. Separate from
+/// `carousel_selected`, which follows the caret: walking the strip with the
+/// arrow keys moves a ring around WITHOUT touching the report's text, and only
+/// Enter or Space commits the walk by selecting that picture's chip.
+carousel_focus: ?usize = null,
 /// Decoded thumbnails, keyed by image number AND tile size. The size is part
 /// of the key rather than something a DPI change has to remember to clear: a
 /// new scale simply misses and decodes, and the stale entries age out with the
@@ -1015,6 +1025,14 @@ fn syncImages(self: *ViewerFeedbackBar) bool {
     if (self.carousel_selected) |i| {
         if (i >= n) self.carousel_selected = null;
     }
+    // The keyboard ring cannot outlive the tiles it was on: deleting the last
+    // picture while the strip held focus hands focus back to the text, and
+    // deleting one from under the ring pulls it onto the last survivor.
+    if (n == 0) {
+        if (self.key_focus == .carousel) self.focusStop(.text) else self.carousel_focus = null;
+    } else if (self.carousel_focus) |i| {
+        if (i >= n) self.carousel_focus = n - 1;
+    }
     self.logCarousel("tiles");
     return true;
 }
@@ -1106,6 +1124,20 @@ pub fn place(self: *ViewerFeedbackBar, top: i32, width: i32, scale: f32) void {
     // this window's client space, so every reposition, DPI change and re-wrap
     // moves the two buttons out from under their tips.
     self.syncTip(l);
+
+    // A narrower band is the OTHER way a strip starts overflowing (T668) — the
+    // pictures did not change, the room for them did. The scroll is re-clamped
+    // to the new viewport and the strip re-states itself, so "is there more
+    // this way" is answerable after a resize and not only after a paste.
+    if (self.images > 0) {
+        const clamped = l.clampScroll(self.carousel_scroll);
+        const moved = clamped != self.carousel_scroll;
+        self.carousel_scroll = clamped;
+        if (moved or l.carousel.width() != self.carousel_view) {
+            self.carousel_view = l.carousel.width();
+            self.logCarousel("resize");
+        }
+    }
 }
 
 /// Push the pane's buffer into the control — what opening the composer does,
@@ -1554,7 +1586,7 @@ fn logCarousel(self: *ViewerFeedbackBar, what: []const u8) void {
     const l = self.currentLayout();
     log.info(
         "viewer feedback pane={s} carousel={s} tiles={d} scroll={d} selected={d} " ++
-            "left={d} top={d} thumb={d} stride={d}",
+            "left={d} top={d} thumb={d} stride={d} view={d} max={d} cue={s} focus={d}",
         .{
             self.pane.paneId(),
             what,
@@ -1565,6 +1597,13 @@ fn logCarousel(self: *ViewerFeedbackBar, what: []const u8) void {
             l.carousel.top,
             l.thumb,
             l.thumb_stride,
+            l.carousel.width(),
+            l.maxScroll(),
+            @tagName(self.cueState(l)),
+            if (self.key_focus == .carousel)
+                (if (self.carousel_focus) |i| @as(i64, @intCast(i)) else -1)
+            else
+                -1,
         },
     );
 }
@@ -1693,6 +1732,63 @@ fn activateThumb(self: *ViewerFeedbackBar, index: usize) void {
         s.end,
     });
     self.logCarousel("click");
+}
+
+/// Which ends of the strip have pictures past them right now (T668) — what the
+/// cue paints, and what the acceptance script reads instead of the fade it
+/// cannot see.
+const CueState = enum { none, start, end, both };
+
+fn cueState(self: *const ViewerFeedbackBar, l: layout_mod.Layout) CueState {
+    const at_start = !l.cueRect(.start, self.carousel_scroll).isEmpty();
+    const at_end = !l.cueRect(.end, self.carousel_scroll).isEmpty();
+    if (at_start and at_end) return .both;
+    if (at_start) return .start;
+    if (at_end) return .end;
+    return .none;
+}
+
+/// A click on an overflow cue pages the strip that way — the mouse's half of
+/// T668. The wheel already scrolled, but nothing on screen said so; a chevron
+/// that does nothing when clicked would be worse than no chevron.
+fn pageCarousel(self: *ViewerFeedbackBar, side: layout_mod.Side) void {
+    const l = self.currentLayout();
+    const next = l.pageScroll(self.carousel_scroll, side);
+    if (next == self.carousel_scroll) return;
+    self.carousel_scroll = next;
+    _ = w32.InvalidateRect(self.hwnd, null, 1);
+    self.logCarousel("page");
+}
+
+/// An arrow key while the strip holds focus (T668): move the ring, scroll the
+/// tile it landed on into view, and change nothing about the report itself.
+fn walkTiles(self: *ViewerFeedbackBar, move: layout_mod.TileMove) void {
+    const next = layout_mod.moveTile(self.carousel_focus, move, self.images) orelse return;
+    const l = self.currentLayout();
+    const scroll = l.scrollToShow(next, self.carousel_scroll);
+    if (next == self.carousel_focus and scroll == self.carousel_scroll) return;
+    self.carousel_focus = next;
+    self.carousel_scroll = scroll;
+    _ = w32.InvalidateRect(self.hwnd, null, 1);
+    self.logCarousel("walk");
+}
+
+/// Enter or Space on the focused tile — the same thing a click on it does.
+///
+/// It selects the picture's chip, which puts the Win32 focus back on the text
+/// surface, so the ring goes with it: the strip is a place focus passes
+/// through, and leaving a ring on a tile the keyboard no longer drives would
+/// be a lie about where the next keystroke lands.
+fn activateFocusedTile(self: *ViewerFeedbackBar) void {
+    const i = self.carousel_focus orelse return;
+    if (i >= self.images) return;
+    // Before the activation, not after: `activateThumb` puts the Win32 focus
+    // on the text surface and states the strip on the way past, and a report
+    // still naming a focused tile there would be a lie about where the next
+    // keystroke lands.
+    self.key_focus = .text;
+    self.carousel_focus = null;
+    self.activateThumb(i);
 }
 
 /// Wheel over the band scrolls the strip, when there is anything to scroll.
@@ -2155,7 +2251,20 @@ fn enabledActions(self: *const ViewerFeedbackBar) [layout_mod.button_count]bool 
 /// straight on to the text surface for `.text`, which is what `WM_SETFOCUS`
 /// has always done.
 fn focusStop(self: *ViewerFeedbackBar, stop: layout_mod.Stop) void {
+    const arriving = stop == .carousel and self.key_focus != .carousel;
     self.key_focus = stop;
+    if (stop == .carousel) {
+        // The ring arrives on the picture the caret is already in when there
+        // is one — walking into the strip from a chip should not throw away
+        // where the user was — and on the first tile otherwise.
+        if (arriving) self.carousel_focus = self.carousel_selected orelse 0;
+        if (self.carousel_focus) |i| {
+            if (i >= self.images) self.carousel_focus = if (self.images > 0) 0 else null;
+        }
+        if (self.carousel_focus) |i| {
+            self.carousel_scroll = self.currentLayout().scrollToShow(i, self.carousel_scroll);
+        }
+    } else self.carousel_focus = null;
     if (stop == .text) {
         self.takeFocus();
     } else if (w32.GetFocus() != self.hwnd) {
@@ -2170,7 +2279,15 @@ fn focusStop(self: *ViewerFeedbackBar, stop: layout_mod.Stop) void {
 
 /// Tab / shift+Tab.
 fn walkFocus(self: *ViewerFeedbackBar, back: bool) void {
-    self.focusStop(layout_mod.nextStop(self.key_focus, back, self.enabledActions()));
+    self.focusStop(layout_mod.nextStop(
+        self.key_focus,
+        back,
+        self.enabledActions(),
+        self.images > 0,
+    ));
+    // The strip reports its own focus, so the acceptance oracle can see the
+    // ring land on a tile the same way it sees it land on a button.
+    if (self.key_focus == .carousel) self.logCarousel("focus");
 }
 
 /// Space or Enter on a focused action — the same thing a click does.
@@ -2258,6 +2375,116 @@ fn paintCarousel(self: *ViewerFeedbackBar, hdc: w32.HDC, l: layout_mod.Layout) v
         const dib = t.dib orelse continue;
         blitThumb(hdc, tile, t, dib);
     }
+
+    // The keyboard's ring, on the tile the arrow keys are on (T668) — drawn
+    // after every tile, so the next tile's frame cannot paint over it.
+    self.paintTileFocus(hdc, l);
+
+    // ...and the overflow cues on top of everything, because their whole job
+    // is to say that what is under them continues past the edge.
+    for ([_]layout_mod.Side{ .start, .end }) |side| self.paintCue(hdc, l, side);
+}
+
+/// The accent focus ring on the tile `key_focus == .carousel` is walking. The
+/// same ring the two circular actions get (design system §2.2), on the tile's
+/// rounded rect rather than on a circle.
+fn paintTileFocus(self: *ViewerFeedbackBar, hdc: w32.HDC, l: layout_mod.Layout) void {
+    if (self.key_focus != .carousel) return;
+    const i = self.carousel_focus orelse return;
+    if (i >= self.images) return;
+    const ring = layout_mod.focusRing(self.scale, l.thumbAt(i, self.carousel_scroll));
+    const pen = w32.CreatePen(0, ring.width, self.accent_ref) orelse return;
+    defer _ = w32.DeleteObject(pen);
+    const prev_pen = w32.SelectObject(hdc, pen);
+    defer _ = w32.SelectObject(hdc, prev_pen);
+    const hollow = w32.GetStockObject(w32.NULL_BRUSH);
+    const prev_brush = if (hollow) |b| w32.SelectObject(hdc, b) else null;
+    defer if (prev_brush) |b| {
+        _ = w32.SelectObject(hdc, b);
+    };
+    _ = w32.RoundRect(
+        hdc,
+        ring.path.left,
+        ring.path.top,
+        ring.path.right,
+        ring.path.bottom,
+        l.thumb_r * 2,
+        l.thumb_r * 2,
+    );
+}
+
+/// The overflow cue at one end of the strip (T668): the band fading in over
+/// whatever continues past the edge, with a chevron pointing that way.
+///
+/// A fade rather than a hard rule because the thing being communicated is
+/// CONTINUATION — a line at the edge says "this stops here", which is the
+/// opposite. The chevron carries the meaning on its own for anyone the fade is
+/// too subtle for, and it is drawn in the secondary text color, which the
+/// design system already holds to a contrast floor against this surface.
+fn paintCue(self: *ViewerFeedbackBar, hdc: w32.HDC, l: layout_mod.Layout, side: layout_mod.Side) void {
+    const cue = l.cueRect(side, self.carousel_scroll);
+    if (cue.isEmpty()) return;
+    const w = cue.width();
+    const h = cue.height();
+    if (w <= 0 or h <= 0) return;
+
+    // A one-row, `w`-wide premultiplied DIB stretched down the strip: the band
+    // background at full alpha on the OUTSIDE edge, transparent on the inside,
+    // so the tiles dissolve into the chrome instead of being chopped by it.
+    var bmi = std.mem.zeroes(w32.BITMAPINFO);
+    bmi.bmiHeader.biSize = @sizeOf(w32.BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -1; // top-down
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+
+    if (w32.CreateCompatibleDC(hdc)) |mem_dc| {
+        defer _ = w32.DeleteDC(mem_dc);
+        var bits: ?*anyopaque = null;
+        if (w32.CreateDIBSection(mem_dc, &bmi, w32.DIB_RGB_COLORS, &bits, null, 0)) |bmp| {
+            defer _ = w32.DeleteObject(bmp);
+            if (bits) |raw| {
+                const pixels = @as([*]u32, @ptrCast(@alignCast(raw)))[0..@intCast(w)];
+                for (pixels, 0..) |*p, col| {
+                    // Opaque at the outer edge, clear at the inner one.
+                    const from_outer: usize = if (side == .start) col else @as(usize, @intCast(w - 1)) - col;
+                    const a: u32 = @intCast(255 - @min(255, (from_outer * 255) / @as(usize, @intCast(w))));
+                    const r = (@as(u32, self.bar_rgb.r) * a) / 255;
+                    const g = (@as(u32, self.bar_rgb.g) * a) / 255;
+                    const b = (@as(u32, self.bar_rgb.b) * a) / 255;
+                    p.* = (a << 24) | (r << 16) | (g << 8) | b;
+                }
+                const old = w32.SelectObject(mem_dc, bmp);
+                defer _ = w32.SelectObject(mem_dc, old);
+                _ = w32.AlphaBlend(
+                    hdc,
+                    cue.left,
+                    cue.top,
+                    w,
+                    h,
+                    mem_dc,
+                    0,
+                    0,
+                    w,
+                    1,
+                    w32.BLENDFUNCTION{ .SourceConstantAlpha = 255 },
+                );
+            }
+        }
+    }
+
+    const m = icon_button.Metrics.init(self.scale);
+    const g: icon_button.Glyph = if (side == .start) .back else .forward;
+    const box_side = @min(w, l.thumb);
+    const cx = @divTrunc(cue.left + cue.right, 2);
+    const cy = @divTrunc(cue.top + cue.bottom, 2);
+    const box: layout_mod.Rect = .{
+        .left = cx - @divTrunc(box_side, 2),
+        .top = cy - @divTrunc(box_side, 2),
+        .right = cx - @divTrunc(box_side, 2) + box_side,
+        .bottom = cy - @divTrunc(box_side, 2) + box_side,
+    };
+    icon_paint.glyph(hdc, m, icon_button.glyphTarget(m, box, g), g, self.secondary_ref);
 }
 
 fn paintTileFrame(
@@ -2683,10 +2910,37 @@ pub fn handleKey(self: *ViewerFeedbackBar, vk: u16) bool {
     // space a space; the guard is exact, so a chorded Space still falls
     // through to whatever else claims it.
     const bare = !mods.ctrl and !mods.shift and !mods.alt and !mods.super;
+
+    // The strip's own keys (T668), claimed ONLY while it holds focus — which
+    // also means the band holds the Win32 focus, so an arrow key in the text
+    // surface still moves the caret and a Space there is still a space.
+    if (bare and self.key_focus == .carousel) {
+        if (tileMoveFor(vk)) |move| {
+            self.walkTiles(move);
+            return true;
+        }
+        if (vk == w32.VK_SPACE or vk == w32.VK_RETURN) {
+            self.activateFocusedTile();
+            return true;
+        }
+    }
+
     if (bare and (vk == w32.VK_SPACE or vk == w32.VK_RETURN)) {
         if (self.activateFocused()) return true;
     }
     return false;
+}
+
+/// The strip's arrow/Home/End walk. Left and Right are the axis the pictures
+/// are laid out on; Home and End are what every Windows list answers with.
+fn tileMoveFor(vk: u16) ?layout_mod.TileMove {
+    return switch (vk) {
+        w32.VK_LEFT => .prev,
+        w32.VK_RIGHT => .next,
+        w32.VK_HOME => .first,
+        w32.VK_END => .last,
+        else => null,
+    };
 }
 
 /// The pane-scoped chords (T161: ctrl+r reload, ctrl+d / ctrl+l / alt+d
@@ -2898,8 +3152,9 @@ fn wndProc(
             // Focus left the band — to the text surface, or out of the
             // composer entirely. Either way no action holds it any more, so
             // the ring goes with it rather than lingering on a control the
-            // keyboard no longer reaches.
+            // keyboard no longer reaches — the strip's ring included.
             self.key_focus = .text;
+            self.carousel_focus = null;
             _ = w32.InvalidateRect(hwnd, null, 1);
             return 0;
         },
@@ -2986,6 +3241,14 @@ fn wndProc(
                     _ = w32.SetCapture(hwnd);
                     _ = w32.InvalidateRect(hwnd, null, 1);
                 }
+                return 0;
+            }
+            // An overflow cue pages the strip, and it is checked BEFORE the
+            // tiles: the cue is painted over the tile it is fading out, so the
+            // pixels belong to the affordance the user can actually see. It
+            // acts on the DOWN, the way a scrollbar's arrow does.
+            if (l.hitCue(self.carousel_scroll, x, y)) |side| {
+                self.pageCarousel(side);
                 return 0;
             }
             // A tile acts on mouse-UP over the same tile, the way the two

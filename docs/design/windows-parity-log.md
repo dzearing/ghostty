@@ -25679,3 +25679,39 @@ offered a third, uncosted option - pin the conhost without pinning the shell -
 and reading the code retired it: `pty_host.zig` pins ITSELF, conhost is its
 child, and affinity is inherited, so that option is already what ships. There is
 no middle path left, which makes the card blocked rather than merely waiting.
+
+## 2026-09-08 - T668: a strip of pictures that runs off the edge now says so, and the keyboard can get to them
+
+The viewer's feedback composer has held a thumbnail strip since T646, and past
+about seven pictures the rest were simply gone: the last tile stopped at the
+clip edge, which reads as a rendering fault rather than as "there is more this
+way". The wheel scrolled to them and nobody would guess that, and from the
+keyboard there was no way to reach a tile at all - the tiles answered clicks and
+nothing else.
+
+Two things landed. **An overflow cue** at whichever end still has pictures past
+it: the band background fading in over the tile under it, with a small chevron
+pointing that way. A fade rather than a rule, because the thing being said is
+CONTINUATION and a line at the edge says the opposite. It is also the mouse
+affordance the wheel never was - clicking it pages the ribbon by whole tiles -
+and it is present only when there is something behind it, so a strip that fits
+looks exactly as it did before, and at either end of the walk the cue for the
+end you have reached is gone.
+
+**And the strip is a Tab stop.** One stop for the whole strip rather than one
+per picture, which is the Windows model for a row of like items: Tab lands on
+it, Left/Right/Home/End walk a focus ring across the tiles and scroll the ring
+into view, and Enter or Space does what a click does - selects that picture's
+chip and hands the keyboard back to the text. The stop is skipped entirely when
+there are no pictures, the same rule that already skipped the dead send button,
+and deleting the last picture while the ring is on it returns focus to the text
+rather than leaving a ring on nothing.
+
+The geometry is pure and asserted at 1.0/1.25/1.5/2.0 in the none lane
+(`cueRect`/`hitCue`/`pageScroll`, and `moveTile`'s clamping walk); the behaviour
+is asserted on the box in `test\win32\viewer-feedback-carousel.ps1`, which grew
+sections F, G and H - 60 assertions, ALL PASS. The oracle for a fade nothing can
+photograph is the strip's own report, which now carries `view=`, `max=`, `cue=`
+and `focus=` beside the geometry it already stated, and it re-states itself on a
+RESIZE too: a band that got narrower is the other way a strip starts
+overflowing, and until now nothing said so.

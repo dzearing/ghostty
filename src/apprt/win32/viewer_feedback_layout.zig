@@ -61,6 +61,24 @@ pub const thumb_gap_dip: f32 = 8.0;
 /// the image rather than a border drawn on top of it. `sm`.
 pub const thumb_inset_dip: f32 = 4.0;
 
+/// The overflow cue's width (T668): the band of pixels at whichever end of the
+/// strip still has tiles past it. A ribbon longer than its viewport otherwise
+/// looks exactly like one that fits — the last tile is simply cut off at the
+/// clip edge, which reads as a rendering fault rather than as "there is more
+/// this way". Wide enough that the fade reads as a fade, narrow enough that it
+/// never covers a whole tile: a cue that hides a picture costs more than it
+/// explains.
+pub const cue_dip: f32 = 20.0;
+
+/// The chevron drawn inside a cue, as a half-extent: the glyph is
+/// `2 * cue_chevron_dip` tall and `cue_chevron_dip` wide, the same small
+/// arrowhead the banner's collapse toggle uses.
+pub const cue_chevron_dip: f32 = 4.0;
+
+/// Which end of the strip something is at. `start` is the leading edge (left in
+/// an LTR band), `end` the trailing one.
+pub const Side = enum { start, end };
+
 /// How many lines the pill grows to before the text scrolls instead. Mac's
 /// `maxInputHeight` is ~6 lines and the reason is the same here: past this the
 /// composer is eating the pane the feedback is ABOUT.
@@ -90,7 +108,14 @@ pub fn label(b: Button) []const u8 {
 /// modal-feeling group inside a viewer pane, and the pane's own chrome has no
 /// tab order to hand focus on to. Tabbing off the end therefore has exactly
 /// one sensible destination, which is where the user was typing.
-pub const Stop = enum { text, snapshot, send };
+///
+/// `carousel` is the thumbnail strip as ONE stop (T668) rather than one stop
+/// per tile: a composite control that Tab reaches and arrow keys walk inside is
+/// the Windows pattern for a strip of like items (a toolbar, a list view), and
+/// the alternative — a Tab stop per picture — makes the cost of tabbing past
+/// the composer grow with the number of attachments. It is skipped entirely
+/// when there are no images, the same way a disabled action is.
+pub const Stop = enum { text, carousel, snapshot, send };
 
 pub fn stopOf(b: Button) Stop {
     return switch (b) {
@@ -99,10 +124,10 @@ pub fn stopOf(b: Button) Stop {
     };
 }
 
-/// The button a stop names, or null for the text surface.
+/// The button a stop names, or null for the text surface and the strip.
 pub fn buttonOf(s: Stop) ?Button {
     return switch (s) {
-        .text => null,
+        .text, .carousel => null,
         .snapshot => .snapshot,
         .send => .send,
     };
@@ -112,10 +137,12 @@ pub fn buttonOf(s: Stop) ?Button {
 ///
 /// A DISABLED action is skipped, the way Windows skips a disabled control in a
 /// dialog's tab order — the send button is dead while the report is empty, and
-/// a focus ring on a button that cannot be pressed is a dead end. `text` is
+/// a focus ring on a button that cannot be pressed is a dead end. The strip is
+/// skipped on the same rule when `has_images` is false: an empty strip is not
+/// painted at all, so stopping on it would be a ring on nothing. `text` is
 /// always a stop, so the walk always terminates.
-pub fn nextStop(cur: Stop, back: bool, enabled: [button_count]bool) Stop {
-    const ring = [_]Stop{ .text, .snapshot, .send };
+pub fn nextStop(cur: Stop, back: bool, enabled: [button_count]bool, has_images: bool) Stop {
+    const ring = [_]Stop{ .text, .carousel, .snapshot, .send };
     var i: usize = for (ring, 0..) |s, idx| {
         if (s == cur) break idx;
     } else 0;
@@ -126,6 +153,10 @@ pub fn nextStop(cur: Stop, back: bool, enabled: [button_count]bool) Stop {
         else
             (i + 1) % ring.len;
         const s = ring[i];
+        if (s == .carousel) {
+            if (has_images) return s;
+            continue;
+        }
         const b = buttonOf(s) orelse return s;
         if (enabled[@intFromEnum(b)]) return s;
     }
@@ -212,6 +243,10 @@ pub const Layout = struct {
     /// A tile's corner radius — 4, the design system's control radius. A tile
     /// is a small chip of content, not a card.
     thumb_r: i32,
+    /// The overflow cue's width (T668), and the half-extent of the chevron
+    /// inside it. Both 0 when there is no carousel.
+    cue_w: i32,
+    cue_chevron: i32,
     /// How many tiles there are, i.e. `Input.images`.
     images: u32,
     /// The footer row, EMPTY when `footer_h` was 0.
@@ -320,6 +355,8 @@ pub const Layout = struct {
             .thumb_stride = thumb + px(thumb_gap_dip, in.scale),
             .thumb_inset = px(thumb_inset_dip, in.scale),
             .thumb_r = px(4.0, in.scale),
+            .cue_w = if (thumb > 0) px(cue_dip, in.scale) else 0,
+            .cue_chevron = if (thumb > 0) @max(px(cue_chevron_dip, in.scale), 1) else 0,
             .images = in.images,
             .footer = footer,
             .lines = lines,
@@ -406,7 +443,92 @@ pub const Layout = struct {
         if (right > scroll + view) return self.clampScroll(right - view);
         return self.clampScroll(scroll);
     }
+
+    // ---------------------------------------------------------------------
+    // The overflow cue (T668)
+    // ---------------------------------------------------------------------
+
+    /// The cue band at `side`, or an EMPTY rect when that side has nothing past
+    /// it — which is the whole contract: a strip that fits has no cue at either
+    /// end, and a strip scrolled hard against one end has none there.
+    ///
+    /// Capped at a third of the viewport so a violently narrow pane gets a
+    /// hint rather than two cues meeting in the middle over the one tile they
+    /// were supposed to be pointing at.
+    pub fn cueRect(self: *const Layout, side: Side, scroll: i32) Rect {
+        if (self.thumb <= 0 or self.cue_w <= 0) return .{};
+        const max = self.maxScroll();
+        if (max == 0) return .{};
+        const s = self.clampScroll(scroll);
+        const w = @min(self.cue_w, @divTrunc(self.carousel.width(), 3));
+        if (w <= 0) return .{};
+        return switch (side) {
+            .start => if (s <= 0) .{} else .{
+                .left = self.carousel.left,
+                .top = self.carousel.top,
+                .right = self.carousel.left + w,
+                .bottom = self.carousel.bottom,
+            },
+            .end => if (s >= max) .{} else .{
+                .left = self.carousel.right - w,
+                .top = self.carousel.top,
+                .right = self.carousel.right,
+                .bottom = self.carousel.bottom,
+            },
+        };
+    }
+
+    /// The cue under a point, or null. Checked BEFORE the tiles by every
+    /// caller: a cue sits on top of the tile it is fading out, and the pixels
+    /// it covers belong to the affordance the user can see.
+    pub fn hitCue(self: *const Layout, scroll: i32, x: i32, y: i32) ?Side {
+        for ([_]Side{ .start, .end }) |side| {
+            const r = self.cueRect(side, scroll);
+            if (!r.isEmpty() and r.containsPoint(x, y)) return side;
+        }
+        return null;
+    }
+
+    /// One page of scroll toward `side` — what clicking a cue does. A page is
+    /// as many WHOLE tiles as the viewport shows, and never less than one, so
+    /// a viewport narrower than a tile still moves.
+    pub fn pageScroll(self: *const Layout, scroll: i32, side: Side) i32 {
+        if (self.thumb_stride <= 0) return self.clampScroll(scroll);
+        const whole = @divTrunc(self.carousel.width(), self.thumb_stride);
+        const step = @max(whole, 1) * self.thumb_stride;
+        return switch (side) {
+            .start => self.clampScroll(scroll - step),
+            .end => self.clampScroll(scroll + step),
+        };
+    }
 };
+
+/// A step of the keyboard walk across the tiles (T668).
+pub const TileMove = enum { prev, next, first, last };
+
+/// Where `move` lands from `cur` in a strip of `count` tiles, or null when
+/// there are no tiles at all.
+///
+/// CLAMPS rather than wraps, which is what every other strip of like items on
+/// Windows does (a list view, a toolbar): arrowing off the end of a row of
+/// pictures and landing back on the first one reads as the strip having
+/// scrolled, not as focus having wrapped. A null `cur` — focus arriving on the
+/// strip for the first time — lands on the end the walk is coming from, so
+/// shift+Tab into it and then Left does not skip the last picture.
+pub fn moveTile(cur: ?usize, move: TileMove, count: usize) ?usize {
+    if (count == 0) return null;
+    const last = count - 1;
+    const at = @min(cur orelse return switch (move) {
+        .next, .first => 0,
+        .prev, .last => last,
+    }, last);
+    return switch (move) {
+        .prev => if (at == 0) 0 else at - 1,
+        .next => if (at >= last) last else at + 1,
+        .first => 0,
+        .last => last,
+    };
+}
 
 /// The largest `src_w` x `src_h` box that fits inside `box` x `box` with the
 /// source's aspect ratio intact, at least 1 px on each side.
@@ -868,13 +990,166 @@ test "fitInto letterboxes rather than crops, and never yields a zero side" {
 test "nextStop walks text -> snapshot -> send -> text, and back" {
     const all = [_]bool{ true, true };
 
-    try testing.expectEqual(Stop.snapshot, nextStop(.text, false, all));
-    try testing.expectEqual(Stop.send, nextStop(.snapshot, false, all));
-    try testing.expectEqual(Stop.text, nextStop(.send, false, all));
+    // No pictures: the strip is not a stop, so the walk is the T640 one.
+    try testing.expectEqual(Stop.snapshot, nextStop(.text, false, all, false));
+    try testing.expectEqual(Stop.send, nextStop(.snapshot, false, all, false));
+    try testing.expectEqual(Stop.text, nextStop(.send, false, all, false));
 
-    try testing.expectEqual(Stop.send, nextStop(.text, true, all));
-    try testing.expectEqual(Stop.snapshot, nextStop(.send, true, all));
-    try testing.expectEqual(Stop.text, nextStop(.snapshot, true, all));
+    try testing.expectEqual(Stop.send, nextStop(.text, true, all, false));
+    try testing.expectEqual(Stop.snapshot, nextStop(.send, true, all, false));
+    try testing.expectEqual(Stop.text, nextStop(.snapshot, true, all, false));
+}
+
+test "with pictures attached the strip is a Tab stop between the text and the actions" {
+    const all = [_]bool{ true, true };
+
+    try testing.expectEqual(Stop.carousel, nextStop(.text, false, all, true));
+    try testing.expectEqual(Stop.snapshot, nextStop(.carousel, false, all, true));
+    try testing.expectEqual(Stop.send, nextStop(.snapshot, false, all, true));
+    try testing.expectEqual(Stop.text, nextStop(.send, false, all, true));
+
+    // Backwards, so shift+Tab out of "+" reaches the pictures.
+    try testing.expectEqual(Stop.carousel, nextStop(.snapshot, true, all, true));
+    try testing.expectEqual(Stop.text, nextStop(.carousel, true, all, true));
+
+    // The last picture deleted while the strip held focus: the walk still
+    // terminates, and never on the strip that is no longer painted.
+    try testing.expectEqual(Stop.snapshot, nextStop(.carousel, false, all, false));
+    try testing.expectEqual(Stop.text, nextStop(.carousel, true, all, false));
+
+    // Neither action live and no pictures: the text is the only stop.
+    const none = [_]bool{ false, false };
+    try testing.expectEqual(Stop.text, nextStop(.text, false, none, false));
+    // ...and with pictures, the strip is the only other one.
+    try testing.expectEqual(Stop.carousel, nextStop(.text, false, none, true));
+    try testing.expectEqual(Stop.text, nextStop(.carousel, false, none, true));
+}
+
+test "moveTile clamps at both ends and skips nothing in between" {
+    // Arriving on the strip: forward from the front, backward from the back.
+    try testing.expectEqual(@as(usize, 0), moveTile(null, .next, 4).?);
+    try testing.expectEqual(@as(usize, 3), moveTile(null, .prev, 4).?);
+    try testing.expectEqual(@as(usize, 0), moveTile(null, .first, 4).?);
+    try testing.expectEqual(@as(usize, 3), moveTile(null, .last, 4).?);
+
+    // Every tile is reachable, one step at a time, with no gaps.
+    var at: usize = 0;
+    for ([_]usize{ 1, 2, 3 }) |want| {
+        at = moveTile(at, .next, 4).?;
+        try testing.expectEqual(want, at);
+    }
+    // ...and the far end holds rather than wrapping to the first picture.
+    try testing.expectEqual(@as(usize, 3), moveTile(3, .next, 4).?);
+    try testing.expectEqual(@as(usize, 0), moveTile(0, .prev, 4).?);
+
+    try testing.expectEqual(@as(usize, 0), moveTile(2, .first, 4).?);
+    try testing.expectEqual(@as(usize, 3), moveTile(1, .last, 4).?);
+
+    // A strip that just lost tiles under a stale index answers inside it,
+    // rather than handing back a tile nobody can paint.
+    try testing.expectEqual(@as(usize, 1), moveTile(9, .next, 2).?);
+    try testing.expectEqual(@as(usize, 0), moveTile(9, .prev, 2).?);
+
+    // The one and only tile is both ends at once.
+    try testing.expectEqual(@as(usize, 0), moveTile(0, .next, 1).?);
+    try testing.expectEqual(@as(usize, 0), moveTile(0, .prev, 1).?);
+
+    // No tiles: no answer, on any move.
+    for (std.enums.values(TileMove)) |m| {
+        try testing.expect(moveTile(null, m, 0) == null);
+        try testing.expect(moveTile(0, m, 0) == null);
+    }
+}
+
+test "the overflow cue appears only on the end that has pictures past it" {
+    for (scales) |scale| {
+        // Narrow enough that eight 56 DIP tiles cannot possibly fit.
+        const width = px(300.0, scale);
+        const l = Layout.init(.{
+            .scale = scale,
+            .width = width,
+            .lines = 1,
+            .line_h = lineAt(scale),
+            .images = 8,
+            .footer_h = lineAt(scale),
+        });
+        try testing.expect(l.maxScroll() > 0);
+
+        // Hard against the leading end: more to the right, nothing to the left.
+        try testing.expect(l.cueRect(.start, 0).isEmpty());
+        const end = l.cueRect(.end, 0);
+        try testing.expect(!end.isEmpty());
+        try testing.expectEqual(l.carousel.right, end.right);
+        try testing.expectEqual(l.carousel.top, end.top);
+        try testing.expectEqual(l.carousel.bottom, end.bottom);
+        // It sits INSIDE the strip and covers well under a whole tile.
+        try testing.expect(end.left > l.carousel.left);
+        try testing.expect(end.width() > 0);
+        try testing.expect(end.width() < l.thumb);
+
+        // Hard against the trailing end: the mirror image.
+        const max = l.maxScroll();
+        try testing.expect(l.cueRect(.end, max).isEmpty());
+        const start = l.cueRect(.start, max);
+        try testing.expect(!start.isEmpty());
+        try testing.expectEqual(l.carousel.left, start.left);
+        try testing.expectEqual(end.width(), start.width());
+
+        // Somewhere in the middle: both ends have content past them.
+        const mid = @divTrunc(max, 2);
+        try testing.expect(mid > 0);
+        try testing.expect(!l.cueRect(.start, mid).isEmpty());
+        try testing.expect(!l.cueRect(.end, mid).isEmpty());
+
+        // The cue is what a click on it hits, and it wins over the tile
+        // underneath — the pixels belong to the affordance the user can see.
+        const cue = l.cueRect(.end, mid);
+        const cx = @divTrunc(cue.left + cue.right, 2);
+        const cy = @divTrunc(cue.top + cue.bottom, 2);
+        try testing.expectEqual(Side.end, l.hitCue(mid, cx, cy).?);
+
+        // Clicking it moves the strip toward that end by whole tiles, and the
+        // clamp still holds at both ends.
+        const paged = l.pageScroll(mid, .end);
+        try testing.expect(paged > mid);
+        try testing.expect(paged <= max);
+        try testing.expectEqual(max, l.pageScroll(max, .end));
+        try testing.expectEqual(@as(i32, 0), l.pageScroll(0, .start));
+
+        // A scroll offset outside the range answers as its clamped self rather
+        // than showing a cue for content that is not there.
+        try testing.expect(l.cueRect(.end, max + 500).isEmpty());
+        try testing.expect(l.cueRect(.start, -500).isEmpty());
+    }
+}
+
+test "a strip that fits has no cue at either end" {
+    for (scales) |scale| {
+        const l = Layout.init(.{
+            .scale = scale,
+            .width = px(600.0, scale),
+            .lines = 1,
+            .line_h = lineAt(scale),
+            .images = 2,
+            .footer_h = lineAt(scale),
+        });
+        try testing.expectEqual(@as(i32, 0), l.maxScroll());
+        try testing.expect(l.cueRect(.start, 0).isEmpty());
+        try testing.expect(l.cueRect(.end, 0).isEmpty());
+        try testing.expect(l.hitCue(0, l.carousel.left + 1, l.carousel.top + 1) == null);
+
+        // And a composer with no pictures at all has no cue to place.
+        const empty = Layout.init(.{
+            .scale = scale,
+            .width = px(600.0, scale),
+            .lines = 1,
+            .line_h = lineAt(scale),
+            .images = 0,
+            .footer_h = lineAt(scale),
+        });
+        try testing.expectEqual(@as(i32, 0), empty.cue_w);
+        try testing.expect(empty.cueRect(.end, 0).isEmpty());
+    }
 }
 
 test "nextStop skips a disabled action rather than parking focus on it" {
@@ -883,15 +1158,15 @@ test "nextStop skips a disabled action rather than parking focus on it" {
     // button that cannot be pressed.
     var enabled = [_]bool{ true, true };
     enabled[@intFromEnum(Button.send)] = false;
-    try testing.expectEqual(Stop.snapshot, nextStop(.text, false, enabled));
-    try testing.expectEqual(Stop.text, nextStop(.snapshot, false, enabled));
-    try testing.expectEqual(Stop.snapshot, nextStop(.text, true, enabled));
+    try testing.expectEqual(Stop.snapshot, nextStop(.text, false, enabled, false));
+    try testing.expectEqual(Stop.text, nextStop(.snapshot, false, enabled, false));
+    try testing.expectEqual(Stop.snapshot, nextStop(.text, true, enabled, false));
 
     // And with neither action live the walk still terminates on the text
     // rather than spinning.
     const none = [_]bool{ false, false };
-    try testing.expectEqual(Stop.text, nextStop(.text, false, none));
-    try testing.expectEqual(Stop.text, nextStop(.send, false, none));
+    try testing.expectEqual(Stop.text, nextStop(.text, false, none, false));
+    try testing.expectEqual(Stop.text, nextStop(.send, false, none, false));
 }
 
 test "the focus ring stays inside the button's painted square at every scale" {

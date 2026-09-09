@@ -15,6 +15,13 @@
 #      and the survivor is the OTHER picture, keeping its number (#2, never
 #      renumbered to #1).
 #   E. Emptying the composer empties the strip, and the row disappears again.
+#   F. (T668) A strip longer than the band SAYS so: the end with pictures past
+#      it carries a cue, clicking that cue pages the ribbon that way, and the
+#      cue at an end with nothing behind it is gone.
+#   G. (T668) The keyboard reaches a picture that is off the edge: Tab stops on
+#      the strip, Home/End/arrows walk it and scroll it, and Enter selects that
+#      picture's chip -- the same observable outcome a click has in C.
+#   H. (T668) Widened past the whole ribbon, neither end shows a cue.
 #
 # ORACLES. This runs on the BACKGROUND test desktop, where CopyFromScreen and
 # SendInput are dead (T233), so nothing here can look at painted pixels. Two
@@ -162,7 +169,8 @@ function Wait-FeedbackOpen($errlog, $paneId) {
 function Get-Carousel($errlog, $paneId) {
     $hit = $null
     $pat = "viewer feedback pane=$([regex]::Escape($paneId)) carousel=(\w+) tiles=(\d+) " +
-           "scroll=(-?\d+) selected=(-?\d+) left=(-?\d+) top=(-?\d+) thumb=(\d+) stride=(\d+)"
+           "scroll=(-?\d+) selected=(-?\d+) left=(-?\d+) top=(-?\d+) thumb=(\d+) stride=(\d+)" +
+           " view=(-?\d+) max=(-?\d+) cue=(\w+) focus=(-?\d+)"
     foreach ($line in (Get-Content $errlog -ErrorAction SilentlyContinue)) {
         if ($line -match $pat) {
             $hit = [pscustomobject]@{
@@ -174,10 +182,25 @@ function Get-Carousel($errlog, $paneId) {
                 Top      = [int]$Matches[6]
                 Thumb    = [int]$Matches[7]
                 Stride   = [int]$Matches[8]
+                View     = [int]$Matches[9]
+                Max      = [int]$Matches[10]
+                Cue      = $Matches[11]
+                Focus    = [int]$Matches[12]
             }
         }
     }
     return $hit
+}
+
+# The last carousel report satisfying $Test -- the T668 arms wait on the cue
+# and the keyboard ring rather than on a tile count.
+function Wait-CarouselWhere($errlog, $paneId, [scriptblock]$Test) {
+    for ($t = 0; $t -lt 40; $t++) {
+        $c = Get-Carousel $errlog $paneId
+        if ($c -and (& $Test $c)) { return $c }
+        Start-Sleep -Milliseconds 250
+    }
+    return (Get-Carousel $errlog $paneId)
 }
 
 function Wait-Carousel($errlog, $paneId, [int]$Tiles) {
@@ -263,6 +286,36 @@ function Click-Thumb($view, $fb, $geo, [int]$Index) {
     $x = $rect.Left + $geo.Left + $Index * $geo.Stride - $geo.Scroll + [int]($geo.Thumb / 2)
     $y = $rect.Top + $geo.Top + [int]($geo.Thumb / 2)
     return (Send-TestMouse -Window $view.Top -Target $fb -X ([int]$x) -Y ([int]$y))
+}
+
+# Click a point in the composer band's own client coordinates -- what the T668
+# cue arms need, since a cue is not a tile and has no index to point at.
+function Click-Band($view, $fb, [int]$X, [int]$Y) {
+    $rect = Get-TestWindowRect $fb
+    if (-not $rect) { return $false }
+    return (Send-TestMouse -Window $view.Top -Target $fb `
+            -X ([int]($rect.Left + $X)) -Y ([int]($rect.Top + $Y)))
+}
+
+# Where keyboard focus last LANDED inside the composer (T640's oracle, which
+# T668 extends with the `carousel` stop).
+function Get-Focus($errlog, $paneId) {
+    $hit = $null
+    foreach ($line in (Get-Content $errlog -ErrorAction SilentlyContinue)) {
+        if ($line -match "viewer feedback focus pane=$([regex]::Escape($paneId)) stop=(\w+)") {
+            $hit = $Matches[1]
+        }
+    }
+    return $hit
+}
+
+function Wait-Focus($errlog, $paneId, [string]$Stop) {
+    for ($t = 0; $t -lt 30; $t++) {
+        $f = Get-Focus $errlog $paneId
+        if ($f -eq $Stop) { return $f }
+        Start-Sleep -Milliseconds 250
+    }
+    return (Get-Focus $errlog $paneId)
 }
 
 function New-TestBitmap([int]$W, [int]$H, [int]$Seed) {
@@ -450,6 +503,123 @@ try {
     $shrunk = (Get-TestWindowRect $fb).Height
     Assert ($shrunk -eq $emptyBarH) `
         "...and the band is exactly as tall as it was before any picture ($shrunk vs $emptyBarH)"
+
+    # --- F. an overflowing strip SAYS there is more, at the end that has it --
+    # T668. The cue is a fade and a chevron -- painted chrome, which this
+    # desktop cannot photograph -- so the strip's own `cue=` is the oracle, and
+    # the clicks below prove the affordance under it actually pages.
+    $wrect = Get-TestWindowRect $view.Top
+    if ($wrect) {
+        [void](Set-TestWindowSize -Window $view.Top -Width 520 -Height $wrect.Height)
+        Start-Sleep -Milliseconds 700
+    }
+
+    $c = $null
+    $pasted = 0
+    while ($pasted -lt 16) {
+        $pasted++
+        [void](Set-ClipboardPng 40 30 (100 + $pasted))
+        [void](Send-TestViewerChord -Window $view.Top -Target $rich -Key V -Modifiers Ctrl)
+        $c = Wait-Carousel $errlog $paneId $pasted
+        if (-not $c -or $c.Tiles -ne $pasted) { break }
+        if ($c.Max -gt 0 -and $pasted -ge 3) { break }
+    }
+    Assert ($c -and $c.Tiles -eq $pasted) `
+        "the strip took $pasted pictures (reports '$($c.Tiles)')"
+    Assert ($c -and $c.Max -gt 0) `
+        "...more than fit across the band (view $($c.View), overflow $($c.Max))"
+    if (-not $c -or $c.Max -le 0) { throw 'the strip never overflowed its viewport' }
+    $tiles = $c.Tiles
+
+    # Page back to the first picture by clicking the LEADING cue, which is the
+    # mouse affordance the fade is advertising.
+    for ($i = 0; $i -lt 20; $i++) {
+        $c = Get-Carousel $errlog $paneId
+        if (-not $c -or $c.Scroll -le 0) { break }
+        [void](Click-Band $view $fb ($c.Left + 3) ($c.Top + [int]($c.Thumb / 2)))
+        Start-Sleep -Milliseconds 300
+    }
+    $c = Wait-CarouselWhere $errlog $paneId { param($x) $x.Scroll -eq 0 }
+    Assert ($c.Scroll -eq 0) `
+        "clicking the leading cue pages back to the first picture (scroll $($c.Scroll))"
+    Assert ($c.Cue -eq 'end') `
+        "...where the only cue is the trailing one, because that is the only end with more (cue '$($c.Cue)')"
+
+    # One click on the TRAILING cue moves the ribbon, and the leading end then
+    # has content past it too.
+    [void](Click-Band $view $fb ($c.Left + $c.View - 3) ($c.Top + [int]($c.Thumb / 2)))
+    $c = Wait-CarouselWhere $errlog $paneId { param($x) $x.Scroll -gt 0 }
+    Assert ($c.Scroll -gt 0) `
+        "clicking the trailing cue pages toward the pictures off the edge (scroll $($c.Scroll))"
+    Assert ($c.Cue -eq 'both' -or $c.Cue -eq 'start') `
+        "...and the leading end now says so as well (cue '$($c.Cue)')"
+
+    # ...and at the far end the trailing cue is gone: a cue that stayed up with
+    # nothing behind it would be the same lie as no cue at all.
+    for ($i = 0; $i -lt 20; $i++) {
+        $c = Get-Carousel $errlog $paneId
+        if (-not $c -or $c.Scroll -ge $c.Max) { break }
+        [void](Click-Band $view $fb ($c.Left + $c.View - 3) ($c.Top + [int]($c.Thumb / 2)))
+        Start-Sleep -Milliseconds 300
+    }
+    $c = Wait-CarouselWhere $errlog $paneId { param($x) $x.Scroll -ge $x.Max }
+    Assert ($c.Scroll -eq $c.Max) "the strip pages all the way to the last picture (scroll $($c.Scroll)/$($c.Max))"
+    Assert ($c.Cue -eq 'start') "...and only the leading cue is left there (cue '$($c.Cue)')"
+
+    # --- G. the keyboard reaches a picture that is off the edge --------------
+    # The gap T668 was filed for: every tile was mouse-only. Tab now stops on
+    # the strip and the arrows walk it, which is the Windows model for a strip
+    # of like items.
+    [void](Send-TestControlKey -Control $rich -Key Tab)
+    $focusStop = Wait-Focus $errlog $paneId 'carousel'
+    Assert ($focusStop -eq 'carousel') `
+        "Tab from the text now stops on the strip of pictures (focus '$focusStop')"
+    $c = Wait-CarouselWhere $errlog $paneId { param($x) $x.Focus -ge 0 }
+    Assert ($c.Focus -ge 0) "...with the ring on a real tile (focus '$($c.Focus)')"
+
+    [void](Send-TestControlKey -Control $fb -Key Home)
+    $c = Wait-CarouselWhere $errlog $paneId { param($x) $x.Focus -eq 0 }
+    Assert ($c.Focus -eq 0) "Home walks the ring to the first picture (focus '$($c.Focus)')"
+    Assert ($c.Scroll -eq 0) "...and the strip scrolled to show it (scroll $($c.Scroll))"
+
+    # End reaches the LAST picture, which at this width is off the edge -- the
+    # exact thing the keyboard could not do before.
+    [void](Send-TestControlKey -Control $fb -Key End)
+    $c = Wait-CarouselWhere $errlog $paneId { param($x) $x.Focus -eq ($tiles - 1) }
+    Assert ($c.Focus -eq ($tiles - 1)) `
+        "End reaches the last picture, which does not fit on screen (focus '$($c.Focus)' of $tiles)"
+    Assert ($c.Scroll -eq $c.Max) "...by scrolling the strip to it (scroll $($c.Scroll)/$($c.Max))"
+
+    [void](Send-TestControlKey -Control $fb -Key Left)
+    $c = Wait-CarouselWhere $errlog $paneId { param($x) $x.Focus -eq ($tiles - 2) }
+    Assert ($c.Focus -eq ($tiles - 2)) "Left steps back one picture (focus '$($c.Focus)')"
+    $tileLeft = $c.Focus * $c.Stride - $c.Scroll
+    Assert ($tileLeft -ge 0 -and ($tileLeft + $c.Thumb) -le $c.View) `
+        "...and it is wholly inside the viewport, not half off it ($tileLeft..$($tileLeft + $c.Thumb) in $($c.View))"
+
+    # Enter does what a click does: it selects that picture's chip, which is
+    # also where the ring goes -- back to the text with the caret.
+    $ringed = $c.Focus
+    [void](Send-TestControlKey -Control $fb -Key Enter)
+    $c = Wait-CarouselWhere $errlog $paneId { param($x) $x.Selected -eq $ringed }
+    Assert ($c.Selected -eq $ringed) `
+        "Enter on the focused tile selects that picture's chip (selected '$($c.Selected)')"
+    Assert ($c.Focus -lt 0) `
+        "...and hands the keyboard back to the text rather than leaving a ring behind (focus '$($c.Focus)')"
+    $afterEnter = (Get-TestControlText $rich)
+    Assert ($afterEnter -match '\[Image #') "the report still holds its pictures after the walk"
+
+    # --- H. a strip that FITS has no cue at either end -----------------------
+    # The other half of the contract, and the one a fade gets wrong by being
+    # always-on: widen the band past the whole ribbon and the cues go away.
+    if ($wrect) {
+        $wide = ($tiles + 2) * $c.Stride + 240
+        [void](Set-TestWindowSize -Window $view.Top -Width $wide -Height $wrect.Height)
+    }
+    $c = Wait-CarouselWhere $errlog $paneId { param($x) $x.Max -eq 0 }
+    Assert ($c.Max -eq 0) `
+        "widened past the whole ribbon, the strip has nothing to scroll (view $($c.View), overflow $($c.Max))"
+    Assert ($c.Cue -eq 'none') "...and neither end shows a cue (cue '$($c.Cue)')"
 
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'GUI process alive after all scenarios'
     Assert (-not (Test-TestDesktopLeak -ProcessId $appPid)) 'GUI never became visible on the interactive desktop'
