@@ -70,6 +70,12 @@ Set-ComposerSurface 'richedit'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
+# Text is compared and printed as ESCAPED code points: a console that cannot
+# render an emoji would otherwise turn a real difference into an unreadable one,
+# and a mismatch nobody can read is a mismatch nobody can fix. Shared with the
+# other composer suites since T672.
+. (Join-Path $PSScriptRoot 'lib\ShowText.ps1')
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -79,20 +85,6 @@ $script:fail = 0
 function Assert([bool]$cond, [string]$label) {
     if ($cond) { $script:pass++; Write-Host "PASS  $label" }
     else { $script:fail++; Write-Host "FAIL  $label" -ForegroundColor Red }
-}
-
-# Text is compared and printed as ESCAPED code points: a console that cannot
-# render an emoji would otherwise turn a real difference into an unreadable
-# one, and a mismatch nobody can read is a mismatch nobody can fix.
-function Show-Text([string]$s) {
-    if ($null -eq $s) { return '<null>' }
-    $sb = New-Object System.Text.StringBuilder
-    foreach ($c in $s.ToCharArray()) {
-        $n = [int]$c
-        if ($n -ge 32 -and $n -lt 127) { [void]$sb.Append($c) }
-        else { [void]$sb.AppendFormat('\u{0:X4}', $n) }
-    }
-    return $sb.ToString()
 }
 
 $EM_GETSEL = 0x00B0

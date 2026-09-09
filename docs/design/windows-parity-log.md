@@ -25807,3 +25807,37 @@ One unrelated red found while proving the hero path still renders:
 `test\win32\hero-viewer-tile.ps1` fails on the TERMINAL tile's border stroke,
 twice in a row, and has no row in `guard-due` to have ever said so. Filed as
 T1469; the viewer tile in the same run is healthy (128 distinct colours).
+
+## 2026-09-08 - T672: two tests that could not see the corruption they are named after
+
+The chip-deletion arms in `test\win32\viewer-feedback-images.ps1` and
+`test\win32\viewer-feedback-carousel.ps1` asked whether a phrase was absent -
+"no `[Image` left", "no `[Image #1]` left". Both questions are answered "yes" by
+a chip that has been half eaten, which is the exact defect the arms exist to
+catch: a chip that no longer parses still looks attached in the composer and
+silently drops its picture from the report. Both now compare the WHOLE composer
+text against the exact text that should be there, the rule T648 landed on.
+
+The measurement, rather than the argument for it. With the chip's selection
+range shortened by one character at each of the two sites that compute it, the
+images arm reports `got ']', want ''` and the carousel arm
+`got '] [Image #2] ', want ' [Image #2] '` - and the OLD needles pass on both of
+those strings, so the tightening is the whole difference between a test that
+notices and one that reports safety. Reverted and re-run: images ALL PASS (40),
+carousel ALL PASS (59).
+
+Two things fell out of doing it. `Show-Text`, which escapes a string to
+`\uXXXX` so a mismatch is readable on a console that cannot render an emoji,
+moved to `test\win32\lib\ShowText.ps1` and is dot-sourced by all three composer
+suites instead of being copied a third time (utf16 ALL PASS (30) over the move).
+And the teeth check found something T673 - the task proposing a cheap seam for
+exactly this - had assumed wrong, now noted there: the chip range is computed at
+TWO sites, `selectChipForDelete` for Backspace and `activateThumb` for a
+thumbnail click, and the carousel's delete arm goes through the second, so a
+stub of the first left it ALL PASS. Worse for T673's premise, an identity
+`charIndex`/`byteOffset` stub is a no-op on the pure-ASCII text both suites use,
+so the seam that task describes could not have teeth-checked either of them.
+
+Three more composer arms were tightened in passing (the post-paste chip and the
+two survivors in images, both chips in carousel). The same weak shape one level
+out, on `report.json`'s body, is filed as T1471.

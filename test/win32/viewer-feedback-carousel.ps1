@@ -66,6 +66,9 @@ Set-ComposerSurface 'richedit'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
+# Show-Text: how a whole-text comparison prints what it actually found (T672).
+. (Join-Path $PSScriptRoot 'lib\ShowText.ps1')
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -447,9 +450,14 @@ try {
         "the strip fits inside the band (bottom $($geo.Top + $geo.Thumb) vs $barH)"
     Assert ($geo.Left -ge 4) "the strip clears the band's leading edge ($($geo.Left))"
 
+    # Compared WHOLE, not by two substring needles: the composer was empty, so
+    # the two pastes are the entire text -- each chip and the one trailing space
+    # that keeps it from fusing to what follows.
+    $wantB = '[Image #1] [Image #2] '
     $text = (Get-TestControlText $rich)
-    Assert (($text -match '\[Image #1\]') -and ($text -match '\[Image #2\]')) `
-        "the composer holds both chips (holds '$text')"
+    Assert ($text -ceq $wantB) `
+        ("the composer holds exactly the two chips " +
+         "(got '$(Show-Text $text)', want '$(Show-Text $wantB)')")
 
     # ...and both were really decoded into a bitmap, letterboxed to the source's
     # own aspect ratio rather than stretched to the square tile.
@@ -480,10 +488,16 @@ try {
     # one Backspace over it removes the WHOLE chip.
     [void](Send-TestControlKey -Control $rich -Key Backspace)
     Start-Sleep -Milliseconds 500
+    # Compared WHOLE, not by "no `[Image #1]` left" (T672): that needle is
+    # satisfied by `[Image #1` with only the closing bracket eaten, which is
+    # precisely what a chip lookup that misses produces and precisely the
+    # corruption this arm is named after. The click selects the chip and nothing
+    # around it, so the space that followed #1 stays behind.
+    $wantC = ' [Image #2] '
     $afterDelete = (Get-TestControlText $rich)
-    Assert ($afterDelete -notmatch '\[Image #1\]') `
-        "one Backspace after the click removed the whole chip (holds '$afterDelete')"
-    Assert ($afterDelete -match '\[Image #2\]') '...and left the other chip alone'
+    Assert ($afterDelete -ceq $wantC) `
+        ("one Backspace after the click removed the whole chip and left the " +
+         "other alone (got '$(Show-Text $afterDelete)', want '$(Show-Text $wantC)')")
 
     # --- D. a deleted chip takes its thumbnail with it -----------------------
     $c = Wait-Carousel $errlog $paneId 1

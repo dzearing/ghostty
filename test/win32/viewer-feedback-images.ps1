@@ -65,6 +65,9 @@ Set-ComposerSurface 'richedit'
 
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
+# Show-Text: how a whole-text comparison prints what it actually found (T672).
+. (Join-Path $PSScriptRoot 'lib\ShowText.ps1')
+
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -334,8 +337,14 @@ try {
         "...taken VERBATIM, byte for byte ($($img.Bytes) vs $($png1.Length) on the clipboard)"
     Assert ($img -and $img.Live -eq 1) "...and one image is live in the report ($($img.Live))"
 
+    # Compared WHOLE, not by "an [Image #1] is in there somewhere": the composer
+    # was empty, so a chip pasted at the caret is the entire text -- the chip and
+    # the one trailing space that keeps it from fusing to what follows.
+    $wantA = '[Image #1] '
     $text = (Get-TestControlText $rich)
-    Assert ($text -match '\[Image #1\]') "the composer shows an '[Image #1]' chip (holds '$text')"
+    Assert ($text -ceq $wantA) `
+        ("the composer holds exactly an '[Image #1]' chip " +
+         "(got '$(Show-Text $text)', want '$(Show-Text $wantA)')")
 
     # --- B. a chip deletes WHOLE ---------------------------------------------
     # The caret sits just past the chip's trailing space. One Backspace takes
@@ -344,9 +353,15 @@ try {
     Start-Sleep -Milliseconds 250
     [void](Send-TestControlKey -Control $rich -Key Backspace)
     Start-Sleep -Milliseconds 400
+    # Compared WHOLE, not by "no `[Image` left" (T672): an unguarded Backspace
+    # eats one character and leaves `[Imag`, which does not match that needle
+    # either while being exactly the corruption this arm exists to catch -- a
+    # chip that still looks attached and silently drops its picture.
+    $wantB = ''
     $afterDelete = (Get-TestControlText $rich)
-    Assert ($afterDelete -notmatch '\[Image') `
-        "one Backspace removes the WHOLE chip, leaving no fragment (holds '$afterDelete')"
+    Assert ($afterDelete -ceq $wantB) `
+        ("one Backspace removes the WHOLE chip, leaving no fragment " +
+         "(got '$(Show-Text $afterDelete)', want '$(Show-Text $wantB)')")
 
     # --- C. the next number is 2, not the freed 1 ----------------------------
     $png2 = Set-ClipboardPng 20 12 91
@@ -368,9 +383,14 @@ try {
     Assert ($img -and $img.Bytes -gt 0) "...encoded to $($img.Bytes) bytes of PNG"
     Assert ($img -and $img.Live -eq 2) "...and two images are now live ($($img.Live))"
 
+    # Whole text again: the deleted chip emptied the composer, so these two
+    # pastes are all of it -- and a fragment of #2 left between them would be
+    # invisible to a pair of substring needles.
+    $wantD = '[Image #2] [Image #3] '
     $text = (Get-TestControlText $rich)
-    Assert (($text -match '\[Image #2\]') -and ($text -match '\[Image #3\]')) `
-        "the composer shows both surviving chips (holds '$text')"
+    Assert ($text -ceq $wantD) `
+        ("the composer holds exactly the two surviving chips " +
+         "(got '$(Show-Text $text)', want '$(Show-Text $wantD)')")
 
     # --- E. send files the pictures ------------------------------------------
     [void](Send-TestControlText -Control $rich -Text 'look at these')
