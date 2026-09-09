@@ -9,6 +9,46 @@ task (why a decision was made, what a past validation actually proved).
 Append newest-first: `YYYY-MM-DD — <tasks touched> — <what happened, what's
 next, any surprises>`.
 
+- 2026-09-08: T670 - **the screenshot picker can take a whole window now, and
+  it comes out without the rim of desktop a hand-dragged rectangle leaves.**
+  T647 built the region half of Mac's `screencapture -i`; the other half is
+  Space, which switches it to picking a WINDOW - hover (or aim with the arrows)
+  highlights the window under the caret, a click or Enter captures exactly it,
+  and a second Space goes back, because a mode with no way out is worse than no
+  mode.
+
+  Two details are the whole accuracy of it, and both are the kind that look
+  like implementation trivia until the picture comes out wrong. The frame is
+  `DWMWA_EXTENDED_FRAME_BOUNDS` rather than `GetWindowRect`: the latter includes
+  the invisible resize border DWM leaves around every window, so the naive
+  version hands the user a screenshot with a few pixels of whatever was behind
+  the window framing it. And the candidate walk is `EnumWindows` rather than
+  `WindowFromPoint`, because this overlay covers the entire virtual screen and
+  is therefore the window under the pointer at every single point - it has to
+  be skipped by handle, and `WindowFromPoint` cannot be told to skip anything.
+
+  Nothing in the paint path changed: window mode answers the existing
+  `selection()` accessor with the picked frame, so the bright rect, the outline,
+  the crop and the announced size all come from where they already came from.
+  The decision itself is pure (`region_select.zig`: `pickWindow` /
+  `isCandidate`), so eight new `none`-lane tests cover the overlay never being a
+  candidate, an invisible/minimized/cloaked window being unpickable AND not
+  shadowing what is behind it, topmost-wins, and the clip on a negative-origin
+  desktop.
+
+  The acceptance arm is section I of `test\win32\viewer-feedback-capture.ps1`
+  and it asserts against the target window's OWN measured rect rather than a
+  number the script chose: `102,94 784x592` announced, captured and cropped. DWM
+  turns out to compose the background test desktop, so the non-circular half is
+  live too - the capture is strictly inside the `GetWindowRect` rect (`800x600`
+  outer), which IS the resize border being left out. That harness also gained a
+  `guard-due` row of its own; it had been the only proof RegionSelector.zig has
+  and nothing tied an edit to a re-run.
+
+  Filed T1470: Tab to cycle candidate windows, which is the keyboard answer for
+  somebody who cannot see where the window they want is. Arrows-aim ships today
+  and is usable, but it is aiming.
+
 - 2026-09-08: T660 - **the instruction sheet Windows hands an AI agent
   described a terminal we do not ship.** The `ghoztty` skill document is what
   an agent READS to learn how to drive panes, and T866 made the Windows build

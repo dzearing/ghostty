@@ -48,11 +48,27 @@
 //! That property is also what makes a real keyboard path possible, so the
 //! selector has one: arrows move a caret, Ctrl+arrow moves it 32 px at a time,
 //! Enter pins the first corner and Enter again captures, Shift+arrow is the
-//! shortcut that does both in one press, and Escape still cancels. Space is
-//! left alone on purpose — it is what Mac's `screencapture -i` uses to switch
-//! to picking a whole window, which is T670. The rules
+//! shortcut that does both in one press, and Escape still cancels. The rules
 //! are pure (`region_select.zig`: `moveCaret` / `dropAnchor`), so the keyboard
 //! and the mouse drive the SAME `anchor`/`cursor` pair and can be interleaved.
+//!
+//! ## Picking a whole window (T670)
+//!
+//! Space toggles into WINDOW mode and back, which is the key and the gesture
+//! Mac's `screencapture -i` uses. Aiming — with the pointer or with the arrows —
+//! highlights the topmost window under the caret and a click (or Enter)
+//! captures exactly it. Nothing about the paint path changes: window mode
+//! answers `selection()` with the picked window's frame, so the bright rect,
+//! the outline, the crop and the announced size all come out of the same
+//! accessor a drag feeds.
+//!
+//! Two details are the whole accuracy of it. The frame is
+//! `DWMWA_EXTENDED_FRAME_BOUNDS`, not `GetWindowRect`, because the latter
+//! includes the invisible resize border and would give every capture a rim of
+//! desktop. And the candidate walk is `EnumWindows` rather than
+//! `WindowFromPoint`, because this overlay covers the entire virtual screen and
+//! is therefore the window under the pointer everywhere — it has to be SKIPPED
+//! by handle, and `WindowFromPoint` cannot be told to skip anything.
 //!
 //! Modifiers are tracked from the `WM_KEYDOWN`/`WM_KEYUP` of `VK_SHIFT` and
 //! `VK_CONTROL` rather than read with `GetKeyState`, for the reason above: a
@@ -92,7 +108,7 @@ const WM_APP_FINISH: u32 = w32.WM_APP + 7;
 /// What the overlay says before the caret has been placed or anything dragged —
 /// the only status line that names both input devices, because it is the one a
 /// user reads before choosing one.
-const hint_text = "Drag, or arrows then Enter  ·  Esc to cancel";
+const hint_text = "Drag, arrows+Enter, or Space for a window  ·  Esc to cancel";
 
 /// Called exactly once per selector, with the captured PNG or null when the
 /// user cancelled. The bytes belong to the SELECTOR and are freed as soon as
@@ -128,6 +144,15 @@ mods: region.Mods = .{},
 
 /// Whether the mouse was captured, so `finish` releases only what it took.
 captured: bool = false,
+
+/// Which thing is being selected — a dragged rectangle or a whole window
+/// (T670). Space toggles, the way Mac's `screencapture -i` does.
+mode: region.Mode = .region,
+
+/// In window mode, the frame of the window under the caret, already clipped to
+/// the desktop and rebased into client coordinates. Null when the caret is over
+/// nothing pickable, which is the mode's version of "no selection yet".
+window_rect: ?region.Rect = null,
 
 /// Whether the keyboard has driven the caret yet. The caret mark is drawn only
 /// once it has, so a pure mouse capture paints exactly what it always did.
@@ -385,7 +410,12 @@ fn dimCopy(snap: screen_capture.Snapshot) ?w32.HANDLE {
 
 /// The selection as it stands, in client coordinates. Null before the drag
 /// starts and for any drag with no area.
+///
+/// In window mode it is simply the picked window's frame: the crop, the bright
+/// rect, the outline and the announced size all read this one accessor, which
+/// is why adding a second way of choosing a rect changed no paint code at all.
 fn selection(self: *const RegionSelector) ?region.Rect {
+    if (self.mode == .window) return self.window_rect;
     const a = self.anchor orelse return null;
     return region.selection(a, self.cursor, .{
         .x = 0,
@@ -427,6 +457,9 @@ fn invalidateCaret(self: *RegionSelector, next: ?region.Point) void {
 /// presses Enter and watches the only mark on screen disappear has been told
 /// their keypress broke something.
 fn caretMark(self: *const RegionSelector) ?region.Point {
+    // Window mode aims at whole windows, not at pixels: a crosshair there would
+    // claim a precision the mode does not have.
+    if (self.mode == .window) return null;
     if (!self.keyboard or self.selection() != null) return null;
     return self.cursor;
 }
@@ -447,10 +480,13 @@ fn refreshStatus(self: *RegionSelector) void {
         .w = r.w,
         .h = r.h,
     } else null;
-    const next = region.statusText(&buf, .{
-        .x = self.cursor.x + origin.x,
-        .y = self.cursor.y + origin.y,
-    }, sel);
+    const next = if (self.mode == .window)
+        region.windowStatusText(&buf, sel)
+    else
+        region.statusText(&buf, .{
+            .x = self.cursor.x + origin.x,
+            .y = self.cursor.y + origin.y,
+        }, sel);
     if (std.mem.eql(u8, next, self.status_buf[0..self.status_len])) return;
 
     @memcpy(self.status_buf[0..next.len], next);
@@ -654,6 +690,124 @@ fn drawHint(self: *RegionSelector, hdc: w32.HDC) void {
     );
 }
 
+// --------------------------------------------------------------- window pick
+
+/// How many windows under the pointer the pick will consider. It is the number
+/// of OVERLAPPING windows at one point, not the number on the desktop, so this
+/// is generous rather than tight — and a desktop that somehow exceeded it still
+/// picks correctly, because the list is filled in z-order and the answer is the
+/// front of it.
+const max_pick_candidates = 32;
+
+const PickCtx = struct {
+    /// The overlay's own handle, which is under the pointer everywhere and is
+    /// therefore the one window that must never be picked.
+    own: usize,
+    /// The point being picked at, in VIRTUAL-SCREEN coordinates.
+    pt: region.Point,
+    list: [max_pick_candidates]region.WindowInfo = undefined,
+    n: usize = 0,
+};
+
+/// A window's frame AS DRAWN, in virtual-screen coordinates.
+///
+/// `DWMWA_EXTENDED_FRAME_BOUNDS` rather than `GetWindowRect`, because the latter
+/// includes the invisible resize border DWM leaves around a window — so a naive
+/// window capture comes out with a rim of desktop around it, which is exactly
+/// the inaccuracy this mode exists to remove. `GetWindowRect` is the fallback
+/// for a window DWM cannot answer for (a non-composited desktop, which is what
+/// the acceptance suite's background desktop is), because a slightly generous
+/// rect is a far better answer than no window pick at all.
+fn frameBounds(hwnd: w32.HWND) ?region.Rect {
+    var rc: w32.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+    const hr = w32.DwmGetWindowAttribute(
+        hwnd,
+        w32.DWMWA_EXTENDED_FRAME_BOUNDS,
+        &rc,
+        @sizeOf(w32.RECT),
+    );
+    if (hr != 0 and w32.GetWindowRect(hwnd, &rc) == 0) return null;
+    return .{
+        .x = rc.left,
+        .y = rc.top,
+        .w = rc.right - rc.left,
+        .h = rc.bottom - rc.top,
+    };
+}
+
+fn pickProc(hwnd: w32.HWND, lparam: isize) callconv(.winapi) i32 {
+    const ctx: *PickCtx = @ptrFromInt(@as(usize, @bitCast(lparam)));
+    if (ctx.n >= max_pick_candidates) return 0;
+
+    const handle = @intFromPtr(hwnd);
+    if (handle == ctx.own) return 1;
+    // Checked here rather than left to `isCandidate` purely for cost: a desktop
+    // has hundreds of invisible top-level windows, and each one that got past
+    // this would cost a DWM round trip on every mouse move.
+    if (w32.IsWindowVisible(hwnd) == 0) return 1;
+
+    const r = frameBounds(hwnd) orelse return 1;
+    if (!r.contains(ctx.pt)) return 1;
+
+    var cloaked: u32 = 0;
+    _ = w32.DwmGetWindowAttribute(hwnd, w32.DWMWA_CLOAKED, &cloaked, @sizeOf(u32));
+
+    ctx.list[ctx.n] = .{
+        .handle = handle,
+        .rect = r,
+        .visible = true,
+        .minimized = w32.IsIconic(hwnd) != 0,
+        .cloaked = cloaked != 0,
+    };
+    ctx.n += 1;
+    return 1;
+}
+
+/// The window under `p` (client coordinates), as a client-coordinate rect
+/// clipped to the desktop — or null when there is nothing pickable there.
+///
+/// The decision itself is `region.pickWindow`, which is pure and unit-tested;
+/// everything here is the enumeration that feeds it. `EnumWindows` walks
+/// top-level windows front to back, which is the order the pick's "topmost
+/// wins" rule reads.
+fn windowUnder(self: *RegionSelector, p: region.Point) ?region.Rect {
+    const bounds = self.snap.bounds;
+    var ctx: PickCtx = .{
+        .own = @intFromPtr(self.hwnd),
+        .pt = .{ .x = p.x + bounds.x, .y = p.y + bounds.y },
+    };
+    _ = w32.EnumWindows(&pickProc, @bitCast(@intFromPtr(&ctx)));
+    const hit = region.pickWindow(ctx.list[0..ctx.n], ctx.pt, ctx.own, bounds) orelse return null;
+    return region.relativeTo(hit, bounds);
+}
+
+/// Switch modes and re-derive everything that depends on which one is live.
+///
+/// Any half-made region selection is dropped on the way in, and the picked
+/// window on the way out: carrying either across would leave the overlay
+/// showing a rect the current mode has no way to change.
+fn setMode(self: *RegionSelector, m: region.Mode) void {
+    self.mode = m;
+    self.anchor = null;
+    self.window_rect = null;
+    if (m == .window) {
+        // The caret mark belongs to region mode; window mode's feedback is the
+        // highlighted window itself.
+        self.keyboard = false;
+        self.window_rect = self.windowUnder(self.cursor);
+    }
+    self.applied(self.selection());
+    log.info("viewer feedback capture=mode {s}", .{@tagName(m)});
+}
+
+/// Re-pick at `p` and repaint. The one path both the pointer and the arrows
+/// take in window mode, so they cannot drift.
+fn aimWindow(self: *RegionSelector, p: region.Point) void {
+    self.cursor = p;
+    self.window_rect = self.windowUnder(p);
+    self.applied(self.selection());
+}
+
 // --------------------------------------------------------------------- input
 
 /// Whether `vk` is held right now, as far as the thread dispatching this
@@ -693,27 +847,47 @@ fn key(self: *RegionSelector, vk: u16, down: bool) void {
                 w32.VK_UP => .up,
                 else => .down,
             };
-            const next = region.moveCaret(self.keyState(), arrow, self.mods, .{
+            const bounds: region.Rect = .{
                 .x = 0,
                 .y = 0,
                 .w = self.snap.bounds.w,
                 .h = self.snap.bounds.h,
-            });
+            };
+            // In window mode the arrows AIM rather than select — there is no
+            // anchor to grow from, so `moveCaret` is asked for the caret alone
+            // and the pick follows it. That makes the window mode reachable
+            // without a mouse at all, which is the point T671 made about it.
+            if (self.mode == .window) {
+                const next = region.moveCaret(
+                    .{ .caret = self.cursor, .anchor = null },
+                    arrow,
+                    self.mods,
+                    bounds,
+                );
+                self.aimWindow(next.caret);
+                return;
+            }
+            const next = region.moveCaret(self.keyState(), arrow, self.mods, bounds);
             self.keyboard = true;
             self.anchor = next.anchor;
             self.cursor = next.caret;
             self.applied(self.selection());
         },
 
+        // Space toggles the window picker on and off, which is the binding
+        // Mac's `screencapture -i` uses for exactly this. Deliberately NOT an
+        // alias for Enter, however button-shaped this window is (T671 left it
+        // free for precisely this).
+        w32.VK_SPACE => self.setMode(region.toggleMode(self.mode)),
+
         // Enter pins the first corner and captures the second — the keyboard's
-        // whole gesture in one key, so nothing here needs a chord.
-        //
-        // Deliberately NOT Space as well, however button-shaped this window is:
-        // Space is what Mac's `screencapture -i` uses to switch to picking a
-        // WINDOW, which is T670's whole subject. A binding is much worse to take
-        // away than never to have shipped.
+        // whole gesture in one key, so nothing here needs a chord. In window
+        // mode there is no corner to pin, so it captures the aimed window: the
+        // keyboard's version of the click.
         w32.VK_RETURN => {
-            if (self.anchor == null) {
+            if (self.mode == .window) {
+                self.finish(self.selection());
+            } else if (self.anchor == null) {
                 self.keyboard = true;
                 const next = region.dropAnchor(self.keyState());
                 self.anchor = next.anchor;
@@ -844,6 +1018,17 @@ fn wndProc(
 
         w32.WM_LBUTTONDOWN => {
             const p: region.Point = .{ .x = xOf(lparam), .y = yOf(lparam) };
+            // In window mode a click IS the capture — there is no drag to
+            // begin. Re-picked at the pressed point rather than trusting the
+            // last hover, so a click that arrives without a move before it
+            // (which is every posted click, and a tap on a touchpad) captures
+            // what is under the press.
+            if (self.mode == .window) {
+                self.cursor = p;
+                self.window_rect = self.windowUnder(p);
+                self.finish(self.selection());
+                return 0;
+            }
             self.anchor = p;
             self.cursor = p;
             // The pointer owns the gesture again: a caret left over from an
@@ -856,6 +1041,13 @@ fn wndProc(
         },
 
         w32.WM_MOUSEMOVE => {
+            // Window mode tracks EVERY move, not just the ones during a drag:
+            // hovering is the whole gesture, and the highlight is how the user
+            // sees what a click would take.
+            if (self.mode == .window) {
+                self.aimWindow(.{ .x = xOf(lparam), .y = yOf(lparam) });
+                return 0;
+            }
             if (self.anchor == null) return 0;
             self.cursor = .{ .x = xOf(lparam), .y = yOf(lparam) };
             self.applied(self.selection());

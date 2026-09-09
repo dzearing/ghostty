@@ -479,6 +479,25 @@ $GuardTable = @(
             'src\apprt\win32\viewer_feedback_doc.zig'
         )
     },
+    # The composer's SCREENSHOT capture (T647/T671/T670): the full-desktop
+    # region selector, its keyboard path, and the whole-window picker Space
+    # toggles into. The pure rect and pick math runs in the `none` lane every
+    # floor run; what only this harness sees is the overlay itself - that it
+    # appears over the real virtual screen, that a posted drag, a keyed
+    # gesture and a window pick each crop what they claim to, that the picked
+    # frame excludes the invisible resize border, and that none of it costs
+    # the user their clipboard.
+    [pscustomobject]@{
+        Name   = 'viewer-feedback-capture'
+        Script = 'test\win32\viewer-feedback-capture.ps1'
+        Stamp  = 'test\win32\viewer-feedback-capture.stamp.json'
+        Covers = @(
+            'test\win32\viewer-feedback-capture.ps1',
+            'src\apprt\win32\RegionSelector.zig',
+            'src\apprt\win32\region_select.zig',
+            'src\apprt\win32\screen_capture.zig'
+        )
+    },
     # The composer's WEB surface (T934): the second WebView2 controller that
     # replaced the RichEdit, its page, and the two-way message channel between
     # them. Separate from `viewer-feedback` above because the two drive

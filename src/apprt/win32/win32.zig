@@ -1802,6 +1802,13 @@ pub extern "dwmapi" fn DwmGetWindowAttribute(
 /// (T290).
 pub const DWMWA_CLOAKED: u32 = 14;
 
+/// `DWMWA_EXTENDED_FRAME_BOUNDS` — the window's frame as it is actually DRAWN,
+/// in screen coordinates. `GetWindowRect` reports a few pixels more on every
+/// side: the invisible resize border DWM leaves around a window for grabbing.
+/// A screenshot cropped to `GetWindowRect` therefore comes out with a rim of
+/// whatever was behind it (T670).
+pub const DWMWA_EXTENDED_FRAME_BOUNDS: u32 = 9;
+
 // -----------------------------------------------------------------------
 // GDI double-buffered painting API
 // -----------------------------------------------------------------------
@@ -2287,6 +2294,18 @@ pub extern "user32" fn GetAncestor(
     hwnd: HWND,
     gaFlags: u32,
 ) callconv(.winapi) ?HWND;
+
+/// Every top-level window on the calling thread's desktop, in FRONT-TO-BACK
+/// z-order. The callback returns 0 to stop the walk and non-zero to continue.
+///
+/// The z-order guarantee is the whole reason the window picker (T670) uses this
+/// rather than `WindowFromPoint`: the picker has to skip its own full-desktop
+/// overlay, which is the topmost window at every point, and `WindowFromPoint`
+/// has no way to be told to ignore a window.
+pub extern "user32" fn EnumWindows(
+    lpEnumFunc: *const fn (hwnd: HWND, lparam: isize) callconv(.winapi) i32,
+    lparam: isize,
+) callconv(.winapi) i32;
 
 pub extern "user32" fn GetWindowThreadProcessId(
     hWnd: HWND,

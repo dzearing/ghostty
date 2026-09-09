@@ -22,6 +22,21 @@
 #      the selection, Escape cancels out of a keyboard-driven state, and Enter
 #      captures a rect of exactly the predicted size.
 #
+#   I. SPACE PICKS A WHOLE WINDOW (T670), the way Mac's `screencapture -i`
+#      does: Space switches modes, aiming at a window highlights it, and a
+#      click captures exactly its frame -- asserted against the target window's
+#      OWN measured rect, not against a number this script chose. Space again
+#      goes back to region mode and a drag still works, because a mode with no
+#      way out is worse than no mode.
+#
+#      The frame oracle here re-implements the selector's rule (extended frame
+#      bounds, falling back to GetWindowRect where DWM cannot answer) because
+#      that fallback is what makes the arm runnable on a non-composited
+#      background desktop at all. The NON-circular half is asserted separately:
+#      where DWM does answer, the captured rect must be strictly inside the
+#      GetWindowRect one, which is the invisible resize border this mode exists
+#      to leave out.
+#
 #      Its oracle is the overlay's own WINDOW TEXT, which the selector keeps as
 #      a live readout of the caret and the selection. That is not a test hook:
 #      it is the window's accessible name, the half of "announce the selection"
@@ -77,6 +92,42 @@ Set-ComposerSurface 'richedit'
 . (Join-Path $PSScriptRoot 'lib\TestDesktop.ps1')
 
 Add-Type -AssemblyName System.Windows.Forms
+
+# The window-frame oracle for section I. Two answers rather than one, so the
+# script can tell the composited case from the non-composited one: DWM's
+# extended frame bounds (what the window actually draws) and GetWindowRect
+# (that plus the invisible resize border).
+Add-Type @'
+using System;
+using System.Runtime.InteropServices;
+public class GhozttyCaptureFrame {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT { public int Left, Top, Right, Bottom; }
+    [DllImport("dwmapi.dll")]
+    static extern int DwmGetWindowAttribute(IntPtr hwnd, int attr, out RECT val, int size);
+    [DllImport("user32.dll")]
+    static extern int GetWindowRect(IntPtr hwnd, out RECT val);
+    const int DWMWA_EXTENDED_FRAME_BOUNDS = 9;
+
+    static int[] Box(RECT r) { return new int[] { r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top }; }
+
+    // Null when DWM cannot answer for this window -- which is the expected
+    // result on a desktop it does not compose.
+    public static int[] Drawn(IntPtr hwnd) {
+        RECT r;
+        int size = Marshal.SizeOf(typeof(RECT));
+        if (DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, out r, size) != 0) return null;
+        if (r.Right <= r.Left || r.Bottom <= r.Top) return null;
+        return Box(r);
+    }
+
+    public static int[] Outer(IntPtr hwnd) {
+        RECT r;
+        if (GetWindowRect(hwnd, out r) == 0) return null;
+        return Box(r);
+    }
+}
+'@ -ErrorAction SilentlyContinue
 
 $script:pass = 0
 $script:fail = 0
@@ -627,6 +678,95 @@ try {
         }
     }
 
+    # --- I. Space picks a whole WINDOW (T670) --------------------------------
+    # The target is the viewer's own top-level window, because it is the one
+    # window this script KNOWS is on the test desktop and can measure. The
+    # overlay covers it entirely and is skipped by handle, which is the thing
+    # that has to work for any of this to be reachable at all.
+    if ($fb) {
+        $target = $view.Top
+        $drawn = [GhozttyCaptureFrame]::Drawn($target)
+        $outer = [GhozttyCaptureFrame]::Outer($target)
+        $frame = if ($drawn) { $drawn } else { $outer }
+        Assert ($null -ne $frame -and $frame[2] -gt 0 -and $frame[3] -gt 0) `
+            "the target window has a measurable frame ($($frame -join ','))"
+
+        # What the selector must produce: that frame, clipped to the virtual
+        # screen, since the snapshot has no pixels outside it.
+        $ex = [Math]::Max($frame[0], $script:vsX)
+        $ey = [Math]::Max($frame[1], $script:vsY)
+        $ew = [Math]::Min($frame[0] + $frame[2], $script:vsX + $script:vsW) - $ex
+        $eh = [Math]::Min($frame[1] + $frame[3], $script:vsY + $script:vsH) - $ey
+        $px = $ex + [int]($ew / 2)
+        $py = $ey + [int]($eh / 2)
+
+        Assert (Invoke-SnapshotButton $view $fb) 'the + button opens a selector for the window pick'
+        $overlay = Wait-Overlay $appPid $true
+        Assert ($null -ne $overlay) '...and the overlay is up'
+
+        [void](Send-TestRawMessage -Window $overlay -Message 0x0100 -WParam ([IntPtr]0x20))
+        Assert ($null -ne (Wait-Status $overlay 'Space for a region')) `
+            "Space switches the overlay to window mode (says '$(Get-Status $overlay)')"
+
+        [void](Send-TestMouse -Window $view.Top -Target $overlay -X $px -Y $py -Action move)
+        $aimed = Wait-Status $overlay ('^' + $ex + ',' + $ey + '\s+' + $ew + 'x' + $eh + '\s')
+        Assert ($null -ne $aimed) `
+            "...and aiming at a window announces that window's own frame ($ex,$ey ${ew}x${eh}; says '$(Get-Status $overlay)')"
+
+        $doneBefore = (Get-CaptureTally $errlog).Done
+        [void](Send-TestMouse -Window $view.Top -Target $overlay -X $px -Y $py -Action down)
+        $tally = Wait-Tally $errlog 'Done' ($doneBefore + 1)
+        Assert ($tally.Done -ge $doneBefore + 1) "a click captures the aimed window (done=$($tally.Done))"
+        Assert ($tally.Rect -and $tally.Rect.W -eq $ew -and $tally.Rect.H -eq $eh) `
+            "...at exactly that window's size ($($tally.Rect.W)x$($tally.Rect.H), want ${ew}x${eh})"
+        Assert ($tally.Rect -and $tally.Rect.X -eq $ex -and $tally.Rect.Y -eq $ey) `
+            "...and at its own origin ($($tally.Rect.X),$($tally.Rect.Y), want $ex,$ey)"
+        Assert ($null -eq (Wait-Overlay $appPid $false)) '...and the overlay came down'
+
+        # The half that is not circular. A capture may never be WIDER than the
+        # window's outer rect, and where DWM composes this desktop it must be
+        # strictly smaller than it -- that difference IS the invisible resize
+        # border, which is the whole reason this mode reads extended frame
+        # bounds instead of GetWindowRect.
+        Assert ($outer -and $ex -ge $outer[0] -and $ey -ge $outer[1] -and
+            ($ex + $ew) -le ($outer[0] + $outer[2]) -and ($ey + $eh) -le ($outer[1] + $outer[3])) `
+            "...inside the window's outer rect, never larger than it ($($outer -join ','))"
+        $rimmed = ($null -ne $drawn) -and (($drawn[2] -lt $outer[2]) -or ($drawn[3] -lt $outer[3]))
+        Assert ((-not $rimmed) -or ($ew -lt $outer[2] -or $eh -lt $outer[3])) `
+            "...with the invisible resize border left out where DWM composes (rimmed=$rimmed, outer $($outer[2])x$($outer[3]) vs captured ${ew}x${eh})"
+
+        # And the way back out: a second Space returns to region mode, where a
+        # drag still does what it always did.
+        Assert (Invoke-SnapshotButton $view $fb) 'the + button opens a selector for the toggle-back arm'
+        $overlay = Wait-Overlay $appPid $true
+        Assert ($null -ne $overlay) '...and the overlay is up'
+        [void](Send-TestRawMessage -Window $overlay -Message 0x0100 -WParam ([IntPtr]0x20))
+        Assert ($null -ne (Wait-Status $overlay 'Space for a region')) '...switched into window mode'
+        [void](Send-TestRawMessage -Window $overlay -Message 0x0100 -WParam ([IntPtr]0x20))
+        Assert ($null -ne (Wait-Status $overlay 'Space for a window')) `
+            "a second Space toggles back to region mode (says '$(Get-Status $overlay)')"
+
+        $doneBefore = (Get-CaptureTally $errlog).Done
+        $rx = $script:vsX + 300
+        $ry = $script:vsY + 220
+        [void](Send-TestMouse -Window $view.Top -Target $overlay -X $rx -Y $ry -Action down)
+        Start-Sleep -Milliseconds 200
+        [void](Send-TestMouse -Window $view.Top -Target $overlay -X ($rx + 140) -Y ($ry + 100) -Action move)
+        Start-Sleep -Milliseconds 200
+        [void](Send-TestMouse -Window $view.Top -Target $overlay -X ($rx + 140) -Y ($ry + 100) -Action up)
+        $tally = Wait-Tally $errlog 'Done' ($doneBefore + 1)
+        Assert ($tally.Done -ge $doneBefore + 1) "...and a drag still captures after the round trip (done=$($tally.Done))"
+        Assert ($tally.Rect -and $tally.Rect.W -eq 140 -and $tally.Rect.H -eq 100) `
+            "...at exactly the dragged size ($($tally.Rect.W)x$($tally.Rect.H), want 140x100)"
+        Assert ($null -eq (Wait-Overlay $appPid $false)) '...and the overlay came down again'
+
+        # C, once more, over the mode this section added: a window pick must
+        # cost the user their clipboard no more than a drag does.
+        $afterWindow = [System.Windows.Forms.Clipboard]::GetText()
+        Assert ($afterWindow -eq $sentinel) `
+            "the clipboard survived the window picks too (holds '$afterWindow')"
+    }
+
     Assert (-not ($app.Process -and $app.Process.HasExited)) 'GUI process alive after all scenarios'
     Assert (-not (Test-TestDesktopLeak -ProcessId $appPid)) 'GUI never became visible on the interactive desktop'
 } finally {
@@ -638,6 +778,14 @@ try {
 $fgSeen = @(Stop-TestForegroundWatch)
 $leaked = @(Get-TestLaunchedPids | Where-Object { $fgSeen -contains $_ })
 Assert ($leaked.Count -eq 0) "no test-desktop app ever became foreground on the interactive desktop (saw $($leaked -join ','))"
+
+# A clean green run stamps the covered files (T783) so scripts\guard-due.ps1
+# can answer "has this harness been run against the selector as it now stands?".
+# Red leaves the stamp alone - red stays due.
+if ($script:fail -eq 0) {
+    & powershell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $repo 'scripts\guard-due.ps1') `
+        update -Guard viewer-feedback-capture -Repo $repo 2>&1 | ForEach-Object { Write-Host "  $_" }
+}
 
 Write-Host ''
 if ($script:fail -eq 0) { Write-Host "ALL PASS ($script:pass)" }

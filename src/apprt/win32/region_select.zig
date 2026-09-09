@@ -181,13 +181,83 @@ pub fn dropAnchor(state: KeyState) KeyState {
     return .{ .caret = state.caret, .anchor = state.caret };
 }
 
+// --------------------------------------------------------------- window pick
+
+/// Which thing the overlay is selecting: a rectangle dragged (or keyed) out of
+/// the desktop, or a whole WINDOW under the pointer.
+///
+/// Mac's `screencapture -i` has exactly these two, on exactly this toggle
+/// (Space), and the second is the one somebody wanting "a picture of THIS
+/// dialog" is reaching for — it is strictly more accurate than any rectangle
+/// they could drag around the same window.
+pub const Mode = enum { region, window };
+
+/// Space toggles, rather than switching one way. A mode with no way out is
+/// worse than no mode: a user who pressed Space to see what it did must be able
+/// to press it again and be back where they were.
+pub fn toggleMode(m: Mode) Mode {
+    return switch (m) {
+        .region => .window,
+        .window => .region,
+    };
+}
+
+/// One top-level window as the picker sees it: a handle (as an integer, so
+/// nothing here imports an OS type), a frame in VIRTUAL-SCREEN coordinates, and
+/// the three states that make a window unpickable even though it is enumerated.
+pub const WindowInfo = struct {
+    handle: usize,
+    rect: Rect,
+    visible: bool = true,
+    /// Minimized. Its frame is off in the negative thousands, which would
+    /// otherwise be a perfectly valid-looking rect to crop.
+    minimized: bool = false,
+    /// Composed but not drawn — a window on another virtual desktop, or one the
+    /// shell has cloaked. It is not on the photograph, so it cannot be picked
+    /// out of it.
+    cloaked: bool = false,
+};
+
+/// Whether `w` may be picked at all, given the overlay's OWN handle.
+///
+/// The overlay is the window under the pointer at every point of the desktop —
+/// it covers the whole virtual screen — so excluding it is not an edge case,
+/// it is the first thing the pick has to do or nothing else is ever reachable.
+pub fn isCandidate(w: WindowInfo, own: usize) bool {
+    if (w.handle == 0 or w.handle == own) return false;
+    if (!w.visible or w.minimized or w.cloaked) return false;
+    return w.rect.w > 0 and w.rect.h > 0;
+}
+
+/// The rect a window pick at `p` selects: the FIRST candidate in `windows` that
+/// contains the point, clipped to `bounds`. Null when nothing under the pointer
+/// qualifies.
+///
+/// `windows` is in front-to-back z-order, which is the order the OS enumerates
+/// top-level windows in, so "first" means "topmost" — the window the user can
+/// actually see under the pointer, not whatever happens to be listed first.
+pub fn pickWindow(windows: []const WindowInfo, p: Point, own: usize, bounds: Rect) ?Rect {
+    for (windows) |w| {
+        if (!isCandidate(w, own)) continue;
+        if (!w.rect.contains(p)) continue;
+        return clampTo(w.rect, bounds);
+    }
+    return null;
+}
+
 // -------------------------------------------------------------------- status
 
 /// The longest status line the overlay can produce, used to MEASURE the hint
 /// card once so it never resizes (and therefore never re-centers, jittering
 /// sideways) while a drag is live. Digits are `8` because it is the widest one
 /// in every proportional face we ship.
-pub const status_template = "-88888,-88888  88888x88888  \u{b7}  Enter to capture  \u{b7}  Esc to cancel";
+///
+/// It has to cover BOTH modes, because Space switches between them with the
+/// card already on screen: a template measured from region mode alone would
+/// clip the window-mode line, and one measured per mode would resize the card
+/// mid-gesture, which is the jitter this exists to prevent.
+pub const status_template =
+    "-88888,-88888  \u{b7}  Drag, arrows+Enter, or Space for a window  \u{b7}  Esc to cancel";
 
 /// The overlay's live status line: what the hint card paints AND what the
 /// window's accessible name is set to, which is the half a screen reader can
@@ -207,12 +277,32 @@ pub fn statusText(buf: []u8, caret: Point, sel: ?Rect) []const u8 {
     }
     return std.fmt.bufPrint(
         buf,
-        "{d},{d}  \u{b7}  Drag, or arrows then Enter  \u{b7}  Esc to cancel",
+        "{d},{d}  \u{b7}  Drag, arrows+Enter, or Space for a window  \u{b7}  Esc to cancel",
         .{ caret.x, caret.y },
     ) catch status_fallback;
 }
 
 const status_fallback = "Drag to capture  \u{b7}  Esc to cancel";
+
+/// The same line for WINDOW mode: the picked window's origin and size, or the
+/// instruction when the pointer is over nothing pickable.
+///
+/// It names Space in both states, because a mode you cannot find your way out
+/// of is the failure this toggle is designed against, and the card is the only
+/// place that says so.
+pub fn windowStatusText(buf: []u8, sel: ?Rect) []const u8 {
+    if (sel) |r| {
+        return std.fmt.bufPrint(
+            buf,
+            "{d},{d}  {d}x{d}  \u{b7}  Click to capture  \u{b7}  Space for a region",
+            .{ r.x, r.y, r.w, r.h },
+        ) catch window_status_fallback;
+    }
+    return window_status_fallback;
+}
+
+const window_status_fallback =
+    "Point at a window  \u{b7}  Space for a region  \u{b7}  Esc to cancel";
 
 /// How long a status line can get. Sized off the template, with room for the
 /// idle line's longer tail.
@@ -569,6 +659,165 @@ test "statusText announces the caret, then the live selection" {
     try testing.expect(statusText(&buf, .{ .x = -32768, .y = -32768 }, null).len <=
         status_template.len);
     try testing.expect(status_template.len < status_max);
+}
+
+// -------------------------------------------------------- window-pick tests
+
+test "Space toggles between the two modes, both ways" {
+    // Both ways, because a one-way switch strands a user who pressed Space to
+    // find out what it does.
+    try testing.expectEqual(Mode.window, toggleMode(.region));
+    try testing.expectEqual(Mode.region, toggleMode(.window));
+}
+
+test "the overlay's own window is never a candidate" {
+    // The overlay covers the whole virtual screen, so it is under the pointer
+    // at every single point: if it were pickable, it would be the ONLY thing
+    // ever picked and the mode would be dead on arrival.
+    const own: usize = 0x1234;
+    const overlay: WindowInfo = .{ .handle = own, .rect = desktop };
+    try testing.expect(!isCandidate(overlay, own));
+    try testing.expect(isCandidate(.{ .handle = 0x5678, .rect = desktop }, own));
+    // A null handle is not a window either.
+    try testing.expect(!isCandidate(.{ .handle = 0, .rect = desktop }, own));
+
+    // And the pick agrees, with the overlay listed first the way the OS would
+    // enumerate it (it is topmost).
+    const under: WindowInfo = .{ .handle = 0x5678, .rect = .{ .x = 100, .y = 100, .w = 400, .h = 300 } };
+    try testing.expectEqual(
+        Rect{ .x = 100, .y = 100, .w = 400, .h = 300 },
+        pickWindow(&.{ overlay, under }, .{ .x = 200, .y = 200 }, own, desktop).?,
+    );
+}
+
+test "a window that cannot be seen cannot be picked" {
+    const own: usize = 1;
+    const r: Rect = .{ .x = 0, .y = 0, .w = 200, .h = 200 };
+    const p: Point = .{ .x = 10, .y = 10 };
+
+    // Each of the three states on its own, then the empty rect. All of them
+    // sit in the enumeration and none of them is on the photograph.
+    try testing.expect(pickWindow(
+        &.{.{ .handle = 2, .rect = r, .visible = false }},
+        p,
+        own,
+        desktop,
+    ) == null);
+    try testing.expect(pickWindow(
+        &.{.{ .handle = 2, .rect = r, .minimized = true }},
+        p,
+        own,
+        desktop,
+    ) == null);
+    try testing.expect(pickWindow(
+        &.{.{ .handle = 2, .rect = r, .cloaked = true }},
+        p,
+        own,
+        desktop,
+    ) == null);
+    try testing.expect(pickWindow(
+        &.{.{ .handle = 2, .rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 } }},
+        p,
+        own,
+        desktop,
+    ) == null);
+
+    // And an unpickable window in FRONT does not shadow the pickable one
+    // behind it — otherwise a cloaked window from another virtual desktop
+    // would swallow every pick made under it.
+    try testing.expectEqual(
+        r,
+        pickWindow(&.{
+            .{ .handle = 2, .rect = desktop, .cloaked = true },
+            .{ .handle = 3, .rect = r },
+        }, p, own, desktop).?,
+    );
+}
+
+test "the pick takes the topmost window under the pointer, and nothing else" {
+    const own: usize = 1;
+    const back: WindowInfo = .{ .handle = 2, .rect = .{ .x = 0, .y = 0, .w = 800, .h = 600 } };
+    const front: WindowInfo = .{ .handle = 3, .rect = .{ .x = 100, .y = 100, .w = 200, .h = 200 } };
+    const list = [_]WindowInfo{ front, back };
+
+    // Over the overlap: the front one, because that is what the user sees.
+    try testing.expectEqual(front.rect, pickWindow(&list, .{ .x = 150, .y = 150 }, own, desktop).?);
+    // Over the back one only: the back one.
+    try testing.expectEqual(back.rect, pickWindow(&list, .{ .x = 500, .y = 500 }, own, desktop).?);
+    // Over neither: nothing. A pick with no window under it is not a capture,
+    // the same way a zero-area drag is not one.
+    try testing.expect(pickWindow(&list, .{ .x = 1500, .y = 900 }, own, desktop) == null);
+    // An empty desktop picks nothing rather than falling over.
+    try testing.expect(pickWindow(&.{}, .{ .x = 10, .y = 10 }, own, desktop) == null);
+}
+
+test "a picked window is clipped to the desktop" {
+    // The common case this exists for: a window dragged half off the left edge
+    // of the leftmost monitor. Its frame is real, but the part outside the
+    // snapshot has no pixels to crop.
+    const own: usize = 1;
+    const half_off: WindowInfo = .{ .handle = 2, .rect = .{ .x = -200, .y = -100, .w = 600, .h = 400 } };
+    try testing.expectEqual(
+        Rect{ .x = 0, .y = 0, .w = 400, .h = 300 },
+        pickWindow(&.{half_off}, .{ .x = 10, .y = 10 }, own, desktop).?,
+    );
+
+    // And on a desktop whose own origin is negative, the clip is to THAT, not
+    // to (0,0) — nothing in this path may assume the desktop starts at the
+    // origin.
+    const negative: Rect = .{ .x = -1920, .y = -300, .w = 3840, .h = 1380 };
+    try testing.expectEqual(
+        Rect{ .x = -1920, .y = -300, .w = 500, .h = 400 },
+        pickWindow(
+            &.{.{ .handle = 2, .rect = .{ .x = -2100, .y = -500, .w = 680, .h = 600 } }},
+            .{ .x = -2000, .y = -400 },
+            own,
+            negative,
+        ).?,
+    );
+}
+
+test "windowStatusText announces the picked window, and always names the way out" {
+    var buf: [status_max]u8 = undefined;
+
+    const aimed = windowStatusText(&buf, .{ .x = -120, .y = 40, .w = 1280, .h = 720 });
+    try testing.expect(std.mem.startsWith(u8, aimed, "-120,40  1280x720  "));
+    try testing.expect(std.mem.indexOf(u8, aimed, "Click to capture") != null);
+    try testing.expect(std.mem.indexOf(u8, aimed, "Space") != null);
+
+    // Over nothing pickable: the instruction, which still names Space.
+    const idle = windowStatusText(&buf, null);
+    try testing.expect(std.mem.indexOf(u8, idle, "Point at a window") != null);
+    try testing.expect(std.mem.indexOf(u8, idle, "Space") != null);
+    try testing.expect(std.mem.indexOf(u8, idle, "Esc") != null);
+}
+
+test "every line of either mode fits the card the template measures" {
+    // The card is measured ONCE, from the template, and Space switches modes
+    // with it already on screen. A window-mode line longer than the template
+    // would be clipped by a card that cannot grow.
+    var buf: [status_max]u8 = undefined;
+    const extreme: Rect = .{ .x = -32768, .y = -32768, .w = 32767, .h = 32767 };
+
+    try testing.expect(windowStatusText(&buf, extreme).len <= status_template.len);
+    try testing.expect(windowStatusText(&buf, null).len <= status_template.len);
+    try testing.expect(statusText(&buf, .{ .x = -32768, .y = -32768 }, extreme).len <=
+        status_template.len);
+    try testing.expect(statusText(&buf, .{ .x = -32768, .y = -32768 }, null).len <=
+        status_template.len);
+    try testing.expect(status_template.len < status_max);
+}
+
+test "the region-mode idle line offers the window mode too" {
+    // Discoverability: Space is a mode nobody would guess at. It is named in
+    // the one line a user reads before choosing an input device, alongside the
+    // keyboard path T671 shipped, which must not have been displaced by it.
+    var buf: [status_max]u8 = undefined;
+    const idle = statusText(&buf, .{ .x = 0, .y = 0 }, null);
+    try testing.expect(std.mem.indexOf(u8, idle, "Space") != null);
+    try testing.expect(std.mem.indexOf(u8, idle, "window") != null);
+    try testing.expect(std.mem.indexOf(u8, idle, "arrows") != null);
+    try testing.expect(std.mem.indexOf(u8, idle, "Drag") != null);
 }
 
 test "caretBox covers the whole mark at every scale" {
